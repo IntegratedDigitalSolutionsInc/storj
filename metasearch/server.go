@@ -100,20 +100,9 @@ func (s *Server) Run() error {
 
 func (s *Server) validateRequest(ctx context.Context, r *http.Request, baseRequest *BaseRequest, body interface{}) error {
 	// Parse authorization header
-	err := s.Auth.Authenticate(r)
+	projectID, err := s.Auth.Authenticate(ctx, r)
 	if err != nil {
 		return err
-	}
-
-	// Parse project ID from header (TODO: get from API token)
-	projectID := r.Header.Get("X-Project-ID")
-	if projectID == "" {
-		return fmt.Errorf("%w: missing project ID", ErrBadRequest)
-	}
-
-	baseRequest.ProjectID, err = uuid.FromString(projectID)
-	if err != nil {
-		return fmt.Errorf("%w: invalid project ID", ErrBadRequest)
 	}
 
 	// Decode request body
@@ -128,7 +117,7 @@ func (s *Server) validateRequest(ctx context.Context, r *http.Request, baseReque
 	bucket := vars["bucket"]
 	key := vars["key"]
 	baseRequest.Location = metabase.ObjectLocation{
-		ProjectID:  baseRequest.ProjectID,
+		ProjectID:  projectID,
 		BucketName: metabase.BucketName(bucket),
 		ObjectKey:  metabase.ObjectKey(key),
 	}
