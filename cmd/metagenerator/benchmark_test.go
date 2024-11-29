@@ -41,7 +41,7 @@ func BenchmarkSimpleQuery(b *testing.B) {
 	teardownSuite, db, ctx := setupSuite()
 	defer teardownSuite(b)
 	for _, tR := range tRs {
-		metagenerator.GeneratorSetup(sharedFields, 1000, 10, tR, apiKey, projectId, defaultMetasearchAPI, db, ctx)
+		metagenerator.GeneratorSetup(1000, 10, tR, apiKey, projectId, defaultMetasearchAPI, db, ctx)
 		for _, n := range metagenerator.MatchingEntries {
 			if tR < n {
 				break

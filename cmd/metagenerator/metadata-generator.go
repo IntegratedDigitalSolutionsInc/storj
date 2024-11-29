@@ -67,7 +67,6 @@ func main() {
 	// Initialize batch generator
 	batchGen := metagenerator.NewBatchGenerator(
 		db,
-		sharedFields,  // 30% shared fileds
 		batchSize,     // batch size
 		workersNumber, // number of workers
 		totalRecords,
