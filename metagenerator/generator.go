@@ -5,12 +5,14 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	"math"
 	"math/rand"
 	"sync"
 	"time"
 
+	"github.com/ddosify/go-faker/faker"
 	_ "github.com/lib/pq"
 	"storj.io/common/uuid"
 )
@@ -43,8 +45,6 @@ type Record struct {
 // Generator handles the creation of test data
 type Generator struct {
 	totalRecords int
-	commonValues map[string][]any
-	fieldShare   float64
 	pathPrefix   chan string // Channel for generating unique path prefixes
 	pathCounter  uint64      // Counter for ensuring unique paths
 	mu           sync.Mutex  // Mutex for thread-safe path generation
@@ -52,7 +52,9 @@ type Generator struct {
 }
 
 // NewGenerator creates a new Generator instance with a buffered path prefix channel
-func NewGenerator(fieldShare float64, pathCounter uint64, totalRecords int) *Generator {
+func NewGenerator(pathCounter uint64, totalRecords int) *Generator {
+	initializeWordLists()
+
 	// Create a pool of random number generators
 	randPool := sync.Pool{
 		New: func() interface{} {
@@ -61,12 +63,6 @@ func NewGenerator(fieldShare float64, pathCounter uint64, totalRecords int) *Gen
 	}
 
 	g := &Generator{
-		commonValues: map[string][]any{
-			"string":  {"red", "blue", "green", "yellow", "purple"},
-			"number":  {1, 2, 3, 4, 5, 6, 7, 8, 9, 10},
-			"boolean": {true, false},
-		},
-		fieldShare:   fieldShare,
 		pathPrefix:   make(chan string, 1000), // Buffered channel for path prefixes
 		pathCounter:  pathCounter,
 		randPool:     randPool,
@@ -116,45 +112,37 @@ func (g *Generator) generatePath() string {
 	return fmt.Sprintf("%s/%d", prefix, counter)
 }
 
-// generateValue creates either a shared or unique value
-func (g *Generator) generateKeyValue(i int) (key string, val any) {
-	r := g.getRand()
-	defer g.putRand(r)
-
-	valueTypes := []string{"string", "number", "boolean"}
-	valueType := valueTypes[r.Intn(len(valueTypes))]
-
-	if r.Float64() < g.fieldShare {
-		values := g.commonValues[valueType]
-		val = values[r.Intn(len(values))]
-		key = fmt.Sprintf("field_%v", val)
-		return
+func (g *Generator) genMeta() (meta map[string]any) {
+	m := Meta{
+		Title: generateSimpleTitle(),
 	}
 
-	key = fmt.Sprintf("field_%d", i)
-	switch valueType {
-	case "string":
-		val = fmt.Sprintf("unique_%d", r.Intn(10000))
-	case "number":
-		val = r.Intn(10000)
-	case "boolean":
-		val = r.Intn(2) == 1
-	}
+	m.Description = generateDescription(10, 30)
+	m.Genres = randomGenres()
+	m.Language = randomLanguage()
+	m.MetadataLanguage = randomLanguage()
+	m.ReleaseYear = randomYear()
+	m.Format = Format(rand.Intn(m.Format.Length()))
+	m.DurationSeconds = int(randomDuration())
+	m.Series.Cast = randomCast()
+	m.Href = strings.ReplaceAll(m.Title, " ", "_")
+	m.Extract = generateDescription(50, 100)
+	m.Thumbnail = faker.NewFaker().RandomImageURL()
+	res := randomResolution()
+	m.ThumbnailWidth = res[0]
+	m.Thumbnail_Height = res[1]
+
+	mB, _ := json.Marshal(m)
+	json.Unmarshal(mB, &meta)
 	return
 }
 
-// GenerateRecord creates a single record with random metadata
+// GenerateRecord creates a single record with random metadata with static metadata
 func (g *Generator) GenerateRecord() Record {
 	r := g.getRand()
 	defer g.putRand(r)
 
-	numKeys := r.Intn(6) + 5 // 5-10 keys
-	metadata := make(map[string]any)
-
-	for i := 0; i < numKeys; i++ {
-		key, val := g.generateKeyValue(i)
-		metadata[key] = val
-	}
+	metadata := g.genMeta()
 
 	for _, n := range MatchingEntries {
 		if g.totalRecords < n {
@@ -190,10 +178,10 @@ type BatchGenerator struct {
 }
 
 // NewBatchGenerator creates a new BatchGenerator
-func NewBatchGenerator(db *sql.DB, fieldShare float64, batchSize, workers, totalRecords int, pathCounter uint64, projectId, apiKey, mode, metaSearchEndpoint string) *BatchGenerator {
+func NewBatchGenerator(db *sql.DB, batchSize, workers, totalRecords int, pathCounter uint64, projectId, apiKey, mode, metaSearchEndpoint string) *BatchGenerator {
 	return &BatchGenerator{
 		db:                 db,
-		generator:          NewGenerator(fieldShare, pathCounter, totalRecords),
+		generator:          NewGenerator(pathCounter, totalRecords),
 		batchSize:          batchSize,
 		workers:            workers,
 		mode:               mode,

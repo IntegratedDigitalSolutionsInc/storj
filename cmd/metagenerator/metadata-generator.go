@@ -37,7 +37,6 @@ var (
 func readArgs() {
 	flag.StringVar(&dbEndpoint, "db", defaultDbEndpoint, fmt.Sprintf("db endpoint, default: %v", defaultDbEndpoint))
 	flag.StringVar(&mode, "mode", metagenerator.DryRunMode, fmt.Sprintf("incert mode [%s, %s, %s], default: %v", metagenerator.ApiMode, metagenerator.DbMode, metagenerator.DryRunMode, metagenerator.DryRunMode))
-	flag.Float64Var(&sharedFields, "sharedFields", defaultSharedFields, fmt.Sprintf("percentage of shared fields, default: %v", defaultSharedFields))
 	flag.IntVar(&batchSize, "batchSize", defaultBatchSize, fmt.Sprintf("number of records per batch, default: %v", defaultBatchSize))
 	flag.IntVar(&workersNumber, "workersNumber", defaultWorkersNumber, fmt.Sprintf("number of workers, default: %v", defaultWorkersNumber))
 	flag.IntVar(&totalRecords, "totalRecords", defaultTotlaRecords, fmt.Sprintf("total number of records, default: %v", defaultTotlaRecords))
@@ -67,7 +66,6 @@ func main() {
 	// Initialize batch generator
 	batchGen := metagenerator.NewBatchGenerator(
 		db,
-		sharedFields,  // 30% shared fileds
 		batchSize,     // batch size
 		workersNumber, // number of workers
 		totalRecords,
