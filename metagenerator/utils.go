@@ -800,7 +800,7 @@ func generateComplexTitle() string {
 }
 
 func generateDescription(f, t int) string {
-	descriptionLength := rand.Intn(t-f) + 10 // Generate description with 10-30 words
+	descriptionLength := rand.Intn(t-f) + f // Generate description with 10-30 words
 
 	var descriptionParts []string
 	descriptionParts = append(descriptionParts, prefixes[rand.Intn(len(prefixes))])
