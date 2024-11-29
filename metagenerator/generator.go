@@ -126,7 +126,7 @@ func (g *Generator) genMeta() (meta map[string]any) {
 	m.DurationSeconds = int(randomDuration())
 	m.Series.Cast = randomCast()
 	m.Href = strings.ReplaceAll(m.Title, " ", "_")
-	m.Extract = generateDescription(30, 50)
+	m.Extract = generateDescription(50, 100)
 	m.Thumbnail = faker.NewFaker().RandomImageURL()
 	res := randomResolution()
 	m.ThumbnailWidth = res[0]
