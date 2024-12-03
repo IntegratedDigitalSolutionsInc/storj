@@ -39,7 +39,7 @@ func main() {
 	metabaseURL := os.Getenv("STORJ_METAINFO_DATABASE_URL")
 	metabase, err := metabase.Open(ctx, log.Named("metabase"), metabaseURL,
 		metabase.Config{
-			ApplicationName: "metadata-api",
+			ApplicationName: "metasearch-api",
 		},
 	)
 	if err != nil {
