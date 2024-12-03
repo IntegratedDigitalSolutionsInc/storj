@@ -81,6 +81,28 @@ func (c *MetaSearchClient) SetObjectMetadata(ctx context.Context, bucket string,
 	return nil
 }
 
+// DeleteObjectMetadata deletes the metadata for an object.
+func (c *MetaSearchClient) DeleteObjectMetadata(ctx context.Context, bucket string, key string) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, c.access.Server+"/metadata/"+bucket+"/"+key, nil)
+	if err != nil {
+		return err
+	}
+
+	req.Header.Set("Authorization", "Bearer "+c.access.Access)
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNoContent {
+		return httpError(resp)
+	}
+
+	return nil
+}
+
 func httpError(resp *http.Response) error {
 	switch resp.StatusCode {
 	case http.StatusUnauthorized:
