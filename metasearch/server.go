@@ -57,7 +57,7 @@ type SearchRequest struct {
 	BatchSize int    `json:"batchSize,omitempty"`
 	PageToken string `json:"pageToken,omitempty"`
 
-	startAfter metabase.ObjectStream
+	startAfter metabase.ObjectStream `json:"-"`
 }
 
 // SearchResponse contains fields for a view or search response.

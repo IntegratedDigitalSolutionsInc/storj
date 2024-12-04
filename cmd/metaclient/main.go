@@ -31,4 +31,5 @@ func commands(cmds clingy.Commands) {
 	cmds.New("get", "Get metadata for an existing object", newCmdGet())
 	cmds.New("set", "Set metadata for an existing object", newCmdSet())
 	cmds.New("rm", "Remove metadata for an existing object", newCmdDelete())
+	cmds.New("search", "Search metadata", newCmdSearch())
 }

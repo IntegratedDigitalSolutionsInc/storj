@@ -74,7 +74,7 @@ func (c *cmdSet) Execute(ctx context.Context) (err error) {
 		return err
 	}
 
-	err = c.setMetadata(ctx)
+	err = c.setMetadata()
 	if err != nil {
 		return err
 	}
@@ -88,45 +88,24 @@ func (c *cmdSet) Execute(ctx context.Context) (err error) {
 	return nil
 }
 
-func (c *cmdSet) setMetadata(ctx context.Context) (err error) {
+func (c *cmdSet) setMetadata() (err error) {
+	var inputdata []byte
+
 	if c.inputfile == "-" {
-		err = c.setMetadataFromStdin(ctx)
+		inputdata, err = io.ReadAll(os.Stdin)
 	} else if c.inputfile != "" {
-		err = c.setMetadataFromFile(ctx)
+		inputdata, err = os.ReadFile(c.inputfile)
+	} else {
+		inputdata = []byte(c.inputdata)
 	}
+
 	if err != nil {
 		return fmt.Errorf("error reading metadata: %w", err)
 	}
 
-	err = json.Unmarshal([]byte(c.inputdata), &c.metadata)
+	err = json.Unmarshal([]byte(inputdata), &c.metadata)
 	if err != nil {
 		return fmt.Errorf("invalid metadata: %w", err)
 	}
-	return nil
-}
-
-func (c *cmdSet) setMetadataFromStdin(ctx context.Context) (err error) {
-	buf, err := io.ReadAll(os.Stdin)
-	if err != nil {
-		return fmt.Errorf("cannot read from stdin: %w", err)
-	}
-
-	c.inputdata = string(buf)
-	return nil
-}
-
-func (c *cmdSet) setMetadataFromFile(ctx context.Context) (err error) {
-	file, err := os.Open(c.inputfile)
-	if err != nil {
-		return fmt.Errorf("cannot open input file: %w", err)
-	}
-	defer file.Close()
-
-	buf, err := io.ReadAll(file)
-	if err != nil {
-		return fmt.Errorf("cannot read from input file: %w", err)
-	}
-
-	c.inputdata = string(buf)
 	return nil
 }
