@@ -34,15 +34,7 @@ func (c *Config) Read() {
 		fmt.Println(err)
 	}
 
-	if c.Database == "" {
-		c.Database = os.Getenv("STORJ_DATABASE")
-	}
-
-	if c.Metainfo.DatabaseURL == "" {
-		c.Metainfo.DatabaseURL = os.Getenv("STORJ_METAINFO_DATABASE_URL")
-	}
-
-	if c.Endpoint == "" {
-		c.Endpoint = os.Getenv("STORJ_METASEARCH_ENDPOINT")
-	}
+	c.Database = os.Getenv("STORJ_DATABASE")
+	c.Metainfo.DatabaseURL = os.Getenv("STORJ_METAINFO_DATABASE_URL")
+	c.Endpoint = os.Getenv("STORJ_METASEARCH_ENDPOINT")
 }
