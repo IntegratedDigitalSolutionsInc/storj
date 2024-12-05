@@ -57,7 +57,9 @@ type SearchRequest struct {
 	BatchSize int    `json:"batchSize,omitempty"`
 	PageToken string `json:"pageToken,omitempty"`
 
-	startAfter metabase.ObjectStream
+	startAfter     metabase.ObjectStream
+	filterPath     *jmespath.JMESPath
+	projectionPath *jmespath.JMESPath
 }
 
 // SearchResponse contains fields for a view or search response.
@@ -194,6 +196,22 @@ func (s *Server) validateSearchRequest(ctx context.Context, r *http.Request, req
 		request.Location.ObjectKey = metabase.ObjectKey(request.KeyPrefix)
 	}
 
+	// Validate filter
+	if request.Filter != "" {
+		request.filterPath, err = jmespath.Compile(request.Filter)
+		if err != nil {
+			return fmt.Errorf("%w: invalid filter expression: %v", ErrBadRequest, err)
+		}
+	}
+
+	// Validate projection
+	if request.Projection != "" {
+		request.projectionPath, err = jmespath.Compile(request.Projection)
+		if err != nil {
+			return fmt.Errorf("%w: invalid projection expression: %v", ErrBadRequest, err)
+		}
+	}
+
 	return nil
 }
 
@@ -226,8 +244,8 @@ func (s *Server) searchMetadata(ctx context.Context, request *SearchRequest) (re
 		}
 
 		// Apply projection
-		if request.Projection != "" {
-			projectedMetadata, err = jmespath.Search(request.Projection, metadata)
+		if request.projectionPath != nil {
+			projectedMetadata, err = request.projectionPath.Search(metadata)
 		} else {
 			projectedMetadata = metadata
 		}
@@ -256,7 +274,7 @@ func (s *Server) filterMetadata(ctx context.Context, request *SearchRequest, met
 	}
 
 	// Evaluate JMESPath filter
-	result, err := jmespath.Search(request.Filter, metadata)
+	result, err := request.filterPath.Search(metadata)
 	if err != nil {
 		return false, fmt.Errorf("%w: %v", ErrBadRequest, err)
 	}
