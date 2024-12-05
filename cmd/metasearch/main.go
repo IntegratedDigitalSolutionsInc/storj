@@ -5,7 +5,6 @@ package main
 
 import (
 	"context"
-	"os"
 
 	"github.com/zeebo/errs"
 	"go.uber.org/zap"
@@ -15,17 +14,21 @@ import (
 	"storj.io/storj/satellite/satellitedb"
 )
 
+var runCfg metasearch.Config
+
+func init() {
+	runCfg.Read()
+}
+
 func main() {
 	ctx := context.Background()
-	log, err := zap.NewDevelopment() // TODO: use production logger
+	log, err := runCfg.Log.Build()
 	if err != nil {
 		panic(err)
 	}
-
 	defer log.Sync()
 
-	databaseURL := os.Getenv("STORJ_DATABASE")
-	db, err := satellitedb.Open(ctx, log.Named("db"), databaseURL, satellitedb.Options{
+	db, err := satellitedb.Open(ctx, log.Named("db"), runCfg.Database, satellitedb.Options{
 		ApplicationName: "metadata-api",
 	})
 	if err != nil {
@@ -36,11 +39,8 @@ func main() {
 		err = errs.Combine(err, db.Close())
 	}()
 
-	metabaseURL := os.Getenv("STORJ_METAINFO_DATABASE_URL")
-	metabase, err := metabase.Open(ctx, log.Named("metabase"), metabaseURL,
-		metabase.Config{
-			ApplicationName: "metasearch-api",
-		},
+	metabase, err := metabase.Open(ctx, log.Named("metabase"), runCfg.Metainfo.DatabaseURL,
+		runCfg.Metainfo.Metabase("metasearch-api"),
 	)
 	if err != nil {
 		log.Error("Error creating metabase connection on metadata api:", zap.Error(err))
@@ -50,10 +50,9 @@ func main() {
 		err = errs.Combine(err, metabase.Close())
 	}()
 
-	endpoint := os.Getenv("STORJ_METASEARCH_ENDPOINT")
 	repo := metasearch.NewMetabaseSearchRepository(metabase)
 	auth := metasearch.NewHeaderAuth(db)
-	metadataAPI, err := metasearch.NewServer(log, repo, auth, endpoint)
+	metadataAPI, err := metasearch.NewServer(log, repo, auth, runCfg.Endpoint)
 	if err != nil {
 		log.Error("Error creating metadata api:", zap.Error(err))
 		return
