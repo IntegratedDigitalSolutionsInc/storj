@@ -10,8 +10,10 @@ import (
 )
 
 const (
-	defaulConfigPath = "/root/.local/share/storj/metasearch/config.yaml"
-	defaultEndpoint  = ":9998"
+	defaulConfigPath        = "/root/.local/share/storj/metasearch/config.yaml"
+	defaultDatabase         = "cockroach://root@cockroachdb-public:26257/master?sslmode=disable"
+	defaultMetainfoDatabase = "cockroach://root@cockroachdb-public:26257/master?sslmode=disable"
+	defaultEndpoint         = ":9998"
 )
 
 type Config struct {
@@ -22,19 +24,42 @@ type Config struct {
 }
 
 func (c *Config) Read() {
+	c.setDefault()
+	c.setConfig()
+	c.setEnv()
+}
+
+func (c *Config) setDefault() {
+	c.Log = zap.NewDevelopmentConfig()
+	c.Database = defaultDatabase
+	c.Metainfo.DatabaseURL = defaultMetainfoDatabase
+	c.Endpoint = defaultEndpoint
+}
+
+func (c *Config) setConfig() {
 	c.Log = zap.NewDevelopmentConfig()
 	yamlData, err := os.ReadFile(defaulConfigPath)
 	if err != nil {
 		fmt.Println(err)
+	} else {
+		err = yaml.Unmarshal(yamlData, c)
+		if err != nil {
+			fmt.Println(err)
+		}
 	}
-	c.Endpoint = defaultEndpoint
+}
 
-	err = yaml.Unmarshal(yamlData, c)
-	if err != nil {
-		fmt.Println(err)
+func (c *Config) setEnv() {
+	envDatabase := os.Getenv("STORJ_DATABASE")
+	if envDatabase != "" {
+		c.Database = envDatabase
 	}
-
-	c.Database = os.Getenv("STORJ_DATABASE")
-	c.Metainfo.DatabaseURL = os.Getenv("STORJ_METAINFO_DATABASE_URL")
-	c.Endpoint = os.Getenv("STORJ_METASEARCH_ENDPOINT")
+	envMetainfoDatabaseURL := os.Getenv("STORJ_METAINFO_DATABASE_URL")
+	if envMetainfoDatabaseURL != "" {
+		c.Metainfo.DatabaseURL = envMetainfoDatabaseURL
+	}
+	envEndpoint := os.Getenv("STORJ_METASEARCH_ENDPOINT")
+	if envEndpoint != "" {
+		c.Endpoint = envEndpoint
+	}
 }
