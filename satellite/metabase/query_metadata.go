@@ -34,15 +34,46 @@ func (db *DB) FindObjectsByClearMetadata(ctx context.Context, opts FindObjectsBy
 func (p *PostgresAdapter) FindObjectsByClearMetadata(ctx context.Context, opts FindObjectsByClearMetadata, startAfter ObjectStream, batchSize int) (result FindObjectsByClearMetadataResult, err error) {
 	defer mon.Task()(&ctx)(&err)
 
+	// Determine first and last object conditions
+	//
+	// It looks like the query is optimized most consistently if we have both a
+	// start and end condition for object keys. So we come up with one, even if
+	// we do not have a start condition or prefix.
+	var startCondition string
+	var startKey ObjectKey
+	var startVersion Version
+	if startAfter.ProjectID.IsZero() {
+		// first page => use key prefix
+		startCondition = `(project_id, bucket_name, object_key, version) >= ($1, $2, $3, $4)`
+		startKey = ObjectKey(opts.KeyPrefix)
+		startVersion = 0
+	} else {
+		// subsequent pages => use startAfter
+		startCondition = `(project_id, bucket_name, object_key, version) > ($1, $2, $3, $4)`
+		startKey = startAfter.ObjectKey
+		startVersion = startAfter.Version
+	}
+
+	var endCondition string
+	var endKey = []byte(opts.KeyPrefix)
+	if len(endKey) == 0 || endKey[len(endKey)-1] == 0xff {
+		// TODO: this is not 100% accurate, but it is the best we can do without a prefix.
+		endKey = append(endKey, 0xff)
+		endCondition = `(project_id, bucket_name, object_key, version) <= ($5, $6, $7, $8)`
+	} else {
+		endKey[len(endKey)-1]++
+		endCondition = `(project_id, bucket_name, object_key, version) < ($5, $6, $7, $8)`
+	}
+
+	// Create query
 	query := `
 		SELECT
 			project_id, bucket_name, object_key, version, stream_id, clear_metadata
 		FROM objects
 		WHERE
-			(project_id, bucket_name) = ($1, $2) AND
-			(project_id, bucket_name, object_key, version) > ($3, $4, $5, $6) AND
-			clear_metadata @> $7 AND
-			left(object_key, $8) = $9 AND
+			` + startCondition + ` AND
+			` + endCondition + ` AND
+			clear_metadata @> $9 AND
 			status <> ` + statusPending + ` AND
 			(expires_at IS NULL OR expires_at > now())
 		ORDER BY project_id, bucket_name, object_key, version
@@ -52,10 +83,9 @@ func (p *PostgresAdapter) FindObjectsByClearMetadata(ctx context.Context, opts F
 	result.Objects = make([]FindObjectsByClearMetadataResultObject, 0, batchSize)
 
 	err = withRows(p.db.QueryContext(ctx, query,
-		opts.ProjectID, opts.BucketName,
-		startAfter.ProjectID, startAfter.BucketName, []byte(startAfter.ObjectKey), startAfter.Version,
+		opts.ProjectID, opts.BucketName, startKey, startVersion,
+		opts.ProjectID, opts.BucketName, endKey, 0,
 		opts.ContainsQuery,
-		len(opts.KeyPrefix), opts.KeyPrefix,
 		batchSize),
 	)(func(rows tagsql.Rows) error {
 		var last FindObjectsByClearMetadataResultObject
