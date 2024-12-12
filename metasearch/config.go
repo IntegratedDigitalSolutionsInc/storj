@@ -13,7 +13,7 @@ const (
 	defaulConfigPath        = "/root/.local/share/storj/metasearch/config.yaml"
 	defaultDatabase         = "cockroach://root@cockroachdb-public:26257/master?sslmode=disable"
 	defaultMetainfoDatabase = "cockroach://root@cockroachdb-public:26257/master?sslmode=disable"
-	defaultEndpoint         = ":9998"
+	defaultEndpoint         = ":6666"
 )
 
 type Config struct {

@@ -45,5 +45,5 @@ COPY --from=storjup /go/bin/storj-up /usr/local/bin/storj-up
 COPY --from=dlv /go/bin/dlv /usr/local/bin/dlv
 # test identities for quick-start
 COPY --from=img.dev.storj.io/storjup/base:20230607-1 /var/lib/storj/identities /var/lib/storj/identities
-COPY cmd/satellite/entrypoint /entrypoint
+COPY entrypoint /entrypoint
 ENTRYPOINT ["/entrypoint"]
