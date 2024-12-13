@@ -34,13 +34,11 @@ func putMeta(record *Record, apiKey, projectId, url string) error {
 	r.Header.Add("Authorization", fmt.Sprintf("Bearer %s", apiKey))
 	r.Header.Add("X-Project-ID", projectId)
 
-	/* TODO: add back with log levels
 	re, err := httputil.DumpRequest(r, true)
 	if err != nil {
 		return err
 	}
 	fmt.Println(string(re))
-	*/
 
 	client := &http.Client{}
 	res, err := client.Do(r)
@@ -56,7 +54,7 @@ func putMeta(record *Record, apiKey, projectId, url string) error {
 	return nil
 }
 
-func SearchMeta(query metasearch.SearchRequest, apiKey, projectId, url string) (bodyBytes []byte, err error) {
+func SearchMeta(query metasearch.SearchRequest, apiKey, url string) (bodyBytes []byte, err error) {
 	req, err := json.Marshal(query)
 	if err != nil {
 		return
@@ -67,7 +65,6 @@ func SearchMeta(query metasearch.SearchRequest, apiKey, projectId, url string) (
 	}
 	r.Header.Add("Content-Type", "application/json")
 	r.Header.Add("Authorization", fmt.Sprintf("Bearer %s", apiKey))
-	r.Header.Add("X-Project-ID", projectId)
 
 	reqest, err := httputil.DumpRequest(r, true)
 	if err != nil {

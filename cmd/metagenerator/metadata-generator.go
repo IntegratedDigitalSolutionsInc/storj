@@ -9,12 +9,7 @@ import (
 	"time"
 
 	_ "github.com/lib/pq"
-	"github.com/zeebo/errs"
-	"go.uber.org/zap"
-	"storj.io/common/macaroon"
 	"storj.io/storj/metagenerator"
-	"storj.io/storj/satellite/console"
-	"storj.io/storj/satellite/satellitedb"
 )
 
 // default values
@@ -56,12 +51,6 @@ func main() {
 	defer db.Close()
 	ctx := context.Background()
 
-	rawToken := os.Getenv("API_KEY")
-	var projectId string
-	if mode == metagenerator.DbMode {
-		projectId = getProjectId(rawToken)
-	}
-
 	// Initialize batch generator
 	batchGen := metagenerator.NewBatchGenerator(
 		db,
@@ -69,10 +58,10 @@ func main() {
 		workersNumber, // number of workers
 		totalRecords,
 		metagenerator.GetPathCount(ctx, db), // get path count
-		projectId,
-		rawToken,
+		os.Getenv("API_KEY"),
 		mode, // incert mode
 		defaultMetasearchAPI,
+		dbEndpoint,
 	)
 
 	// Generate and insert/debug records
@@ -83,37 +72,4 @@ func main() {
 	}
 
 	fmt.Printf("Generated %v records in %v\n", totalRecords, time.Since(startTime))
-}
-
-func getProjectId(rawToken string) string {
-	ctx := context.Background()
-	log, err := zap.NewDevelopment()
-	if err != nil {
-		panic(err)
-	}
-	defer log.Sync()
-
-	db, err := satellitedb.Open(context.Background(), log.Named("db"), dbEndpoint, satellitedb.Options{
-		ApplicationName: "metadata-api",
-	})
-	if err != nil {
-		panic(err)
-	}
-	defer func() {
-		err = errs.Combine(err, db.Close())
-	}()
-
-	// Parse API token
-	apiKey, err := macaroon.ParseAPIKey(rawToken)
-	if err != nil {
-		panic(err)
-	}
-
-	// Get projectId
-	var keyInfo *console.APIKeyInfo
-	keyInfo, err = db.Console().APIKeys().GetByHead(ctx, apiKey.Head())
-	if err != nil {
-		panic(err)
-	}
-	return keyInfo.ProjectID.String()
 }

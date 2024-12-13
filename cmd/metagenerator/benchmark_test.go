@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"testing"
 
@@ -11,13 +12,11 @@ import (
 )
 
 const (
-	apiKey    = "15XZjcVqxQeggDyDpPhqJvMUB6NtQ1CiuW6mAwzRAVNE5gtr7Yh12MdtqvVbYQ9rvCadeve1f2LGiB53QnFyVV9CTY5HAv3jtFvtnKiVvehh4Dz9jwYx6yhV5bD1wGBrADuKCkQxa"
-	projectId = "9088e8cc-d344-4767-8e07-901abc2734b6"
+	apiKey = "15XZhA5kFHCNUqkWT7YsQP6ASUvp91TgsJQBHJhVZNNQpcsMaqxWXTw3A9juWRHPaXkc9qJbhUuH6kR4eE6ThhmJrmJZRDggA5iXKgknxwLTb2JgnbYrNjQ3Vnf6MHEeJ1LxLQWk6"
 )
 
 var tRs = []int{
-	10,
-	//100_000,
+	100_000,
 	//900_000,
 	//9_000_000,
 	//99_000_000,
@@ -42,7 +41,7 @@ func BenchmarkSimpleQuery(b *testing.B) {
 	teardownSuite, db, ctx := setupSuite()
 	defer teardownSuite(b)
 	for _, tR := range tRs {
-		metagenerator.GeneratorSetup(1000, 10, tR, apiKey, projectId, defaultMetasearchAPI, db, ctx)
+		metagenerator.GeneratorSetup(1000, 10, tR, apiKey, "", defaultMetasearchAPI, defaultDbEndpoint, db, ctx)
 		for _, n := range metagenerator.MatchingEntries {
 			if tR < n {
 				break
@@ -52,24 +51,24 @@ func BenchmarkSimpleQuery(b *testing.B) {
 					val := fmt.Sprintf("benchmarkValue_%v", n)
 					b.ResetTimer()
 					url := fmt.Sprintf("%s/metasearch/%s", defaultMetasearchAPI, metagenerator.Label)
-					_, err := metagenerator.SearchMeta(metasearch.SearchRequest{
+					res, err := metagenerator.SearchMeta(metasearch.SearchRequest{
 						Match: map[string]any{
 							"field_" + val: val,
 						},
-					}, apiKey, projectId, url)
+					}, apiKey, url)
 
 					if err != nil {
 						panic(err)
 					}
-					/*
-						b.StopTimer()
-						var resp metagenerator.Response
-						err = json.Unmarshal(res, &resp)
-						if err != nil {
-							panic(err)
-						}
-						fmt.Printf("Got %v entries\n", len(resp.Results))
-					*/
+
+					b.StopTimer()
+					var resp metagenerator.Response
+					err = json.Unmarshal(res, &resp)
+					if err != nil {
+						panic(err)
+					}
+					fmt.Printf("Got %v entries\n", len(resp.Results))
+
 				}
 			})
 		}

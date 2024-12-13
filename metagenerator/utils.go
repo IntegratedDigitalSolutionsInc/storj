@@ -19,6 +19,11 @@ import (
 
 	"github.com/Netflix/go-expect"
 	"github.com/google/goterm/term"
+	"github.com/zeebo/errs"
+	"go.uber.org/zap"
+	"storj.io/common/macaroon"
+	"storj.io/storj/satellite/console"
+	"storj.io/storj/satellite/satellitedb"
 )
 
 var (
@@ -607,6 +612,7 @@ func deleteFile(record *Record) error {
 }
 
 func UplinkSetup(satelliteAddress, apiKey string) {
+
 	c, err := expect.NewConsole(expect.WithStdout(os.Stdout))
 	if err != nil {
 		log.Fatal(err)
@@ -641,7 +647,7 @@ func UplinkSetup(satelliteAddress, apiKey string) {
 	fmt.Println(term.Greenf("Uplink setup done"))
 }
 
-func GeneratorSetup(bS, wN, tR int, apiKey, projectId, metaSearchEndpoint string, db *sql.DB, ctx context.Context) {
+func GeneratorSetup(bS, wN, tR int, apiKey, projectId, metaSearchEndpoint, dbEndpoint string, db *sql.DB, ctx context.Context) {
 	// Initialize batch generator
 	batchGen := NewBatchGenerator(
 		db,
@@ -649,20 +655,20 @@ func GeneratorSetup(bS, wN, tR int, apiKey, projectId, metaSearchEndpoint string
 		wN,
 		tR,
 		GetPathCount(ctx, db),
-		projectId,
 		apiKey,
 		DbMode,
 		metaSearchEndpoint,
+		dbEndpoint,
 	)
 
 	// Generate and insert/debug records
-	//startTime := time.Now()
+	startTime := time.Now()
 
 	if err := batchGen.GenerateAndInsert(ctx); err != nil {
 		panic(fmt.Sprintf("failed to generate records: %v", err))
 	}
 
-	//fmt.Printf("Generated %v records in %v\n", tR, time.Since(startTime))
+	fmt.Printf("Generated %v records in %v\n", tR, time.Since(startTime))
 }
 
 func Clean() {
@@ -800,7 +806,7 @@ func generateComplexTitle() string {
 }
 
 func generateDescription(f, t int) string {
-	descriptionLength := rand.Intn(t-f) + f 
+	descriptionLength := rand.Intn(t-f) + f
 
 	var descriptionParts []string
 	descriptionParts = append(descriptionParts, prefixes[rand.Intn(len(prefixes))])
@@ -821,4 +827,37 @@ func generateDescription(f, t int) string {
 	}
 
 	return strings.Join(descriptionParts, " ")
+}
+
+func getProjectId(rawToken string, dbEndpoint string) string {
+	ctx := context.Background()
+	log, err := zap.NewDevelopment()
+	if err != nil {
+		panic(err)
+	}
+	defer log.Sync()
+
+	db, err := satellitedb.Open(context.Background(), log.Named("db"), dbEndpoint, satellitedb.Options{
+		ApplicationName: "metadata-api",
+	})
+	if err != nil {
+		panic(err)
+	}
+	defer func() {
+		err = errs.Combine(err, db.Close())
+	}()
+
+	// Parse API token
+	apiKey, err := macaroon.ParseAPIKey(rawToken)
+	if err != nil {
+		panic(err)
+	}
+
+	// Get projectId
+	var keyInfo *console.APIKeyInfo
+	keyInfo, err = db.Console().APIKeys().GetByHead(ctx, apiKey.Head())
+	if err != nil {
+		panic(err)
+	}
+	return keyInfo.ProjectID.String()
 }

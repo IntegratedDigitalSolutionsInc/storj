@@ -178,7 +178,12 @@ type BatchGenerator struct {
 }
 
 // NewBatchGenerator creates a new BatchGenerator
-func NewBatchGenerator(db *sql.DB, batchSize, workers, totalRecords int, pathCounter uint64, projectId, apiKey, mode, metaSearchEndpoint string) *BatchGenerator {
+func NewBatchGenerator(db *sql.DB, batchSize, workers, totalRecords int, pathCounter uint64, apiKey, mode, metaSearchEndpoint, dbEndpoint string) *BatchGenerator {
+	var projectId string
+	if mode == DbMode {
+		projectId = getProjectId(apiKey, dbEndpoint)
+	}
+
 	return &BatchGenerator{
 		db:                 db,
 		generator:          NewGenerator(pathCounter, totalRecords),
