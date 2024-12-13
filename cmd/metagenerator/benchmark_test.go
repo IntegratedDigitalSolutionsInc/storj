@@ -16,10 +16,11 @@ const (
 )
 
 var tRs = []int{
-	100_000,
-	900_000,
-	9_000_000,
-	99_000_000,
+	10,
+	//100_000,
+	//900_000,
+	//9_000_000,
+	//99_000_000,
 }
 
 func setupSuite() (func(tb testing.TB), *sql.DB, context.Context) {

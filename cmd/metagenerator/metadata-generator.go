@@ -9,25 +9,27 @@ import (
 	"time"
 
 	_ "github.com/lib/pq"
-	"storj.io/common/uuid"
+	"github.com/zeebo/errs"
+	"go.uber.org/zap"
+	"storj.io/common/macaroon"
 	"storj.io/storj/metagenerator"
+	"storj.io/storj/satellite/console"
+	"storj.io/storj/satellite/satellitedb"
 )
 
 // default values
 const (
-	clusterPath          = "/Users/bohdanbashynskyi/storj-cluster"
-	defaultDbEndpoint    = "postgresql://root@localhost:26257/metainfo?sslmode=disable"
+	defaultDbEndpoint    = "postgresql://root@localhost:26257/master?sslmode=disable"
 	defaultSharedFields  = 0.3
 	defaultBatchSize     = 10
 	defaultWorkersNumber = 1
 	defaultTotlaRecords  = 10
-	defaultMetasearchAPI = "http://localhost:9998"
+	defaultMetasearchAPI = "http://localhost:6666"
 )
 
 // main parameters decalaration
 var (
 	dbEndpoint    string
-	sharedFields  float64 = 0.3
 	batchSize     int
 	workersNumber int
 	totalRecords  int
@@ -54,13 +56,10 @@ func main() {
 	defer db.Close()
 	ctx := context.Background()
 
+	rawToken := os.Getenv("API_KEY")
 	var projectId string
-	if mode == metagenerator.ApiMode {
-		projectId = metagenerator.GetProjectId(ctx, db).String()
-	}
 	if mode == metagenerator.DbMode {
-		pId, _ := uuid.New()
-		projectId = pId.String()
+		projectId = getProjectId(rawToken)
 	}
 
 	// Initialize batch generator
@@ -71,7 +70,7 @@ func main() {
 		totalRecords,
 		metagenerator.GetPathCount(ctx, db), // get path count
 		projectId,
-		os.Getenv("API_KEY"),
+		rawToken,
 		mode, // incert mode
 		defaultMetasearchAPI,
 	)
@@ -84,4 +83,37 @@ func main() {
 	}
 
 	fmt.Printf("Generated %v records in %v\n", totalRecords, time.Since(startTime))
+}
+
+func getProjectId(rawToken string) string {
+	ctx := context.Background()
+	log, err := zap.NewDevelopment()
+	if err != nil {
+		panic(err)
+	}
+	defer log.Sync()
+
+	db, err := satellitedb.Open(context.Background(), log.Named("db"), dbEndpoint, satellitedb.Options{
+		ApplicationName: "metadata-api",
+	})
+	if err != nil {
+		panic(err)
+	}
+	defer func() {
+		err = errs.Combine(err, db.Close())
+	}()
+
+	// Parse API token
+	apiKey, err := macaroon.ParseAPIKey(rawToken)
+	if err != nil {
+		panic(err)
+	}
+
+	// Get projectId
+	var keyInfo *console.APIKeyInfo
+	keyInfo, err = db.Console().APIKeys().GetByHead(ctx, apiKey.Head())
+	if err != nil {
+		panic(err)
+	}
+	return keyInfo.ProjectID.String()
 }
