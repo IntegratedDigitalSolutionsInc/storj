@@ -227,11 +227,9 @@ func (bg *BatchGenerator) GenerateAndInsert(ctx context.Context) (err error) {
 					errChan <- fmt.Errorf("worker %d failed: %v", workerID, err)
 					return
 				}
-				/*
-					if j%(bg.batchSize) == 0 {
-						fmt.Printf("Worker %d processed %d records\n", workerID, j+bg.batchSize)
-					}
-				*/
+				if j%(bg.batchSize) == 0 {
+					fmt.Printf("Worker %d processed %d records\n", workerID, j+bg.batchSize)
+				}
 			}
 		}(i)
 	}
