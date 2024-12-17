@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"flag"
 	"fmt"
-	"os"
 	"time"
 
 	_ "github.com/lib/pq"
@@ -20,6 +19,8 @@ const (
 	defaultWorkersNumber = 1
 	defaultTotlaRecords  = 10
 	defaultMetasearchAPI = "http://localhost:6666"
+	defaultApiKey        = "122VGqUbmpzC3cjoMkApS8vYjNNzqUGE6aHm6mwhhKBswTQugNxuxBF9zfof2h3h4Hw41u3hew3i1UpSGks7FHaxwkhW4ZSYRKQG61RK6haWgq3tAzDMQHqVEuyy9yXLo1RJnLzn"
+	defaultClean         = false
 )
 
 // main parameters decalaration
@@ -29,14 +30,18 @@ var (
 	workersNumber int
 	totalRecords  int
 	mode          string
+	apiKey        string
+	clean         bool
 )
 
 func readArgs() {
 	flag.StringVar(&dbEndpoint, "db", defaultDbEndpoint, fmt.Sprintf("db endpoint, default: %v", defaultDbEndpoint))
 	flag.StringVar(&mode, "mode", metagenerator.DryRunMode, fmt.Sprintf("incert mode [%s, %s, %s], default: %v", metagenerator.ApiMode, metagenerator.DbMode, metagenerator.DryRunMode, metagenerator.DryRunMode))
+	flag.StringVar(&apiKey, "apiKey", defaultApiKey, fmt.Sprintf("satelite api key, default: %v", defaultApiKey))
 	flag.IntVar(&batchSize, "batchSize", defaultBatchSize, fmt.Sprintf("number of records per batch, default: %v", defaultBatchSize))
 	flag.IntVar(&workersNumber, "workersNumber", defaultWorkersNumber, fmt.Sprintf("number of workers, default: %v", defaultWorkersNumber))
 	flag.IntVar(&totalRecords, "totalRecords", defaultTotlaRecords, fmt.Sprintf("total number of records, default: %v", defaultTotlaRecords))
+	flag.BoolVar(&clean, "clean", defaultClean, fmt.Sprintf("clean db before incerting, default: %v", defaultClean))
 	flag.Parse()
 }
 
@@ -51,14 +56,21 @@ func main() {
 	defer db.Close()
 	ctx := context.Background()
 
+	if clean {
+		metagenerator.CleanTable(ctx, db)
+	}
+
+	pathCount := metagenerator.GetPathCount(ctx, db)
+	fmt.Printf("Detected %v records\n", pathCount)
+
 	// Initialize batch generator
 	batchGen := metagenerator.NewBatchGenerator(
 		db,
 		batchSize,     // batch size
 		workersNumber, // number of workers
 		totalRecords,
-		metagenerator.GetPathCount(ctx, db), // get path count
-		os.Getenv("API_KEY"),
+		pathCount, // get path count
+		apiKey,
 		mode, // incert mode
 		defaultMetasearchAPI,
 		dbEndpoint,

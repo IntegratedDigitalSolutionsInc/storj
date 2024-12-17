@@ -11,10 +11,6 @@ import (
 	"storj.io/storj/metasearch"
 )
 
-const (
-	apiKey = "122VGMnBkPTFHkhwmcW13e599vsV8C6qsMYczDvxTvwdK5KqTq6RFQNPaXBSacY7nW1YpCyHpYqq2om7qf8yvgLPVkX8qeq6abEvFn7Ms7L7dYvWpYFxwunLNLYr64c6huogiFDk"
-)
-
 var tRs = []int{
 	100_000,
 	//900_000,
@@ -41,7 +37,7 @@ func BenchmarkSimpleQuery(b *testing.B) {
 	teardownSuite, db, ctx := setupSuite()
 	defer teardownSuite(b)
 	for _, tR := range tRs {
-		metagenerator.GeneratorSetup(1000, 10, tR, apiKey, "", defaultMetasearchAPI, defaultDbEndpoint, db, ctx)
+		metagenerator.GeneratorSetup(1000, 10, tR, defaultApiKey, "", defaultMetasearchAPI, defaultDbEndpoint, db, ctx)
 		for _, n := range metagenerator.MatchingEntries {
 			if tR < n {
 				break
@@ -68,7 +64,6 @@ func BenchmarkSimpleQuery(b *testing.B) {
 						panic(err)
 					}
 					fmt.Printf("Got %v entries\n", len(resp.Results))
-
 				}
 			})
 		}
