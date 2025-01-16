@@ -1959,6 +1959,15 @@ func (endpoint *Endpoint) UpdateObjectMetadata(ctx context.Context, req *pb.Obje
 		encryptedMetadataNonce = req.EncryptedMetadataNonce[:]
 	}
 
+	var clearMetadata *string
+	if len(req.ClearMetadata) > 0 {
+		um, err := usermeta.UnmarshalJSON(req.ClearMetadata)
+		if err != nil {
+			return nil, rpcstatus.Error(rpcstatus.InvalidArgument, "invalid clear_metadata")
+		}
+		clearMetadata = &um
+	}
+
 	err = endpoint.metabase.UpdateObjectLastCommittedMetadata(ctx, metabase.UpdateObjectLastCommittedMetadata{
 		ObjectLocation: metabase.ObjectLocation{
 			ProjectID:  keyInfo.ProjectID,
@@ -1969,6 +1978,7 @@ func (endpoint *Endpoint) UpdateObjectMetadata(ctx context.Context, req *pb.Obje
 		EncryptedMetadata:             req.EncryptedMetadata,
 		EncryptedMetadataNonce:        encryptedMetadataNonce,
 		EncryptedMetadataEncryptedKey: req.EncryptedMetadataEncryptedKey,
+		ClearMetadata:                 clearMetadata,
 	})
 	if err != nil {
 		return nil, endpoint.ConvertMetabaseErr(err)
