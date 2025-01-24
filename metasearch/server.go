@@ -17,8 +17,10 @@ import (
 	"github.com/jmespath/go-jmespath"
 	"go.uber.org/zap"
 
+	"storj.io/common/usermeta"
 	"storj.io/common/uuid"
 	"storj.io/storj/satellite/metabase"
+	"storj.io/uplink"
 )
 
 // Server implements the REST API for metadata search.
@@ -32,8 +34,7 @@ type Server struct {
 
 // BaseRequest contains common fields for all requests.
 type BaseRequest struct {
-	ProjectID uuid.UUID               `json:"-"`
-	Location  metabase.ObjectLocation `json:"-"`
+	Location metabase.ObjectLocation `json:"-"`
 }
 
 const defaultBatchSize = 1000
@@ -102,17 +103,17 @@ func (s *Server) Run() error {
 	return http.ListenAndServe(s.Endpoint, s.Handler)
 }
 
-func (s *Server) validateRequest(ctx context.Context, r *http.Request, baseRequest *BaseRequest, body interface{}) error {
+func (s *Server) validateRequest(ctx context.Context, r *http.Request, baseRequest *BaseRequest, body interface{}) (*uplink.Project, error) {
 	// Parse authorization header
-	projectID, err := s.Auth.Authenticate(ctx, r)
+	project, err := s.Auth.Authenticate(ctx, r)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	// Decode request body
 	if body != nil && r.Body != nil {
 		if err = json.NewDecoder(r.Body).Decode(body); err != nil {
-			return fmt.Errorf("%w: error decoding request body: %w", ErrBadRequest, err)
+			return nil, fmt.Errorf("%w: error decoding request body: %w", ErrBadRequest, err)
 		}
 	}
 
@@ -121,27 +122,33 @@ func (s *Server) validateRequest(ctx context.Context, r *http.Request, baseReque
 	bucket := vars["bucket"]
 	key := vars["key"]
 	baseRequest.Location = metabase.ObjectLocation{
-		ProjectID:  projectID,
 		BucketName: metabase.BucketName(bucket),
 		ObjectKey:  metabase.ObjectKey(key),
 	}
 
-	return nil
+	return project, nil
 }
 
 func (s *Server) HandleGet(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	var request BaseRequest
 
-	err := s.validateRequest(ctx, r, &request, nil)
+	project, err := s.validateRequest(ctx, r, &request, nil)
+	if err != nil {
+		s.errorResponse(w, err)
+		return
+	}
+	defer project.Close()
+
+	info, err := project.StatObject(ctx, request.Location.BucketName.String(), string(request.Location.ObjectKey))
 	if err != nil {
 		s.errorResponse(w, err)
 		return
 	}
 
-	meta, err := s.Repo.GetMetadata(ctx, request.Location)
+	meta, err := usermeta.UserMeta(info.Custom).ToDeepUserMeta()
 	if err != nil {
-		s.errorResponse(w, err)
+		s.errorResponse(w, fmt.Errorf("cannot convert object metadata to deep JSON structure: %s", request.Location.ObjectKey))
 		return
 	}
 
@@ -152,28 +159,73 @@ func (s *Server) HandleGet(w http.ResponseWriter, r *http.Request) {
 func (s *Server) HandleQuery(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	var request SearchRequest
-	var result SearchResponse
 
-	err := s.validateSearchRequest(ctx, r, &request)
+	project, err := s.validateRequest(ctx, r, &request.BaseRequest, &request)
+	if err != nil {
+		s.errorResponse(w, err)
+		return
+	}
+	defer project.Close()
+
+	err = s.validateSearchRequest(ctx, r, &request)
 	if err != nil {
 		s.errorResponse(w, err)
 		return
 	}
 
-	result, err = s.searchMetadata(ctx, &request)
+	queries := make([]uplink.MetadataQuery, 0)
+	if request.Match != nil {
+		queries = append(queries, uplink.MetadataQueryMatchValues{
+			Values: request.Match,
+		})
+	}
+
+	it := project.FindObjectsByMetadata(ctx, request.BaseRequest.Location.BucketName.String(), &uplink.FindObjectsByMetadataOptions{
+		Prefix:  request.KeyPrefix,
+		Queries: queries,
+	})
+
+	results := make([]SearchResult, 0)
+	var meta usermeta.DeepUserMeta
+	for range request.BatchSize {
+		if !it.Next() {
+			err = it.Err()
+			break
+		}
+		obj := it.Item()
+		if obj == nil {
+			// TODO: needed?
+			s.Logger.Info("Skipping nil object")
+			continue
+		}
+
+		if obj.Custom != nil {
+			meta, err = usermeta.UserMeta(obj.Custom).ToDeepUserMeta()
+			if err != nil {
+				break
+			}
+		}
+
+		item := SearchResult{
+			Path:     obj.Key,
+			Metadata: meta,
+		}
+		results = append(results, item)
+	}
+
 	if err != nil {
 		s.errorResponse(w, err)
 		return
 	}
 
-	s.jsonResponse(w, http.StatusOK, result)
+	s.jsonResponse(w, http.StatusOK, SearchResponse{
+		Results:   results,
+		PageToken: "TODO",
+	})
 }
 
 func (s *Server) validateSearchRequest(ctx context.Context, r *http.Request, request *SearchRequest) error {
-	err := s.validateRequest(ctx, r, &request.BaseRequest, request)
-	if err != nil {
-		return err
-	}
+	var err error
 
 	// Validate match query
 	if request.Match == nil {
@@ -301,13 +353,20 @@ func (s *Server) HandleUpdate(w http.ResponseWriter, r *http.Request) {
 	var request BaseRequest
 	var metadata map[string]interface{}
 
-	err := s.validateRequest(ctx, r, &request, &metadata)
+	project, err := s.validateRequest(ctx, r, &request, &metadata)
 	if err != nil {
 		s.errorResponse(w, err)
 		return
 	}
+	defer project.Close()
 
-	err = s.Repo.UpdateMetadata(ctx, request.Location, metadata)
+	shallowMeta, err := usermeta.DeepUserMeta(metadata).ToUserMeta()
+	if err != nil {
+		s.errorResponse(w, fmt.Errorf("%w: %s", ErrBadRequest, request.Location.ObjectKey))
+		return
+	}
+
+	err = project.UpdateObjectMetadata(ctx, request.Location.BucketName.String(), string(request.Location.ObjectKey), uplink.CustomMetadata(shallowMeta), nil)
 	if err != nil {
 		s.errorResponse(w, err)
 		return
@@ -321,13 +380,14 @@ func (s *Server) HandleDelete(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	var request BaseRequest
 
-	err := s.validateRequest(ctx, r, &request, nil)
+	project, err := s.validateRequest(ctx, r, &request, nil)
 	if err != nil {
 		s.errorResponse(w, err)
 		return
 	}
+	defer project.Close()
 
-	err = s.Repo.DeleteMetadata(ctx, request.Location)
+	err = project.UpdateObjectMetadata(ctx, request.Location.BucketName.String(), string(request.Location.ObjectKey), nil, nil)
 	if err != nil {
 		s.errorResponse(w, err)
 		return
@@ -351,16 +411,35 @@ func (s *Server) jsonResponse(w http.ResponseWriter, status int, body interface{
 func (s *Server) errorResponse(w http.ResponseWriter, err error) {
 	s.Logger.Warn("error during API request", zap.Error(err))
 
-	var e *ErrorResponse
-	if !errors.As(err, &e) {
-		e = ErrInternalError
+	resp := ErrorResponse{
+		Message:    "internal error",
+		StatusCode: http.StatusInternalServerError,
 	}
 
-	resp, _ := json.Marshal(e)
+	switch {
+	case errors.Is(err, uplink.ErrBucketNotFound) || errors.Is(err, uplink.ErrObjectNotFound):
+		resp.StatusCode = http.StatusNotFound
+		resp.Message = err.Error()
+	case errors.Is(err, uplink.ErrBucketNameInvalid) || errors.Is(err, uplink.ErrObjectKeyInvalid):
+		resp.StatusCode = http.StatusBadRequest
+		resp.Message = err.Error()
+	case errors.Is(err, uplink.ErrTooManyRequests):
+		resp.StatusCode = http.StatusTooManyRequests
+		resp.Message = err.Error()
+	}
+
+	// TODO: remove this
+	var e *ErrorResponse
+	if errors.As(err, &e) {
+		resp.StatusCode = e.StatusCode
+		resp.Message = e.Message
+	}
+
+	body, _ := json.Marshal(resp)
 
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(e.StatusCode)
-	w.Write([]byte(resp))
+	w.WriteHeader(resp.StatusCode)
+	w.Write([]byte(body))
 }
 
 func getPageToken(obj metabase.ObjectStream) string {

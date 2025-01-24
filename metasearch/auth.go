@@ -9,15 +9,18 @@ import (
 	"net/http"
 	"strings"
 
-	"storj.io/common/macaroon"
-	"storj.io/common/uuid"
+	"storj.io/common/version"
 	"storj.io/storj/satellite"
-	"storj.io/storj/satellite/console"
+	"storj.io/uplink"
+)
+
+var (
+	userAgent = "MetaSearch/" + version.Build.Version.String()
 )
 
 // Auth authenticates HTTP requests for metasearch
 type Auth interface {
-	Authenticate(ctx context.Context, r *http.Request) (projectID uuid.UUID, err error)
+	Authenticate(ctx context.Context, r *http.Request) (project *uplink.Project, err error)
 }
 
 // HeaderAuth authenticates metasearch HTTP requests based on the Authorization header
@@ -31,7 +34,7 @@ func NewHeaderAuth(db satellite.DB) *HeaderAuth {
 	}
 }
 
-func (a *HeaderAuth) Authenticate(ctx context.Context, r *http.Request) (projectID uuid.UUID, err error) {
+func (a *HeaderAuth) Authenticate(ctx context.Context, r *http.Request) (project *uplink.Project, err error) {
 	// Parse authorization header
 	hdr := r.Header.Get("Authorization")
 	if hdr == "" {
@@ -45,21 +48,16 @@ func (a *HeaderAuth) Authenticate(ctx context.Context, r *http.Request) (project
 		return
 	}
 
-	// Parse API token
-	rawToken := strings.TrimPrefix(hdr, "Bearer ")
-	apiKey, err := macaroon.ParseAPIKey(rawToken)
+	// Parse access token
+	rawAccess := strings.TrimPrefix(hdr, "Bearer ")
+	access, err := uplink.ParseAccess(rawAccess)
 	if err != nil {
 		err = fmt.Errorf("%w: %s", ErrAuthorizationFailed, err)
 		return
 	}
 
-	// Get projectId
-	var keyInfo *console.APIKeyInfo
-	keyInfo, err = a.db.Console().APIKeys().GetByHead(ctx, apiKey.Head())
-	if err != nil {
-		err = fmt.Errorf("%w: %s", ErrAuthorizationFailed, err)
-		return
+	config := uplink.Config{
+		UserAgent: userAgent,
 	}
-	projectID = keyInfo.ProjectID
-	return
+	return config.OpenProject(ctx, access)
 }

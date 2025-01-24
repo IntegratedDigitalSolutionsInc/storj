@@ -20,6 +20,7 @@ import (
 	"storj.io/common/uuid"
 	"storj.io/storj/cmd/uplink/ulloc"
 	"storj.io/storj/satellite/metabase"
+	"storj.io/uplink"
 )
 
 // Mock repository
@@ -87,8 +88,8 @@ func (r *mockRepo) QueryMetadata(ctx context.Context, loc metabase.ObjectLocatio
 
 type mockAuth struct{}
 
-func (a *mockAuth) Authenticate(ctx context.Context, r *http.Request) (uuid.UUID, error) {
-	return uuid.UUID{}, nil
+func (a *mockAuth) Authenticate(ctx context.Context, r *http.Request) (*uplink.Project, error) {
+	return nil, nil
 }
 
 // Utility functions

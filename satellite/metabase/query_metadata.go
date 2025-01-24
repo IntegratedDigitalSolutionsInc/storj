@@ -56,12 +56,15 @@ func (p *PostgresAdapter) FindObjectsByClearMetadata(ctx context.Context, opts F
 	// multiple JSONB values, and would often scan the full table instead of
 	// using the GIN index.
 	args := make([]interface{}, 0)
-	containsQueryParts, err := splitToJSONLeaves(opts.ContainsQuery)
-	if err != nil {
-		return FindObjectsByClearMetadataResult{}, Error.Wrap(err)
-	}
-	if len(containsQueryParts) > MaxFindObjectsByClearMetadataQuerySize {
-		return FindObjectsByClearMetadataResult{}, Error.New("too many values in metadata query")
+	var containsQueryParts []string
+	if opts.ContainsQuery != "" {
+		containsQueryParts, err = splitToJSONLeaves(opts.ContainsQuery)
+		if err != nil {
+			return FindObjectsByClearMetadataResult{}, Error.Wrap(err)
+		}
+		if len(containsQueryParts) > MaxFindObjectsByClearMetadataQuerySize {
+			return FindObjectsByClearMetadataResult{}, Error.New("too many values in metadata query")
+		}
 	}
 
 	if len(containsQueryParts) > 0 {
@@ -79,7 +82,7 @@ func (p *PostgresAdapter) FindObjectsByClearMetadata(ctx context.Context, opts F
 		query += ` AND `
 	}
 
-	query += fmt.Sprintf("project_id = $%d AND bucket_name = $%d AND status <> $%d AND (expires_at IS NULL OR expires_at > now())", len(args)+1, len(args)+2, len(args)+3)
+	query += fmt.Sprintf("project_id = $%d AND bucket_name = $%d AND clear_metadata IS NOT NULL AND status <> $%d AND (expires_at IS NULL OR expires_at > now())", len(args)+1, len(args)+2, len(args)+3)
 	args = append(args, opts.ProjectID, opts.BucketName, statusPending)
 
 	// Determine first and last object conditions
@@ -100,8 +103,8 @@ func (p *PostgresAdapter) FindObjectsByClearMetadata(ctx context.Context, opts F
 	}
 
 	query += fmt.Sprintf("\nORDER BY project_id, bucket_name, object_key, version LIMIT $%d", len(args)+1)
-	// fmt.Println(query)
 	args = append(args, batchSize)
+	p.log.Debug("## FindObjectsByClearMetadata query", zap.String("query", query), zap.Any("args", args))
 
 	// Execute query
 	p.log.Debug("Querying objects by clear metadata",

@@ -44,6 +44,9 @@ const (
 // ListLimit is the maximum number of items the client can request for listing.
 const ListLimit = intLimitRange(1000)
 
+// QueryByMetadataLimit is the maximum number of items the client can request by metadata.
+const QueryByMetadataLimit = intLimitRange(1000)
+
 // MoveSegmentLimit is the maximum number of segments that can be moved.
 const MoveSegmentLimit = int64(10000)
 

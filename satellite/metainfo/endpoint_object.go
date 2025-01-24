@@ -1578,6 +1578,120 @@ func (endpoint *Endpoint) ListObjects(ctx context.Context, req *pb.ObjectListReq
 	return resp, nil
 }
 
+func (endpoint *Endpoint) FindObjectsByMetadata(ctx context.Context, req *pb.FindObjectsByMetadataRequest) (resp *pb.FindObjectsByMetadataResponse, err error) {
+	defer mon.Task()(&ctx)(&err)
+
+	endpoint.versionCollector.collect(req.Header.UserAgent, mon.Func().ShortName())
+
+	// Validate request
+	if err = validateRequestSimple(req); err != nil {
+		return nil, err
+	}
+
+	keyInfo, err := endpoint.validateAuth(ctx, req.Header, macaroon.Action{
+		Op:            macaroon.ActionList,
+		Bucket:        req.Bucket,
+		EncryptedPath: req.EncryptedPrefix,
+		Time:          time.Now(),
+	}, console.RateLimitList)
+	if err != nil {
+		return nil, err
+	}
+	endpoint.usageTracking(keyInfo, req.Header, fmt.Sprintf("%T", req))
+
+	// TODO this needs to be optimized to avoid DB call on each request
+	bucket, err := endpoint.buckets.GetBucket(ctx, req.Bucket, keyInfo.ProjectID)
+	if err != nil {
+		if buckets.ErrBucketNotFound.Has(err) {
+			return nil, rpcstatus.Errorf(rpcstatus.NotFound, "bucket not found: %s", req.Bucket)
+		}
+		endpoint.log.Error("unable to check bucket", zap.Error(err))
+		return nil, rpcstatus.Error(rpcstatus.Internal, "unable to get bucket placement")
+	}
+
+	// Parse request
+	limit := int(req.Limit)
+	if limit < 0 {
+		return nil, rpcstatus.Error(rpcstatus.InvalidArgument, "limit is negative")
+	}
+	metabase.ListLimit.Ensure(&limit)
+
+	cursorKey := metabase.ObjectKey(req.EncryptedCursor)
+	cursorVersion := metabase.Version(0)
+	if len(req.VersionCursor) != 0 {
+		sv, err := metabase.StreamVersionIDFromBytes(req.VersionCursor)
+		if err != nil {
+			return nil, endpoint.ConvertMetabaseErr(err)
+		}
+		cursorVersion = sv.Version()
+	}
+
+	var containsQuery string
+	for _, query := range req.Queries {
+		if query.GetQueryType() == pb.MetadataQuery_JSON_MATCH {
+			containsQuery = string(query.GetQueryValue())
+		}
+	}
+
+	opts := metabase.FindObjectsByClearMetadata{
+		ProjectID:     keyInfo.ProjectID,
+		BucketName:    metabase.BucketName(bucket.Name),
+		KeyPrefix:     string(req.EncryptedPrefix), // TODO: support encrypted paths
+		ContainsQuery: containsQuery,
+	}
+	startAfter := metabase.ObjectStream{
+		ProjectID:  keyInfo.ProjectID,
+		BucketName: metabase.BucketName(bucket.Name),
+		ObjectKey:  cursorKey,
+		Version:    cursorVersion,
+	}
+
+	// Make request
+	result, err := endpoint.metabase.FindObjectsByClearMetadata(ctx, opts, startAfter, limit)
+	endpoint.log.Info(fmt.Sprintf("## Found %d objects", len(result.Objects)))
+	endpoint.log.Info(fmt.Sprintf("   ProjectID: %s", keyInfo.ProjectID.String()))
+	endpoint.log.Info(fmt.Sprintf("   BucketName: %s", metabase.BucketName(bucket.Name)))
+	endpoint.log.Info(fmt.Sprintf("   KeyPrefix: %s", string(req.EncryptedPrefix)))
+	endpoint.log.Info(fmt.Sprintf("   ContainsQuery: %s", containsQuery))
+
+	if err != nil {
+		return nil, endpoint.ConvertMetabaseErr(err)
+	}
+
+	// Generate response
+	resp = &pb.FindObjectsByMetadataResponse{}
+	if len(result.Objects) > 0 {
+		resp.More = true
+		last := result.Objects[len(result.Objects)-1]
+		resp.Cursor = []byte(last.ObjectKey)
+		resp.VersionCursor = metabase.NewStreamVersionID(last.Version, last.StreamID).Bytes()
+	}
+
+	resp.Items = make([]*pb.FindObjectsByMetadataItem, len(result.Objects))
+	for i, object := range result.Objects {
+		// TODO: filter, projection
+
+		resp.Items[i] = &pb.FindObjectsByMetadataItem{
+			EncryptedObjectKey: []byte(object.ObjectKey),
+			ObjectVersion:      metabase.NewStreamVersionID(object.Version, object.StreamID).Bytes(),
+			// TODO: Status
+			StreamId: object.StreamID.Bytes(),
+			// TODO: CreatedAt, StatusAt, ExpiresAt,
+			ClearMetadata: []byte(object.ClearMetadata),
+		}
+
+		if object.ClearMetadata != "" {
+			meta, err := usermeta.MarshalJSON(object.ClearMetadata)
+			if err != nil {
+				return nil, endpoint.ConvertMetabaseErr(err)
+			}
+			resp.Items[i].ClearMetadata = meta
+		}
+	}
+
+	return resp, nil
+}
+
 // ListPendingObjectStreams list pending objects according to specific parameters.
 func (endpoint *Endpoint) ListPendingObjectStreams(ctx context.Context, req *pb.ObjectListPendingStreamsRequest) (resp *pb.ObjectListPendingStreamsResponse, err error) {
 	defer mon.Task()(&ctx)(&err)

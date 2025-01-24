@@ -11,6 +11,7 @@ import (
 
 	"cloud.google.com/go/spanner"
 	"github.com/zeebo/errs"
+	"go.uber.org/zap"
 	"google.golang.org/api/iterator"
 
 	"storj.io/common/uuid"
@@ -141,19 +142,21 @@ func (p *PostgresAdapter) ListObjects(ctx context.Context, opts ListObjects) (re
 			statusCondition = `status = ` + statusPending
 		}
 
-		rows, err := p.db.QueryContext(ctx, `SELECT
-			`+objectKey+`,
+		query := `SELECT
+			` + objectKey + `,
 			version
-			`+opts.selectedFields()+`
+			` + opts.selectedFields() + `
 			FROM objects
 			WHERE
-				`+opts.boundaryPostgres()+`
+				` + opts.boundaryPostgres() + `
 				AND (project_id, bucket_name) < ($1, $6)
-				AND `+statusCondition+`
+				AND ` + statusCondition + `
 				AND (expires_at IS NULL OR expires_at > now())
-			ORDER BY `+opts.orderBy()+`
+			ORDER BY ` + opts.orderBy() + `
 			LIMIT $5
-		`, args...)
+		`
+		p.log.Debug("## ListObjects query", zap.String("query", query), zap.Any("args", args))
+		rows, err := p.db.QueryContext(ctx, query, args...)
 		if errors.Is(err, sql.ErrNoRows) {
 			return result, nil
 		}
