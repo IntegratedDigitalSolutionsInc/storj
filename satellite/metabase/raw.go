@@ -184,7 +184,8 @@ func (p *PostgresAdapter) TestingGetAllObjects(ctx context.Context) (_ []RawObje
 			total_plain_size, total_encrypted_size, fixed_segment_size,
 			encryption,
 			zombie_deletion_deadline,
-			retention_mode, retain_until
+			retention_mode, retain_until,
+			clear_metadata
 		FROM objects
 		ORDER BY project_id ASC, bucket_name ASC, object_key ASC, version ASC
 	`)
@@ -224,6 +225,7 @@ func (p *PostgresAdapter) TestingGetAllObjects(ctx context.Context) (_ []RawObje
 				legalHold:     &obj.LegalHold,
 			},
 			timeWrapper{&obj.Retention.RetainUntil},
+			&obj.ClearMetadata,
 		)
 		if err != nil {
 			return nil, Error.New("testingGetAllObjects scan failed: %w", err)
@@ -481,10 +483,18 @@ func (ctr *copyFromRawObjects) Next() bool {
 	return ctr.idx < len(ctr.rows)
 }
 
-func (ctr *copyFromRawObjects) Columns() []string { return objectInsertColumns() }
+// Columns and Values append clear_metadata to the shared
+// objectInsertColumns/objectInsertValues base: this type is only used by the
+// Postgres adapter's TestingBatchInsertObjects (TiDB's batch insert calls
+// objectInsertColumns/objectInsertValues directly), and unlike the base list,
+// clear_metadata is a real column on Postgres's objects table.
+func (ctr *copyFromRawObjects) Columns() []string {
+	return append(objectInsertColumns(), "clear_metadata")
+}
 
 func (ctr *copyFromRawObjects) Values() ([]any, error) {
-	return objectInsertValues(&ctr.rows[ctr.idx]), nil
+	obj := &ctr.rows[ctr.idx]
+	return append(objectInsertValues(obj), obj.ClearMetadata), nil
 }
 
 func (ctr *copyFromRawObjects) Err() error { return nil }
@@ -948,6 +958,12 @@ var postgresObjectInsertOrUpdateQuery = sync.OnceValue(func() string {
 		}
 		fmt.Fprintf(&updates, "%s = EXCLUDED.%s", rawObjectColumns[i], rawObjectColumns[i])
 	}
+	// clear_metadata isn't part of rawObjectColumns (TiDB has no such column;
+	// this query is Postgres-only) and is populated out-of-band by metasearch
+	// via UpdateObjectLastCommittedClearMetadata. Reset it here so an
+	// overwritten object doesn't keep serving the previous content's search
+	// metadata until it's reindexed.
+	updates.WriteString(", clear_metadata = NULL")
 
 	return `INSERT INTO objects (` + postgresObjectColumns + `) SELECT ` + args.String() +
 		` ON CONFLICT (project_id, bucket_name, object_key, version) DO UPDATE SET ` + updates.String()

@@ -381,7 +381,7 @@ func (p *PostgresAdapter) UpdateObjectLastCommittedClearMetadata(ctx context.Con
 // UpdateObjectLastCommittedClearMetadata is not implemented for TiDB: TiDB is not currently
 // a target backend for the metasearch feature (no clear_metadata column exists in its schema).
 func (t *TiDBAdapter) UpdateObjectLastCommittedClearMetadata(ctx context.Context, opts UpdateObjectLastCommittedClearMetadata) (err error) {
-	return errors.New("not implemented")
+	return ErrUnimplemented.New("UpdateObjectLastCommittedClearMetadata is not supported on TiDB")
 }
 
 // GetPendingObjectMetadata contains arguments necessary for retrieving the metadata of a pending object.

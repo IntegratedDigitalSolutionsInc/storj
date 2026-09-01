@@ -111,7 +111,7 @@ func (p *PostgresAdapter) testMigrateToLatest(ctx context.Context) error {
 
 					COMMENT ON COLUMN objects.clear_metadata is 'clear_metadata contains unencrypted metadata that indexed for efficient metadata search.';
 
-					CREATE INDEX IF NOT EXISTS objects_clear_metadata_idx ON objects USING GIN (project_id, bucket_name, clear_metadata);
+					CREATE INDEX IF NOT EXISTS objects_clear_metadata_idx ON objects USING GIN (clear_metadata);
 
 					CREATE TABLE segments (
 						stream_id  BYTEA NOT NULL,

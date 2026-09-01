@@ -242,7 +242,7 @@ var rxPostgresCompositeForeignKey = regexp.MustCompile(
 )
 
 var (
-	rxIndex                  = regexp.MustCompile(`^CREATE( UNIQUE)? INDEX (.*) ON .*\.(.*) USING btree \(([^)]+)\)(?: STORING \([^)]+\))?(?: WHERE (.+))?`)
+	rxIndex                  = regexp.MustCompile(`^CREATE( UNIQUE)? INDEX (.*) ON .*\.(.*) USING (?:btree|gin) \(([^)]+)\)(?: STORING \([^)]+\))?(?: WHERE (.+))?`)
 	indexDirNullsOrderRemove = strings.NewReplacer(" ASC", "", " DESC", "", " NULLS", "", " FIRST", "", " LAST", "")
 	typeDescriptorRx         = regexp.MustCompile(`::(:)?[a-zA-Z0-9_ ]+`)
 )

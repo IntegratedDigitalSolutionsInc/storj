@@ -751,7 +751,11 @@ func (p *PostgresAdapter) PostgresMigration() *migrate.Migration {
 				Version:     29,
 				Action: migrate.SQL{
 					`ALTER TABLE objects ADD COLUMN IF NOT EXISTS clear_metadata JSONB`,
-					`CREATE INDEX IF NOT EXISTS objects_clear_metadata_idx ON objects USING GIN (project_id, bucket_name, clear_metadata)`,
+					// project_id/bucket_name are BYTEA, which has no default GIN operator
+					// class, so they can't share a composite GIN index with the JSONB
+					// column. Equality filtering on them is already served by the objects
+					// primary key; Postgres combines that with this index via a bitmap scan.
+					`CREATE INDEX IF NOT EXISTS objects_clear_metadata_idx ON objects USING GIN (clear_metadata)`,
 					`
 					COMMENT ON COLUMN objects.clear_metadata is 'clear_metadata contains unencrypted metadata that indexed for efficient metadata search.';
 				`},

@@ -2,7 +2,6 @@ package metabase
 
 import (
 	"context"
-	"errors"
 
 	"go.uber.org/zap"
 
@@ -118,5 +117,5 @@ func (p *PostgresAdapter) FindObjectsByClearMetadata(ctx context.Context, opts F
 // a target backend for the metasearch feature (no clear_metadata column/index
 // exists in its schema).
 func (t *TiDBAdapter) FindObjectsByClearMetadata(ctx context.Context, opts FindObjectsByClearMetadata, startAfter ObjectStream, batchSize int) (result FindObjectsByClearMetadataResult, err error) {
-	return FindObjectsByClearMetadataResult{}, errors.New("not implemented")
+	return FindObjectsByClearMetadataResult{}, ErrUnimplemented.New("FindObjectsByClearMetadata is not supported on TiDB")
 }
