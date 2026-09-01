@@ -177,7 +177,6 @@ func (p *PostgresAdapter) UpdateObjectLastCommittedMetadata(ctx context.Context,
 	// to CommitObject, they will need to account for them being optional.
 	// Leading to scenarios where uplink calls update metadata, but wants to clear them
 	// during commit object.
-
 	row := p.db.QueryRowContext(ctx, `
 		WITH last_committed AS (
 			SELECT stream_id, version, status
@@ -306,6 +305,83 @@ func (t *TiDBAdapter) UpdateObjectLastCommittedMetadata(ctx context.Context, opt
 		}
 		return nil
 	})
+}
+
+// UpdateObjectLastCommittedClearMetadata contains arguments necessary for replacing the
+// unencrypted, searchable clear_metadata of an object's most recently committed version.
+//
+// ClearMetadata is independent from EncryptedUserData: it is maintained out-of-band by the
+// metasearch service and is not part of the encrypted user data round trip used by uplink
+// clients, so it has its own dedicated update path rather than going through
+// UpdateObjectLastCommittedMetadata's Includes-gated encrypted-field logic (which always
+// requires the caller to resupply the current encryption nonce/key).
+type UpdateObjectLastCommittedClearMetadata struct {
+	ObjectLocation
+	StreamID uuid.UUID
+
+	ClearMetadata *string
+}
+
+// Verify verifies update clear metadata request fields.
+func (opts *UpdateObjectLastCommittedClearMetadata) Verify() error {
+	if err := opts.ObjectLocation.Verify(); err != nil {
+		return err
+	}
+	if opts.StreamID.IsZero() {
+		return ErrInvalidRequest.New("StreamID missing")
+	}
+	return nil
+}
+
+// UpdateObjectLastCommittedClearMetadata updates an object's clear_metadata (searchable, unencrypted metadata).
+func (db *DB) UpdateObjectLastCommittedClearMetadata(ctx context.Context, opts UpdateObjectLastCommittedClearMetadata) (err error) {
+	defer mon.Task()(&ctx)(&err)
+
+	if err := opts.Verify(); err != nil {
+		return err
+	}
+
+	return db.ChooseAdapter(opts.ProjectID).UpdateObjectLastCommittedClearMetadata(ctx, opts)
+}
+
+// UpdateObjectLastCommittedClearMetadata updates an object's clear_metadata (searchable, unencrypted metadata).
+func (p *PostgresAdapter) UpdateObjectLastCommittedClearMetadata(ctx context.Context, opts UpdateObjectLastCommittedClearMetadata) (err error) {
+	defer mon.Task()(&ctx)(&err)
+
+	result, err := p.db.ExecContext(ctx, `
+		UPDATE objects SET
+			clear_metadata = $5
+		WHERE
+			(project_id, bucket_name, object_key) = ($1, $2, $3) AND
+			version IN (SELECT version FROM objects WHERE
+				(project_id, bucket_name, object_key) = ($1, $2, $3) AND
+				status <> `+statusPending+` AND
+				(expires_at IS NULL OR expires_at > now())
+				ORDER BY version DESC
+				LIMIT 1
+			) AND
+			stream_id = $4 AND
+			status    IN `+statusesCommitted,
+		opts.ProjectID, opts.BucketName, opts.ObjectKey, opts.StreamID, opts.ClearMetadata)
+	if err != nil {
+		return Error.New("unable to update object clear metadata: %w", err)
+	}
+
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return Error.New("unable to update object clear metadata: %w", err)
+	}
+	if affected == 0 {
+		return ErrObjectNotFound.New("object with specified version and committed status is missing")
+	}
+
+	return nil
+}
+
+// UpdateObjectLastCommittedClearMetadata is not implemented for TiDB: TiDB is not currently
+// a target backend for the metasearch feature (no clear_metadata column exists in its schema).
+func (t *TiDBAdapter) UpdateObjectLastCommittedClearMetadata(ctx context.Context, opts UpdateObjectLastCommittedClearMetadata) (err error) {
+	return errors.New("not implemented")
 }
 
 // GetPendingObjectMetadata contains arguments necessary for retrieving the metadata of a pending object.

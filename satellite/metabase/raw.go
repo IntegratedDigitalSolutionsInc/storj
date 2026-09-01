@@ -32,6 +32,11 @@ type RawObject struct {
 	Status       ObjectStatus
 	SegmentCount int32
 
+	// ClearMetadata contains unencrypted metadata that is indexed for efficient
+	// metadata search (see the metasearch package). It is independent from
+	// EncryptedUserData and is not part of the encrypted user data round trip.
+	ClearMetadata *string
+
 	EncryptedUserData
 
 	// TotalPlainSize is 0 for a migrated object.

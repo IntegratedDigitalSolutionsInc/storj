@@ -71,6 +71,8 @@ func (p *PostgresAdapter) testMigrateToLatest(ctx context.Context) error {
 
 						checksum BYTEA,
 
+						clear_metadata JSONB,
+
 						PRIMARY KEY (project_id, bucket_name, object_key, version)
 					);
 
@@ -106,6 +108,10 @@ func (p *PostgresAdapter) testMigrateToLatest(ctx context.Context) error {
 					COMMENT ON COLUMN objects.retain_until   is 'retain_until specifies when an object version''s retention period ends.';
 
 					COMMENT ON COLUMN objects.checksum is 'checksum is the serialized set of checksum properties (checksum algorithm, checksum type, and encrypted checksum value) for an object.';
+
+					COMMENT ON COLUMN objects.clear_metadata is 'clear_metadata contains unencrypted metadata that indexed for efficient metadata search.';
+
+					CREATE INDEX IF NOT EXISTS objects_clear_metadata_idx ON objects USING GIN (project_id, bucket_name, clear_metadata);
 
 					CREATE TABLE segments (
 						stream_id  BYTEA NOT NULL,

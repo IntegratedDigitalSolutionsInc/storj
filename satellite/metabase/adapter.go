@@ -92,6 +92,7 @@ type Adapter interface {
 
 	GetPendingObjectMetadata(ctx context.Context, opts GetPendingObjectMetadata) (result GetPendingObjectMetadataResult, err error)
 	UpdateObjectLastCommittedMetadata(ctx context.Context, opts UpdateObjectLastCommittedMetadata) error
+	UpdateObjectLastCommittedClearMetadata(ctx context.Context, opts UpdateObjectLastCommittedClearMetadata) error
 
 	DeleteObjectExactVersion(ctx context.Context, opts DeleteObjectExactVersion) (result DeleteObjectResult, err error)
 	DeletePendingObject(ctx context.Context, opts DeletePendingObject) (result DeleteObjectResult, err error)
@@ -105,6 +106,8 @@ type Adapter interface {
 	DeleteInactiveObjectsAndSegments(ctx context.Context, opts DeleteInactiveObjectsAndSegments) (objectsDeleted, segmentsDeleted int64, err error)
 	DeleteAllBucketObjects(ctx context.Context, opts DeleteAllBucketObjects) (deletedObjectCount, deletedSegmentCount int64, err error)
 	UncoordinatedDeleteAllBucketObjects(ctx context.Context, opts UncoordinatedDeleteAllBucketObjects) (deletedObjectCount, deletedSegmentCount int64, err error)
+
+	FindObjectsByClearMetadata(ctx context.Context, opts FindObjectsByClearMetadata, startAfter ObjectStream, batchSize int) (result FindObjectsByClearMetadataResult, err error)
 
 	EnsureNodeAliases(ctx context.Context, opts EnsureNodeAliases) error
 	ListNodeAliases(ctx context.Context) (entries []NodeAliasEntry, err error)
