@@ -6,7 +6,6 @@ package pieces
 import (
 	"context"
 	"errors"
-	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -85,7 +84,7 @@ func (service *CacheService) Run(ctx context.Context) (err error) {
 		for _, id := range satellites {
 			piecesTotal, contentSize, err := service.store.WalkAndComputeSpaceUsedBySatellite(ctx, id, service.store.lazyFilewalkerEnabled())
 			if err != nil {
-				service.log.Error("encountered error while computing space used by satellite", zap.Error(err), zap.Stringer("SatelliteID", id))
+				service.log.Error("encountered error while computing space used by satellite", zap.Error(err), zap.Stringer("satellite_id", id))
 				continue
 			}
 			usage := SatelliteUsage{
@@ -321,7 +320,7 @@ func (blobs *BlobsUsageCache) Delete(ctx context.Context, blobRef blobstore.Blob
 		return err
 	}
 	blobs.Update(ctx, satelliteID, -pieceTotal, -pieceContentSize, 0)
-	blobs.log.Debug("deleted piece", zap.Stringer("Satellite ID", satelliteID), zap.Int64("disk space freed in bytes", pieceContentSize))
+	blobs.log.Debug("deleted piece", zap.Stringer("satellite_id", satelliteID), zap.Int64("disk_space_freed_in_bytes", pieceContentSize))
 	return nil
 }
 
@@ -359,7 +358,7 @@ func (blobs *BlobsUsageCache) DeleteWithStorageFormat(ctx context.Context, ref b
 	}
 
 	blobs.Update(ctx, satelliteID, -pieceTotal, -pieceContentSize, 0)
-	blobs.log.Debug("deleted piece", zap.Stringer("Satellite ID", satelliteID), zap.Any("Version", formatVer), zap.Int64("disk space freed in bytes", pieceContentSize))
+	blobs.log.Debug("deleted piece", zap.Stringer("satellite_id", satelliteID), zap.Any("version", formatVer), zap.Int64("disk_space_freed_in_bytes", pieceContentSize))
 	return nil
 }
 
@@ -402,7 +401,7 @@ func (blobs *BlobsUsageCache) ensurePositiveCacheValue(value *int64, name string
 	if *value >= 0 {
 		return
 	}
-	blobs.log.Error(fmt.Sprintf("%s < 0", name), zap.Int64(name, *value))
+	blobs.log.Error(name+" < 0", zap.Int64(name, *value))
 	*value = 0
 }
 

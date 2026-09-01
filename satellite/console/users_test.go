@@ -70,6 +70,37 @@ func TestUserRepository(t *testing.T) {
 			SignupPromoCode: signupPromoCode,
 		}
 		testUsers(ctx, t, repository, user)
+
+		// test inserting paid user
+		user = &console.User{
+			ID:           testrand.UUID(),
+			FullName:     name,
+			ShortName:    lastName,
+			Email:        email,
+			Kind:         console.PaidUser,
+			PasswordHash: []byte(passValid),
+			CreatedAt:    time.Now(),
+		}
+		user, err := repository.Insert(ctx, user)
+		assert.NoError(t, err)
+		assert.Equal(t, console.PaidUser, user.Kind)
+
+		// test inserting tenant user.
+		tenantID := "test-tenant-123"
+		user = &console.User{
+			ID:           testrand.UUID(),
+			FullName:     name,
+			ShortName:    lastName,
+			Email:        "tenant@mail.test",
+			Kind:         console.FreeUser,
+			TenantID:     &tenantID,
+			PasswordHash: []byte(passValid),
+			CreatedAt:    time.Now(),
+		}
+		user, err = repository.Insert(ctx, user)
+		assert.NoError(t, err)
+		assert.Equal(t, console.FreeUser, user.Kind)
+		assert.Equal(t, &tenantID, user.TenantID)
 	})
 }
 
@@ -106,7 +137,7 @@ func TestUserEmailCase(t *testing.T) {
 			})
 			assert.NoError(t, err)
 
-			retrievedUser, err := db.Console().Users().GetByEmail(ctx, testCase.email)
+			retrievedUser, err := db.Console().Users().GetByEmailAndTenant(ctx, testCase.email, nil)
 			assert.NoError(t, err)
 			assert.Equal(t, testCase.email, retrievedUser.Email)
 		}
@@ -137,32 +168,49 @@ func TestUserUpdatePaidTier(t *testing.T) {
 		require.Equal(t, email, createdUser.Email)
 		require.Equal(t, fullName, createdUser.FullName)
 		require.Equal(t, shortName, createdUser.ShortName)
-		require.False(t, createdUser.PaidTier)
+		require.Equal(t, console.FreeUser, createdUser.Kind)
 
 		now := time.Now()
-		err = db.Console().Users().UpdatePaidTier(ctx, createdUser.ID, true, projectBandwidthLimit, storageStorageLimit, segmentLimit, projectLimit, &now)
+		expiration := now.Add(time.Hour * 24 * 30)
+		expirationPtr := &expiration
+		notifications := console.TrialExpirationReminder
+
+		err = db.Console().Users().Update(ctx, createdUser.ID, console.UpdateUserRequest{
+			TrialNotifications: &notifications,
+			TrialExpiration:    &expirationPtr,
+		})
 		require.NoError(t, err)
 
 		retrievedUser, err := db.Console().Users().Get(ctx, createdUser.ID)
 		require.NoError(t, err)
+		require.NotNil(t, retrievedUser.TrialExpiration)
+		require.WithinDuration(t, expiration, *retrievedUser.TrialExpiration, time.Minute)
+		require.Equal(t, int(notifications), retrievedUser.TrialNotifications)
+
+		err = db.Console().Users().UpdatePaidTier(ctx, createdUser.ID, true, projectBandwidthLimit, storageStorageLimit, segmentLimit, projectLimit, &now)
+		require.NoError(t, err)
+
+		retrievedUser, err = db.Console().Users().Get(ctx, createdUser.ID)
+		require.NoError(t, err)
 		require.Equal(t, email, retrievedUser.Email)
 		require.Equal(t, fullName, retrievedUser.FullName)
 		require.Equal(t, shortName, retrievedUser.ShortName)
-		require.True(t, retrievedUser.PaidTier)
+		require.Equal(t, console.PaidUser, retrievedUser.Kind)
 		require.WithinDuration(t, now, *retrievedUser.UpgradeTime, time.Minute)
+		require.Nil(t, retrievedUser.TrialExpiration)
+		require.Zero(t, retrievedUser.TrialNotifications)
 
 		err = db.Console().Users().UpdatePaidTier(ctx, createdUser.ID, false, projectBandwidthLimit, storageStorageLimit, segmentLimit, projectLimit, nil)
 		require.NoError(t, err)
 
 		retrievedUser, err = db.Console().Users().Get(ctx, createdUser.ID)
 		require.NoError(t, err)
-		require.False(t, retrievedUser.PaidTier)
+		require.Equal(t, console.FreeUser, retrievedUser.Kind)
 		require.WithinDuration(t, now, *retrievedUser.UpgradeTime, time.Minute)
 	})
 }
 
 func testUsers(ctx context.Context, t *testing.T, repository console.Users, user *console.User) {
-
 	t.Run("User insertion success", func(t *testing.T) {
 
 		insertedUser, err := repository.Insert(ctx, user)
@@ -177,12 +225,12 @@ func testUsers(ctx context.Context, t *testing.T, repository console.Users, user
 	})
 
 	t.Run("Get user success", func(t *testing.T) {
-		userByEmail, err := repository.GetByEmail(ctx, email)
+		userByEmail, err := repository.GetByEmailAndTenant(ctx, email, nil)
 		assert.NoError(t, err)
 		assert.Equal(t, name, userByEmail.FullName)
 		assert.Equal(t, lastName, userByEmail.ShortName)
 		assert.Equal(t, user.SignupPromoCode, userByEmail.SignupPromoCode)
-		assert.False(t, user.PaidTier)
+		assert.Equal(t, console.FreeUser, user.Kind)
 		assert.False(t, user.MFAEnabled)
 		assert.Empty(t, user.MFASecretKey)
 		assert.Empty(t, user.MFARecoveryCodes)
@@ -235,7 +283,7 @@ func testUsers(ctx context.Context, t *testing.T, repository console.Users, user
 	})
 
 	t.Run("Update user success", func(t *testing.T) {
-		oldUser, err := repository.GetByEmail(ctx, email)
+		oldUser, err := repository.GetByEmailAndTenant(ctx, email, nil)
 		assert.NoError(t, err)
 
 		newUserInfo := &console.User{
@@ -244,7 +292,7 @@ func testUsers(ctx context.Context, t *testing.T, repository console.Users, user
 			ShortName:        newLastName,
 			Email:            newEmail,
 			Status:           console.Active,
-			PaidTier:         true,
+			Kind:             console.PaidUser,
 			MFAEnabled:       true,
 			MFASecretKey:     mfaSecretKey,
 			MFARecoveryCodes: []string{"1", "2"},
@@ -254,12 +302,16 @@ func testUsers(ctx context.Context, t *testing.T, repository console.Users, user
 		shortNamePtr := &newUserInfo.ShortName
 		secretKeyPtr := &newUserInfo.MFASecretKey
 
+		year, month, day := time.Now().UTC().Date()
+		timestamp := time.Date(year, month, day, 12, 0, 0, 0, time.UTC)
+		repository.TestSetNow(func() time.Time { return timestamp })
+
 		err = repository.Update(ctx, newUserInfo.ID, console.UpdateUserRequest{
 			FullName:         &newUserInfo.FullName,
 			ShortName:        &shortNamePtr,
 			Email:            &newUserInfo.Email,
 			Status:           &newUserInfo.Status,
-			PaidTier:         &newUserInfo.PaidTier,
+			Kind:             &newUserInfo.Kind,
 			MFAEnabled:       &newUserInfo.MFAEnabled,
 			MFASecretKey:     &secretKeyPtr,
 			MFARecoveryCodes: &newUserInfo.MFARecoveryCodes,
@@ -274,15 +326,17 @@ func testUsers(ctx context.Context, t *testing.T, repository console.Users, user
 		assert.Equal(t, newLastName, newUser.ShortName)
 		assert.Equal(t, newEmail, newUser.Email)
 		assert.Equal(t, []byte(newPass), newUser.PasswordHash)
-		assert.True(t, newUser.PaidTier)
+		assert.Equal(t, console.PaidUser, newUser.Kind)
 		assert.True(t, newUser.MFAEnabled)
 		assert.Equal(t, mfaSecretKey, newUser.MFASecretKey)
 		assert.Equal(t, newUserInfo.MFARecoveryCodes, newUser.MFARecoveryCodes)
 		assert.Equal(t, oldUser.CreatedAt, newUser.CreatedAt)
+		assert.NotNil(t, newUser.StatusUpdatedAt)
+		assert.WithinDuration(t, timestamp, *newUser.StatusUpdatedAt, time.Minute)
 	})
 
 	t.Run("Delete user success", func(t *testing.T) {
-		oldUser, err := repository.GetByEmail(ctx, newEmail)
+		oldUser, err := repository.GetByEmailAndTenant(ctx, newEmail, nil)
 		assert.NoError(t, err)
 
 		err = repository.Delete(ctx, oldUser.ID)
@@ -308,10 +362,10 @@ func TestGetUserByEmail(t *testing.T) {
 		_, err := usersRepo.Insert(ctx, &inactiveUser)
 		require.NoError(t, err)
 
-		_, err = usersRepo.GetByEmail(ctx, email)
+		_, err = usersRepo.GetByEmailAndTenant(ctx, email, nil)
 		require.ErrorIs(t, sql.ErrNoRows, err)
 
-		verified, unverified, err := usersRepo.GetByEmailWithUnverified(ctx, email)
+		verified, unverified, err := usersRepo.GetByEmailAndTenantWithUnverified(ctx, email, nil)
 		require.NoError(t, err)
 		require.Nil(t, verified)
 		require.Equal(t, inactiveUser.ID, unverified[0].ID)
@@ -333,9 +387,38 @@ func TestGetUserByEmail(t *testing.T) {
 		})
 		require.NoError(t, err)
 
-		dbUser, err := usersRepo.GetByEmail(ctx, email)
+		dbUser, err := usersRepo.GetByEmailAndTenant(ctx, email, nil)
 		require.NoError(t, err)
 		require.Equal(t, activeUser.ID, dbUser.ID)
+
+		tenantID := "test-tenant"
+		tenantUserEmail := email + "tenant"
+		tenantUser := console.User{
+			ID:           testrand.UUID(),
+			FullName:     "Tenant User",
+			Email:        tenantUserEmail,
+			PasswordHash: []byte("password"),
+			Status:       console.Active,
+			TenantID:     &tenantID,
+		}
+		_, err = usersRepo.Insert(ctx, &tenantUser)
+		require.NoError(t, err)
+
+		err = usersRepo.Update(ctx, tenantUser.ID, console.UpdateUserRequest{
+			Status: &tenantUser.Status,
+		})
+		require.NoError(t, err)
+
+		dbUser, err = usersRepo.GetByEmailAndTenant(ctx, tenantUserEmail, &tenantID)
+		require.NoError(t, err)
+		require.Equal(t, tenantUser.ID, dbUser.ID)
+		require.Equal(t, tenantUser.TenantID, dbUser.TenantID)
+
+		verified, unverified, err = usersRepo.GetByEmailAndTenantWithUnverified(ctx, tenantUserEmail, &tenantID)
+		require.NoError(t, err)
+		require.Nil(t, unverified)
+		require.Equal(t, tenantUser.ID, verified.ID)
+		require.Equal(t, tenantUser.TenantID, verified.TenantID)
 	})
 }
 
@@ -408,13 +491,11 @@ func TestGetEmailsForDeletion(t *testing.T) {
 		require.Len(t, emails, 0)
 
 		freeTrialUser := console.User{
-			ID:              testrand.UUID(),
-			FullName:        "Free Trial User",
-			Email:           email + "1",
-			Status:          console.UserRequestedDeletion,
-			PaidTier:        false,
-			PasswordHash:    []byte("password"),
-			StatusUpdatedAt: &now,
+			ID:           testrand.UUID(),
+			FullName:     "Free Trial User",
+			Email:        email + "1",
+			Status:       console.UserRequestedDeletion,
+			PasswordHash: []byte("password"),
 		}
 
 		_, err = usersRepo.Insert(ctx, &freeTrialUser)
@@ -435,13 +516,12 @@ func TestGetEmailsForDeletion(t *testing.T) {
 		require.Len(t, emails, 1)
 
 		proUserWithoutLastInvoice := console.User{
-			ID:              testrand.UUID(),
-			FullName:        "Pro User",
-			Email:           email + "2",
-			Status:          console.UserRequestedDeletion,
-			PaidTier:        true,
-			PasswordHash:    []byte("password"),
-			StatusUpdatedAt: &now,
+			ID:           testrand.UUID(),
+			FullName:     "Pro User",
+			Email:        email + "2",
+			Status:       console.UserRequestedDeletion,
+			Kind:         console.PaidUser,
+			PasswordHash: []byte("password"),
 		}
 
 		_, err = usersRepo.Insert(ctx, &proUserWithoutLastInvoice)
@@ -575,28 +655,72 @@ func TestGetExpiredFreeTrialsAfter(t *testing.T) {
 		})
 		require.NoError(t, err)
 
-		paidTier := true
+		kind := console.PaidUser
 		err = usersRepo.Update(ctx, proUser.ID, console.UpdateUserRequest{
-			PaidTier: &paidTier,
+			Kind: &kind,
 		})
 		require.NoError(t, err)
 
 		limit := 100
-		users, err := usersRepo.GetExpiredFreeTrialsAfter(ctx, now, limit)
+		users, err := usersRepo.GetExpiredFreeTrialsAfter(ctx, now, limit, nil)
 		require.NoError(t, err)
 		require.Len(t, users, 1, "expected 1 expired user")
 		require.Equal(t, expiredUser.ID, users[0].ID)
 
-		// trial expiration freeze user
+		// trial expiration freeze user.
 		_, err = accountFreezeRepo.Upsert(ctx, &console.AccountFreezeEvent{
 			UserID: expiredUser.ID,
 			Type:   console.TrialExpirationFreeze,
 		})
 		require.NoError(t, err)
 
-		users, err = usersRepo.GetExpiredFreeTrialsAfter(ctx, now, limit)
+		users, err = usersRepo.GetExpiredFreeTrialsAfter(ctx, now, limit, nil)
 		require.NoError(t, err)
 		require.Empty(t, users, "expected no trial frozen users")
+
+		// tenant isolation: users of a specific tenant should be isolated from non-tenant users.
+		tenantID := "acme"
+		otherTenantID := "other"
+		tenantUser, err := usersRepo.Insert(ctx, &console.User{
+			ID:              testrand.UUID(),
+			FullName:        "tenant expired",
+			Email:           email + "6",
+			PasswordHash:    []byte("123a123"),
+			TrialExpiration: &expired,
+			TenantID:        &tenantID,
+		})
+		require.NoError(t, err)
+		err = usersRepo.Update(ctx, tenantUser.ID, console.UpdateUserRequest{Status: &activeStatus})
+		require.NoError(t, err)
+
+		otherTenantUser, err := usersRepo.Insert(ctx, &console.User{
+			ID:              testrand.UUID(),
+			FullName:        "other tenant expired",
+			Email:           email + "7",
+			PasswordHash:    []byte("123a123"),
+			TrialExpiration: &expired,
+			TenantID:        &otherTenantID,
+		})
+		require.NoError(t, err)
+		err = usersRepo.Update(ctx, otherTenantUser.ID, console.UpdateUserRequest{Status: &activeStatus})
+		require.NoError(t, err)
+
+		// nil returns only non-tenant users (still empty since expiredUser was frozen above).
+		users, err = usersRepo.GetExpiredFreeTrialsAfter(ctx, now, limit, nil)
+		require.NoError(t, err)
+		require.Empty(t, users, "expected no non-tenant expired users")
+
+		// acme tenant returns only acme users.
+		users, err = usersRepo.GetExpiredFreeTrialsAfter(ctx, now, limit, &tenantID)
+		require.NoError(t, err)
+		require.Len(t, users, 1, "expected 1 acme tenant expired user")
+		require.Equal(t, tenantUser.ID, users[0].ID)
+
+		// other tenant returns only other tenant users.
+		users, err = usersRepo.GetExpiredFreeTrialsAfter(ctx, now, limit, &otherTenantID)
+		require.NoError(t, err)
+		require.Len(t, users, 1, "expected 1 other tenant expired user")
+		require.Equal(t, otherTenantUser.ID, users[0].ID)
 	})
 }
 
@@ -658,5 +782,196 @@ func TestGetUnverifiedNeedingReminder(t *testing.T) {
 		}
 		require.True(t, sentFirstReminder)
 		require.True(t, sentSecondReminder)
+	})
+}
+
+func TestUserStatus(t *testing.T) {
+	t.Run("String", func(t *testing.T) {
+		for i := 0; i < console.UserStatusCount; i++ {
+			status := console.UserStatus(i)
+			require.NotEmptyf(
+				t, status.String(), "status without associated string representation: %d", i,
+			)
+		}
+
+		// We add one to the highest value to verify it returns an empty string.
+		status := console.UserStatus(console.UserStatusCount)
+		require.Emptyf(t,
+			status.String(),
+			"invalid status should return empty string: %d", console.UserStatusCount,
+		)
+	})
+
+	t.Run("Set", func(t *testing.T) {
+		tcases := []struct {
+			status   string
+			isValid  bool
+			expected console.UserStatus
+		}{
+			{
+				status:   "inactive",
+				isValid:  true,
+				expected: console.Inactive,
+			},
+			{
+				status:   "Active",
+				isValid:  true,
+				expected: console.Active,
+			},
+			{
+				status:   "DELETED",
+				isValid:  true,
+				expected: console.Deleted,
+			},
+			{
+				status:   "PendinG DeletioN",
+				isValid:  true,
+				expected: console.PendingDeletion,
+			},
+			{
+				status:   "Legal Hold",
+				isValid:  true,
+				expected: console.LegalHold,
+			},
+			{
+				status:   "pending bot verification",
+				isValid:  true,
+				expected: console.PendingBotVerification,
+			},
+			{
+				status:   "user requested Deletion",
+				isValid:  true,
+				expected: console.UserRequestedDeletion,
+			},
+			{
+				status:  "does not exists this status",
+				isValid: false,
+			},
+		}
+
+		var status console.UserStatus
+		for _, tcase := range tcases {
+			err := status.Set(tcase.status)
+			if err != nil {
+				require.False(t, tcase.isValid)
+				require.ErrorContains(t, err, tcase.status)
+			} else {
+				require.True(t, tcase.isValid)
+				require.NoError(t, err)
+				require.Equal(t, tcase.expected, status)
+			}
+		}
+	})
+}
+
+func TestUserKind(t *testing.T) {
+	t.Run("String", func(t *testing.T) {
+		testCases := []struct {
+			kind     console.UserKind
+			expected string
+		}{
+			{console.FreeUser, "Free Trial"},
+			{console.PaidUser, "Pro Account"},
+			{console.NFRUser, "Not-For-Resale"},
+			{console.MemberUser, "Member Account"},
+		}
+
+		for _, tc := range testCases {
+			require.Equal(t, tc.expected, tc.kind.String())
+		}
+
+		// Test invalid kind.
+		invalidKind := console.UserKind(999)
+		require.Empty(t, invalidKind.String())
+	})
+
+	t.Run("Info", func(t *testing.T) {
+		testCases := []struct {
+			kind            console.UserKind
+			expectedName    string
+			expectedHasPaid bool
+		}{
+			{console.FreeUser, "Free Trial", false},
+			{console.PaidUser, "Pro Account", true},
+			{console.NFRUser, "Not-For-Resale", true},
+			{console.MemberUser, "Member Account", false},
+		}
+
+		for _, tc := range testCases {
+			info := tc.kind.Info()
+			require.Equal(t, tc.kind, info.Value)
+			require.Equal(t, tc.expectedName, info.Name)
+			require.Equal(t, tc.expectedHasPaid, info.HasPaidPrivileges)
+		}
+	})
+}
+
+func TestUserMethods(t *testing.T) {
+	t.Run("HasPaidPrivileges", func(t *testing.T) {
+		tenantID := "some-tenant"
+		testCases := []struct {
+			name     string
+			user     console.User
+			expected bool
+		}{
+			{"Free user should not have paid privileges", console.User{Kind: console.FreeUser}, false},
+			{"Paid user should have paid privileges", console.User{Kind: console.PaidUser}, true},
+			{"NFR user should have paid privileges", console.User{Kind: console.NFRUser}, true},
+			{"Member user should not have paid privileges", console.User{Kind: console.MemberUser}, false},
+			// User.HasPaidPrivileges is Kind-only; billing+tenant logic lives in Service.UserHasPaidPrivileges.
+			{"Free user with TenantID should not have paid privileges", console.User{Kind: console.FreeUser, TenantID: &tenantID}, false},
+			{"Paid user with TenantID should have paid privileges", console.User{Kind: console.PaidUser, TenantID: &tenantID}, true},
+		}
+
+		for _, tc := range testCases {
+			t.Run(tc.name, func(t *testing.T) {
+				require.Equal(t, tc.expected, tc.user.HasPaidPrivileges())
+			})
+		}
+	})
+
+	t.Run("IsBillingExempt", func(t *testing.T) {
+		tenantID := "some-tenant"
+		emptyTenantID := ""
+		testCases := []struct {
+			name     string
+			user     console.User
+			expected bool
+		}{
+			{"Free user should return true", console.User{Kind: console.FreeUser}, true},
+			{"Paid user should return false", console.User{Kind: console.PaidUser}, false},
+			{"NFR user should return true", console.User{Kind: console.NFRUser}, true},
+			{"Member user should return true", console.User{Kind: console.MemberUser}, true},
+			// Users with a non-empty TenantID are billing exempt regardless of Kind.
+			{"Paid user with non-empty TenantID should return true", console.User{Kind: console.PaidUser, TenantID: &tenantID}, true},
+			{"Free user with non-empty TenantID should return true", console.User{Kind: console.FreeUser, TenantID: &tenantID}, true},
+			// Empty TenantID is treated the same as no TenantID.
+			{"Paid user with empty TenantID should return false", console.User{Kind: console.PaidUser, TenantID: &emptyTenantID}, false},
+		}
+
+		for _, tc := range testCases {
+			t.Run(tc.name, func(t *testing.T) {
+				require.Equal(t, tc.expected, tc.user.IsBillingExempt())
+			})
+		}
+	})
+
+	t.Run("IsPaid", func(t *testing.T) {
+		testCases := []struct {
+			name     string
+			user     console.User
+			expected bool
+		}{
+			{"Free user should not be paid", console.User{Kind: console.FreeUser}, false},
+			{"Paid user should be paid", console.User{Kind: console.PaidUser}, true},
+			{"NFR user should not be paid", console.User{Kind: console.NFRUser}, false},
+			{"Member user should not be paid", console.User{Kind: console.MemberUser}, false},
+		}
+
+		for _, tc := range testCases {
+			t.Run(tc.name, func(t *testing.T) {
+				require.Equal(t, tc.expected, tc.user.IsPaid())
+			})
+		}
 	})
 }

@@ -4,32 +4,49 @@
 import { reactive } from 'vue';
 import { defineStore } from 'pinia';
 import {
+    type S3ClientConfig,
+    type BucketLocationConstraint,
+    type ObjectLockRule,
+    type ListObjectVersionsCommandInput,
+    type ListObjectVersionsCommandOutput,
     S3Client,
-    S3ClientConfig,
     CreateBucketCommand,
     DeleteBucketCommand,
     ListObjectsV2Command,
     PutBucketVersioningCommand,
     BucketVersioningStatus,
+    PutObjectLockConfigurationCommand,
+    ListObjectVersionsCommand,
 } from '@aws-sdk/client-s3';
 import { SignatureV4 } from '@smithy/signature-v4';
 
 import {
-    Bucket,
+    type Bucket,
+    type BucketsApi,
+    type BucketMetadata,
+    type PlacementDetails,
     BucketCursor,
     BucketPage,
-    BucketsApi,
-    BucketMetadata,
 } from '@/types/buckets';
 import { BucketsHttpApi } from '@/api/buckets';
-import { AccessGrant, EdgeCredentials } from '@/types/accessGrants';
+import {
+    BucketManagementHttpApiV1,
+    CreateBucketRequest as PrivateCreateBucketRequest,
+} from '@/api/private.gen';
+import { type AccessGrant, EdgeCredentials  } from '@/types/accessGrants';
 import { useAccessGrantsStore } from '@/store/modules/accessGrantsStore';
-import { useProjectsStore } from '@/store/modules/projectsStore';
 import { useConfigStore } from '@/store/modules/configStore';
 import { DEFAULT_PAGE_LIMIT } from '@/types/pagination';
 import { Duration } from '@/utils/time';
+import { useAccessGrantWorker } from '@/composables/useAccessGrantWorker';
 
 const FIRST_PAGE = 1;
+
+export enum ClientType {
+    REGULAR,
+    FOR_CREATE,
+    FOR_OBJECT_LOCK,
+}
 
 export class BucketsState {
     public allBucketNames: string[] = [];
@@ -40,6 +57,8 @@ export class BucketsState {
     public edgeCredentialsForDelete: EdgeCredentials = new EdgeCredentials();
     public edgeCredentialsForCreate: EdgeCredentials = new EdgeCredentials();
     public edgeCredentialsForVersioning: EdgeCredentials = new EdgeCredentials();
+    public edgeCredentialsForObjectLock: EdgeCredentials = new EdgeCredentials();
+    public edgeCredentialsForEventing: EdgeCredentials = new EdgeCredentials();
     public s3Client: S3Client = new S3Client({
         forcePathStyle: true,
         signerConstructor: SignatureV4,
@@ -53,6 +72,14 @@ export class BucketsState {
         signerConstructor: SignatureV4,
     });
     public s3ClientForVersioning: S3Client = new S3Client({
+        forcePathStyle: true,
+        signerConstructor: SignatureV4,
+    });
+    public s3ClientForObjectLock: S3Client = new S3Client({
+        forcePathStyle: true,
+        signerConstructor: SignatureV4,
+    });
+    public s3ClientForEventing: S3Client = new S3Client({
         forcePathStyle: true,
         signerConstructor: SignatureV4,
     });
@@ -71,16 +98,25 @@ export const useBucketsStore = defineStore('buckets', () => {
 
     const api: BucketsApi = new BucketsHttpApi();
 
+    const { setPermissions, generateAccess } = useAccessGrantWorker();
+
     function setBucketsSearch(search: string): void {
         state.cursor.search = search;
     }
 
     async function getBuckets(page: number, projectID: string, limit = DEFAULT_PAGE_LIMIT): Promise<void> {
-        const before = new Date();
+        const now = new Date();
+        const since = new Date(Date.UTC(
+            now.getUTCFullYear(),
+            now.getUTCMonth(),
+            1,
+            0, 0, 0, 0,
+        ));
+
         state.cursor.page = page;
         state.cursor.limit = limit;
 
-        state.page = await api.get(projectID, before, state.cursor);
+        state.page = await api.get(projectID, since, now, state.cursor);
     }
 
     async function getSingleBucket(projectID: string, bucketName: string): Promise<Bucket> {
@@ -95,6 +131,10 @@ export const useBucketsStore = defineStore('buckets', () => {
 
     async function getAllBucketsMetadata(projectID: string): Promise<void> {
         state.allBucketMetadata = await api.getAllBucketMetadata(projectID);
+    }
+
+    async function getPlacementDetails(projectID: string): Promise<PlacementDetails[]> {
+        return await api.getPlacementDetails(projectID);
     }
 
     function setPromptForPassphrase(value: boolean): void {
@@ -170,7 +210,43 @@ export const useBucketsStore = defineStore('buckets', () => {
         state.s3ClientForVersioning = new S3Client(s3Config);
     }
 
+    function setEdgeCredentialsForObjectLock(credentials: EdgeCredentials): void {
+        state.edgeCredentialsForObjectLock = credentials;
+
+        const s3Config: S3ClientConfig = {
+            credentials: {
+                accessKeyId: state.edgeCredentialsForObjectLock.accessKeyId || '',
+                secretAccessKey: state.edgeCredentialsForObjectLock.secretKey || '',
+            },
+            endpoint: state.edgeCredentialsForObjectLock.endpoint,
+            forcePathStyle: true,
+            signerConstructor: SignatureV4,
+            region: 'us-east-1',
+        };
+
+        state.s3ClientForObjectLock = new S3Client(s3Config);
+    }
+
+    function setEdgeCredentialsForEventing(credentials: EdgeCredentials): void {
+        state.edgeCredentialsForEventing = credentials;
+
+        const s3Config: S3ClientConfig = {
+            credentials: {
+                accessKeyId: state.edgeCredentialsForEventing.accessKeyId || '',
+                secretAccessKey: state.edgeCredentialsForEventing.secretKey || '',
+            },
+            endpoint: state.edgeCredentialsForEventing.endpoint,
+            forcePathStyle: true,
+            signerConstructor: SignatureV4,
+            region: 'us-east-1',
+        };
+
+        state.s3ClientForEventing = new S3Client(s3Config);
+    }
+
     async function setS3Client(projectID: string): Promise<void> {
+        if (!state.passphrase) throw new Error('Passphrase can\'t be empty');
+
         const agStore = useAccessGrantsStore();
         const { objectBrowserKeyNamePrefix, objectBrowserKeyLifetime } = useConfigStore().state.config;
         const now = new Date();
@@ -180,60 +256,29 @@ export const useBucketsStore = defineStore('buckets', () => {
             setApiKey(cleanAPIKey.secret);
         }
 
-        const worker = agStore.state.accessGrantsWebWorker;
-        if (!worker) {
-            throw new Error('Worker is not defined');
-        }
-
-        worker.onerror = (error: ErrorEvent) => {
-            throw new Error(error.message);
-        };
-
         const notAfter = new Date(now.setDate(now.getDate() + new Duration(objectBrowserKeyLifetime).days));
-        worker.postMessage({
-            'type': 'SetPermission',
-            'isDownload': true,
-            'isUpload': true,
-            'isList': true,
-            'isDelete': true,
-            'isPutObjectRetention': true,
-            'isGetObjectRetention': true,
-            'isPutObjectLegalHold': true,
-            'isGetObjectLegalHold': true,
-            'notAfter': notAfter.toISOString(),
-            'buckets': JSON.stringify([]),
-            'apiKey': state.apiKey,
+
+        const macaroon = await setPermissions({
+            isDownload: true,
+            isUpload: true,
+            isList: true,
+            isDelete: true,
+            isPutObjectRetention: true,
+            isGetObjectRetention: true,
+            isPutObjectLegalHold: true,
+            isGetObjectLegalHold: true,
+            isPutObjectLockConfiguration: true,
+            isGetObjectLockConfiguration: true,
+            notAfter: notAfter.toISOString(),
+            buckets: JSON.stringify([]),
+            apiKey: state.apiKey,
         });
 
-        const grantEvent: MessageEvent = await new Promise(resolve => worker.onmessage = resolve);
-        if (grantEvent.data.error) {
-            throw new Error(grantEvent.data.error);
-        }
+        const accessGrant = await generateAccess({
+            apiKey: macaroon,
+            passphrase: state.passphrase,
+        }, projectID);
 
-        const projectsStore = useProjectsStore();
-        const configStore = useConfigStore();
-
-        const salt = await projectsStore.getProjectSalt(projectID);
-        const satelliteNodeURL: string = configStore.state.config.satelliteNodeURL;
-
-        if (!state.passphrase) {
-            throw new Error('Passphrase can\'t be empty');
-        }
-
-        worker.postMessage({
-            'type': 'GenerateAccess',
-            'apiKey': grantEvent.data.value,
-            'passphrase': state.passphrase,
-            'salt': salt,
-            'satelliteNodeURL': satelliteNodeURL,
-        });
-
-        const accessGrantEvent: MessageEvent = await new Promise(resolve => worker.onmessage = resolve);
-        if (accessGrantEvent.data.error) {
-            throw new Error(accessGrantEvent.data.error);
-        }
-
-        const accessGrant = accessGrantEvent.data.value;
         state.edgeCredentials = await agStore.getEdgeCredentials(accessGrant);
 
         const s3Config: S3ClientConfig = {
@@ -262,15 +307,22 @@ export const useBucketsStore = defineStore('buckets', () => {
         state.fileComponentPath = path;
     }
 
-    async function createBucket(name: string, enableObjectLock: boolean, enableBucketVersioning: boolean): Promise<void> {
+    async function createBucket(params: {
+        name: string, enableObjectLock: boolean,
+        enableVersioning: boolean,
+        placementName?: string,
+    }): Promise<void> {
         await state.s3Client.send(new CreateBucketCommand({
-            Bucket: name,
-            ObjectLockEnabledForBucket: enableObjectLock,
+            Bucket: params.name,
+            ObjectLockEnabledForBucket: params.enableObjectLock,
+            CreateBucketConfiguration: {
+                LocationConstraint: params.placementName as BucketLocationConstraint,
+            },
         }));
         // If object lock is enabled, versioning is enabled implicitly.
-        if (enableBucketVersioning && !enableObjectLock) {
+        if (params.enableVersioning && !params.enableObjectLock) {
             await state.s3Client.send(new PutBucketVersioningCommand({
-                Bucket: name,
+                Bucket: params.name,
                 VersioningConfiguration: {
                     Status: BucketVersioningStatus.Enabled,
                 },
@@ -278,15 +330,64 @@ export const useBucketsStore = defineStore('buckets', () => {
         }
     }
 
-    async function createBucketWithNoPassphrase(name: string, enableObjectLock: boolean, enableBucketVersioning: boolean): Promise<void> {
-        await state.s3ClientForCreate.send(new CreateBucketCommand({
+    async function createBucketViaSatellite(params: {
+        projectID: string,
+        name: string,
+        enableObjectLock: boolean,
+        enableVersioning: boolean,
+        placementName?: string,
+        defaultRetention?: { mode: string, days?: number, years?: number },
+    }): Promise<void> {
+        const req = new PrivateCreateBucketRequest();
+        req.projectID = params.projectID;
+        req.name = params.name;
+        req.placement = params.placementName;
+        req.objectLockEnabled = params.enableObjectLock;
+        req.versioning = params.enableVersioning;
+        if (params.defaultRetention?.mode) {
+            req.defaultRetention = {
+                mode: params.defaultRetention.mode,
+                days: params.defaultRetention.days,
+                years: params.defaultRetention.years,
+            };
+        }
+        await new BucketManagementHttpApiV1().createBucket(req);
+    }
+
+    async function setObjectLockConfig(name: string, clientType: ClientType, rule?: ObjectLockRule): Promise<void> {
+        let client: S3Client = state.s3Client;
+        if (clientType === ClientType.FOR_CREATE) {
+            client = state.s3ClientForCreate;
+        } else if (clientType === ClientType.FOR_OBJECT_LOCK) {
+            client = state.s3ClientForObjectLock;
+        }
+
+        await client.send(new PutObjectLockConfigurationCommand({
             Bucket: name,
-            ObjectLockEnabledForBucket: enableObjectLock,
+            ObjectLockConfiguration: {
+                ObjectLockEnabled: 'Enabled',
+                Rule: rule,
+            },
+        }));
+    }
+
+    async function createBucketWithNoPassphrase(params: {
+        name: string,
+        enableObjectLock: boolean,
+        enableVersioning: boolean,
+        placementName?: string,
+    }): Promise<void> {
+        await state.s3ClientForCreate.send(new CreateBucketCommand({
+            Bucket: params.name,
+            ObjectLockEnabledForBucket: params.enableObjectLock,
+            CreateBucketConfiguration: {
+                LocationConstraint: params.placementName as BucketLocationConstraint,
+            },
         }));
         // If object lock is enabled, versioning is enabled implicitly.
-        if (enableBucketVersioning && !enableObjectLock) {
+        if (params.enableVersioning && !params.enableObjectLock) {
             await state.s3ClientForCreate.send(new PutBucketVersioningCommand({
-                Bucket: name,
+                Bucket: params.name,
                 VersioningConfiguration: {
                     Status: BucketVersioningStatus.Enabled,
                 },
@@ -333,6 +434,18 @@ export const useBucketsStore = defineStore('buckets', () => {
         return (!response || response.KeyCount === undefined) ? 0 : response.KeyCount;
     }
 
+    async function checkBucketEmpty(name: string): Promise<boolean> {
+        const input: ListObjectVersionsCommandInput = {
+            Bucket: name,
+            Delimiter: '/',
+            Prefix: '',
+            MaxKeys: 10,
+        };
+
+        const response: ListObjectVersionsCommandOutput = await state.s3ClientForDelete.send(new ListObjectVersionsCommand(input));
+        return !(response.DeleteMarkers?.length || response.Versions?.length || response.CommonPrefixes?.length);
+    }
+
     function clearS3Data(): void {
         state.apiKey = '';
         state.passphrase = '';
@@ -341,6 +454,8 @@ export const useBucketsStore = defineStore('buckets', () => {
         state.edgeCredentialsForDelete = new EdgeCredentials();
         state.edgeCredentialsForCreate = new EdgeCredentials();
         state.edgeCredentialsForVersioning = new EdgeCredentials();
+        state.edgeCredentialsForObjectLock = new EdgeCredentials();
+        state.edgeCredentialsForEventing = new EdgeCredentials();
         state.s3Client = new S3Client({
             forcePathStyle: true,
             signerConstructor: SignatureV4,
@@ -354,6 +469,14 @@ export const useBucketsStore = defineStore('buckets', () => {
             signerConstructor: SignatureV4,
         });
         state.s3ClientForVersioning = new S3Client({
+            forcePathStyle: true,
+            signerConstructor: SignatureV4,
+        });
+        state.s3ClientForObjectLock = new S3Client({
+            forcePathStyle: true,
+            signerConstructor: SignatureV4,
+        });
+        state.s3ClientForEventing = new S3Client({
             forcePathStyle: true,
             signerConstructor: SignatureV4,
         });
@@ -377,22 +500,28 @@ export const useBucketsStore = defineStore('buckets', () => {
         getSingleBucket,
         getAllBucketsNames,
         getAllBucketsMetadata,
+        getPlacementDetails,
         setPromptForPassphrase,
         setEdgeCredentials,
         setEdgeCredentialsForDelete,
         setEdgeCredentialsForCreate,
         setEdgeCredentialsForVersioning,
+        setEdgeCredentialsForObjectLock,
+        setEdgeCredentialsForEventing,
+        setObjectLockConfig,
         setS3Client,
         setPassphrase,
         setApiKey,
         setFileComponentBucketName,
         setFileComponentPath,
         createBucket,
+        createBucketViaSatellite,
         createBucketWithNoPassphrase,
         setVersioning,
         deleteBucket,
         handleDeleteBucketRequest,
         getObjectsCount,
+        checkBucketEmpty,
         clearS3Data,
         clear,
     };

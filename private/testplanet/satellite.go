@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"runtime/pprof"
 	"strconv"
+	"time"
 
 	"github.com/spf13/pflag"
 	"github.com/zeebo/errs"
@@ -19,8 +20,10 @@ import (
 	"storj.io/common/cfgstruct"
 	"storj.io/common/errs2"
 	"storj.io/common/identity"
+	"storj.io/common/macaroon"
 	"storj.io/common/rpc"
 	"storj.io/common/storj"
+	"storj.io/common/testrand"
 	"storj.io/common/uuid"
 	"storj.io/common/version"
 	"storj.io/storj/private/revocation"
@@ -42,6 +45,7 @@ import (
 	"storj.io/storj/satellite/contact"
 	"storj.io/storj/satellite/gc/sender"
 	"storj.io/storj/satellite/gracefulexit"
+	"storj.io/storj/satellite/jobq"
 	"storj.io/storj/satellite/mailservice"
 	"storj.io/storj/satellite/metabase"
 	"storj.io/storj/satellite/metabase/zombiedeletion"
@@ -54,9 +58,13 @@ import (
 	"storj.io/storj/satellite/overlay/offlinenodes"
 	"storj.io/storj/satellite/overlay/straynodes"
 	"storj.io/storj/satellite/payments/stripe"
+	"storj.io/storj/satellite/projectlimitevents"
+	"storj.io/storj/satellite/repair/queue"
 	"storj.io/storj/satellite/repair/repairer"
 	"storj.io/storj/satellite/reputation"
+	"storj.io/storj/satellite/satellitedb"
 	"storj.io/storj/satellite/satellitedb/satellitedbtest"
+	"storj.io/storj/shared/lrucache"
 )
 
 // Satellite contains all the processes needed to run a full Satellite setup.
@@ -90,10 +98,12 @@ type Satellite struct {
 	}
 
 	Overlay struct {
-		DB                overlay.DB
-		Service           *overlay.Service
-		OfflineNodeEmails *offlinenodes.Chore
-		DQStrayNodes      *straynodes.Chore
+		DB                     overlay.DB
+		Service                *overlay.Service
+		UploadSelectionCache   *overlay.UploadSelectionCache
+		DownloadSelectionCache *overlay.DownloadSelectionCache
+		OfflineNodeEmails      *offlinenodes.Chore
+		DQStrayNodes           *straynodes.Chore
 	}
 
 	NodeEvents struct {
@@ -102,9 +112,12 @@ type Satellite struct {
 		Chore    *nodeevents.Chore
 	}
 
+	ProjectLimitEvents struct {
+		DB    projectlimitevents.DB
+		Chore *projectlimitevents.Chore
+	}
+
 	Metainfo struct {
-		// TODO remove when uplink will be adjusted to use Metabase.DB
-		Metabase *metabase.DB
 		Endpoint *metainfo.Endpoint
 	}
 
@@ -125,6 +138,7 @@ type Satellite struct {
 
 	Repair struct {
 		Repairer *repairer.Service
+		Queue    queue.RepairQueue
 	}
 
 	Audit struct {
@@ -168,12 +182,6 @@ type Satellite struct {
 
 	Mail struct {
 		Service *mailservice.Service
-	}
-
-	ConsoleBackend struct {
-		Listener net.Listener
-		Service  *console.Service
-		Endpoint *consoleweb.Server
 	}
 
 	ConsoleFrontend struct {
@@ -228,28 +236,25 @@ func (system *Satellite) AddUser(ctx context.Context, newUser console.CreateUser
 		service = system.API.Console.Service
 	}
 
-	regToken, err := service.CreateRegToken(ctx, maxNumberOfProjects)
-	if err != nil {
-		return nil, errs.Wrap(err)
+	var regToken *console.RegistrationToken
+	if !system.Config.Console.OpenRegistrationEnabled {
+		regToken, err = service.CreateRegToken(ctx, maxNumberOfProjects)
+		if err != nil {
+			return nil, errs.Wrap(err)
+		}
 	}
 
 	newUser.Password = newUser.FullName
-	user, err := service.CreateUser(ctx, newUser, regToken.Secret)
+	user, err := service.CreateUser(ctx, newUser, regToken)
 	if err != nil {
 		return nil, errs.Wrap(err)
 	}
 
-	activationToken, err := service.GenerateActivationToken(ctx, user.ID, user.Email)
-	if err != nil {
+	if err = service.SetAccountActive(ctx, user); err != nil {
 		return nil, errs.Wrap(err)
 	}
 
-	_, err = service.ActivateAccount(ctx, activationToken)
-	if err != nil {
-		return nil, errs.Wrap(err)
-	}
-
-	userCtx, err := system.UserContext(ctx, user.ID)
+	userCtx := console.WithUser(ctx, user)
 	if err != nil {
 		return nil, errs.Wrap(err)
 	}
@@ -262,28 +267,62 @@ func (system *Satellite) AddUser(ctx context.Context, newUser console.CreateUser
 }
 
 // AddProject adds project to a satellite and makes specified user an owner.
+// This method only mimics the behavior of the console API. It's simplified to
+// be faster for tests.
 func (system *Satellite) AddProject(ctx context.Context, ownerID uuid.UUID, name string) (project *console.Project, err error) {
 	defer mon.Task()(&ctx)(&err)
 
-	ctx, err = system.UserContext(ctx, ownerID)
+	project, err = system.DB.Console().Projects().Insert(ctx, &console.Project{
+		ID:             testrand.UUID(),
+		PublicID:       testrand.UUID(),
+		Name:           name,
+		OwnerID:        ownerID,
+		StorageLimit:   &system.Config.Console.UsageLimits.Storage.Free,
+		BandwidthLimit: &system.Config.Console.UsageLimits.Bandwidth.Free,
+		SegmentLimit:   &system.Config.Console.UsageLimits.Segment.Free,
+	})
 	if err != nil {
 		return nil, errs.Wrap(err)
 	}
 
-	if system.Config.DisableConsoleFromSatelliteAPI && system.ConsoleAPI != nil {
-		project, err = system.ConsoleAPI.Console.Service.CreateProject(ctx, console.UpsertProjectInfo{
-			Name: name,
-		})
-	} else {
-		project, err = system.API.Console.Service.CreateProject(ctx, console.UpsertProjectInfo{
-			Name: name,
-		})
-	}
+	_, err = system.DB.Console().ProjectMembers().Insert(ctx, ownerID, project.ID, console.RoleAdmin)
 	if err != nil {
 		return nil, errs.Wrap(err)
 	}
 
 	return project, nil
+}
+
+// CreateAPIKey creates an API key for the specified project and user with the given version.
+// This method only mimics the behavior of the console API. It's simplified to
+// be faster for tests.
+func (system *Satellite) CreateAPIKey(ctx context.Context, projectID uuid.UUID, userID uuid.UUID, version macaroon.APIKeyVersion) (_ *macaroon.APIKey, err error) {
+	defer mon.Task()(&ctx)(&err)
+
+	secret, err := macaroon.NewSecret()
+	if err != nil {
+		return nil, errs.Wrap(err)
+	}
+
+	key, err := macaroon.NewAPIKey(secret)
+	if err != nil {
+		return nil, errs.Wrap(err)
+	}
+
+	apikey := console.APIKeyInfo{
+		Name:      "root",
+		ProjectID: projectID,
+		CreatedBy: userID,
+		Secret:    secret,
+		Version:   version,
+	}
+
+	_, err = system.DB.Console().APIKeys().Create(ctx, key.Head(), apikey)
+	if err != nil {
+		return nil, errs.Wrap(err)
+	}
+
+	return key, nil
 }
 
 // UserContext creates context with user.
@@ -403,7 +442,22 @@ func (planet *Planet) newSatellite(ctx context.Context, prefix string, index int
 		return nil, errs.Wrap(err)
 	}
 
-	db, err := satellitedbtest.CreateMasterDB(ctx, log.Named("db"), planet.config.Name, "S", index, databases.MasterDB, applicationName)
+	defaultSatDBOptions := satellitedb.Options{
+		ApplicationName: applicationName,
+		APIKeysLRUOptions: lrucache.Options{
+			Expiration: 1 * time.Minute,
+			Capacity:   100,
+		},
+		RevocationLRUOptions: lrucache.Options{
+			Expiration: 1 * time.Minute,
+			Capacity:   100,
+		},
+	}
+	if planet.config.Reconfigure.SatelliteDBOptions != nil {
+		planet.config.Reconfigure.SatelliteDBOptions(log, index, &defaultSatDBOptions)
+	}
+
+	db, err := satellitedbtest.CreateMasterDB(ctx, log.Named("db"), planet.config.Name, "S", index, databases.MasterDB, defaultSatDBOptions)
 	if err != nil {
 		return nil, errs.Wrap(err)
 	}
@@ -435,7 +489,9 @@ func (planet *Planet) newSatellite(ctx context.Context, prefix string, index int
 		cfgstruct.UseTestDefaults(),
 		cfgstruct.ConfDir(storageDir),
 		cfgstruct.IdentityDir(storageDir),
-		cfgstruct.ConfigVar("TESTINTERVAL", defaultInterval.String()))
+		cfgstruct.ConfigVar("TESTINTERVAL", defaultInterval.String()),
+		cfgstruct.ConfigVar("HOST", planet.config.Host),
+	)
 
 	// TODO: these are almost certainly mistakenly set to the zero value
 	// in tests due to a prior mismatch between testplanet config and
@@ -445,7 +501,6 @@ func (planet *Planet) newSatellite(ctx context.Context, prefix string, index int
 	config.Debug.Addr = ""
 	config.Reputation.AuditHistory.OfflineDQEnabled = false
 	config.Server.Config.Extensions.Revocation = false
-	config.Orders.OrdersSemaphoreSize = 0
 	config.Checker.NodeFailureRate = 0
 	config.Audit.MaxRetriesStatDB = 0
 	config.GarbageCollection.RetainSendTimeout = 0
@@ -467,7 +522,6 @@ func (planet *Planet) newSatellite(ctx context.Context, prefix string, index int
 	config.Console.ProjectLimitsIncreaseRequestURL = ""
 	config.Console.GatewayCredentialsRequestURL = ""
 	config.Console.DocumentationURL = ""
-	config.Console.PathwayOverviewEnabled = false
 	config.Compensation.Rates.AtRestGBHours = compensation.Rate{}
 	config.Compensation.Rates.GetTB = compensation.Rate{}
 	config.Compensation.Rates.GetRepairTB = compensation.Rate{}
@@ -501,12 +555,13 @@ func (planet *Planet) newSatellite(ctx context.Context, prefix string, index int
 		planet.config.Reconfigure.Satellite(log, index, &config)
 	}
 
-	metabaseDB, err := satellitedbtest.CreateMetabaseDB(context.TODO(), log.Named("metabase"), planet.config.Name, "M", index, databases.MetabaseDB, metabase.Config{
-		ApplicationName:  "satellite-testplanet",
-		MinPartSize:      config.Metainfo.MinPartSize,
-		MaxNumberOfParts: config.Metainfo.MaxNumberOfParts,
-		ServerSideCopy:   config.Metainfo.ServerSideCopy,
-	})
+	metabaseConfig := config.Metainfo.Metabase("satellite-testplanet")
+	if planet.config.Reconfigure.SatelliteMetabaseDBConfig != nil {
+		planet.config.Reconfigure.SatelliteMetabaseDBConfig(log, index, &metabaseConfig)
+	}
+
+	metabaseDB, err := satellitedbtest.CreateMetabaseDB(ctx, log.Named("metabase"), planet.config.Name, "M", index, databases.MetabaseDB,
+		metabaseConfig)
 	if err != nil {
 		return nil, errs.Wrap(err)
 	}
@@ -528,6 +583,14 @@ func (planet *Planet) newSatellite(ctx context.Context, prefix string, index int
 		return nil, errs.Wrap(err)
 	}
 
+	if config.JobQueue.ServerNodeURL.IsZero() {
+		return nil, errs.New("job queue server node URL is required")
+	}
+	repairQueue, err := jobq.OpenJobQueue(ctx, nil, config.JobQueue)
+	if err != nil {
+		return nil, errs.Wrap(err)
+	}
+
 	planet.databases = append(planet.databases, revocationDB)
 
 	liveAccounting, err := live.OpenCache(ctx, log.Named("live-accounting"), config.LiveAccounting)
@@ -539,7 +602,7 @@ func (planet *Planet) newSatellite(ctx context.Context, prefix string, index int
 	config.Payments.Provider = "mock"
 	config.Payments.MockProvider = stripe.NewStripeMock(db.StripeCoinPayments().Customers(), db.Console().Users())
 
-	peer, err := satellite.New(log, identity, db, metabaseDB, revocationDB, liveAccounting, versionInfo, &config, nil)
+	peer, err := satellite.New(log, identity, db, metabaseDB, revocationDB, repairQueue, liveAccounting, versionInfo, &config, nil)
 	if err != nil {
 		return nil, errs.Wrap(err)
 	}
@@ -592,7 +655,7 @@ func (planet *Planet) newSatellite(ctx context.Context, prefix string, index int
 		return nil, errs.Wrap(err)
 	}
 
-	repairerPeer, err := planet.newRepairer(ctx, index, identity, db, metabaseDB, config, versionInfo)
+	repairerPeer, err := planet.newRepairer(ctx, index, identity, db, metabaseDB, repairQueue, config, versionInfo)
 	if err != nil {
 		return nil, errs.Wrap(err)
 	}
@@ -607,7 +670,7 @@ func (planet *Planet) newSatellite(ctx context.Context, prefix string, index int
 		return nil, errs.Wrap(err)
 	}
 
-	rangedLoopPeer, err := planet.newRangedLoop(ctx, index, db, metabaseDB, config)
+	rangedLoopPeer, err := planet.newRangedLoop(ctx, index, db, metabaseDB, repairQueue, config)
 	if err != nil {
 		return nil, errs.Wrap(err)
 	}
@@ -648,6 +711,8 @@ func createNewSystem(name string, log *zap.Logger, config satellite.Config, peer
 
 	system.Overlay.DB = api.Overlay.DB
 	system.Overlay.Service = api.Overlay.Service
+	system.Overlay.UploadSelectionCache = api.Overlay.UploadSelectionCache
+	system.Overlay.DownloadSelectionCache = api.Overlay.DownloadSelectionCache
 	system.Overlay.OfflineNodeEmails = peer.Overlay.OfflineNodeEmails
 	system.Overlay.DQStrayNodes = peer.Overlay.DQStrayNodes
 
@@ -655,11 +720,12 @@ func createNewSystem(name string, log *zap.Logger, config satellite.Config, peer
 	system.NodeEvents.Notifier = peer.NodeEvents.Notifier
 	system.NodeEvents.Chore = peer.NodeEvents.Chore
 
+	system.ProjectLimitEvents.DB = peer.ProjectLimitEvents.DB
+	system.ProjectLimitEvents.Chore = peer.ProjectLimitEvents.Chore
+
 	system.Reputation.Service = peer.Reputation.Service
 
-	// system.Metainfo.Metabase = api.Metainfo.Metabase
 	system.Metainfo.Endpoint = api.Metainfo.Endpoint
-	// system.Metainfo.SegmentLoop = peer.Metainfo.SegmentLoop
 
 	system.Userinfo.Endpoint = api.Userinfo.Endpoint
 
@@ -670,6 +736,7 @@ func createNewSystem(name string, log *zap.Logger, config satellite.Config, peer
 	system.Orders.Service = api.Orders.Service
 	system.Orders.Chore = api.Orders.Chore
 
+	system.Repair.Queue = repairerPeer.Queue
 	system.Repair.Repairer = repairerPeer.Repairer
 
 	system.Audit.VerifyQueue = auditorPeer.Audit.VerifyQueue
@@ -704,7 +771,6 @@ func createNewSystem(name string, log *zap.Logger, config satellite.Config, peer
 		system.API.ABTesting = consoleAPI.ABTesting
 		system.API.KeyManagement = consoleAPI.KeyManagement
 		system.API.Payments = consoleAPI.Payments
-		system.API.REST = consoleAPI.REST
 		system.API.HealthCheck = consoleAPI.HealthCheck
 		system.API.Userinfo = consoleAPI.Userinfo
 		system.API.Accounting = consoleAPI.Accounting
@@ -785,7 +851,7 @@ func (planet *Planet) newAdmin(ctx context.Context, index int, identity *identit
 	return satellite.NewAdmin(log, identity, db, metabaseDB, liveAccounting, versionInfo, &config, nil)
 }
 
-func (planet *Planet) newRepairer(ctx context.Context, index int, identity *identity.FullIdentity, db satellite.DB, metabaseDB *metabase.DB, config satellite.Config, versionInfo version.Info) (_ *satellite.Repairer, err error) {
+func (planet *Planet) newRepairer(ctx context.Context, index int, identity *identity.FullIdentity, db satellite.DB, metabaseDB *metabase.DB, repairQueue queue.RepairQueue, config satellite.Config, versionInfo version.Info) (_ *satellite.Repairer, err error) {
 	defer mon.Task()(&ctx)(&err)
 
 	prefix := "satellite-repairer" + strconv.Itoa(index)
@@ -797,7 +863,7 @@ func (planet *Planet) newRepairer(ctx context.Context, index int, identity *iden
 	}
 	planet.databases = append(planet.databases, revocationDB)
 
-	return satellite.NewRepairer(log, identity, metabaseDB, revocationDB, db.RepairQueue(), db.Buckets(), db.OverlayCache(), db.NodeEvents(), db.Reputation(), db.Containment(), versionInfo, &config, nil)
+	return satellite.NewRepairer(log, identity, metabaseDB, revocationDB, repairQueue, db.Buckets(), db.OverlayCache(), db.NodeEvents(), db.Reputation(), db.Containment(), versionInfo, &config, nil)
 }
 
 func (planet *Planet) newAuditor(ctx context.Context, index int, identity *identity.FullIdentity, db satellite.DB, metabaseDB *metabase.DB, config satellite.Config, versionInfo version.Info) (_ *satellite.Auditor, err error) {
@@ -834,15 +900,15 @@ func (planet *Planet) newGarbageCollectionBF(ctx context.Context, index int, db 
 		return nil, errs.Wrap(err)
 	}
 	planet.databases = append(planet.databases, revocationDB)
-	return satellite.NewGarbageCollectionBF(log, db, metabaseDB, revocationDB, versionInfo, &config, nil)
+	return satellite.NewGarbageCollectionBF(log, db, metabaseDB, revocationDB, versionInfo, &config, nil, time.Time{})
 }
 
-func (planet *Planet) newRangedLoop(ctx context.Context, index int, db satellite.DB, metabaseDB *metabase.DB, config satellite.Config) (_ *satellite.RangedLoop, err error) {
+func (planet *Planet) newRangedLoop(ctx context.Context, index int, db satellite.DB, metabaseDB *metabase.DB, repairQueue queue.RepairQueue, config satellite.Config) (_ *satellite.RangedLoop, err error) {
 	defer mon.Task()(&ctx)(&err)
 
 	prefix := "satellite-ranged-loop" + strconv.Itoa(index)
 	log := planet.log.Named(prefix)
-	return satellite.NewRangedLoop(log, db, metabaseDB, &config, nil)
+	return satellite.NewRangedLoop(log, db, metabaseDB, repairQueue, &config, nil)
 }
 
 // atLeastOne returns 1 if value < 1, or value otherwise.

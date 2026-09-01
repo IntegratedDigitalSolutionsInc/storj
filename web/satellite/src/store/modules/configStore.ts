@@ -1,16 +1,26 @@
 // Copyright (C) 2023 Storj Labs, Inc.
 // See LICENSE for copying information.
 
-import { computed, ComputedRef, reactive } from 'vue';
+import { computed, reactive, ref } from 'vue';
 import { defineStore } from 'pinia';
 
-import { FrontendConfig, FrontendConfigApi } from '@/types/config';
+import {
+    type BrandingConfig,
+    type FrontendConfigApi,
+    createDefaultBranding,
+    defaultBrandingName,
+    FrontendConfig,
+    LogoKey,
+} from '@/types/config';
 import { FrontendConfigHttpApi } from '@/api/config';
-import { NavigationLink } from '@/types/navigation';
-import { RouteConfig } from '@/types/router';
+import { centsToDollars } from '@/utils/strings';
+import type { User } from '@/types/users';
+import type { PricingPlanInfo } from '@/types/common';
+import { APIError } from '@/utils/error';
 
 export class ConfigState {
     public config: FrontendConfig = new FrontendConfig();
+    public branding: BrandingConfig = createDefaultBranding();
 }
 
 export const useConfigStore = defineStore('config', () => {
@@ -18,16 +28,47 @@ export const useConfigStore = defineStore('config', () => {
 
     const configApi: FrontendConfigApi = new FrontendConfigHttpApi();
 
-    const firstOnboardingStep = computed((): NavigationLink => {
-        return state.config.pricingPackagesEnabled ? RouteConfig.PricingPlanStep : RouteConfig.OverviewStep;
+    const minimumCharge = computed<MinimumCharge>(() => {
+        if (!state.config.minimumCharge) {
+            return new MinimumCharge();
+        }
+        return new MinimumCharge(
+            state.config.minimumCharge.enabled,
+            state.config.minimumCharge.amount,
+            state.config.minimumCharge.legacyAmount,
+            state.config.minimumCharge.startDate,
+            state.config.minimumCharge.cleanupDate,
+        );
     });
 
-    /**
-     * This is whether the UI for object locking is globally enabled or not.
-     * It is a combination of whether the object lock feature itself is enabled
-     * in metainfo and another flag of the same name console.
-     */
-    const objectLockUIEnabled: ComputedRef<boolean> = computed(() => state.config.objectLockUIEnabled);
+    const freeTrialDuration = computed<string>(() => {
+        const ms = state.config.freeTrialDuration / 1000000;
+        const totalMinutes = Math.floor(ms / 60000);
+        const totalHours = Math.floor(totalMinutes / 60);
+        const days = Math.floor(totalHours / 24);
+
+        return `${days} days`;
+    });
+
+    const brandName = computed<string>(() => state.branding.name);
+    const supportUrl = computed<string>(() => state.branding.supportUrl);
+    const docsUrl = computed<string>(() => state.branding.docsUrl);
+    const homepageUrl = computed<string>(() => state.branding.homepageUrl);
+    const gatewayUrl = computed<string>(() => state.branding.gatewayUrl);
+    const isDefaultBrand = computed<boolean>(() => brandName.value === defaultBrandingName);
+    const freeTrialsEnabled = computed<boolean>(() => state.branding.freeTrialsEnabled);
+    const logo = computed<string>(() => state.branding.getLogo(LogoKey.FullLight) ?? '');
+    const darkLogo = computed<string>(() => state.branding.getLogo(LogoKey.FullDark) ?? '');
+    const smallLogo = computed<string>(() => state.branding.getLogo(LogoKey.SmallLight) ?? '');
+    const smallDarkLogo = computed<string>(() => state.branding.getLogo(LogoKey.SmallDark) ?? '');
+    const projectLimitsIncreaseRequestURL = computed<string>(() => {
+        if (isDefaultBrand.value) return state.config.projectLimitsIncreaseRequestURL;
+        return state.branding.supportUrl;
+    });
+
+    const billingEnabled = computed<boolean>(() => state.config.billingFeaturesEnabled);
+
+    const externalAuthEnabled = computed<boolean>(() => !!state.config.primaryAuthLoginURL);
 
     async function getConfig(): Promise<FrontendConfig> {
         const result = await configApi.get();
@@ -37,15 +78,167 @@ export const useConfigStore = defineStore('config', () => {
         return result;
     }
 
-    function getBillingEnabled(hasVarPartner: boolean): boolean {
-        return state.config.billingFeaturesEnabled && !hasVarPartner;
+    async function getBranding(): Promise<BrandingConfig> {
+        const result = await configApi.getBranding();
+
+        state.branding = result;
+
+        return result;
+    }
+
+    function setFallbackBranding(cfg: FrontendConfig): void {
+        state.branding.getInTouchUrl = cfg.scheduleMeetingURL;
+        state.branding.supportUrl = cfg.generalRequestURL;
+        state.branding.homepageUrl = cfg.homepageURL;
+        state.branding.docsUrl = cfg.documentationURL;
+    }
+
+    const signupConfig = ref<Map<string, unknown>>(new Map());
+    const onboardingConfig = ref<Map<string, unknown>>(new Map());
+
+    async function getPartnerSignupConfig(partner: string): Promise<void> {
+        if (!partner || signupConfig.value.has(partner)) return;
+
+        try {
+            const conf = await configApi.getPartnerUIConfig('signup', partner);
+            signupConfig.value.set(partner, conf);
+        } catch (error) {
+            if (error instanceof APIError && error.status !== 404) {
+                throw error;
+            }
+            try {
+                const config = (await import('@/configs/registrationViewConfig.json')).default;
+                if (!config[partner]) return;
+                signupConfig.value.set(partner, config[partner]);
+            } catch { /* empty */ }
+        }
+    }
+
+    async function getPartnerOnboardingConfig(partner: string): Promise<void> {
+        if (!partner || onboardingConfig.value.has(partner)) return;
+
+        try {
+            const conf = await configApi.getPartnerUIConfig('onboarding', partner);
+            onboardingConfig.value.set(partner, conf);
+        } catch (error) {
+            if (error instanceof APIError && error.status !== 404) {
+                throw error;
+            }
+            try {
+                const config = (await import('@/configs/onboardingConfig.json')).default;
+                if (!config[partner]) return;
+                onboardingConfig.value.set(partner, config[partner]);
+            } catch { /* empty */ }
+        }
+    }
+
+    async function getPartnerPricingPlanConfig(partner: string): Promise<PricingPlanInfo | null> {
+        if (!partner) return null;
+        try {
+            return (await configApi.getPartnerUIConfig('pricing-plan', partner)) as PricingPlanInfo;
+        } catch (error) {
+            if (error instanceof APIError && error.status !== 404) {
+                throw error;
+            }
+            try {
+                const config = (await import('@/configs/pricingPlanConfig.json')).default;
+                return (config[partner] as PricingPlanInfo);
+            } catch {
+                return null;
+            }
+        }
+    }
+
+    function accountInfoFieldEnabled(field: string): boolean {
+        return (state.config.accountInfoEnabledFields ?? []).includes(field);
+    }
+
+    function getBillingEnabled(user: User): boolean {
+        return billingEnabled.value && !user.hasVarPartner && !user.isNFR;
+    }
+
+    /**
+     * Determines if a project has the new pricing based on its creation date.
+     * @param projectCreatedAt
+     */
+    function getProjectHasNewPricing(projectCreatedAt: string | null): boolean {
+        if (!projectCreatedAt) {
+            return false;
+        }
+        if (!state.config.previousPricingUpdateDate) {
+            return false;
+        }
+        const projectCreatedDate = new Date(projectCreatedAt);
+        const previousPricingUpdateDate = new Date(state.config.previousPricingUpdateDate);
+        return projectCreatedDate >= previousPricingUpdateDate;
     }
 
     return {
         state,
-        firstOnboardingStep,
-        objectLockUIEnabled,
+        freeTrialDuration,
+        minimumCharge,
+        externalAuthEnabled,
+        signupConfig,
+        onboardingConfig,
+        brandName,
+        supportUrl,
+        docsUrl,
+        homepageUrl,
+        gatewayUrl,
+        projectLimitsIncreaseRequestURL,
+        isDefaultBrand,
+        logo,
+        darkLogo,
+        smallLogo,
+        smallDarkLogo,
+        billingEnabled,
+        freeTrialsEnabled,
         getConfig,
+        getBranding,
+        getPartnerSignupConfig,
+        getPartnerOnboardingConfig,
+        getPartnerPricingPlanConfig,
+        accountInfoFieldEnabled,
         getBillingEnabled,
+        getProjectHasNewPricing,
+        setFallbackBranding,
     };
 });
+
+/**
+ * MinimumCharge represents minimum charge config.
+ */
+export class MinimumCharge {
+    public constructor(
+        public enabled = false,
+        public _amount = 0,
+        public _legacyAmount = 0,
+        public _startDate: string | null = null,
+        public _cleanupDate: string | null = null,
+    ) { }
+
+    getAmount(isLegacyPricingUser: boolean): number {
+        return isLegacyPricingUser ? this._legacyAmount : this._amount;
+    }
+
+    // returns the formatted minimum charge amount that applies to the given user.
+    getAmountString(isLegacyPricingUser: boolean): string {
+        return centsToDollars(this.getAmount(isLegacyPricingUser));
+    }
+
+    get startDate(): Date | null {
+        return this._startDate !== null ? new Date(this._startDate) : null;
+    }
+
+    // indicates whether minimum charge is fully enabled for the given user,
+    // accounting for the per-user (standard vs legacy) amount.
+    isEnabledForUser(isLegacyPricingUser: boolean): boolean {
+        if (!this.enabled || this.getAmount(isLegacyPricingUser) <= 0) return false;
+        return this.startDate === null || new Date() >= this.startDate;
+    }
+
+    // indicates whether transitional "Starting July 1" copy should be hidden.
+    get isCleanupActive(): boolean {
+        return this._cleanupDate !== null && new Date() >= new Date(this._cleanupDate);
+    }
+}

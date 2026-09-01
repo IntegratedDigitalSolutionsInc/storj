@@ -5,7 +5,10 @@ package rangedloop
 
 import (
 	"context"
+	"sync"
 	"time"
+
+	"go.uber.org/zap"
 
 	"storj.io/common/uuid"
 	"storj.io/storj/satellite/metabase"
@@ -13,57 +16,106 @@ import (
 
 // MetabaseRangeSplitter implements RangeSplitter.
 type MetabaseRangeSplitter struct {
-	db *metabase.DB
+	log *zap.Logger
+	db  *metabase.DB
 
-	asOfSystemInterval   time.Duration
-	spannerStaleInterval time.Duration
-	batchSize            int
+	config                Config
+	overrideReadTimestamp time.Time
+	warnedLiveReads       sync.Once
 }
 
 // MetabaseSegmentProvider implements SegmentProvider.
 type MetabaseSegmentProvider struct {
 	db *metabase.DB
 
-	uuidRange            UUIDRange
-	asOfSystemInterval   time.Duration
-	spannerReadTimestamp time.Time
-	batchSize            int
+	uuidRange          UUIDRange
+	asOfSystemInterval time.Duration
+	readTimestamp      time.Time
+	allowLiveReads     bool
+	batchSize          int
 }
 
 // NewMetabaseRangeSplitter creates the segment provider.
-func NewMetabaseRangeSplitter(db *metabase.DB, asOfSystemInterval time.Duration, spannerStaleInterval time.Duration, batchSize int) *MetabaseRangeSplitter {
+func NewMetabaseRangeSplitter(log *zap.Logger, db *metabase.DB, config Config) *MetabaseRangeSplitter {
+	return NewMetabaseRangeSplitterWithReadTimestamp(log, db, config, time.Time{})
+}
+
+// NewMetabaseRangeSplitterWithReadTimestamp creates the segment provider reading
+// a consistent snapshot of the database at the given timestamp.
+func NewMetabaseRangeSplitterWithReadTimestamp(log *zap.Logger, db *metabase.DB, config Config, overrideReadTimestamp time.Time) *MetabaseRangeSplitter {
 	return &MetabaseRangeSplitter{
-		db:                   db,
-		asOfSystemInterval:   asOfSystemInterval,
-		spannerStaleInterval: spannerStaleInterval,
-		batchSize:            batchSize,
+		log:                   log,
+		db:                    db,
+		config:                config,
+		overrideReadTimestamp: overrideReadTimestamp,
 	}
 }
 
 // CreateRanges splits the segment table into chunks.
-func (provider *MetabaseRangeSplitter) CreateRanges(nRanges int, batchSize int) ([]SegmentProvider, error) {
+func (provider *MetabaseRangeSplitter) CreateRanges(ctx context.Context, nRanges int, batchSize int) ([]SegmentProvider, error) {
 	uuidRanges, err := CreateUUIDRanges(uint32(nRanges))
 	if err != nil {
 		return nil, err
 	}
 
-	spannerReadTimestamp := time.Time{}
-	if provider.spannerStaleInterval > 0 {
-		spannerReadTimestamp = time.Now().Add(-provider.spannerStaleInterval)
+	// batchSize comes from operator configuration, while the iterator rejects
+	// anything above its maximum. Cap it here so that a misconfigured satellite
+	// keeps making progress instead of failing every run, and so that the size we
+	// group the entries by stays the size the iterator really pages at: the
+	// iterator recycles its buffers once a page has been handed over, and a group
+	// spanning two pages would carry entries it has already overwritten.
+	if batchSize > metabase.MaxLoopIteratorBatchSize {
+		provider.log.Warn("configured batch size is above the maximum, using the maximum instead",
+			zap.Int("configured", batchSize),
+			zap.Int("batch_size", metabase.MaxLoopIteratorBatchSize),
+		)
+		batchSize = metabase.MaxLoopIteratorBatchSize
+	}
+
+	readTimestamp := provider.overrideReadTimestamp
+	if readTimestamp.IsZero() && provider.config.StaleInterval > 0 {
+		readTimestamp = time.Now().Add(-provider.config.StaleInterval)
+	}
+
+	if !readTimestamp.IsZero() {
+		provider.log.Info("Setting fixed read timestamp", zap.Time("timestamp", readTimestamp))
+	}
+	if provider.config.AllowLiveReads {
+		// whether the scan reads live is a property of the metabase, not of
+		// the pass, so say it once rather than on every pass of a continuous loop
+		provider.warnedLiveReads.Do(func() {
+			WarnLiveReads(provider.log, provider.db.Implementations())
+		})
 	}
 
 	rangeProviders := []SegmentProvider{}
 	for _, uuidRange := range uuidRanges {
 		rangeProviders = append(rangeProviders, &MetabaseSegmentProvider{
-			db:                   provider.db,
-			uuidRange:            uuidRange,
-			asOfSystemInterval:   provider.asOfSystemInterval,
-			spannerReadTimestamp: spannerReadTimestamp,
-			batchSize:            batchSize,
+			db:                 provider.db,
+			uuidRange:          uuidRange,
+			asOfSystemInterval: provider.config.AsOfSystemInterval,
+			readTimestamp:      readTimestamp,
+			allowLiveReads:     provider.config.AllowLiveReads,
+			batchSize:          batchSize,
 		})
 	}
 
 	return rangeProviders, err
+}
+
+// ReadsSnapshot reports whether the scan reads one snapshot of the whole
+// metabase: at one fixed timestamp, one the caller pinned, one derived from
+// the stale interval or one the run pins from the safepoint it holds when it
+// starts, that every backend serves; or live, where live reads were allowed
+// and no backend could have served a timestamp anyway, which is a single
+// Postgres backend for testing or a restored backup, one snapshot by
+// construction. See CanReadSnapshot. A configured safepoint counts because
+// only the jobs that hold one may be configured with one: the mud providers
+// for Service and RunOnce reject the flag, and those jobs pin the hold before
+// they build their splitter.
+func (provider *MetabaseRangeSplitter) ReadsSnapshot() bool {
+	fixed := !provider.overrideReadTimestamp.IsZero() || provider.config.StaleInterval > 0 || provider.config.Safepoint.Enabled()
+	return CanReadSnapshot(fixed, provider.config.AllowLiveReads, provider.db.Implementations())
 }
 
 // Range returns range which is processed by this provider.
@@ -84,11 +136,12 @@ func (provider *MetabaseSegmentProvider) Iterate(ctx context.Context, fn func([]
 	}
 
 	return provider.db.IterateLoopSegments(ctx, metabase.IterateLoopSegments{
-		BatchSize:            provider.batchSize,
-		AsOfSystemInterval:   provider.asOfSystemInterval,
-		StartStreamID:        startStreamID,
-		EndStreamID:          endStreamID,
-		SpannerReadTimestamp: provider.spannerReadTimestamp,
+		BatchSize:          provider.batchSize,
+		AsOfSystemInterval: provider.asOfSystemInterval,
+		StartStreamID:      startStreamID,
+		EndStreamID:        endStreamID,
+		ReadTimestamp:      provider.readTimestamp,
+		AllowLiveReads:     provider.allowLiveReads,
 	}, func(ctx context.Context, iterator metabase.LoopSegmentsIterator) error {
 		segments := make([]Segment, 0, provider.batchSize)
 

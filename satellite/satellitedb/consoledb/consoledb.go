@@ -6,11 +6,14 @@ package consoledb
 import (
 	"context"
 	"sync"
+	"time"
 
 	"github.com/zeebo/errs"
 
 	"storj.io/storj/satellite/console"
 	"storj.io/storj/satellite/console/consoleauth"
+	"storj.io/storj/satellite/console/restapikeys"
+	"storj.io/storj/satellite/entitlements"
 	"storj.io/storj/satellite/satellitedb/dbx"
 	"storj.io/storj/shared/dbutil"
 	"storj.io/storj/shared/lrucache"
@@ -32,21 +35,38 @@ type ConsoleDB struct {
 
 	ApikeysOnce  *sync.Once
 	apikeysCache *lrucache.ExpiringLRUOf[*projectApiKeyRow]
+
+	// ensure Users() returns the same instance.
+	usersDB console.Users
+
+	// ensure Projects() returns the same instance.
+	projectsDB console.Projects
 }
 
 // Users is getter a for Users repository.
 func (db *ConsoleDB) Users() console.Users {
-	return &users{db: db.Methods, impl: db.Impl}
+	if db.usersDB == nil {
+		db.usersDB = &users{db: db.Methods, impl: db.Impl, nowFn: time.Now}
+	}
+	return db.usersDB
 }
 
 // Projects is a getter for Projects repository.
 func (db *ConsoleDB) Projects() console.Projects {
-	return &projects{db: db.Methods, impl: db.Impl}
+	if db.projectsDB == nil {
+		db.projectsDB = &projects{db: db.Methods, impl: db.Impl, nowFn: time.Now}
+	}
+	return db.projectsDB
 }
 
 // ProjectMembers is a getter for ProjectMembers repository.
 func (db *ConsoleDB) ProjectMembers() console.ProjectMembers {
 	return &projectMembers{db: db.Methods, impl: db.Impl}
+}
+
+// Entitlements is a getter for Entitlements repository.
+func (db *ConsoleDB) Entitlements() entitlements.DB {
+	return &entitlementsDB{db: db.Methods}
 }
 
 // ProjectInvitations is a getter for ProjectInvitations repository.
@@ -69,6 +89,11 @@ func (db *ConsoleDB) APIKeys() console.APIKeys {
 	}
 }
 
+// RestApiKeys returns the database for REST API keys.
+func (db *ConsoleDB) RestApiKeys() restapikeys.DB {
+	return &restApiKeysDB{db: db.Methods}
+}
+
 // RegistrationTokens is a getter for RegistrationTokens repository.
 func (db *ConsoleDB) RegistrationTokens() console.RegistrationTokens {
 	return &registrationTokens{db: db.Methods}
@@ -89,6 +114,21 @@ func (db *ConsoleDB) AccountFreezeEvents() console.AccountFreezeEvents {
 	return &accountFreezeEvents{db: db.Methods}
 }
 
+// APIKeyTails is a getter for APIKeyTails repository.
+func (db *ConsoleDB) APIKeyTails() console.APIKeyTails {
+	return &apiKeyTails{db: db.DB.DB, dbMethods: db.Methods, impl: db.Impl}
+}
+
+// Domains is a getter for Domains repository.
+func (db *ConsoleDB) Domains() console.Domains {
+	return &domains{db: db.Methods}
+}
+
+// TenantWhiteLabelConfigs is a getter for per-tenant whitelabel config repository.
+func (db *ConsoleDB) TenantWhiteLabelConfigs() console.TenantWhiteLabelConfigs {
+	return &tenantWhiteLabelConfigs{db: db.Methods}
+}
+
 // WithTx is a method for executing and retrying transaction.
 func (db *ConsoleDB) WithTx(ctx context.Context, fn func(context.Context, console.DBTx) error) error {
 	if db.DB == nil {
@@ -96,6 +136,14 @@ func (db *ConsoleDB) WithTx(ctx context.Context, fn func(context.Context, consol
 	}
 
 	return db.DB.WithTx(ctx, func(ctx context.Context, tx *dbx.Tx) error {
+		usersDb := &users{db: tx, impl: db.Impl, nowFn: time.Now}
+		if db.usersDB != nil {
+			usersDb.nowFn = db.usersDB.GetNowFn()
+		}
+		projectsDb := &projects{db: tx, impl: db.Impl, nowFn: time.Now}
+		if db.projectsDB != nil {
+			projectsDb.nowFn = db.projectsDB.GetNowFn()
+		}
 		dbTx := &DBTx{
 			ConsoleDB: &ConsoleDB{
 				ApikeysLRUOptions: db.ApikeysLRUOptions,
@@ -107,6 +155,9 @@ func (db *ConsoleDB) WithTx(ctx context.Context, fn func(context.Context, consol
 
 				ApikeysOnce:  db.ApikeysOnce,
 				apikeysCache: db.apikeysCache,
+
+				usersDB:    usersDb,
+				projectsDB: projectsDb,
 			},
 		}
 		return fn(ctx, dbTx)

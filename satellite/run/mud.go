@@ -1,0 +1,117 @@
+// Copyright (C) 2024 Storj Labs, Inc.
+// See LICENSE for copying information.
+
+package root
+
+import (
+	"storj.io/storj/satellite"
+	"storj.io/storj/satellite/metabase"
+	"storj.io/storj/satellite/satellitedb"
+	trustmud "storj.io/storj/satellite/trust/mud"
+	"storj.io/storj/shared/modular"
+	"storj.io/storj/shared/modular/cli"
+	"storj.io/storj/shared/modular/config"
+	"storj.io/storj/shared/modular/logger"
+	"storj.io/storj/shared/modular/opentelemetry"
+	"storj.io/storj/shared/mud"
+)
+
+// Module registers all the possible components for the satellite instance.
+func Module(ball *mud.Ball) {
+	opentelemetry.Module(ball)
+	logger.Module(ball)
+	modular.IdentityModule(ball)
+
+	// defining the databases here, and not in satellite.Module, as mudplanet would like to use different options
+	satellitedb.Module(ball)
+	mud.Provide[*metabase.DB](ball, metabase.OpenDatabaseWithMigration)
+
+	satellite.Module(ball)
+	trustmud.Module(ball)
+
+	mud.Provide[*DBVersionCheck](ball, NewDBVersionCheck)
+
+	mud.Provide[*modular.MonkitReport](ball, modular.NewMonkitReport)
+
+	mud.Provide[*Auditor](ball, func() *Auditor {
+		return &Auditor{}
+	})
+	cli.RegisterSubcommand[*Auditor](ball, "auditor", "run the auditor service")
+	mud.Provide[*Repair](ball, func() *Repair {
+		return &Repair{}
+	})
+	cli.RegisterSubcommand[*Repair](ball, "repair", "run the repair worker service")
+	mud.Provide[*ChangeStream](ball, func() *ChangeStream {
+		return &ChangeStream{}
+	})
+	cli.RegisterSubcommand[*ChangeStream](ball, "change-stream", "run the change stream processor service")
+	mud.Provide[*GcBf](ball, func() *GcBf {
+		return &GcBf{}
+	})
+	cli.RegisterSubcommand[*GcBf](ball, "gc-bf", "run the ranged-loop with bloom filter generation only")
+	mud.Provide[*GcBfOnce](ball, func() *GcBfOnce {
+		return &GcBfOnce{}
+	})
+	cli.RegisterSubcommand[*GcBfOnce](ball, "gc-bf-once", "run the ranged-loop with bloom filter generation only, stop after one iteration")
+	mud.Provide[*GcSender](ball, func() *GcSender {
+		return &GcSender{}
+	})
+	cli.RegisterSubcommand[*GcSender](ball, "gc-sender", "run the garbage collection sender that ships bloom filters to storage nodes")
+	mud.Provide[*Admin](ball, func() *Admin {
+		return &Admin{}
+	})
+	cli.RegisterSubcommand[*Admin](ball, "admin", "run the admin server")
+	mud.Provide[*Console](ball, func() *Console {
+		return &Console{}
+	})
+	cli.RegisterSubcommand[*Console](ball, "console", "run console (web ui)")
+	mud.Provide[*Api](ball, func() *Api {
+		return &Api{}
+	})
+	cli.RegisterSubcommand[*Api](ball, "api", "run API services")
+	mud.Provide[*RangedLoop](ball, func() *RangedLoop {
+		return &RangedLoop{}
+	})
+	cli.RegisterSubcommand[*RangedLoop](ball, "ranged-loop", "run ranged loop with configurable observers (use --components to enable)")
+	mud.Provide[*RangedLoopOnce](ball, func() *RangedLoopOnce {
+		return &RangedLoopOnce{}
+	})
+	cli.RegisterSubcommand[*RangedLoopOnce](ball, "ranged-loop-once", "run ranged loop once with configurable observers and stop (use --components to enable)")
+	mud.Provide[*Core](ball, func() *Core {
+		return &Core{}
+	})
+	cli.RegisterSubcommand[*Core](ball, "core", "run Core services")
+	mud.Provide[*Migrate](ball, NewMigrate)
+	cli.RegisterSubcommand[*Migrate](ball, "migrate", "run the satellite database migration")
+	mud.Provide[*LogTest](ball, NewLogTest)
+	cli.RegisterSubcommand[*LogTest](ball, "log-test", "test eventkit an open telemetry loggin")
+
+	compensationGroup := cli.SubcommandGroup{
+		Name:        "compensation",
+		Description: "storage node compensation commands",
+	}
+
+	config.RegisterConfig[GenerateInvoicesConfig](ball, "")
+	mud.Provide[*GenerateInvoices](ball, NewGenerateInvoices)
+	cli.RegisterGroupSubcommand[*GenerateInvoices](ball, compensationGroup, "generate-invoices", "generate storage node invoices for a pay period")
+
+	config.RegisterConfig[RecordPeriodConfig](ball, "")
+	mud.Provide[*RecordPeriod](ball, NewRecordPeriod)
+	cli.RegisterGroupSubcommand[*RecordPeriod](ball, compensationGroup, "record-period", "record storage node paystubs and payments for a pay period")
+
+	config.RegisterConfig[PrepareCmdConfig](ball, "")
+	mud.Provide[*Prepare](ball, NewPrepare)
+	cli.RegisterGroupSubcommand[*Prepare](ball, compensationGroup, "prepare", "prepares paystubs and payouts from invoices")
+
+	config.RegisterConfig[RecordOneOffPaymentsConfig](ball, "")
+	mud.Provide[*RecordOneOffPayments](ball, NewRecordOneOffPayments)
+	cli.RegisterGroupSubcommand[*RecordOneOffPayments](ball, compensationGroup, "record-one-off-payments", "record one-off storage node payments outside of a pay period")
+
+	config.RegisterConfig[FinalizeConfig](ball, "")
+	mud.Provide[*Finalize](ball, NewFinalize)
+	cli.RegisterGroupSubcommand[*Finalize](ball, compensationGroup, "finalize", "finalize payment reports from invoices, incomplete paystubs and payment receipts")
+
+	config.RegisterConfig[WalletSummaryConfig](ball, "")
+	mud.Provide[*WalletSummary](ball, NewWalletSummary)
+	cli.RegisterGroupSubcommand[*WalletSummary](ball, compensationGroup, "wallet-summary", "aggregate invoice CSVs across satellites into per-wallet distributable and held-for-GE totals")
+}

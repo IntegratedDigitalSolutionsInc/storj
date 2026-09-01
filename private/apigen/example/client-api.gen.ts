@@ -2,7 +2,7 @@
 // DO NOT EDIT.
 
 import { HttpClient } from '@/utils/httpClient';
-import { Time, UUID } from '@/types/common';
+import type { Time, UUID } from '@/types/common';
 
 export class Document {
     id: UUID;
@@ -31,6 +31,7 @@ export class User {
     name: string;
     surname: string;
     email: string;
+    created_at: Time;
     company: string;
     position: string;
 }
@@ -46,7 +47,7 @@ export class Version {
     number: number;
 }
 
-class APIError extends Error {
+export class APIError extends Error {
     constructor(
         public readonly msg: string,
         public readonly responseStatusCode?: number,
@@ -69,6 +70,16 @@ export class DocumentsHttpApiV0 {
         throw new APIError(err.error, response.status);
     }
 
+    public async export(): Promise<Blob> {
+        const fullPath = `${this.ROOT_PATH}/export`;
+        const response = await this.http.get(fullPath);
+        if (response.ok) {
+            return response.blob();
+        }
+        const err = await response.json();
+        throw new APIError(err.error, response.status);
+    }
+
     public async getOne(path: string): Promise<Document> {
         const fullPath = `${this.ROOT_PATH}/${path}`;
         const response = await this.http.get(fullPath);
@@ -79,18 +90,8 @@ export class DocumentsHttpApiV0 {
         throw new APIError(err.error, response.status);
     }
 
-    public async getTag(path: string, tagName: string): Promise<string[]> {
-        const fullPath = `${this.ROOT_PATH}/${path}/${tagName}`;
-        const response = await this.http.get(fullPath);
-        if (response.ok) {
-            return response.json().then((body) => body as string[]);
-        }
-        const err = await response.json();
-        throw new APIError(err.error, response.status);
-    }
-
     public async getVersions(path: string): Promise<Version[]> {
-        const fullPath = `${this.ROOT_PATH}/${path}`;
+        const fullPath = `${this.ROOT_PATH}/${path}/versions`;
         const response = await this.http.get(fullPath);
         if (response.ok) {
             return response.json().then((body) => body as Version[]);
@@ -99,10 +100,10 @@ export class DocumentsHttpApiV0 {
         throw new APIError(err.error, response.status);
     }
 
-    public async updateContent(request: NewDocument, path: string, id: UUID, date: Time): Promise<Document> {
+    public async updateContent(request: NewDocument, path: string, id: UUID, date?: Time): Promise<Document> {
         const u = new URL(`${this.ROOT_PATH}/${path}`, window.location.href);
         u.searchParams.set('id', id);
-        u.searchParams.set('date', date);
+        if (date !== undefined) { u.searchParams.set('date', date); }
         const fullPath = u.toString();
         const response = await this.http.post(fullPath, JSON.stringify(request));
         if (response.ok) {
@@ -117,8 +118,10 @@ export class UsersHttpApiV0 {
     private readonly http: HttpClient = new HttpClient();
     private readonly ROOT_PATH: string = '/api/v0/users';
 
-    public async get(): Promise<User[]> {
-        const fullPath = `${this.ROOT_PATH}/`;
+    public async get(created_at?: Time): Promise<User[]> {
+        const u = new URL(`${this.ROOT_PATH}/`, window.location.href);
+        if (created_at !== undefined) { u.searchParams.set('created_at', created_at); }
+        const fullPath = u.toString();
         const response = await this.http.get(fullPath);
         if (response.ok) {
             return response.json().then((body) => body as User[]);
@@ -127,8 +130,10 @@ export class UsersHttpApiV0 {
         throw new APIError(err.error, response.status);
     }
 
-    public async create(request: User[]): Promise<void> {
-        const fullPath = `${this.ROOT_PATH}/`;
+    public async create(request: User[], upsert?: boolean): Promise<void> {
+        const u = new URL(`${this.ROOT_PATH}/`, window.location.href);
+        if (upsert !== undefined) { u.searchParams.set('upsert', upsert); }
+        const fullPath = u.toString();
         const response = await this.http.post(fullPath, JSON.stringify(request));
         if (response.ok) {
             return;

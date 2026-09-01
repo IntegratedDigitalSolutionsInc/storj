@@ -8,6 +8,8 @@ import (
 	"database/sql"
 	"errors"
 	"time"
+
+	"storj.io/storj/shared/dbutil"
 )
 
 const statsUpToDateThreshold = 8 * time.Hour
@@ -88,28 +90,46 @@ func (c *CockroachAdapter) GetTableStats(ctx context.Context, opts GetTableStats
 	return result, nil
 }
 
-// GetTableStats (will) implement Adapter.
-func (s *SpannerAdapter) GetTableStats(ctx context.Context, opts GetTableStats) (result TableStats, err error) {
-	// TODO:spanner gather a total number of bytes stored instead of rows
+// GetTableStats implements Adapter.
+func (t *TiDBAdapter) GetTableStats(ctx context.Context, opts GetTableStats) (result TableStats, err error) {
+	defer mon.Task()(&ctx)(&err)
+	// Read TiDB's persisted statistics from mysql.stats_meta directly, rather
+	// than INFORMATION_SCHEMA.TABLES.TABLE_ROWS/UPDATE_TIME. The latter is
+	// derived from the in-memory stats handle and reports UPDATE_TIME as NULL
+	// for a large, never-fully-analyzed table (pseudo stats), which would make
+	// the freshness check below never pass and force an exact COUNT(1) on
+	// billions of rows every time. mysql.stats_meta.count is the row-count
+	// estimate TiDB keeps continuously updated via background delta-dumping,
+	// and version is a TSO whose physical time tells us how fresh it is. Trust
+	// the estimate only if it is within statsUpToDateThreshold, otherwise fall
+	// back to an exact COUNT(1) to match the Postgres/CockroachDB contract.
 	//
-	// Unfortunately, https://cloud.google.com/spanner/docs/introspection/table-sizes-statistics
-	// won't quite be able to get us a number of rows here. It can only tell us how many total
-	// bytes are used to store a table, and not the number of rows. We could theoretically use
-	// the average number of bytes per row to get a decent estimate of the number of rows, but
-	// the sizes in TABLE_SIZES_STATS_1HOUR include all past versions of rows and deleted rows
-	// for whatever the version_retention_period is.
-	//
-	// Some other problems are (1) the Spanner emulator does not support TABLE_SIZES_STATS_1HOUR
-	// at all, and (2) there is no way to request or force an update to the statistics other than
-	// waiting until the top of the next hour.
-	//
-	// Instead of trying to force spanner into a cockroach-shaped hole, we should probably just
-	// report the table sizes in bytes. This will require storing some different metrics in
-	// rangedloop/observerlivecount.go, but that shouldn't be too bad.
-
-	return TableStats{
-		SegmentCount: 0,
-	}, nil
+	// Note: reading mysql.stats_meta requires SELECT on the mysql schema for
+	// the connecting user.
+	var (
+		count      sql.NullInt64
+		ageSeconds sql.NullInt64
+	)
+	err = t.db.QueryRowContext(ctx, `
+		SELECT sm.count,
+		       TIMESTAMPDIFF(SECOND, TIDB_PARSE_TSO(sm.version), NOW())
+		FROM mysql.stats_meta sm
+		JOIN INFORMATION_SCHEMA.TABLES it ON it.tidb_table_id = sm.table_id
+		WHERE it.table_schema = DATABASE() AND it.table_name = 'segments'
+	`).Scan(&count, &ageSeconds)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return TableStats{}, err
+	}
+	if count.Valid && count.Int64 > 0 &&
+		ageSeconds.Valid && time.Duration(ageSeconds.Int64)*time.Second <= statsUpToDateThreshold {
+		result.SegmentCount = count.Int64
+		return result, nil
+	}
+	err = t.db.QueryRowContext(ctx, `SELECT COUNT(1) FROM segments`).Scan(&result.SegmentCount)
+	if err != nil {
+		return TableStats{}, err
+	}
+	return result, nil
 }
 
 // UpdateTableStats forces an update of table statistics. Probably useful mostly in test scenarios.
@@ -136,6 +156,66 @@ func (c *CockroachAdapter) UpdateTableStats(ctx context.Context) error {
 }
 
 // UpdateTableStats forces an update of table statistics. Probably useful mostly in test scenarios.
-func (s *SpannerAdapter) UpdateTableStats(ctx context.Context) error {
-	return nil
+func (t *TiDBAdapter) UpdateTableStats(ctx context.Context) error {
+	_, err := t.db.ExecContext(ctx, "ANALYZE TABLE segments")
+	return Error.Wrap(err)
+}
+
+// SegmentsStats contains information about the segments table.
+type SegmentsStats struct {
+	SegmentCount           int64
+	PerAdapterSegmentCount []int64
+}
+
+// CountSegments returns the number of segments in the segments table.
+func (db *DB) CountSegments(ctx context.Context, checkTimestamp time.Time) (result SegmentsStats, err error) {
+	defer mon.Task()(&ctx)(&err)
+
+	for _, adapter := range db.adapters {
+		count, err := adapter.CountSegments(ctx, checkTimestamp)
+		if err != nil {
+			return SegmentsStats{}, Error.Wrap(err)
+		}
+		result.SegmentCount += count
+		result.PerAdapterSegmentCount = append(result.PerAdapterSegmentCount, count)
+	}
+	return result, nil
+}
+
+// CountSegments returns the number of segments in the segments table.
+// Postgres has no AS OF SYSTEM TIME, so it can only count live and refuses a
+// checkTimestamp rather than silently describing a different snapshot than
+// the caller asked for. CockroachDB inherits this and counts AS OF SYSTEM
+// TIME, which is a full scan of the segments table at that timestamp;
+// CockroachDB is a legacy metabase backend with limited support, and that
+// cost is accepted there.
+func (p *PostgresAdapter) CountSegments(ctx context.Context, checkTimestamp time.Time) (result int64, err error) {
+	defer mon.Task()(&ctx)(&err)
+
+	asOf := p.Implementation().AsOfSystemTime(checkTimestamp)
+	if !checkTimestamp.IsZero() && asOf == "" {
+		return 0, ErrInvalidRequest.New("checkTimestamp is not supported on %v", p.Implementation())
+	}
+
+	err = p.db.QueryRowContext(ctx, `SELECT count(1) FROM segments`+asOf).Scan(&result)
+	if err != nil {
+		return 0, Error.Wrap(err)
+	}
+	return result, nil
+}
+
+// CountSegments returns the number of segments in the segments table.
+func (t *TiDBAdapter) CountSegments(ctx context.Context, checkTimestamp time.Time) (result int64, err error) {
+	defer mon.Task()(&ctx)(&err)
+
+	asOf := ""
+	if !checkTimestamp.IsZero() {
+		asOf = dbutil.TiDB.AsOfSystemTime(checkTimestamp)
+	}
+
+	err = t.db.QueryRowContext(ctx, `SELECT COUNT(1) FROM segments`+asOf).Scan(&result)
+	if err != nil {
+		return 0, Error.Wrap(err)
+	}
+	return result, nil
 }

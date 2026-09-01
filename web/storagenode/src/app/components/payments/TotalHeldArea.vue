@@ -10,43 +10,38 @@
             </div>
             <div class="total-held-area__united-info-area__item align-center">
                 <p class="total-held-area__united-info-area__item__label">Total Held Amount</p>
-                <p class="total-held-area__united-info-area__item__amount">{{ totalPayments.held | centsToDollars }}</p>
+                <p class="total-held-area__united-info-area__item__amount">{{ centsToDollars(totalPayments.held) }}</p>
             </div>
             <div class="total-held-area__united-info-area__item align-end">
                 <p class="total-held-area__united-info-area__item__label">Total Held Returned</p>
-                <p class="total-held-area__united-info-area__item__amount">{{ totalPayments.disposed | centsToDollars }}</p>
+                <p class="total-held-area__united-info-area__item__amount">{{ centsToDollars(totalPayments.disposed) }}</p>
             </div>
         </div>
         <div class="total-held-area__info-area">
             <SingleInfo width="100%" label="Held Amount Rate" :value="heldPercentage + '%'" />
-            <SingleInfo width="100%" label="Total Held Amount" :value="totalPayments.held | centsToDollars" />
-            <SingleInfo width="100%" label="Total Held Returned" :value="totalPayments.disposed | centsToDollars" />
+            <SingleInfo width="100%" label="Total Held Amount" :value="centsToDollars(totalPayments.held)" />
+            <SingleInfo width="100%" label="Total Held Returned" :value="centsToDollars(totalPayments.disposed)" />
         </div>
     </section>
 </template>
 
-<script lang="ts">
-import { Component, Vue } from 'vue-property-decorator';
+<script setup lang="ts">
+import { computed } from 'vue';
 
-import { TotalPayments } from '@/storagenode/payouts/payouts';
+import { centsToDollars } from '@/app/utils/payout';
+import { usePayoutStore } from '@/app/store/modules/payoutStore';
 
 import SingleInfo from '@/app/components/payments/SingleInfo.vue';
 
-// @vue/component
-@Component({
-    components: {
-        SingleInfo,
-    },
-})
-export default class TotalPayoutArea extends Vue {
-    public get totalPayments(): TotalPayments {
-        return this.$store.state.payoutModule.totalPayments;
-    }
+const payoutStore = usePayoutStore();
 
-    public get heldPercentage(): string {
-        return this.$store.state.payoutModule.heldPercentage;
-    }
-}
+const totalPayments = computed(() => {
+    return payoutStore.state.totalPayments;
+});
+
+const heldPercentage = computed(() => {
+    return payoutStore.state.heldPercentage;
+});
 </script>
 
 <style scoped lang="scss">
@@ -99,7 +94,7 @@ export default class TotalPayoutArea extends Vue {
         align-items: flex-end;
     }
 
-    @media screen and (max-width: 780px) {
+    @media screen and (width <= 780px) {
 
         .total-held-area {
 

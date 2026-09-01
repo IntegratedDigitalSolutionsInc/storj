@@ -4,17 +4,20 @@ pipeline {
             label 'main'
             image 'storjlabs/ci:latest'
             alwaysPull true
-            args '-u root:root --cap-add SYS_PTRACE -v "/tmp/gomod":/go/pkg/mod -v /tmp/golangci-lint:/root/.cache/golangci-lint -v /tmp/gocache:/root/.cache/go-build -v /tmp/gocache-benchmarks:/root/.cache/go-build-benchmarks -v "/tmp/npm":/npm'
+            args '-u root:root --cap-add SYS_PTRACE -v "/cache/gomod":/go/pkg/mod -v /cache/golangci-lint:/root/.cache/golangci-lint -v /cache/gobuild:/root/.cache/go-build -v /cache/gobenchmarks:/root/.cache/go-build-benchmarks -v "/cache/npm":/npm'
         }
     }
     options {
         timeout(time: 4, unit: 'HOURS')
         skipDefaultCheckout(true)
+        buildDiscarder(logRotator(
+            numToKeepStr: '20',
+            daysToKeepStr: '7',
+        ))
     }
     environment {
         NPM_CONFIG_CACHE = '/npm/cache'
         GOTRACEBACK = 'all'
-        COCKROACH_MEMPROF_INTERVAL=0
     }
     stages {
         stage('Checkout') {
@@ -50,31 +53,19 @@ pipeline {
             parallel {
                 stage('web/satellite') {
                     steps {
-                        sh './web/satellite/build.sh'
-                    }
-                }
-
-                stage('wasm') {
-                    steps {
-                        sh './testsuite/wasm/start.sh'
+                        sh './web/satellite/check-and-build.sh'
                     }
                 }
 
                 stage('web/storagenode') {
                     steps {
-                        sh './web/storagenode/build.sh'
+                        sh './web/storagenode/check-and-build.sh'
                     }
                 }
 
                 stage('web/multinode') {
                     steps {
-                        sh './web/multinode/build.sh'
-                    }
-                }
-
-                stage('satellite/admin/ui') {
-                    steps {
-                        sh './satellite/admin/ui/build.sh'
+                        sh './web/multinode/check-and-build.sh'
                     }
                 }
             }
@@ -105,9 +96,6 @@ pipeline {
                 stage('db') {
                     steps {
                         sh 'service postgresql start'
-                        dir('.build') {
-                            sh 'cockroach start-single-node --insecure --store=type=mem,size=4GiB --listen-addr=localhost:26257 --http-addr=localhost:8087 --cache 1024MiB --max-sql-memory 1024MiB --background'
-                        }
                     }
                 }
 
@@ -116,10 +104,6 @@ pipeline {
                         // verify most of the commands, we cannot check everything since some of them
                         // have a C dependency and we don't have cross-compilation in storj/ci image
                         sh 'check-cross-compile storj.io/storj/cmd/uplink storj.io/storj/cmd/satellite storj.io/storj/cmd/storagenode-updater storj.io/storj/cmd/storj-sim'
-
-                        dir("cmd/storagenode-updater") {
-                            sh 'GOOS=windows GOARCH=amd64 go vet -tags service .'
-                        }
                     }
                 }
 
@@ -136,13 +120,14 @@ pipeline {
         stage('Check Benchmark') {
             environment {
                 STORJ_TEST_COCKROACH = 'omit'
-                STORJ_TEST_SPANNER = 'omit'
                 STORJ_TEST_POSTGRES = 'postgres://postgres@localhost/benchstorj?sslmode=disable'
+                STORJ_TEST_TIDB = 'omit'
+
                 GOCACHE = '/root/.cache/go-build-benchmarks'
             }
             steps {
                 sh 'psql -U postgres -c \'create database benchstorj;\''
-                sh 'go test -parallel 1 -p 1 -vet=off -timeout 32m -short -run XYZXYZXYZXYZ -bench . -benchtime 1x ./...'
+                sh 'go test -parallel 1 -p 16 -vet=off -timeout 60m -short -run XYZXYZXYZXYZ -bench . -benchtime 1x ./...'
             }
         }
 
@@ -162,21 +147,6 @@ pipeline {
                         sh 'make test-sim'
 
                         // sh 'make test-certificates' // flaky
-                    }
-                }
-
-                stage('Cockroach') {
-                    environment {
-                        STORJ_NETWORK_HOST4 = '127.0.0.4'
-                        STORJ_NETWORK_HOST6 = '127.0.0.4'
-
-                        STORJ_SIM_POSTGRES = 'cockroach://root@localhost:26257/testcockroach4?sslmode=disable'
-                    }
-
-                    steps {
-                        sh 'cockroach sql --insecure --host=localhost:26257 -e \'create database testcockroach4;\''
-                        sh 'make test-sim'
-                        sh 'cockroach sql --insecure --host=localhost:26257 -e \'drop database testcockroach4;\''
                     }
                 }
             }
@@ -200,24 +170,6 @@ pipeline {
                         sh 'make test-sim-backwards-compatible'
                     }
                 }
-
-                stage('Cockroach') {
-                    environment {
-                        STORJ_NETWORK_HOST4 = '127.0.0.5'
-                        STORJ_NETWORK_HOST6 = '127.0.0.5'
-
-                        STORJ_SIM_POSTGRES = 'cockroach://root@localhost:26257/testcockroach5?sslmode=disable'
-                        STORJ_MIGRATION_DB = 'postgres://root@localhost:26257/testcockroach5/satellite/0/meta?sslmode=disable'
-
-                        STORJ_CONSOLE_SIGNUP_ACTIVATION_CODE_ENABLED = 'false'
-                    }
-
-                    steps {
-                        sh 'cockroach sql --insecure --host=localhost:26257 -e \'create database testcockroach5;\''
-                        sh 'make test-sim-backwards-compatible'
-                        sh 'cockroach sql --insecure --host=localhost:26257 -e \'drop database testcockroach5;\''
-                    }
-                }
             }
         }
 
@@ -239,22 +191,13 @@ pipeline {
 
         stage('Test Web') {
             parallel {
-                stage('wasm npm') {
-                    steps {
-                        dir(".build") {
-                            sh 'cp -r ../satellite/console/wasm/tests/ .'
-                            sh 'cd tests && cp "$(go env GOROOT)/misc/wasm/wasm_exec.js" .'
-                            sh 'cd tests && npm install && npm run test'
-                        }
-                    }
-                }
-
                 stage('web/satellite') {
                     steps {
                         dir("web/satellite") {
                             sh 'npm run lint-ci'
                             sh script: 'npm audit', returnStatus: true
                             sh 'npm run test'
+                            sh 'npm run test-wasm'
                         }
                     }
                 }
@@ -282,16 +225,9 @@ pipeline {
                 stage('satellite/admin/ui') {
                     steps {
                         dir("satellite/admin/ui") {
-                            sh script: 'npm audit', returnStatus: true
-                        }
-                    }
-                }
-
-                stage('satellite/admin/back-office/ui') {
-                    steps {
-                        dir("satellite/admin/back-office/ui") {
                             sh 'npm install --prefer-offline --no-audit --loglevel verbose'
                             sh 'npm run lint-ci'
+                            sh 'npm run type-check'
                             sh script: 'npm audit', returnStatus: true
                         }
                     }

@@ -17,7 +17,7 @@ type TrialExpirationReminderEmail struct {
 func (*TrialExpirationReminderEmail) Template() string { return "TrialExpirationReminder" }
 
 // Subject gets email subject.
-func (*TrialExpirationReminderEmail) Subject() string { return "Your Storj trial is ending soon" }
+func (*TrialExpirationReminderEmail) Subject() string { return "Your trial is ending soon" }
 
 // TrialExpirationEscalationReminderEmail is mailservice template with trial expiration escalation reminder data.
 type TrialExpirationEscalationReminderEmail struct {
@@ -31,7 +31,7 @@ func (*TrialExpirationEscalationReminderEmail) Template() string {
 
 // Subject gets email subject.
 func (*TrialExpirationEscalationReminderEmail) Subject() string {
-	return "Your Storj trial is ending soon"
+	return "Your trial has ended"
 }
 
 // TrialExpiredEmail is mailservice template with trial expiration data.
@@ -47,7 +47,7 @@ func (*TrialExpiredEmail) Template() string { return "TrialExpired" }
 
 // Subject gets email subject.
 func (*TrialExpiredEmail) Subject() string {
-	return "Your Storj trial has ended - Act now to continue!"
+	return "Your trial has ended - Act now to continue!"
 }
 
 // AccountActivationEmail is mailservice template with activation data.
@@ -74,6 +74,19 @@ func (*AccountActivationCodeEmail) Template() string { return "WelcomeWithCode" 
 
 // Subject gets email subject.
 func (*AccountActivationCodeEmail) Subject() string { return "Activate your email" }
+
+// NewUserNotificationEmail is a mailservice template notifying admins of a new user registration.
+type NewUserNotificationEmail struct {
+	UserEmail string
+	UserID    string
+	CreatedAt string
+}
+
+// Template returns email template name.
+func (*NewUserNotificationEmail) Template() string { return "NewUserNotificationEmail" }
+
+// Subject gets email subject.
+func (*NewUserNotificationEmail) Subject() string { return "New user registration" }
 
 // ChangeEmailSuccessEmail is mailservice template to notify user about successful email change.
 type ChangeEmailSuccessEmail struct{}
@@ -144,7 +157,7 @@ func (*ExistingUserProjectInvitationEmail) Template() string { return "ExistingU
 
 // Subject gets email subject.
 func (email *ExistingUserProjectInvitationEmail) Subject() string {
-	return "You were invited to join a project on Storj"
+	return "You were invited to join a project"
 }
 
 // UnverifiedUserProjectInvitationEmail is mailservice template for project invitation email for unverified users.
@@ -159,7 +172,7 @@ func (*UnverifiedUserProjectInvitationEmail) Template() string { return "Unverif
 
 // Subject gets email subject.
 func (email *UnverifiedUserProjectInvitationEmail) Subject() string {
-	return "You were invited to join a project on Storj"
+	return "You were invited to join a project"
 }
 
 // NewUserProjectInvitationEmail is mailservice template for project invitation email for new users.
@@ -174,7 +187,20 @@ func (*NewUserProjectInvitationEmail) Template() string { return "NewUserInvite"
 
 // Subject gets email subject.
 func (email *NewUserProjectInvitationEmail) Subject() string {
-	return "You were invited to join a project on Storj"
+	return "You were invited to join a project"
+}
+
+// NewUserRegistrationLink is mailservice template for sending registration link to new user.
+type NewUserRegistrationLink struct {
+	SignUpLink string
+}
+
+// Template returns email template name.
+func (*NewUserRegistrationLink) Template() string { return "NewUserRegistrationLink" }
+
+// Subject gets email subject.
+func (email *NewUserRegistrationLink) Subject() string {
+	return "You were invited to create an account"
 }
 
 // UnknownResetPasswordEmail is mailservice template with unknown password reset data.
@@ -291,4 +317,127 @@ func (b *BillingFreezeNotificationEmail) Subject() string {
 		title = "Your data is marked for deletion"
 	}
 	return title + " - Act now to continue!"
+}
+
+// OptOutFreezeNotificationEmail is an email sent to notify users of an opt-out freeze event.
+type OptOutFreezeNotificationEmail struct {
+	Days        int
+	SignInLink  string
+	SupportLink string
+}
+
+// Template returns email template name.
+func (*OptOutFreezeNotificationEmail) Template() string { return "OptOutFreezeNotification" }
+
+// Subject gets email subject.
+func (e *OptOutFreezeNotificationEmail) Subject() string {
+	title := "Your account has been suspended"
+	if e.Days <= 0 {
+		title = "Your data is marked for deletion"
+	}
+	return title + " - Act now to continue!"
+}
+
+// InactivityWarningEmail is an email sent to warn users that their account will be suspended
+// due to inactivity if no billable usage occurs during the grace period.
+type InactivityWarningEmail struct {
+	GracePeriodDays int
+	SignInLink      string
+	SupportLink     string
+}
+
+// Template returns email template name.
+func (*InactivityWarningEmail) Template() string { return "InactivityWarning" }
+
+// Subject gets email subject.
+func (*InactivityWarningEmail) Subject() string {
+	return "Your account may be suspended due to inactivity"
+}
+
+// InactivityFreezeEmail is an email sent to notify users that their account has been suspended
+// due to inactivity.
+type InactivityFreezeEmail struct {
+	SignInLink  string
+	SupportLink string
+}
+
+// Template returns email template name.
+func (*InactivityFreezeEmail) Template() string { return "InactivityFreeze" }
+
+// Subject gets email subject.
+func (*InactivityFreezeEmail) Subject() string {
+	return "Your account has been suspended due to inactivity"
+}
+
+// MFAActivatedEmail is an email sent to notify users of successful two-factor authentication activation.
+type MFAActivatedEmail struct{}
+
+// Template returns email template name.
+func (*MFAActivatedEmail) Template() string { return "MFAActivated" }
+
+// Subject gets email subject.
+func (*MFAActivatedEmail) Subject() string {
+	return "Two-factor authentication has been activated"
+}
+
+// MFADisabledEmail is an email sent to notify users of successful two-factor authentication deactivation.
+type MFADisabledEmail struct{}
+
+// Template returns email template name.
+func (*MFADisabledEmail) Template() string { return "MFADisabled" }
+
+// Subject gets email subject.
+func (*MFADisabledEmail) Subject() string {
+	return "Two-factor authentication has been disabled"
+}
+
+// CreditCardAddedEmail is the template for sending card added emails.
+type CreditCardAddedEmail struct {
+	LoginURL   string
+	SupportURL string
+}
+
+// Template returns email template name.
+func (*CreditCardAddedEmail) Template() string { return "CreditCardAdded" }
+
+// Subject gets email subject.
+func (*CreditCardAddedEmail) Subject() string {
+	return "Your new payment method has been added"
+}
+
+// UpgradeToProEmail is the template for account upgraded emails.
+type UpgradeToProEmail struct {
+	LoginURL string
+}
+
+// Template returns email template name.
+func (*UpgradeToProEmail) Template() string { return "UpgradeToPro" }
+
+// Subject gets email subject.
+func (*UpgradeToProEmail) Subject() string {
+	return "Your Account Has Been Upgraded to Pro"
+}
+
+// NewPricingAcceptedEmail is the template for new pricing opt-in confirmation emails.
+type NewPricingAcceptedEmail struct {
+	LoginURL string
+}
+
+// Template returns email template name.
+func (*NewPricingAcceptedEmail) Template() string { return "NewPricingAccepted" }
+
+// Subject gets email subject.
+func (*NewPricingAcceptedEmail) Subject() string { return "New pricing accepted" }
+
+// NewPricingDeclinedEmail is the template for new pricing opt-out confirmation emails.
+type NewPricingDeclinedEmail struct {
+	LoginURL string
+}
+
+// Template returns email template name.
+func (*NewPricingDeclinedEmail) Template() string { return "NewPricingDeclined" }
+
+// Subject gets email subject.
+func (*NewPricingDeclinedEmail) Subject() string {
+	return "Your account will be cancelled on July 1st, 2026"
 }

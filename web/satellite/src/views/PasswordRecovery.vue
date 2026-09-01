@@ -2,21 +2,23 @@
 // See LICENSE for copying information.
 
 <template>
-    <v-container class="fill-height">
+    <v-container class="fill-height align-content-center">
         <v-row justify="center">
-            <v-col cols="12" sm="9" md="7" lg="5" xl="4" xxl="3">
+            <v-col cols="12" sm="9" md="7" lg="5" xl="5" xxl="5">
                 <v-card v-if="!isMFARequired" title="Reset Password" subtitle="Please enter your new password." class="pa-2 pa-sm-7 overflow-visible">
                     <v-card-text>
                         <v-form ref="form" v-model="formValid" class="pt-4" @submit.prevent>
                             <div class="pos-relative">
                                 <v-text-field
-                                    id="Password"
+                                    id="password"
                                     v-model="password"
                                     class="mb-2"
                                     label="Password"
                                     placeholder="Enter a password"
+                                    name="password"
                                     color="secondary"
                                     :type="showPassword ? 'text' : 'password'"
+                                    autocomplete="new-password"
                                     :rules="passwordRules"
                                     @update:focused="showPasswordStrength = !showPasswordStrength"
                                 >
@@ -24,7 +26,7 @@
                                         <password-input-eye-icons
                                             :is-visible="showPassword"
                                             type="password"
-                                            @toggleVisibility="showPassword = !showPassword"
+                                            @toggle-visibility="showPassword = !showPassword"
                                         />
                                     </template>
                                 </v-text-field>
@@ -35,20 +37,22 @@
                             </div>
 
                             <v-text-field
-                                id="Retype Password"
+                                id="retype-password"
                                 ref="repPasswordField"
                                 v-model="repPassword"
                                 label="Retype password"
                                 placeholder="Enter a password"
+                                name="retype-password"
                                 color="secondary"
                                 :type="showPassword ? 'text' : 'password'"
+                                autocomplete="new-password"
                                 :rules="repeatPasswordRules"
                             >
                                 <template #append-inner>
                                     <password-input-eye-icons
                                         :is-visible="showPassword"
                                         type="password"
-                                        @toggleVisibility="showPassword = !showPassword"
+                                        @toggle-visibility="showPassword = !showPassword"
                                     />
                                 </template>
                             </v-text-field>
@@ -74,7 +78,7 @@
                     :loading="isLoading"
                     @verify="onResetClick"
                 />
-                <p class="mt-5 text-center text-body-2"><router-link class="link" :to="ROUTES.Login.path">Back to login</router-link></p>
+                <p class="mt-5 text-center text-body-medium"><router-link class="link" :to="ROUTES.Login.path">Back to login</router-link></p>
             </v-col>
         </v-row>
     </v-container>
@@ -82,23 +86,28 @@
 
 <script setup lang="ts">
 import { VBtn, VCard, VCardText, VCol, VContainer, VForm, VRow, VTextField } from 'vuetify/components';
-import { computed, onMounted, ref, watch } from 'vue';
+import { computed, onBeforeMount, onMounted, ref, watch } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 
-import { RequiredRule, ValidationRule } from '@/types/common';
+import { type ValidationRule, GoodPasswordRule, RequiredRule  } from '@/types/common';
 import { ErrorMFARequired } from '@/api/errors/ErrorMFARequired';
 import { ErrorTokenExpired } from '@/api/errors/ErrorTokenExpired';
 import { ErrorTooManyAttempts } from '@/api/errors/ErrorTooManyAttempts';
 import { AuthHttpApi } from '@/api/auth';
-import { useNotify } from '@/utils/hooks';
+import { useNotify } from '@/composables/useNotify';
 import { useLoading } from '@/composables/useLoading';
 import { ROUTES } from '@/router';
+import { useConfigStore } from '@/store/modules/configStore';
+import { useUsersStore } from '@/store/modules/usersStore';
 
 import MfaComponent from '@/views/MfaComponent.vue';
 import PasswordInputEyeIcons from '@/components/PasswordInputEyeIcons.vue';
 import PasswordStrength from '@/components/PasswordStrength.vue';
 
 const auth: AuthHttpApi = new AuthHttpApi();
+
+const configStore = useConfigStore();
+const usersStore = useUsersStore();
 
 const router = useRouter();
 const route = useRoute();
@@ -121,12 +130,25 @@ const token = ref<string>('');
 const form = ref<VForm | null>(null);
 const repPasswordField = ref<VTextField | null>(null);
 
-const passwordRules: ValidationRule<string>[] = [
-    RequiredRule,
-];
+const passMaxLength = computed<number>(() => configStore.state.config.passwordMaximumLength);
+const passMinLength = computed<number>(() => configStore.state.config.passwordMinimumLength);
+const badPasswords = computed<Set<string>>(() => usersStore.state.badPasswords);
+const liveCheckBadPassword = computed<boolean>(() => configStore.state.config.liveCheckBadPasswords);
+
+const passwordRules = computed<ValidationRule<string>[]>(() => {
+    const rules = [
+        RequiredRule,
+        (value: string) => value.length < passMinLength.value || value.length > passMaxLength.value
+            ? `Password must be between ${passMinLength.value} and ${passMaxLength.value} characters`
+            : true,
+    ];
+    if (liveCheckBadPassword.value) rules.push(GoodPasswordRule);
+
+    return rules;
+});
 
 const repeatPasswordRules = computed<ValidationRule<string>[]>(() => [
-    ...passwordRules,
+    ...passwordRules.value,
     (value: string) => {
         if (password.value !== value) {
             return 'Passwords do not match';
@@ -177,6 +199,12 @@ function onResetClick(): void {
         }
     });
 }
+
+onBeforeMount(() => {
+    if (liveCheckBadPassword.value && badPasswords.value.size === 0) {
+        usersStore.getBadPasswords().catch(() => {});
+    }
+});
 
 /**
  * Lifecycle hook after initial render.

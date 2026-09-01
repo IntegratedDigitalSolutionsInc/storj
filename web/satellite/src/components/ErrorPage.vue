@@ -7,23 +7,23 @@
             <v-img
                 v-if="theme.global.current.value.dark"
                 class="error-area__logo-wrapper__logo"
-                src="@/assets/logo-dark.svg"
+                :src="configStore.darkLogo"
                 width="140"
-                alt="Storj Logo"
+                alt="Logo"
                 @click="goToHomepage"
             />
             <v-img
                 v-else
                 class="error-area__logo-wrapper__logo"
-                src="@/assets/logo.svg"
+                :src="configStore.logo"
                 width="140"
-                alt="Storj Logo"
+                alt="Logo"
                 @click="goToHomepage"
             />
         </div>
         <div class="d-flex flex-column align-center text-center">
-            <h2 class="text-h2 font-weight-bold mb-4">{{ statusCode }}</h2>
-            <h5 class="text-h5 mb-6">{{ message }}</h5>
+            <h2 class="text-display-medium font-weight-bold mb-4">{{ statusCode }}</h2>
+            <h5 class="text-headline-small mb-6">{{ message }}</h5>
             <v-btn
                 @click="onButtonClick"
             >
@@ -78,7 +78,7 @@ const isFatal = computed((): boolean => {
  * Navigates to the homepage.
  */
 function goToHomepage(): void {
-    window.location.href = configStore.state.config.homepageURL || 'https://www.storj.io';
+    window.location.href = configStore.homepageUrl;
 }
 
 /**

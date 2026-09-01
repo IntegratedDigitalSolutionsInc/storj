@@ -14,7 +14,7 @@ export enum NodeStatus {
     'offline' = 'Offline',
     'not reachable' = 'Not Reachable',
     'unauthorized' = 'Unauthorized',
-    'storagenode internal error' = 'Internal Error'
+    'storagenode internal error' = 'Internal Error',
 }
 
 /**
@@ -60,6 +60,7 @@ export class CreateNodeFields {
         public id: string = '',
         public apiSecret: string = '',
         public publicAddress: string = '',
+        public name: string = '',
     ) {}
 }
 

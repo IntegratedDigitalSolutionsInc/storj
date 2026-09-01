@@ -2,9 +2,9 @@
 // See LICENSE for copying information.
 
 import {
+    type AccessGrantCursor,
+    type AccessGrantsApi,
     AccessGrant,
-    AccessGrantCursor,
-    AccessGrantsApi,
     AccessGrantsPage,
     EdgeCredentials,
 } from '@/types/accessGrants';
@@ -47,12 +47,13 @@ export class AccessGrantsHttpApi implements AccessGrantsApi {
      *
      * @param projectId - stores current project id
      * @param name - name of access grant that will be created
+     * @param csrfProtectionToken - CSRF token
      * @returns AccessGrant
      * @throws Error
      */
-    public async create(projectId: string, name: string): Promise<AccessGrant> {
+    public async create(projectId: string, name: string, csrfProtectionToken: string): Promise<AccessGrant> {
         const path = `${this.ROOT_PATH}/create/${projectId}`;
-        const response = await this.client.post(path, name);
+        const response = await this.client.post(path, name, { csrfProtectionToken });
 
         if (!response.ok) {
             throw new APIError({
@@ -74,11 +75,12 @@ export class AccessGrantsHttpApi implements AccessGrantsApi {
      * Used to delete access grant.
      *
      * @param ids - ids of access grants that will be deleted
+     * @param csrfProtectionToken - CSRF token
      * @throws Error
      */
-    public async delete(ids: string[]): Promise<void> {
+    public async delete(ids: string[], csrfProtectionToken: string): Promise<void> {
         const path = `${this.ROOT_PATH}/delete-by-ids`;
-        const response = await this.client.delete(path, JSON.stringify({ ids }));
+        const response = await this.client.delete(path, JSON.stringify({ ids }), { csrfProtectionToken });
 
         if (response.ok) {
             return;
@@ -121,11 +123,12 @@ export class AccessGrantsHttpApi implements AccessGrantsApi {
      *
      * @param name - name of the access grant that will be deleted
      * @param projectID - id of the project where access grant was created
+     * @param csrfProtectionToken - CSRF token
      * @throws Error
      */
-    public async deleteByNameAndProjectID(name: string, projectID: string): Promise<void> {
+    public async deleteByNameAndProjectID(name: string, projectID: string, csrfProtectionToken: string): Promise<void> {
         const path = `${this.ROOT_PATH}/delete-by-name?name=${name}&publicID=${projectID}`;
-        const response = await this.client.delete(path, null);
+        const response = await this.client.delete(path, null, { csrfProtectionToken });
 
         if (response.ok || response.status === 204) {
             return;
@@ -163,12 +166,18 @@ export class AccessGrantsHttpApi implements AccessGrantsApi {
 
         const result = await response.json();
 
+        let freeTierRestrictedExpiration: Date | null = null;
+        if (result.freeTierRestrictedExpiration) {
+            freeTierRestrictedExpiration = new Date(result.freeTierRestrictedExpiration);
+        }
+
         return new EdgeCredentials(
             result.id,
             new Date(result.created_at),
             result.access_key_id,
             result.secret_key,
             result.endpoint,
+            freeTierRestrictedExpiration,
         );
     }
 
@@ -189,6 +198,7 @@ export class AccessGrantsHttpApi implements AccessGrantsApi {
             key.name,
             new Date(key.createdAt),
             '',
+            key.creatorEmail,
         ));
 
         accessGrantsPage.search = page.search;

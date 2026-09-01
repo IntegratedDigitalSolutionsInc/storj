@@ -5,10 +5,7 @@ package metabase
 
 import (
 	"context"
-	"strings"
 	"time"
-
-	"github.com/zeebo/errs"
 
 	"storj.io/common/storj"
 	"storj.io/common/uuid"
@@ -17,6 +14,7 @@ import (
 // ObjectEntry contains information about an item in a bucket.
 type ObjectEntry struct {
 	IsPrefix bool
+	IsLatest bool
 
 	ObjectKey ObjectKey
 	Version   Version
@@ -28,9 +26,7 @@ type ObjectEntry struct {
 	Status       ObjectStatus
 	SegmentCount int32
 
-	EncryptedMetadataNonce        []byte
-	EncryptedMetadata             []byte
-	EncryptedMetadataEncryptedKey []byte
+	EncryptedUserData
 
 	TotalPlainSize     int64
 	TotalEncryptedSize int64
@@ -90,15 +86,25 @@ type StreamIDCursor struct {
 
 // IterateObjectsWithStatus contains arguments necessary for listing objects in a bucket.
 type IterateObjectsWithStatus struct {
-	ProjectID             uuid.UUID
-	BucketName            BucketName
-	Recursive             bool
-	BatchSize             int
-	Prefix                ObjectKey
-	Cursor                IterateCursor
-	Pending               bool
-	IncludeCustomMetadata bool
-	IncludeSystemMetadata bool
+	ProjectID  uuid.UUID
+	BucketName BucketName
+	Recursive  bool
+	BatchSize  int
+	Prefix     ObjectKey
+	Delimiter  ObjectKey
+	Cursor     IterateCursor
+	Pending    bool
+
+	IncludeCustomMetadata       bool
+	IncludeSystemMetadata       bool
+	IncludeETag                 bool
+	IncludeETagOrCustomMetadata bool
+	IncludeChecksum             bool
+
+	// listMode is the query strategy resolved by DB.IterateObjectsAllVersionsWithStatus
+	// from Config.DefaultListMode and Config.ProjectListMode. Only the descending
+	// iteration uses it; ascending iterations stream on every backend as-is.
+	listMode ListMode
 }
 
 // IterateObjectsAllVersionsWithStatus iterates through all versions of all objects with specified status.
@@ -107,6 +113,12 @@ func (db *DB) IterateObjectsAllVersionsWithStatus(ctx context.Context, opts Iter
 	if err = opts.Verify(); err != nil {
 		return err
 	}
+
+	opts.listMode = db.config.DefaultListMode
+	if mode, ok := db.config.ProjectListMode[opts.ProjectID]; ok {
+		opts.listMode = mode
+	}
+
 	return iterateAllVersionsWithStatusDescending(ctx, db.ChooseAdapter(opts.ProjectID), opts, fn)
 }
 
@@ -132,73 +144,4 @@ func (opts *IterateObjectsWithStatus) Verify() error {
 		return ErrInvalidRequest.New("BatchSize is negative")
 	}
 	return nil
-}
-
-// ListObjectsWithIterator lists objects.
-func (db *DB) ListObjectsWithIterator(ctx context.Context, opts ListObjects) (result ListObjectsResult, err error) {
-	defer mon.Task()(&ctx)(&err)
-
-	if err := opts.Verify(); err != nil {
-		return ListObjectsResult{}, err
-	}
-	if opts.Pending || opts.AllVersions {
-		return ListObjectsResult{}, errs.New("not implemented")
-	}
-
-	ListLimit.Ensure(&opts.Limit)
-
-	err = db.IterateObjectsAllVersionsWithStatus(ctx,
-		IterateObjectsWithStatus{
-			ProjectID:  opts.ProjectID,
-			BucketName: opts.BucketName,
-			Prefix:     opts.Prefix,
-			Cursor: IterateCursor{
-				Key:     opts.Cursor.Key,
-				Version: MaxVersion,
-			},
-			Recursive: opts.Recursive,
-			// TODO we may need to increase batch size to optimize number
-			// of DB calls for objects with multiple versions
-			BatchSize:             opts.Limit + 1,
-			Pending:               false,
-			IncludeCustomMetadata: opts.IncludeCustomMetadata,
-			IncludeSystemMetadata: opts.IncludeSystemMetadata,
-		}, func(ctx context.Context, it ObjectsIterator) error {
-			var previousLatestSet bool
-			var entry, previousLatest ObjectEntry
-			prefix := opts.Prefix
-			if prefix != "" && !strings.HasSuffix(string(prefix), "/") {
-				prefix += "/"
-			}
-
-			for len(result.Objects) < opts.Limit && it.Next(ctx, &entry) {
-				objectKey := prefix + entry.ObjectKey
-				if opts.Cursor.Key == objectKey && opts.Cursor.Version >= entry.Version {
-					previousLatestSet = true
-					previousLatest = entry
-					continue
-				}
-
-				if entry.Status.IsDeleteMarker() && (!previousLatestSet || prefix+previousLatest.ObjectKey != objectKey) {
-					previousLatestSet = true
-					previousLatest = entry
-					continue
-				}
-
-				if !previousLatestSet || prefix+previousLatest.ObjectKey != objectKey {
-					previousLatestSet = true
-					previousLatest = entry
-
-					result.Objects = append(result.Objects, entry)
-				}
-			}
-
-			result.More = it.Next(ctx, &entry)
-			return nil
-		},
-	)
-	if err != nil {
-		return ListObjectsResult{}, err
-	}
-	return result, nil
 }

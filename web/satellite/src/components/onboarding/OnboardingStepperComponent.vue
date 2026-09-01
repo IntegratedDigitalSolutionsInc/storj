@@ -11,27 +11,30 @@
             :lg="steps.length === ONBOARDING_STEPPER_STEPS.length ? 3 : 4"
             :xl="steps.length === ONBOARDING_STEPPER_STEPS.length ? 3 : 4"
         >
-            <v-card class="pa-5 pt-3">
-                <p class="text-overline">
-                    {{ step?.stepTxt }}
-                </p>
-                <h4>
-                    {{ step?.title }}
-                </h4>
-                <p class="mt-1 mb-2">
-                    {{ step?.description }}
-                </p>
-                <v-btn
-                    :color="step?.color"
-                    :variant="step?.variant"
-                    :disabled="step?.disabled"
-                    :prepend-icon="step?.prependIcon"
-                    :append-icon="step?.appendIcon"
-                    block
-                    @click="step?.onClick"
-                >
-                    {{ step?.buttonTxt }}
-                </v-btn>
+            <v-card class="pa-5 pt-3 h-100 d-flex flex-column">
+                <div class="flex-grow-1">
+                    <p class="text-label-medium text-medium-emphasis">
+                        {{ step?.stepTxt }}
+                    </p>
+                    <h4>
+                        {{ step?.title }}
+                    </h4>
+                    <p class="mt-1 mb-2">
+                        {{ step?.description }}
+                    </p>
+                </div>
+                <div class="flex-shrink-0">
+                    <v-btn
+                        :color="step?.color"
+                        :variant="step?.variant"
+                        :disabled="step?.disabled"
+                        :prepend-icon="step?.prependIcon"
+                        :append-icon="step?.appendIcon"
+                        @click="step?.onClick"
+                    >
+                        {{ step?.buttonTxt }}
+                    </v-btn>
+                </div>
             </v-card>
         </v-col>
     </v-row>
@@ -43,14 +46,13 @@
         @access-created="onAccessCreated"
     />
     <CreateBucketDialog
-        v-if="currentStep === OnboardingStep.CreateBucket"
         v-model="isBucketDialogOpen"
         @created="onBucketCreated"
     />
     <enter-bucket-passphrase-dialog
         v-if="currentStep === OnboardingStep.UploadFiles || currentStep === OnboardingStep.CreateAccess"
         v-model="isBucketPassphraseDialogOpen"
-        @passphraseEntered="passphraseDialogCallback"
+        @passphrase-entered="passphraseDialogCallback"
     />
     <manage-passphrase-dialog
         v-if="currentStep === OnboardingStep.EncryptionPassphrase"
@@ -62,23 +64,23 @@
 
 <script setup lang="ts">
 import { VBtn, VCard, VCol, VRow } from 'vuetify/components';
-import { computed, FunctionalComponent, onMounted, ref, watch } from 'vue';
+import { type FunctionalComponent, computed, ref, watch  } from 'vue';
 import { useRouter } from 'vue-router';
-import { ArrowRight, Check } from 'lucide-vue-next';
+import { ArrowRight, Check } from '@lucide/vue';
 
 import { useProjectsStore } from '@/store/modules/projectsStore';
 import { useUsersStore } from '@/store/modules/usersStore';
-import { ONBOARDING_STEPPER_STEPS, OnboardingStep, User } from '@/types/users';
+import { ONBOARDING_STEPPER_STEPS, OnboardingStep } from '@/types/users';
 import { useBucketsStore } from '@/store/modules/bucketsStore';
-import { EdgeCredentials } from '@/types/accessGrants';
+import type { EdgeCredentials } from '@/types/accessGrants';
 import { AnalyticsErrorEventSource, AnalyticsEvent } from '@/utils/constants/analyticsEventNames';
 import { useAnalyticsStore } from '@/store/modules/analyticsStore';
-import { useNotify } from '@/utils/hooks';
+import { useNotify } from '@/composables/useNotify';
 import { ROUTES } from '@/router';
-import { OnboardingInfo } from '@/types/common';
+import type { OnboardingInfo } from '@/types/common';
 import { SetupStep } from '@/types/setupAccess';
 import { usePreCheck } from '@/composables/usePreCheck';
-import { useObjectBrowserStore } from '@/store/modules/objectBrowserStore';
+import { useConfigStore } from '@/store/modules/configStore';
 
 import CreateBucketDialog from '@/components/dialogs/CreateBucketDialog.vue';
 import EnterBucketPassphraseDialog from '@/components/dialogs/EnterBucketPassphraseDialog.vue';
@@ -100,7 +102,7 @@ interface StepData {
 
 const analyticsStore = useAnalyticsStore();
 const bucketsStore = useBucketsStore();
-const obStore = useObjectBrowserStore();
+const configStore = useConfigStore();
 const projectsStore = useProjectsStore();
 const userStore = useUsersStore();
 
@@ -127,6 +129,9 @@ const steps = computed<StepData[]>(() => {
     let onBoardSteps = ONBOARDING_STEPPER_STEPS;
     if (hasManagedPassphrase.value) {
         onBoardSteps = onBoardSteps.filter(s => s !== OnboardingStep.EncryptionPassphrase);
+    }
+    if (!configStore.isDefaultBrand) {
+        onBoardSteps = onBoardSteps.filter(s => s !== OnboardingStep.CreateAccess);
     }
     return onBoardSteps.map<StepData>((step, i) => {
         const data: StepData = {
@@ -158,8 +163,8 @@ const steps = computed<StepData[]>(() => {
         case OnboardingStep.UploadFiles:
             return {
                 ...data,
-                title: 'Upload Objects',
-                description: 'You are ready to upload objects in your bucket, and share with the world.',
+                title: 'Upload Files',
+                description: 'You are ready to upload files in the bucket you created.',
                 buttonTxt: 'Go to Upload',
                 color: uploadStepInfo.value.color,
                 variant: uploadStepInfo.value.variant as VBtn['$props']['variant'],
@@ -172,7 +177,7 @@ const steps = computed<StepData[]>(() => {
                 ...data,
                 stepTxt: `Step ${i + 1} ${!onboardingInfo.value ? '(Optional)' : ''}`,
                 title: onboardingInfo.value?.accessTitle || 'Connect Applications',
-                description: onboardingInfo.value?.accessText || 'Connect your S3 compatible application to Storj with S3 credentials.',
+                description: onboardingInfo.value?.accessText || `Connect your S3 compatible application to ${configStore.brandName} with S3 credentials.`,
                 buttonTxt: onboardingInfo.value?.accessBtnText || 'View Applications',
                 color: accessStepInfo.value.color,
                 variant: accessStepInfo.value.variant as VBtn['$props']['variant'],
@@ -191,15 +196,14 @@ const steps = computed<StepData[]>(() => {
  * based on a configured partner. This will remain
  * undefined if the user is not associated with a partner.
  */
-const onboardingInfo = ref<OnboardingInfo>();
+const onboardingInfo = computed<OnboardingInfo | null>(() =>
+    (configStore.onboardingConfig.get(userStore.state.user.partner ?? '') ?? null) as OnboardingInfo | null,
+);
 
 const userSettings = computed(() => userStore.state.settings);
 
 const currentStep = computed<OnboardingStep>(() => {
-    if (!ONBOARDING_STEPPER_STEPS.find(s => userStore.state.settings.onboardingStep === s)) {
-        return ONBOARDING_STEPPER_STEPS[0];
-    }
-    return userSettings.value.onboardingStep as OnboardingStep;
+    return ONBOARDING_STEPPER_STEPS.find(s => s === userSettings.value.onboardingStep) ?? ONBOARDING_STEPPER_STEPS[0];
 });
 
 const currentStepIndex = computed(() => ONBOARDING_STEPPER_STEPS.findIndex(s => s === currentStep.value));
@@ -223,7 +227,7 @@ const isBucketDone = computed(() => {
 const accessStepInfo = computed(() => {
     const isRelevantStep = currentStep.value === OnboardingStep.CreateAccess
         || currentStep.value === OnboardingStep.UploadFiles;
-    const color = isRelevantStep ? 'primary' : 'default';
+    const color = 'default';
     const variant = isRelevantStep ? (onboardingInfo.value ? 'elevated' : 'outlined') : 'tonal';
     const disabled = !isRelevantStep;
     const appendIcon = onboardingInfo.value ? undefined : ArrowRight;
@@ -326,9 +330,6 @@ async function openTrackedBucket(): Promise<void> {
             }
         }
 
-        const objCount = bucketsStore.state.page.buckets?.find((bucket) => bucket.name === trackedBucketName.value)?.objectCount ?? 0;
-        obStore.setObjectCountOfSelectedBucket(objCount);
-
         await router.push({
             name: ROUTES.Bucket.name,
             params: {
@@ -415,24 +416,20 @@ async function endOnboarding(): Promise<void> {
     }
 }
 
-onMounted(async () => {
-    const user: User = userStore.state.user;
-    if (!user.partner) {
-        return;
-    }
-
-    try {
-        const config = (await import('@/configs/onboardingConfig.json')).default;
-        onboardingInfo.value = config[user.partner] as OnboardingInfo;
-    } catch { /* empty */ }
-});
-
 watch(() => projectsStore.state.selectedProjectConfig, config => {
     const hasSatelliteManagedEncryption = config.hasManagedPassphrase;
     if (hasSatelliteManagedEncryption && currentStep.value === OnboardingStep.EncryptionPassphrase) {
     // Skip the passphrase step if the project passphrase is satellite managed
         progressStep();
     }
+}, { immediate: true });
+
+watch(() => userStore.state.user.partner, async (newPartner) => {
+    if (!newPartner) return;
+
+    try {
+        await configStore.getPartnerOnboardingConfig(newPartner);
+    } catch { /* empty */ }
 }, { immediate: true });
 
 defineExpose({ endOnboarding });

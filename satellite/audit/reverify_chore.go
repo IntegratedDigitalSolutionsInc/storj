@@ -5,7 +5,6 @@ package audit
 
 import (
 	"context"
-	"time"
 
 	"go.uber.org/zap"
 
@@ -31,12 +30,12 @@ type ContainmentSyncChore struct {
 }
 
 // NewContainmentSyncChore creates a new ContainmentSyncChore.
-func NewContainmentSyncChore(log *zap.Logger, queue ReverifyQueue, overlay overlay.DB, interval time.Duration) *ContainmentSyncChore {
+func NewContainmentSyncChore(log *zap.Logger, queue ReverifyQueue, overlay overlay.DB, cfg Config) *ContainmentSyncChore {
 	return &ContainmentSyncChore{
 		log:     log,
 		queue:   queue,
 		overlay: overlay,
-		Loop:    sync2.NewCycle(interval),
+		Loop:    sync2.NewCycle(cfg.ContainmentSyncChoreInterval),
 	}
 }
 
@@ -64,6 +63,6 @@ func (rc *ContainmentSyncChore) syncContainedStatus(ctx context.Context) (err er
 		return nil
 	}
 	rc.log.Info("updated containment status of all nodes as necessary",
-		zap.Int("num contained nodes", len(containedSet)))
+		zap.Int("num_contained_nodes", len(containedSet)))
 	return nil
 }

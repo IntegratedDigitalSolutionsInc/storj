@@ -24,7 +24,7 @@ import (
 // ensures that apikeys implements console.APIKeys.
 var _ console.APIKeys = (*apikeys)(nil)
 
-type projectApiKeyRow = dbx.ApiKey_Project_PublicId_Project_RateLimit_Project_BurstLimit_Project_RateLimitHead_Project_BurstLimitHead_Project_RateLimitGet_Project_BurstLimitGet_Project_RateLimitPut_Project_BurstLimitPut_Project_RateLimitList_Project_BurstLimitList_Project_RateLimitDel_Project_BurstLimitDel_Project_SegmentLimit_Project_UsageLimit_Project_BandwidthLimit_Project_UserSpecifiedUsageLimit_Project_UserSpecifiedBandwidthLimit_Row
+type projectApiKeyRow = dbx.ApiKey_Project_PublicId_Project_RateLimit_Project_BurstLimit_Project_RateLimitHead_Project_BurstLimitHead_Project_RateLimitGet_Project_BurstLimitGet_Project_RateLimitPut_Project_BurstLimitPut_Project_RateLimitList_Project_BurstLimitList_Project_RateLimitDel_Project_BurstLimitDel_Project_SegmentLimit_Project_UsageLimit_Project_BandwidthLimit_Project_UserSpecifiedUsageLimit_Project_UserSpecifiedBandwidthLimit_Project_NotificationFlags_Row
 
 // apikeys is an implementation of satellite.APIKeys.
 type apikeys struct {
@@ -33,10 +33,11 @@ type apikeys struct {
 	impl dbutil.Implementation
 }
 
+// GetPagedByProjectID retrieves API keys for a given projectID and cursor.
 func (keys *apikeys) GetPagedByProjectID(ctx context.Context, projectID uuid.UUID, cursor console.APIKeyCursor, ignoredNamePrefix string) (page *console.APIKeyPage, err error) {
 	defer mon.Task()(&ctx)(&err)
 
-	search := "%" + strings.ReplaceAll(cursor.Search, " ", "%") + "%"
+	search := strings.ToLower("%" + strings.ReplaceAll(cursor.Search, " ", "%") + "%")
 
 	if cursor.Limit == 0 {
 		return nil, console.ErrAPIKeyRequest.New("limit cannot be 0")
@@ -54,29 +55,38 @@ func (keys *apikeys) GetPagedByProjectID(ctx context.Context, projectID uuid.UUI
 		OrderDirection: cursor.OrderDirection,
 	}
 
+	// This expression hides emails of ex‐members.
+	emailExpr := "CASE WHEN pm.member_id IS NOT NULL THEN u.email ELSE '' END"
+
+	whereClause := `
+      WHERE ak.project_id = ?
+        AND (
+          LOWER(ak.name) LIKE ?
+          OR LOWER(` + emailExpr + `) LIKE ?
+        )
+    `
+	if ignoredNamePrefix != "" {
+		whereClause += " AND ak.name NOT LIKE '" + ignoredNamePrefix + "%' "
+	}
+
 	countQuery := keys.db.Rebind(`
 		SELECT COUNT(*)
 		FROM api_keys ak
-		WHERE ak.project_id = ?
-		AND lower(ak.name) LIKE ?
-	`)
+		LEFT JOIN users u
+			ON u.id = ak.created_by
+		LEFT JOIN project_members pm
+			ON pm.project_id = ak.project_id
+		AND pm.member_id = ak.created_by
+    ` + whereClause)
 
-	ignorePrefixClause := ""
-	if ignoredNamePrefix != "" {
-		ignorePrefixClause = "AND ak.name NOT LIKE '" + ignoredNamePrefix + "%' "
-		countQuery += ignorePrefixClause
-	}
-
-	countRow := keys.db.QueryRowContext(ctx,
+	err = keys.db.QueryRowContext(ctx,
 		countQuery,
-		projectID[:],
-		strings.ToLower(search),
-	)
-
-	err = countRow.Scan(&page.TotalCount)
+		projectID[:], search, search,
+	).Scan(&page.TotalCount)
 	if err != nil {
 		return nil, err
 	}
+
 	if page.TotalCount == 0 {
 		return page, nil
 	}
@@ -85,51 +95,59 @@ func (keys *apikeys) GetPagedByProjectID(ctx context.Context, projectID uuid.UUI
 	}
 
 	repoundQuery := keys.db.Rebind(`
-		SELECT ak.id, ak.project_id, ak.name, ak.user_agent, ak.created_at, ak.version, p.public_id
-		FROM api_keys ak, projects p
-		WHERE ak.project_id = ?
-		AND ak.project_id = p.id
-		AND lower(ak.name) LIKE ?
-		` + ignorePrefixClause + apikeySortClause(cursor.Order, page.OrderDirection) + `
-		LIMIT ? OFFSET ?`)
+		SELECT
+			ak.id,
+			ak.project_id,
+			ak.name,
+			ak.user_agent,
+			ak.created_at,
+			ak.version,
+			p.public_id AS project_public_id,
+			` + emailExpr + ` AS creator_email
+		FROM api_keys ak
+		JOIN projects p
+			ON p.id = ak.project_id
+		LEFT JOIN users u
+			ON u.id = ak.created_by
+		LEFT JOIN project_members pm
+			ON pm.project_id = ak.project_id
+			AND pm.member_id = ak.created_by
+    	` + whereClause + apikeySortClause(cursor.Order, cursor.OrderDirection) + ` LIMIT ? OFFSET ?`,
+	)
 
-	rows, err := keys.db.QueryContext(ctx,
+	rows, err := keys.db.QueryContext(
+		ctx,
 		repoundQuery,
 		projectID[:],
-		strings.ToLower(search),
+		search,
+		search,
 		page.Limit,
-		page.Offset)
-
+		page.Offset,
+	)
 	if err != nil {
 		return nil, err
 	}
 	defer func() { err = errs.Combine(err, rows.Close()) }()
 
-	var apiKeys []console.APIKeyInfo
 	for rows.Next() {
 		ak := console.APIKeyInfo{}
 
-		err = rows.Scan(&ak.ID, &ak.ProjectID, &ak.Name, &ak.UserAgent, &ak.CreatedAt, &ak.Version, &ak.ProjectPublicID)
+		err = rows.Scan(&ak.ID, &ak.ProjectID, &ak.Name, &ak.UserAgent, &ak.CreatedAt, &ak.Version, &ak.ProjectPublicID, &ak.CreatorEmail)
 		if err != nil {
 			return nil, err
 		}
 
-		apiKeys = append(apiKeys, ak)
+		page.APIKeys = append(page.APIKeys, ak)
+	}
+	if err = rows.Err(); err != nil {
+		return nil, err
 	}
 
-	page.APIKeys = apiKeys
 	page.Order = cursor.Order
-
+	page.CurrentPage = cursor.Page
 	page.PageCount = uint(page.TotalCount / uint64(cursor.Limit))
 	if page.TotalCount%uint64(cursor.Limit) != 0 {
 		page.PageCount++
-	}
-
-	page.CurrentPage = cursor.Page
-
-	err = rows.Err()
-	if err != nil {
-		return nil, err
 	}
 
 	return page, err
@@ -150,13 +168,13 @@ func (keys *apikeys) Get(ctx context.Context, id uuid.UUID) (_ *console.APIKeyIn
 func (keys *apikeys) GetByHead(ctx context.Context, head []byte) (_ *console.APIKeyInfo, err error) {
 	defer mon.Task()(&ctx)(&err)
 
-	dbKey, err := keys.lru.Get(ctx, string(head), func() (*dbx.ApiKey_Project_PublicId_Project_RateLimit_Project_BurstLimit_Project_RateLimitHead_Project_BurstLimitHead_Project_RateLimitGet_Project_BurstLimitGet_Project_RateLimitPut_Project_BurstLimitPut_Project_RateLimitList_Project_BurstLimitList_Project_RateLimitDel_Project_BurstLimitDel_Project_SegmentLimit_Project_UsageLimit_Project_BandwidthLimit_Project_UserSpecifiedUsageLimit_Project_UserSpecifiedBandwidthLimit_Row, error) {
-		return keys.db.Get_ApiKey_Project_PublicId_Project_RateLimit_Project_BurstLimit_Project_RateLimitHead_Project_BurstLimitHead_Project_RateLimitGet_Project_BurstLimitGet_Project_RateLimitPut_Project_BurstLimitPut_Project_RateLimitList_Project_BurstLimitList_Project_RateLimitDel_Project_BurstLimitDel_Project_SegmentLimit_Project_UsageLimit_Project_BandwidthLimit_Project_UserSpecifiedUsageLimit_Project_UserSpecifiedBandwidthLimit_By_ApiKey_Head(ctx, dbx.ApiKey_Head(head))
+	dbKey, err := keys.lru.Get(ctx, string(head), func() (*dbx.ApiKey_Project_PublicId_Project_RateLimit_Project_BurstLimit_Project_RateLimitHead_Project_BurstLimitHead_Project_RateLimitGet_Project_BurstLimitGet_Project_RateLimitPut_Project_BurstLimitPut_Project_RateLimitList_Project_BurstLimitList_Project_RateLimitDel_Project_BurstLimitDel_Project_SegmentLimit_Project_UsageLimit_Project_BandwidthLimit_Project_UserSpecifiedUsageLimit_Project_UserSpecifiedBandwidthLimit_Project_NotificationFlags_Row, error) {
+		return keys.db.Get_ApiKey_Project_PublicId_Project_RateLimit_Project_BurstLimit_Project_RateLimitHead_Project_BurstLimitHead_Project_RateLimitGet_Project_BurstLimitGet_Project_RateLimitPut_Project_BurstLimitPut_Project_RateLimitList_Project_BurstLimitList_Project_RateLimitDel_Project_BurstLimitDel_Project_SegmentLimit_Project_UsageLimit_Project_BandwidthLimit_Project_UserSpecifiedUsageLimit_Project_UserSpecifiedBandwidthLimit_Project_NotificationFlags_By_ApiKey_Head(ctx, dbx.ApiKey_Head(head))
 	})
 	if err != nil {
 		return nil, err
 	}
-	return fromDBXApiKey_ApiKey_Project_PublicId_Project_RateLimit_Project_BurstLimit_Project_RateLimitHead_Project_BurstLimitHead_Project_RateLimitGet_Project_BurstLimitGet_Project_RateLimitPut_Project_BurstLimitPut_Project_RateLimitList_Project_BurstLimitList_Project_RateLimitDel_Project_BurstLimitDel_Project_SegmentLimit_Project_UsageLimit_Project_BandwidthLimit_Project_UserSpecifiedUsageLimit_Project_UserSpecifiedBandwidthLimit_Row(ctx, dbKey)
+	return fromDBXApiKey_ApiKey_Project_PublicId_Project_RateLimit_Project_BurstLimit_Project_RateLimitHead_Project_BurstLimitHead_Project_RateLimitGet_Project_BurstLimitGet_Project_RateLimitPut_Project_BurstLimitPut_Project_RateLimitList_Project_BurstLimitList_Project_RateLimitDel_Project_BurstLimitDel_Project_SegmentLimit_Project_UsageLimit_Project_BandwidthLimit_Project_UserSpecifiedUsageLimit_Project_UserSpecifiedBandwidthLimit_Project_NotificationFlags_Row(ctx, dbKey)
 }
 
 // GetByNameAndProjectID implements satellite.APIKeys.
@@ -228,7 +246,7 @@ func (keys *apikeys) Create(ctx context.Context, head []byte, info console.APIKe
 		optional.CreatedBy = dbx.ApiKey_CreatedBy(info.CreatedBy[:])
 	}
 
-	_, err = keys.db.Create_ApiKey(
+	apiKey, err := keys.db.Create_ApiKey(
 		ctx,
 		dbx.ApiKey_Id(id[:]),
 		dbx.ApiKey_ProjectId(info.ProjectID[:]),
@@ -242,7 +260,7 @@ func (keys *apikeys) Create(ctx context.Context, head []byte, info console.APIKe
 		return nil, err
 	}
 
-	return keys.Get(ctx, id)
+	return apiKeyToAPIKeyInfo(ctx, apiKey)
 }
 
 // Update implements satellite.APIKeys.
@@ -271,9 +289,6 @@ func (keys *apikeys) DeleteMultiple(ctx context.Context, ids []uuid.UUID) (err e
 	case dbutil.Cockroach, dbutil.Postgres:
 		query := `DELETE FROM api_keys WHERE id = ANY($1)`
 		_, err = keys.db.ExecContext(ctx, query, pgutil.UUIDArray(ids))
-	case dbutil.Spanner:
-		query := `DELETE FROM api_keys WHERE id IN UNNEST(?)`
-		_, err = keys.db.ExecContext(ctx, query, uuidsToBytesArray(ids))
 	default:
 		return errs.New("unsupported database dialect: %s", keys.impl)
 	}
@@ -287,6 +302,13 @@ func (keys *apikeys) DeleteMultiple(ctx context.Context, ids []uuid.UUID) (err e
 func (keys *apikeys) DeleteAllByProjectID(ctx context.Context, id uuid.UUID) (err error) {
 	defer mon.Task()(&ctx)(&err)
 	_, err = keys.db.Delete_ApiKey_By_ProjectId(ctx, dbx.ApiKey_ProjectId(id[:]))
+	return err
+}
+
+// DeleteAllByProjectIDAndOwnerID deletes all APIKeyInfos from store by given projectID and ownerID.
+func (keys *apikeys) DeleteAllByProjectIDAndOwnerID(ctx context.Context, projectID, ownerID uuid.UUID) (err error) {
+	defer mon.Task()(&ctx)(&err)
+	_, err = keys.db.Delete_ApiKey_By_ProjectId_And_CreatedBy(ctx, dbx.ApiKey_ProjectId(projectID[:]), dbx.ApiKey_CreatedBy(ownerID[:]))
 	return err
 }
 
@@ -365,9 +387,6 @@ func (keys *apikeys) DeleteExpiredByNamePrefix(ctx context.Context, lifetime tim
 			case dbutil.Cockroach, dbutil.Postgres:
 				query := `DELETE FROM api_keys WHERE id = ANY($1)`
 				_, err = keys.db.ExecContext(ctx, query, pgutil.UUIDArray(toBeDeleted))
-			case dbutil.Spanner:
-				query := `DELETE FROM api_keys WHERE id IN UNNEST(?)`
-				_, err = keys.db.ExecContext(ctx, query, uuidsToBytesArray(toBeDeleted))
 			default:
 				return errs.New("unsupported database dialect: %s", keys.impl)
 			}
@@ -439,7 +458,7 @@ func fromDBXApiKeyProjectPublicIdRow(ctx context.Context, row *dbx.ApiKey_Projec
 	return result, nil
 }
 
-func fromDBXApiKey_ApiKey_Project_PublicId_Project_RateLimit_Project_BurstLimit_Project_RateLimitHead_Project_BurstLimitHead_Project_RateLimitGet_Project_BurstLimitGet_Project_RateLimitPut_Project_BurstLimitPut_Project_RateLimitList_Project_BurstLimitList_Project_RateLimitDel_Project_BurstLimitDel_Project_SegmentLimit_Project_UsageLimit_Project_BandwidthLimit_Project_UserSpecifiedUsageLimit_Project_UserSpecifiedBandwidthLimit_Row(ctx context.Context, row *dbx.ApiKey_Project_PublicId_Project_RateLimit_Project_BurstLimit_Project_RateLimitHead_Project_BurstLimitHead_Project_RateLimitGet_Project_BurstLimitGet_Project_RateLimitPut_Project_BurstLimitPut_Project_RateLimitList_Project_BurstLimitList_Project_RateLimitDel_Project_BurstLimitDel_Project_SegmentLimit_Project_UsageLimit_Project_BandwidthLimit_Project_UserSpecifiedUsageLimit_Project_UserSpecifiedBandwidthLimit_Row) (_ *console.APIKeyInfo, err error) {
+func fromDBXApiKey_ApiKey_Project_PublicId_Project_RateLimit_Project_BurstLimit_Project_RateLimitHead_Project_BurstLimitHead_Project_RateLimitGet_Project_BurstLimitGet_Project_RateLimitPut_Project_BurstLimitPut_Project_RateLimitList_Project_BurstLimitList_Project_RateLimitDel_Project_BurstLimitDel_Project_SegmentLimit_Project_UsageLimit_Project_BandwidthLimit_Project_UserSpecifiedUsageLimit_Project_UserSpecifiedBandwidthLimit_Project_NotificationFlags_Row(ctx context.Context, row *dbx.ApiKey_Project_PublicId_Project_RateLimit_Project_BurstLimit_Project_RateLimitHead_Project_BurstLimitHead_Project_RateLimitGet_Project_BurstLimitGet_Project_RateLimitPut_Project_BurstLimitPut_Project_RateLimitList_Project_BurstLimitList_Project_RateLimitDel_Project_BurstLimitDel_Project_SegmentLimit_Project_UsageLimit_Project_BandwidthLimit_Project_UserSpecifiedUsageLimit_Project_UserSpecifiedBandwidthLimit_Project_NotificationFlags_Row) (_ *console.APIKeyInfo, err error) {
 	defer mon.Task()(&ctx)(&err)
 
 	result, err := apiKeyToAPIKeyInfo(ctx, &row.ApiKey)
@@ -473,6 +492,10 @@ func fromDBXApiKey_ApiKey_Project_PublicId_Project_RateLimit_Project_BurstLimit_
 	}
 	result.ProjectSegmentsLimit = row.Project_SegmentLimit
 
+	if row.Project_NotificationFlags != nil {
+		result.LimitNotificationFlags = *row.Project_NotificationFlags
+	}
+
 	return result, nil
 }
 
@@ -483,8 +506,14 @@ func apikeySortClause(order console.APIKeyOrder, direction console.OrderDirectio
 		dirStr = "DESC"
 	}
 
-	if order == console.CreationDate {
-		return "ORDER BY ak.created_at " + dirStr + ", ak.name, ak.project_id"
+	switch order {
+	case console.CreationDate:
+		return " ORDER BY ak.created_at " + dirStr + ", ak.name, ak.project_id "
+	case console.KeyCreatorEmail:
+		// we COALESCE to '' so NULL emails sort consistently,
+		// and LOWER() so sorting is case‑insensitive.
+		return " ORDER BY LOWER(COALESCE(u.email, '')) " + dirStr + ", ak.name, ak.project_id "
+	default:
+		return " ORDER BY LOWER(ak.name) " + dirStr + ", ak.name, ak.project_id "
 	}
-	return "ORDER BY LOWER(ak.name) " + dirStr + ", ak.name, ak.project_id"
 }

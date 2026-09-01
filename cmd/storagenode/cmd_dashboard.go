@@ -33,7 +33,7 @@ type dashboardClient struct {
 }
 
 type dashboardCfg struct {
-	Address  string `default:"127.0.0.1:7778" help:"address for dashboard service"`
+	Address  string `default:"127.0.0.1:7778" testDefault:"$HOST:0" help:"address for dashboard service"`
 	Identity identity.Config
 	UseColor bool `internal:"true"`
 }
@@ -78,7 +78,7 @@ func cmdDashboard(cmd *cobra.Command, cfg *dashboardCfg) (err error) {
 	if err != nil {
 		zap.L().Fatal("Failed to load identity.", zap.Error(err))
 	} else {
-		zap.L().Info("Identity loaded.", zap.Stringer("Node ID", ident.ID))
+		zap.L().Info("Identity loaded.", zap.Stringer("node_id", ident.ID))
 	}
 
 	client, err := dialDashboardClient(ctx, cfg.Address)
@@ -112,7 +112,7 @@ func printDashboard(cfg *dashboardCfg, data *internalpb.DashboardResponse) error
 	color.NoColor = !cfg.UseColor
 
 	heading := color.New(color.FgGreen, color.Bold)
-	_, _ = heading.Printf("\nStorage Node Dashboard ( Node Version: %s )\n", version.Build.Version.String())
+	_, _ = heading.Printf("\nStorage Node Dashboard ( Node Version: %s )\n", version.Build.Version.VString())
 	_, _ = heading.Printf("\n======================\n\n")
 
 	w := tabwriter.NewWriter(color.Output, 0, 0, 1, ' ', 0)

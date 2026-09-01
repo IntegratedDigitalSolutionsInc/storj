@@ -8,11 +8,11 @@
         <PageTitleComponent title="Team Members" />
         <PageSubtitleComponent
             subtitle="Invite people and manage the team of this project."
-            link="https://docs.storj.io/support/users"
+            :link="configStore.isDefaultBrand ? 'https://docs.storj.io/support/users' : undefined"
         />
 
-        <v-col>
-            <v-row class="mt-1 mb-3">
+        <v-col class="py-3">
+            <v-row class="mt-1 mb-2">
                 <div class="d-inline">
                     <v-btn
                         :loading="isLoading"
@@ -36,20 +36,23 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue';
+import { computed, onBeforeMount, onMounted, ref } from 'vue';
+import { useRouter } from 'vue-router';
 import { VBtn, VCol, VContainer, VRow, VTooltip } from 'vuetify/components';
-import { UserPlus } from 'lucide-vue-next';
+import { UserPlus } from '@lucide/vue';
 
 import { useProjectsStore } from '@/store/modules/projectsStore';
 import { usePreCheck } from '@/composables/usePreCheck';
 import { useLoading } from '@/composables/useLoading';
 import { useUsersStore } from '@/store/modules/usersStore';
 import { useProjectMembersStore } from '@/store/modules/projectMembersStore';
-import { useNotify } from '@/utils/hooks';
-import { Project } from '@/types/projects';
-import { User } from '@/types/users';
+import { useNotify } from '@/composables/useNotify';
+import type { Project } from '@/types/projects';
+import type { User } from '@/types/users';
 import { ProjectRole } from '@/types/projectMembers';
 import { AnalyticsErrorEventSource } from '@/utils/constants/analyticsEventNames';
+import { useConfigStore } from '@/store/modules/configStore';
+import { ROUTES } from '@/router';
 
 import PageTitleComponent from '@/components/PageTitleComponent.vue';
 import PageSubtitleComponent from '@/components/PageSubtitleComponent.vue';
@@ -57,9 +60,12 @@ import TeamTableComponent from '@/components/TeamTableComponent.vue';
 import AddTeamMemberDialog from '@/components/dialogs/AddTeamMemberDialog.vue';
 import TrialExpirationBanner from '@/components/TrialExpirationBanner.vue';
 
+const router = useRouter();
+
 const usersStore = useUsersStore();
 const pmStore = useProjectMembersStore();
 const projectsStore = useProjectsStore();
+const configStore = useConfigStore();
 
 const { isTrialExpirationBanner, isUserProjectOwner, isExpired, withTrialCheck } = usePreCheck();
 const { isLoading, withLoading } = useLoading();
@@ -69,6 +75,7 @@ const isAddMemberDialogShown = ref<boolean>(false);
 const isUserAdmin = ref<boolean>(false);
 
 const selectedProject = computed<Project>(() => projectsStore.state.selectedProject);
+const projectInvitationsEnabled = computed<boolean>(() => configStore.state.config.projectInvitationsEnabled);
 const user = computed<User>(() => usersStore.state.user);
 
 /**
@@ -82,6 +89,10 @@ function onAddMember(): void {
     });
 }
 
+onBeforeMount(() => {
+    if (!projectInvitationsEnabled.value) router.replace({ name: ROUTES.Dashboard.name });
+});
+
 onMounted(() => {
     if (selectedProject.value.ownerId === user.value.id) {
         isUserAdmin.value = true;
@@ -93,7 +104,7 @@ onMounted(() => {
             const pm = await pmStore.getSingleMember(selectedProject.value.id, user.value.id);
             isUserAdmin.value = pm.role === ProjectRole.Admin;
         } catch (error) {
-            notify.error(error.message, AnalyticsErrorEventSource.PROJECT_MEMBERS_PAGE);
+            notify.notifyError(error, AnalyticsErrorEventSource.PROJECT_MEMBERS_PAGE);
         }
     });
 });

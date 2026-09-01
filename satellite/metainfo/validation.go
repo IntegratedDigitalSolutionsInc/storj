@@ -7,29 +7,34 @@ import (
 	"bytes"
 	"context"
 	"crypto/subtle"
+	"encoding/hex"
+	"errors"
 	"fmt"
 	"regexp"
 	"strconv"
-	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/zeebo/errs"
 	"go.uber.org/zap"
+	"golang.org/x/exp/slices"
 	"golang.org/x/time/rate"
 
 	"storj.io/common/encryption"
-	"storj.io/common/errs2"
 	"storj.io/common/macaroon"
 	"storj.io/common/memory"
 	"storj.io/common/pb"
 	"storj.io/common/rpc/rpcstatus"
 	"storj.io/common/storj"
+	"storj.io/common/time2"
 	"storj.io/common/uuid"
 	"storj.io/eventkit"
 	"storj.io/storj/satellite/accounting"
 	"storj.io/storj/satellite/buckets"
 	"storj.io/storj/satellite/console"
 	"storj.io/storj/satellite/console/consoleauth"
+	"storj.io/storj/satellite/entitlements"
 	"storj.io/storj/satellite/metabase"
 )
 
@@ -38,14 +43,25 @@ const (
 
 	maxRetentionDays  = 36500
 	maxRetentionYears = 10
+
+	minBucketNameLength = 3
+	maxBucketNameLength = 63
+
+	maxBucketTags          = 50
+	maxBucketTagKeyChars   = 128
+	maxBucketTagValueChars = 256
+
+	unauthorizedErrMsg = "Unauthorized API credentials"
+	bucketNameErrMsg   = "The specified bucket name must be at least %d and no more than %d characters long"
+
+	checksumsDisabledErrMsg = "Checksum options may not be provided at this time"
 )
 
 var (
-	ipRegexp           = regexp.MustCompile(`^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])$`)
-	unauthorizedErrMsg = "Unauthorized API credentials"
-)
+	ipRegexp = regexp.MustCompile(`^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])$`)
 
-var ek = eventkit.Package()
+	ek = eventkit.Package()
+)
 
 func getAPIKey(ctx context.Context, header *pb.RequestHeader) (key *macaroon.APIKey, err error) {
 	defer mon.Task()(&ctx)(&err)
@@ -68,6 +84,14 @@ func (endpoint *Endpoint) validateAuth(ctx context.Context, header *pb.RequestHe
 	key, keyInfo, err := endpoint.validateBasic(ctx, header, rateLimitKind)
 	if err != nil {
 		return nil, err
+	}
+
+	if endpoint.migrationModeFlag.Enabled() {
+		if _, found := endpoint.config.TestingMigratedProjects[keyInfo.ProjectID]; !found {
+			if !readAction(action) {
+				return nil, rpcstatus.Error(rpcstatus.ResourceExhausted, "try again later")
+			}
+		}
 	}
 
 	err = key.Check(ctx, keyInfo.Secret, keyInfo.Version, action, endpoint.revocations)
@@ -112,6 +136,16 @@ func (endpoint *Endpoint) ValidateAuthN(ctx context.Context, header *pb.RequestH
 		return nil, err
 	}
 
+	if endpoint.migrationModeFlag.Enabled() {
+		if _, found := endpoint.config.TestingMigratedProjects[keyInfo.ProjectID]; !found {
+			for _, p := range permissions {
+				if !readAction(p.Action) {
+					return nil, rpcstatus.Error(rpcstatus.ResourceExhausted, "try again later")
+				}
+			}
+		}
+	}
+
 	for _, p := range permissions {
 		err = key.Check(ctx, keyInfo.Secret, keyInfo.Version, p.Action, endpoint.revocations)
 		if p.ActionPermitted != nil {
@@ -124,6 +158,14 @@ func (endpoint *Endpoint) ValidateAuthN(ctx context.Context, header *pb.RequestH
 	}
 
 	return keyInfo, nil
+}
+
+func readAction(action macaroon.Action) bool {
+	switch action.Op {
+	case macaroon.ActionRead, macaroon.ActionList, macaroon.ActionGetObjectRetention, macaroon.ActionGetObjectLegalHold:
+		return true
+	}
+	return false
 }
 
 // ValidateAuthAny validates things like API keys, rate limit and user permissions.
@@ -152,6 +194,16 @@ func (endpoint *Endpoint) ValidateAuthAny(ctx context.Context, header *pb.Reques
 	key, keyInfo, err := endpoint.validateBasic(ctx, header, rateLimitKind)
 	if err != nil {
 		return nil, err
+	}
+
+	if endpoint.migrationModeFlag.Enabled() {
+		if _, found := endpoint.config.TestingMigratedProjects[keyInfo.ProjectID]; !found {
+			for _, p := range permissions {
+				if !readAction(p.Action) {
+					return nil, rpcstatus.Error(rpcstatus.ResourceExhausted, "try again later")
+				}
+			}
+		}
 	}
 
 	var combinedErrs error
@@ -194,23 +246,91 @@ func (endpoint *Endpoint) validateBasic(ctx context.Context, header *pb.RequestH
 	if keyInfo.UserAgent != nil {
 		userAgent = string(keyInfo.UserAgent)
 	}
-	ek.Event("auth",
+
+	// we add 3 tags now, 1 in a defer, and 4 tags in checkRate, so allocate space for
+	// 8 tags. the only downside to getting this number wrong is we do some unnecessary
+	// allocations.
+	authTags := make([]eventkit.Tag, 0, 8)
+	authTags = append(authTags,
 		eventkit.String("user-agent", userAgent),
-		eventkit.String("project", keyInfo.ProjectID.String()),
+		eventkit.String("project-public-id", keyInfo.ProjectPublicID.String()),
 		eventkit.String("partner", string(keyInfo.UserAgent)),
 	)
+	defer func() {
+		authTags = append(authTags,
+			// this might be OK but the overall rpc might still return some other
+			// code besides this one.
+			eventkit.String("basic-status", rpcstatus.Code(err).String()),
+		)
+
+		ek.Event("auth", authTags...)
+	}()
 
 	if err = endpoint.checkUserStatus(ctx, keyInfo); err != nil {
 		endpoint.log.Debug("user status check failed", zap.Error(err))
 		return nil, nil, err
 	}
 
-	if err = endpoint.checkRate(ctx, keyInfo, rateKind); err != nil {
+	if err = endpoint.checkRate(ctx, keyInfo, rateKind, &authTags); err != nil {
 		endpoint.log.Debug("rate check failed", zap.Error(err))
 		return nil, nil, err
 	}
 
+	err = endpoint.handleAPIKeyTails(ctx, key, keyInfo)
+	if err != nil {
+		endpoint.log.Debug("api key tails check failed", zap.Error(err))
+		return nil, nil, err
+	}
+
 	return key, keyInfo, nil
+}
+
+func (endpoint *Endpoint) handleAPIKeyTails(ctx context.Context, key *macaroon.APIKey, keyInfo *console.APIKeyInfo) error {
+	if endpoint.keyTailsHandler == nil {
+		return nil
+	}
+
+	if !keyInfo.Version.SupportsAuditability() {
+		// For non-auditable keys, store tails automatically.
+		combiner := endpoint.keyTailsHandler.combiner.Load()
+		if combiner != nil {
+			combiner.Enqueue(ctx, keyTailTask{
+				rootKeyID:  keyInfo.ID,
+				serialized: key.Serialize(),
+				raw:        key.SerializeRaw(),
+				secret:     keyInfo.Secret,
+			})
+		}
+
+		return nil
+	}
+
+	// For auditable keys, check that all tails exist.
+	mac, err := macaroon.ParseMacaroon(key.SerializeRaw())
+	if err != nil {
+		return rpcstatus.Errorf(rpcstatus.InvalidArgument, "invalid macaroon: %v", err)
+	}
+
+	tails := mac.Tails(keyInfo.Secret)
+	if len(tails) <= 1 {
+		return nil
+	}
+
+	tailsToCheck := tails[1:]
+
+	results, err := endpoint.apiKeyTails.CheckExistenceBatch(ctx, tailsToCheck)
+	if err != nil {
+		return rpcstatus.Errorf(rpcstatus.Internal, "failed to check tail existence: %v", err)
+	}
+
+	for _, tail := range tailsToCheck {
+		tailHex := hex.EncodeToString(tail)
+		if !results[tailHex] {
+			return rpcstatus.Errorf(rpcstatus.PermissionDenied, "unregistered tail not allowed for auditable API key")
+		}
+	}
+
+	return nil
 }
 
 func (endpoint *Endpoint) validateRevoke(ctx context.Context, header *pb.RequestHeader, macToRevoke *macaroon.Macaroon) (_ *console.APIKeyInfo, err error) {
@@ -239,11 +359,73 @@ func (endpoint *Endpoint) validateRevoke(ctx context.Context, header *pb.Request
 	return nil, rpcstatus.Error(rpcstatus.PermissionDenied, "Unauthorized attempt to revoke macaroon")
 }
 
+// validateSelfServePlacement enforces entitlements-first placement validation.
+// Rules:
+//  1. If entitlements are enabled and project has entitlements row: check placement is in that list.
+//     Placements not in selfServePlacements are allowed if entitlements explicitly grant them,
+//     but waitlisted placements (WaitlistURL set) are always denied.
+//  2. If entitlements are enabled but project not found in entitlements: fallback to selfServePlacements.
+//  3. If entitlements disabled: check selfServePlacements and project default placement.
+func (endpoint *Endpoint) validateSelfServePlacement(ctx context.Context, project *console.Project, placement storj.PlacementConstraint) error {
+	if endpoint.entitlementsConfig.Enabled {
+		feats, err := endpoint.entitlementsService.Projects().GetByPublicID(ctx, project.PublicID)
+		if err == nil {
+			// Project has entitlements row - use entitlements-based validation.
+			if len(feats.NewBucketPlacements) == 0 || !slices.Contains(feats.NewBucketPlacements, placement) {
+				return rpcstatus.Error(rpcstatus.PlacementInvalidValue, "placement not allowed")
+			}
+
+			if detail, exists := endpoint.selfServePlacements[placement]; exists && detail.WaitlistURL != "" {
+				return rpcstatus.Error(rpcstatus.PlacementInvalidValue, "placement not allowed")
+			}
+			// Allowed in entitlements and not waitlisted.
+			return nil
+		}
+		if !entitlements.ErrNotFound.Has(err) {
+			return rpcstatus.Error(rpcstatus.Internal, "unable to validate project entitlements")
+		}
+		// No entitlements row: fallback to global allowlist.
+	} else {
+		if project.DefaultPlacement != storj.DefaultPlacement {
+			return rpcstatus.Error(rpcstatus.PlacementConflictingValues, "conflicting placement values")
+		}
+	}
+
+	if detail, exists := endpoint.selfServePlacements[placement]; !exists || detail.WaitlistURL != "" {
+		return rpcstatus.Error(rpcstatus.PlacementInvalidValue, "placement not allowed")
+	}
+
+	// Allowed in self-serve placements.
+
+	return nil
+}
+
+// activeSunsetPlacements returns the configured sunset placement migrations, or nil while
+// the new pricing effective date hasn't passed or isn't configured.
+func (endpoint *Endpoint) activeSunsetPlacements() buckets.PlacementMigrations {
+	if endpoint.sunsetPlacementEffectiveDate.IsZero() || time.Now().Before(endpoint.sunsetPlacementEffectiveDate) {
+		return nil
+	}
+	return buckets.PlacementMigrations(endpoint.config.SunsetPlacements)
+}
+
+// allowedSunsetPlacementChange returns whether recreating bucket with `requested` placement
+// should be allowed given that it was originally created with `existing`. If the new pricing
+// effective date hasn't passed or isn't configured, this will always return false.
+func (endpoint *Endpoint) allowedSunsetPlacementChange(existing, requested storj.PlacementConstraint) bool {
+	sunsetMap := endpoint.activeSunsetPlacements()
+	if sunsetMap == nil {
+		return false
+	}
+	return sunsetMap.Allows(existing, requested)
+}
+
 // checkRate validates whether the rate limiter has been hit for a particular project and operation.
 // If the project has an operation-specific rate limit for the operation in question, that is used
 // Otherwise, if the project has a basic "project-level" rate limit, that is used
 // Otherwise, the global rate limit configs on the satellite are used.
-func (endpoint *Endpoint) checkRate(ctx context.Context, apiKeyInfo *console.APIKeyInfo, rateKind console.LimitKind) (err error) {
+// If eventTags is not nil, project rate limit tags are added to the eventTag list.
+func (endpoint *Endpoint) checkRate(ctx context.Context, apiKeyInfo *console.APIKeyInfo, rateKind console.LimitKind, eventTags *[]eventkit.Tag) (err error) {
 	defer mon.Task()(&ctx)(&err)
 	if !endpoint.config.RateLimiter.Enabled {
 		return nil
@@ -303,13 +485,17 @@ func (endpoint *Endpoint) checkRate(ctx context.Context, apiKeyInfo *console.API
 		if limiter.Burst() == 0 && limiter.Limit() == 0 {
 			return rpcstatus.Error(rpcstatus.PermissionDenied, "All access disabled")
 		}
-		endpoint.log.Warn("too many requests for project",
-			zap.Stringer("Project Public ID", apiKeyInfo.ProjectPublicID),
-			zap.Float64("rate limit", float64(limiter.Limit())),
-			zap.Float64("burst limit", float64(limiter.Burst())),
-			zap.Int("rate limit kind", int(rateKind)))
 
-		mon.Event("metainfo_rate_limit_exceeded") //mon:locked
+		if eventTags != nil {
+			*eventTags = append(*eventTags,
+				eventkit.Bool("project-limited", true),
+				eventkit.Float64("rate-limit", float64(limiter.Limit())),
+				eventkit.Float64("burst-limit", float64(limiter.Burst())),
+				eventkit.Int64("rate-limit-kind", int64(rateKind)),
+			)
+		}
+
+		mon.Event("metainfo_rate_limit_exceeded")
 
 		if rateKind != console.RateLimitPutNoError {
 			return rpcstatus.Error(rpcstatus.ResourceExhausted, "Too Many Requests")
@@ -332,7 +518,6 @@ func (endpoint *Endpoint) checkUserStatus(ctx context.Context, keyInfo *console.
 		return endpoint.users.GetUserInfoByProjectID(ctx, keyInfo.ProjectID)
 	})
 	if err != nil {
-		endpoint.log.Error("internal", zap.Error(err))
 		return rpcstatus.Error(rpcstatus.Internal, "unable to get user info")
 	}
 
@@ -347,8 +532,8 @@ func validateBucketNameLength(bucket []byte) (err error) {
 		return Error.Wrap(buckets.ErrNoBucket.New(""))
 	}
 
-	if len(bucket) < 3 || len(bucket) > 63 {
-		return Error.New("bucket name must be at least 3 and no more than 63 characters long")
+	if len(bucket) < minBucketNameLength || len(bucket) > maxBucketNameLength {
+		return Error.New(bucketNameErrMsg, minBucketNameLength, maxBucketNameLength)
 	}
 
 	return nil
@@ -369,7 +554,7 @@ func validateBucketName(bucket []byte) error {
 		}
 	}
 
-	if ipRegexp.MatchString(string(bucket)) {
+	if ipRegexp.Match(bucket) {
 		return Error.New("bucket name cannot be formatted as an IP address")
 	}
 
@@ -395,6 +580,16 @@ func validateBucketLabel(label []byte) error {
 		}
 	}
 
+	return nil
+}
+
+func validateBucketObjectLockStatus(bucket buckets.UploadBucket, retention metabase.Retention, legalHoldRequested bool) error {
+	if (retention.Enabled() || legalHoldRequested) && (bucket.Versioning != buckets.VersioningEnabled || !bucket.ObjectLock.Enabled) {
+		// note: AWS returns an "object lock configuration missing"
+		// error for both unversioned or missing object lock
+		// configuration.
+		return rpcstatus.Errorf(rpcstatus.ObjectLockBucketRetentionConfigurationMissing, "cannot specify Object Lock settings when uploading into a bucket without Object Lock enabled")
+	}
 	return nil
 }
 
@@ -639,21 +834,28 @@ func (endpoint *Endpoint) validateRemoteSegment(ctx context.Context, commitReque
 }
 
 func (endpoint *Endpoint) checkDownloadLimits(ctx context.Context, keyInfo *console.APIKeyInfo) error {
-	if exceeded, limit, err := endpoint.projectUsage.ExceedsBandwidthUsage(ctx, keyInfoToLimits(keyInfo)); err != nil {
-		if errs2.IsCanceled(err) {
-			return rpcstatus.Wrap(rpcstatus.Canceled, err)
+	bwLimit, err := endpoint.projectUsage.ExceedsBandwidthUsage(ctx, keyInfoToLimits(keyInfo), endpoint.config.LimitEmailNotificationsEnabled)
+	if err != nil {
+		// don't log errors if it was user cancellation
+		if !errors.Is(ctx.Err(), context.Canceled) {
+			endpoint.log.Error(
+				"Retrieving project bandwidth total failed; bandwidth limit won't be enforced",
+				zap.Stringer("public_id", keyInfo.ProjectPublicID),
+				zap.Error(err),
+			)
 		}
+		return nil
+	}
 
-		endpoint.log.Error(
-			"Retrieving project bandwidth total failed; bandwidth limit won't be enforced",
-			zap.Stringer("Project ID", keyInfo.ProjectID),
-			zap.Error(err),
-		)
-	} else if exceeded {
-		if limit > 0 {
+	if endpoint.config.LimitEmailNotificationsEnabled {
+		endpoint.enqueueThresholdEvents(ctx, keyInfo, bwLimit.BandwidthThresholds, bwLimit.BandwidthResets)
+	}
+
+	if bwLimit.Exceeds {
+		if bwLimit.Limit > 0 {
 			endpoint.log.Warn("Monthly bandwidth limit exceeded",
-				zap.Stringer("Limit", limit),
-				zap.Stringer("Project ID", keyInfo.ProjectID),
+				zap.Stringer("limit", bwLimit.Limit),
+				zap.Stringer("public_id", keyInfo.ProjectPublicID),
 			)
 		}
 		return rpcstatus.Error(rpcstatus.ResourceExhausted, "Exceeded Usage Limit")
@@ -669,11 +871,12 @@ func (endpoint *Endpoint) checkUploadLimitsForNewObject(
 	ctx context.Context, keyInfo *console.APIKeyInfo, newObjectSize int64, newObjectSegmentCount int64,
 ) error {
 	limit := endpoint.projectUsage.ExceedsUploadLimits(ctx, newObjectSize, newObjectSegmentCount, keyInfoToLimits(keyInfo))
+
 	if limit.ExceedsSegments {
 		if limit.SegmentsLimit > 0 {
 			endpoint.log.Warn("Segment limit exceeded",
-				zap.String("Limit", strconv.Itoa(int(limit.SegmentsLimit))),
-				zap.Stringer("Project ID", keyInfo.ProjectID),
+				zap.String("limit", strconv.Itoa(int(limit.SegmentsLimit))),
+				zap.Stringer("public_id", keyInfo.ProjectPublicID),
 			)
 		}
 		return rpcstatus.Error(rpcstatus.ResourceExhausted, "Exceeded Segments Limit")
@@ -682,8 +885,8 @@ func (endpoint *Endpoint) checkUploadLimitsForNewObject(
 	if limit.ExceedsStorage {
 		if limit.StorageLimit > 0 {
 			endpoint.log.Warn("Storage limit exceeded",
-				zap.String("Limit", strconv.Itoa(limit.StorageLimit.Int())),
-				zap.Stringer("Project ID", keyInfo.ProjectID),
+				zap.String("limit", strconv.Itoa(limit.StorageLimit.Int())),
+				zap.Stringer("public_id", keyInfo.ProjectPublicID),
 			)
 		}
 		return rpcstatus.Error(rpcstatus.ResourceExhausted, "Exceeded Storage Limit")
@@ -692,26 +895,49 @@ func (endpoint *Endpoint) checkUploadLimitsForNewObject(
 	return nil
 }
 
-func (endpoint *Endpoint) addSegmentToUploadLimits(ctx context.Context, keyInfo *console.APIKeyInfo, segmentSize int64) error {
-	return endpoint.addToUploadLimits(ctx, keyInfo, segmentSize, 1)
+// enqueueThresholdEvents inserts threshold and reset events into the project limit events queue.
+// Individual inserts are used intentionally: thresholds contains at most one event (only the highest
+// newly-crossed threshold is emitted) and resets contains at most two, so the overhead is negligible.
+func (endpoint *Endpoint) enqueueThresholdEvents(ctx context.Context, keyInfo *console.APIKeyInfo, thresholds, resets []accounting.ProjectUsageThreshold) {
+	for _, eventType := range thresholds {
+		if _, err := endpoint.projectLimitEventsDB.Insert(ctx, keyInfo.ProjectID, eventType, false); err != nil {
+			if !errors.Is(ctx.Err(), context.Canceled) {
+				endpoint.log.Error("Could not insert project limit threshold event",
+					zap.Stringer("public_id", keyInfo.ProjectPublicID),
+					zap.Error(err),
+				)
+			}
+		}
+	}
+	for _, eventType := range resets {
+		if _, err := endpoint.projectLimitEventsDB.Insert(ctx, keyInfo.ProjectID, eventType, true); err != nil {
+			if !errors.Is(ctx.Err(), context.Canceled) {
+				endpoint.log.Error("Could not insert project limit reset event",
+					zap.Stringer("public_id", keyInfo.ProjectPublicID),
+					zap.Error(err),
+				)
+			}
+		}
+	}
 }
 
-func (endpoint *Endpoint) addToUploadLimits(ctx context.Context, keyInfo *console.APIKeyInfo, size, segmentCount int64) error {
+func (endpoint *Endpoint) addSegmentToUploadLimits(ctx context.Context, keyInfo *console.APIKeyInfo, segmentSize int64) {
+	endpoint.addToUploadLimits(ctx, keyInfo, segmentSize, 1)
+}
+
+func (endpoint *Endpoint) addToUploadLimits(ctx context.Context, keyInfo *console.APIKeyInfo, size, segmentCount int64) {
 	if err := endpoint.projectUsage.UpdateProjectStorageAndSegmentUsage(ctx, keyInfoToLimits(keyInfo), size, segmentCount); err != nil {
-		if errs2.IsCanceled(err) {
-			return rpcstatus.Wrap(rpcstatus.Canceled, err)
+		// don't log errors if it was user cancellation
+		if !errors.Is(ctx.Err(), context.Canceled) {
+			// log it and continue. it's most likely our own fault that we couldn't
+			// track it, and the only thing that will be affected is our per-project
+			// bandwidth and storage limits.
+			endpoint.log.Error("Could not track new project's storage and segment usage",
+				zap.Stringer("public_id", keyInfo.ProjectPublicID),
+				zap.Error(err),
+			)
 		}
-
-		// log it and continue. it's most likely our own fault that we couldn't
-		// track it, and the only thing that will be affected is our per-project
-		// bandwidth and storage limits.
-		endpoint.log.Error("Could not track new project's storage and segment usage",
-			zap.Stringer("Project ID", keyInfo.ProjectID),
-			zap.Error(err),
-		)
 	}
-
-	return nil
 }
 
 func (endpoint *Endpoint) addStorageUsageUpToLimit(ctx context.Context, keyInfo *console.APIKeyInfo, storage int64, segments int64) (err error) {
@@ -720,21 +946,20 @@ func (endpoint *Endpoint) addStorageUsageUpToLimit(ctx context.Context, keyInfo 
 	if err != nil {
 		if accounting.ErrProjectLimitExceeded.Has(err) {
 			endpoint.log.Warn("Upload limit exceeded",
-				zap.Stringer("Project ID", keyInfo.ProjectID),
+				zap.Stringer("public_id", keyInfo.ProjectPublicID),
 				zap.Error(err),
 			)
 			return rpcstatus.Error(rpcstatus.ResourceExhausted, err.Error())
 		}
 
-		if errs2.IsCanceled(err) {
-			return rpcstatus.Wrap(rpcstatus.Canceled, err)
+		// don't log errors if it was user cancellation
+		if !errors.Is(ctx.Err(), context.Canceled) {
+			endpoint.log.Error(
+				"Updating project upload limits failed; limits won't be enforced",
+				zap.Stringer("public_id", keyInfo.ProjectPublicID),
+				zap.Error(err),
+			)
 		}
-
-		endpoint.log.Error(
-			"Updating project upload limits failed; limits won't be enforced",
-			zap.Stringer("Project ID", keyInfo.ProjectID),
-			zap.Error(err),
-		)
 	}
 
 	return nil
@@ -742,37 +967,173 @@ func (endpoint *Endpoint) addStorageUsageUpToLimit(ctx context.Context, keyInfo 
 
 // checkEncryptedMetadata checks encrypted metadata and it's encrypted key sizes. Metadata encrypted key nonce
 // is serialized to storj.Nonce automatically.
-func (endpoint *Endpoint) checkEncryptedMetadataSize(encryptedMetadata, encryptedKey []byte) error {
-	metadataSize := memory.Size(len(encryptedMetadata))
+func (endpoint *Endpoint) checkEncryptedMetadataSize(userData metabase.EncryptedUserData) error {
+	metadataSize := memory.Size(len(userData.EncryptedMetadata) + len(userData.EncryptedETag) + len(userData.Checksum.EncryptedValue))
 	if metadataSize > endpoint.config.MaxMetadataSize {
 		return rpcstatus.Errorf(rpcstatus.InvalidArgument, "Encrypted metadata is too large, got %v, maximum allowed is %v", metadataSize, endpoint.config.MaxMetadataSize)
 	}
 
-	// verify key only if any metadata was set
-	if metadataSize > 0 && len(encryptedKey) != encryptedKeySize {
-		return rpcstatus.Errorf(rpcstatus.InvalidArgument, "Encrypted metadata key size is invalid, got %v, expected %v", len(encryptedKey), encryptedKeySize)
+	if userData.EncryptedMetadataEncryptedKey != nil && len(userData.EncryptedMetadataEncryptedKey) != encryptedKeySize {
+		return rpcstatus.Errorf(rpcstatus.InvalidArgument, "Encrypted metadata key size is invalid, got %v, expected %v", len(userData.EncryptedMetadataEncryptedKey), encryptedKeySize)
 	}
 	return nil
 }
 
-func (endpoint *Endpoint) checkObjectUploadRate(ctx context.Context, projectID uuid.UUID, bucketName []byte, objectKey []byte) error {
+func (endpoint *Endpoint) validateChecksumOptions(checksumAlgorithm pb.ObjectChecksumAlgorithm, isChecksumComposite bool, encryptedChecksum []byte) error {
+	if err := endpoint.validateChecksumOptionsForBegin(checksumAlgorithm, isChecksumComposite, encryptedChecksum); err != nil {
+		return err
+	}
+	if checksumAlgorithm != pb.ObjectChecksumAlgorithm_NONE && encryptedChecksum == nil {
+		return rpcstatus.Error(rpcstatus.ChecksumMissing, "A checksum must be provided if a checksum algorithm is provided")
+	}
+	return nil
+}
+
+func (endpoint *Endpoint) validateChecksumOptionsForBegin(checksumAlgorithm pb.ObjectChecksumAlgorithm, isChecksumComposite bool, encryptedChecksum []byte) error {
+	hasChecksumOpt := checksumAlgorithm != pb.ObjectChecksumAlgorithm_NONE || isChecksumComposite || encryptedChecksum != nil
+	if hasChecksumOpt {
+		if !endpoint.config.ChecksumsEnabled {
+			return rpcstatus.Error(rpcstatus.ChecksumsUnsupported, checksumsDisabledErrMsg)
+		}
+	} else {
+		return nil
+	}
+
+	if checksumAlgorithm < pb.ObjectChecksumAlgorithm_NONE || checksumAlgorithm > pb.ObjectChecksumAlgorithm_SHA256 {
+		return rpcstatus.Error(rpcstatus.ChecksumAlgorithmInvalid, "The checksum algorithm is invalid")
+	}
+
+	if checksumAlgorithm == pb.ObjectChecksumAlgorithm_NONE {
+		if isChecksumComposite {
+			return rpcstatus.Error(rpcstatus.ChecksumTypeUnexpected, "A checksum type must not be provided if a checksum algorithm is not provided")
+		}
+		if encryptedChecksum != nil {
+			return rpcstatus.Error(rpcstatus.ChecksumUnexpected, "A checksum must not be provided if a checksum algorithm is not provided")
+		}
+	}
+
+	return nil
+}
+
+func (endpoint *Endpoint) checkObjectUploadRate(ctx context.Context, publicID uuid.UUID, bucketName []byte, objectKey []byte) error {
 	if !endpoint.config.UploadLimiter.Enabled {
 		return nil
 	}
 
-	limited := true
-	// if object location is in cache it means that we won't allow to upload yet here,
-	// if it's not or internally key expired we are good to go
-	key := strings.Join([]string{string(projectID[:]), string(bucketName), string(objectKey)}, "/")
-	_, _ = endpoint.singleObjectLimitCache.Get(ctx, key, func() (struct{}, error) {
-		limited = false
-		return struct{}{}, nil
-	})
-	if limited {
+	if !endpoint.singleObjectUploadLimitCache.Allow(time2.Now(ctx),
+		bytes.Join([][]byte{publicID[:], bucketName, objectKey}, []byte{'/'})) {
+		ek.Event("single-object-upload-limit",
+			eventkit.String("project-public-id", publicID.String()),
+			eventkit.String("bucket", string(bucketName)),
+			eventkit.Bytes("object-key", objectKey),
+		)
 		return rpcstatus.Error(rpcstatus.ResourceExhausted, "Too Many Requests")
 	}
 
 	return nil
+}
+
+func (endpoint *Endpoint) validateDeleteObjectsRequestSimple(req *pb.DeleteObjectsRequest) (err error) {
+	bucketNameLen := len(req.Bucket)
+	if bucketNameLen == 0 {
+		return rpcstatus.Error(rpcstatus.BucketNameMissing, "A bucket name is required")
+	}
+	if err := validateBucketNameLength(req.Bucket); err != nil {
+		return rpcstatus.Error(rpcstatus.BucketNameInvalid, err.Error())
+	}
+
+	numItems := len(req.Items)
+	if numItems == 0 {
+		return rpcstatus.Error(rpcstatus.DeleteObjectsNoItems, "The list of objects must contain at least one item")
+	}
+	if numItems > metabase.DeleteObjectsMaxItems {
+		return rpcstatus.Error(rpcstatus.DeleteObjectsTooManyItems, "The list of objects contains too many items")
+	}
+
+	for _, item := range req.Items {
+		objectKeyLen := len(item.EncryptedObjectKey)
+		if objectKeyLen == 0 {
+			return rpcstatus.Error(rpcstatus.ObjectKeyMissing, "An object key was not provided")
+		}
+		if objectKeyLen > endpoint.config.MaxEncryptedObjectKeyLength {
+			return rpcstatus.Error(rpcstatus.ObjectKeyTooLong, "A provided object key is too long")
+		}
+
+		if versionLen := len(item.ObjectVersion); versionLen > 0 {
+			invalid := versionLen != len(metabase.StreamVersionID{})
+			if !invalid {
+				invalid = metabase.StreamVersionID(item.ObjectVersion).Version() == 0
+			}
+			if invalid {
+				return rpcstatus.Error(rpcstatus.ObjectVersionInvalid, "A provided object version is invalid")
+			}
+		}
+	}
+
+	return nil
+}
+
+func (endpoint *Endpoint) validateSetBucketTaggingRequestSimple(req *pb.SetBucketTaggingRequest) (err error) {
+	bucketNameLen := len(req.Name)
+	if bucketNameLen == 0 {
+		return rpcstatus.Error(rpcstatus.BucketNameMissing, "A bucket name is required")
+	}
+	if err := validateBucketNameLength(req.Name); err != nil {
+		return rpcstatus.Error(rpcstatus.BucketNameInvalid, err.Error())
+	}
+
+	numTags := len(req.Tags)
+	if numTags > maxBucketTags {
+		return rpcstatus.Error(rpcstatus.TooManyTags, "The tag set contains too many items")
+	}
+
+	keys := make(map[string]struct{}, numTags)
+	for _, protoTag := range req.Tags {
+		key := string(protoTag.Key)
+		if _, seen := keys[key]; seen {
+			return rpcstatus.Error(rpcstatus.TagKeyDuplicate, "A provided tag key is duplicated")
+		}
+		keys[key] = struct{}{}
+
+		if len(key) == 0 {
+			return rpcstatus.Error(rpcstatus.TagKeyInvalid, "A tag key was not provided")
+		}
+		if !utf8.ValidString(key) {
+			return rpcstatus.Error(rpcstatus.TagKeyInvalid, "A provided tag key is not a valid UTF-8 string")
+		}
+		if utf8.RuneCountInString(key) > maxBucketTagKeyChars {
+			return rpcstatus.Error(rpcstatus.TagKeyInvalid, "A provided tag key is too long")
+		}
+		for _, r := range key {
+			if !isTagRuneValid(r) {
+				return rpcstatus.Error(rpcstatus.TagKeyInvalid, "A provided tag key contains a disallowed character")
+			}
+		}
+
+		value := string(protoTag.Value)
+		if !utf8.ValidString(value) {
+			return rpcstatus.Error(rpcstatus.TagValueInvalid, "A provided tag value is not a valid UTF-8 string")
+		}
+		if utf8.RuneCountInString(value) > maxBucketTagValueChars {
+			return rpcstatus.Error(rpcstatus.TagValueInvalid, "A provided tag value is too long")
+		}
+		for _, r := range value {
+			if !isTagRuneValid(r) {
+				return rpcstatus.Error(rpcstatus.TagValueInvalid, "A provided tag value contains a disallowed character")
+			}
+		}
+	}
+
+	return nil
+}
+
+func isTagRuneValid(r rune) bool {
+	switch r {
+	case '+', '-', '.', '/', ':', '=', '@', '_':
+		return true
+	default:
+		return unicode.IsLetter(r) || unicode.IsDigit(r) || unicode.IsSpace(r)
+	}
 }
 
 func keyInfoToLimits(keyInfo *console.APIKeyInfo) accounting.ProjectLimits {
@@ -788,5 +1149,14 @@ func keyInfoToLimits(keyInfo *console.APIKeyInfo) accounting.ProjectLimits {
 
 		RateLimit:  keyInfo.ProjectRateLimit,
 		BurstLimit: keyInfo.ProjectBurstLimit,
+
+		NotificationFlags: keyInfo.LimitNotificationFlags,
 	}
+}
+
+func validateServerSideCopyFlag(flag bool, trustedUplink bool) error {
+	if flag && !trustedUplink {
+		return rpcstatus.Error(rpcstatus.InvalidArgument, "ServerSideCopy flag is only allowed for trusted uplink clients")
+	}
+	return nil
 }

@@ -5,27 +5,36 @@ import { computed, reactive, ref } from 'vue';
 import { defineStore } from 'pinia';
 
 import {
+    type AddCardRequest,
+    type AddFundsResponse,
+    type BillingAddress,
+    type BillingInformation,
+    type ChargeCardIntent,
+    type Coupon,
+    type NativePaymentHistoryItem,
+    type PaymentHistoryParam,
+    type PaymentsApi,
+    type PaymentsHistoryItem,
+    type PaymentWithConfirmations,
+    type PriceModelForPlacementRequest,
+    type PurchaseRequest,
+    type Tax,
+    type TaxCountry,
+    type UpdateCardParams,
     AccountBalance,
-    BillingInformation,
-    BillingAddress,
-    Coupon,
     CreditCard,
     DateRange,
-    NativePaymentHistoryItem,
     PaymentHistoryPage,
-    PaymentHistoryParam,
-    PaymentsApi,
     PaymentStatus,
-    PaymentWithConfirmations,
-    ProjectCharges,
-    ProjectUsagePriceModel,
+    ProductCharges,
+    UsagePriceModel,
     Wallet,
-    TaxCountry,
-    Tax,
-    TaxID,
 } from '@/types/payments';
 import { PaymentsHttpApi } from '@/api/payments';
-import { PricingPlanInfo } from '@/types/common';
+import { PricingPlanInfo, PricingPlanType } from '@/types/common';
+import { useConfigStore } from '@/store/modules/configStore';
+import { useUsersStore } from '@/store/modules/usersStore';
+import { CENTS_MB_TO_DOLLARS_GB_SHIFT, centsToDollars, decimalShift, formatPrice } from '@/utils/strings';
 
 export class PaymentsState {
     public balance: AccountBalance = new AccountBalance();
@@ -33,8 +42,8 @@ export class PaymentsState {
     public paymentsHistory: PaymentHistoryPage = new PaymentHistoryPage([]);
     public pendingPaymentsWithConfirmations: PaymentWithConfirmations[] = [];
     public nativePaymentsHistory: NativePaymentHistoryItem[] = [];
-    public projectCharges: ProjectCharges = new ProjectCharges();
-    public usagePriceModel: ProjectUsagePriceModel = new ProjectUsagePriceModel();
+    public usagePriceModel: UsagePriceModel = new UsagePriceModel();
+    public productCharges: ProductCharges = new ProductCharges();
     public startDate: Date = new Date();
     public endDate: Date = new Date();
     public coupon: Coupon | null = null;
@@ -44,6 +53,7 @@ export class PaymentsState {
     public taxes: Tax[] = [];
     public pricingPlansAvailable: boolean = false;
     public pricingPlanInfo: PricingPlanInfo | null = null;
+    public failedInvoice: PaymentsHistoryItem | null = null;
 }
 
 export const useBillingStore = defineStore('billing', () => {
@@ -51,9 +61,139 @@ export const useBillingStore = defineStore('billing', () => {
 
     const api: PaymentsApi = new PaymentsHttpApi();
 
+    const configStore = useConfigStore();
+    const usersStore = useUsersStore();
+    const csrfToken = computed<string>(() => configStore.state.config.csrfToken);
+
     const paymentsPollingInterval = ref<number>();
 
     const defaultCard = computed<CreditCard>(() => state.creditCards.find(card => card.isDefault) ?? new CreditCard());
+
+    const upgradePayUpfrontAmount = computed<number>(() => {
+        if (usersStore.isLegacyPricingUserAgent) {
+            return configStore.state.config.legacyUpgradePayUpfrontAmount;
+        }
+        return configStore.state.config.upgradePayUpfrontAmount;
+    });
+
+    const showNewPricingTiers = computed<boolean>(() => configStore.state.config.showNewPricingTiers);
+
+    const storagePrice = computed(() => {
+        const storage =  formatPrice(decimalShift(configStore.state.config.storageMBMonthCents, CENTS_MB_TO_DOLLARS_GB_SHIFT));
+        return `${storage} per GB-month`;
+    });
+
+    const egressPrice = computed(() => {
+        const egress = formatPrice(decimalShift(configStore.state.config.egressMBCents, CENTS_MB_TO_DOLLARS_GB_SHIFT));
+        return `${egress} per GB`;
+    });
+
+    const segmentPrice = computed(() => formatPrice(decimalShift(configStore.state.config.segmentMonthCents, 2)));
+
+    const minimumChargeLink = '<a href="https://storj.dev/dcs/pricing#minimum-monthly-billing" target="_blank">minimum monthly usage fee</a>';
+
+    const minimumCharge = computed(() => configStore.minimumCharge);
+
+    const proPlanCostInfo = computed<string>(() => {
+        let minimumChargeTxt: string;
+
+        if (minimumCharge.value.isEnabledForUser(usersStore.isLegacyPricingUserAgent)) {
+            minimumChargeTxt = `Minimum charge: ${minimumCharge.value.getAmountString(usersStore.isLegacyPricingUserAgent)}/month plus usage.`;
+        } else {
+            minimumChargeTxt = 'No minimum, billed monthly.';
+        }
+
+        if (configStore.isDefaultBrand) {
+            minimumChargeTxt += '<a href="https://storj.dev/dcs/pricing" target="_blank">View pricing</a>';
+        }
+
+        return minimumChargeTxt;
+    });
+
+    const proMinimumInfo = computed<string>(() => {
+        // if (!minimumCharge.value.enabled) return '';
+        let minimumChargeTxt = 'Only pay for what you use';
+
+        if (minimumCharge.value.isEnabledForUser(usersStore.isLegacyPricingUserAgent)) {
+            minimumChargeTxt += `, with a ${minimumChargeLink} of ${minimumCharge.value.getAmountString(usersStore.isLegacyPricingUserAgent)}.`;
+        } else {
+            minimumChargeTxt += '. No minimum, billed monthly.';
+        }
+
+        return minimumChargeTxt;
+    });
+
+    const freePlanInfo = computed(() => {
+        const info = new PricingPlanInfo({
+            type: PricingPlanType.FREE,
+            planTitle: 'Free Trial',
+            planCTA: 'Start Free Trial',
+            planInfo: configStore.isDefaultBrand ? [
+                '25GB storage included',
+                '25GB download included',
+                '1 project',
+            ] : [],
+        });
+        if (new Date() >= new Date(configStore.state.config.newPricingEffectiveDate)) {
+            info.planSubtitle = `Try ${configStore.brandName} for free for 30 days and get started with no payment details needed to get started.`;
+        } else {
+            info.planSubtitle = `Perfect for trying out ${configStore.brandName}.`;
+            info.planCost = 'Free';
+            info.planCostInfo = `${configStore.freeTrialDuration} trial, no card needed.`;
+        }
+
+        return info;
+    });
+
+    const proPlanInfo = computed(() => {
+        const priceSummaries = configStore.state.config.productPriceSummaries ?? [];
+
+        const payUpfrontDollars = centsToDollars(upgradePayUpfrontAmount.value);
+
+        const info =  new PricingPlanInfo({
+            type: PricingPlanType.PRO,
+            planMinimumFeeInfo:  proMinimumInfo.value,
+            activationButtonText: upgradePayUpfrontAmount.value > 0 ? `Activate account - ${payUpfrontDollars}` : 'Activate account',
+            planUpfrontCharge: upgradePayUpfrontAmount.value > 0 ? `${payUpfrontDollars}` : '',
+            planBalanceCredit: upgradePayUpfrontAmount.value > 0 ? `${payUpfrontDollars}` : '',
+        });
+
+        if (new Date() >= new Date(configStore.state.config.newPricingEffectiveDate)) {
+            /*
+            Start without limits on Standard or Advanced plans. Monthly billing per project with a ${minimumCharge.value.amount} account minimum.
+            * */
+            info.planTitle = `Pay as you go`;
+            info.planSubtitle = `Start without limits on Standard or Advanced plans. Monthly billing per project with a ${minimumCharge.value.getAmountString(usersStore.isLegacyPricingUserAgent)} account minimum.`;
+            info.planSubtitle += '&nbsp;<a href="https://storj.dev/dcs/pricing" target="_blank">View pricing</a>';
+            info.planCTA = 'Enter payment details';
+            info.planInfo =  configStore.isDefaultBrand ? [
+                'Unlimited storage',
+                'Unlimited download',
+                '3+ Projects',
+                'Custom domain',
+                'Priority support',
+            ] : [];
+        } else {
+            info.planTitle = `Pro Account`;
+            info.planSubtitle = `Scale as you grow with usage based pricing.`;
+            info.planCost = 'Pay-as-you-go';
+            info.planCostInfo = proPlanCostInfo.value;
+            info.planCTA = 'Start Pro Account';
+            info.planInfo =  configStore.isDefaultBrand ? [
+                showNewPricingTiers.value ? '' : `Storage as low as ${storagePrice.value}`,
+                showNewPricingTiers.value ? '' : `Download bandwidth as low as ${egressPrice.value}`,
+                showNewPricingTiers.value ? '' : `Per-segment fee of ${segmentPrice.value}`,
+                ...(showNewPricingTiers.value ? priceSummaries : []),
+                'Set your own usage limits',
+                '3 projects (+ more on request)',
+                'Unlimited team members',
+                'Custom domain support',
+                'Priority support',
+            ] : [];
+        }
+
+        return info;
+    });
 
     async function getBalance(): Promise<AccountBalance> {
         const balance: AccountBalance = await api.getBalance();
@@ -74,15 +214,28 @@ export const useBillingStore = defineStore('billing', () => {
         state.taxes = await api.getCountryTaxes(countryCode);
     }
 
-    async function addTaxID(taxID: TaxID): Promise<void> {
-        state.billingInformation = await api.addTaxID(taxID);
+    async function addFunds(cardID: string, amount: number, intent: ChargeCardIntent): Promise<AddFundsResponse> {
+        return await api.addFunds(cardID, amount, intent, csrfToken.value);
     }
+
+    async function createIntent(amount: number, withCustomCard: boolean): Promise<string> {
+        return await api.createIntent(amount, withCustomCard, csrfToken.value);
+    }
+
+    async function getCardSetupSecret(): Promise<string> {
+        return await api.getCardSetupSecret();
+    }
+
+    async function addTaxID(type: string, value: string): Promise<void> {
+        state.billingInformation = await api.addTaxID(type, value, csrfToken.value);
+    }
+
     async function removeTaxID(ID: string): Promise<void> {
-        state.billingInformation = await api.removeTaxID(ID);
+        state.billingInformation = await api.removeTaxID(ID, csrfToken.value);
     }
 
     async function addInvoiceReference(reference: string): Promise<void> {
-        state.billingInformation = await api.addInvoiceReference(reference);
+        state.billingInformation = await api.addInvoiceReference(reference, csrfToken.value);
     }
 
     async function getBillingInformation(): Promise<void> {
@@ -90,7 +243,7 @@ export const useBillingStore = defineStore('billing', () => {
     }
 
     async function saveBillingAddress(address: BillingAddress): Promise<void> {
-        state.billingInformation = await api.saveBillingAddress(address);
+        state.billingInformation = await api.saveBillingAddress(address, csrfToken.value);
     }
 
     async function getWallet(): Promise<void> {
@@ -98,11 +251,11 @@ export const useBillingStore = defineStore('billing', () => {
     }
 
     async function claimWallet(): Promise<void> {
-        state.wallet = await api.claimWallet();
+        state.wallet = await api.claimWallet(csrfToken.value);
     }
 
     async function setupAccount(): Promise<string> {
-        return await api.setupAccount();
+        return await api.setupAccount(csrfToken.value);
     }
 
     async function getCreditCards(): Promise<CreditCard[]> {
@@ -113,24 +266,20 @@ export const useBillingStore = defineStore('billing', () => {
         return creditCards;
     }
 
-    async function addCreditCard(token: string): Promise<void> {
-        await api.addCreditCard(token);
+    async function updateCreditCard(params: UpdateCardParams): Promise<void> {
+        await api.updateCreditCard(params, csrfToken.value);
     }
 
-    async function addCardByPaymentMethodID(pmID: string): Promise<void> {
-        await api.addCardByPaymentMethodID(pmID);
+    async function addCardByPaymentMethodID(request: AddCardRequest): Promise<void> {
+        await api.addCardByPaymentMethodID(request, csrfToken.value);
     }
 
     async function attemptPayments(): Promise<void> {
-        await api.attemptPayments();
-    }
-
-    function clearPendingPayments(): void {
-        state.pendingPaymentsWithConfirmations = [];
+        await api.attemptPayments(csrfToken.value);
     }
 
     async function makeCardDefault(id: string): Promise<void> {
-        await api.makeCreditCardDefault(id);
+        await api.makeCreditCardDefault(id, csrfToken.value);
 
         state.creditCards.forEach(card => {
             card.isDefault = card.id === id;
@@ -138,13 +287,17 @@ export const useBillingStore = defineStore('billing', () => {
     }
 
     async function removeCreditCard(cardId: string): Promise<void> {
-        await api.removeCreditCard(cardId);
+        await api.removeCreditCard(cardId, csrfToken.value);
 
         state.creditCards = state.creditCards.filter(card => card.id !== cardId);
     }
 
     async function getPaymentsHistory(params: PaymentHistoryParam): Promise<void> {
         state.paymentsHistory = await api.paymentsHistory(params);
+    }
+
+    async function getFailedInvoice(): Promise<void> {
+        state.failedInvoice = await api.getFailedInvoice();
     }
 
     async function getNativePaymentsHistory(): Promise<void> {
@@ -182,12 +335,12 @@ export const useBillingStore = defineStore('billing', () => {
         });
     }
 
-    async function getProjectUsageAndChargesCurrentRollup(): Promise<void> {
+    async function getProductUsageAndChargesCurrentRollup(): Promise<void> {
         const now = new Date();
         const endUTC = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), now.getUTCHours(), now.getUTCMinutes()));
         const startUTC = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1, 0, 0));
 
-        state.projectCharges = await api.projectsUsageAndCharges(startUTC, endUTC);
+        state.productCharges = await api.productsUsageAndCharges(startUTC, endUTC);
 
         const dateRange = new DateRange(startUTC, endUTC);
         state.startDate = dateRange.startDate;
@@ -198,8 +351,12 @@ export const useBillingStore = defineStore('billing', () => {
         state.usagePriceModel = await api.projectUsagePriceModel();
     }
 
+    async function getPriceModelForPlacement(params: PriceModelForPlacementRequest): Promise<UsagePriceModel> {
+        return await api.getPlacementPriceModel(params);
+    }
+
     async function applyCouponCode(code: string): Promise<void> {
-        state.coupon = await api.applyCouponCode(code);
+        state.coupon = await api.applyCouponCode(code, csrfToken.value);
     }
 
     async function getCoupon(): Promise<void> {
@@ -210,13 +367,27 @@ export const useBillingStore = defineStore('billing', () => {
         return await api.pricingPackageAvailable();
     }
 
-    async function purchasePricingPackage(dataStr: string, isPMID: boolean): Promise<void> {
-        await api.purchasePricingPackage(dataStr, isPMID);
+    async function purchasePricingPackage(request: PurchaseRequest): Promise<void> {
+        await api.purchase(request, csrfToken.value);
+    }
+
+    async function purchaseUpgradedAccount(request: PurchaseRequest): Promise<void> {
+        await api.purchase(request, csrfToken.value);
     }
 
     function setPricingPlansAvailable(available: boolean, info: PricingPlanInfo | null = null): void {
+        if (info) {
+            info.planMinimumFeeInfo = `After the discount is used or expires, continue with pay-as-you-go.`;
+            info.planMinimumFeeInfo += '&nbsp;<a href="https://storj.dev/dcs/pricing" target="_blank">View pricing</a>';
+            if (minimumCharge.value.isEnabledForUser(usersStore.isLegacyPricingUserAgent))
+                info.planInfo.push(`${minimumCharge.value.getAmountString(usersStore.isLegacyPricingUserAgent)} minimum monthly usage after validity period`);
+        }
         state.pricingPlansAvailable = available;
         state.pricingPlanInfo = info;
+    }
+
+    async function startFreeTrial(): Promise<void> {
+        await api.startFreeTrial(csrfToken.value);
     }
 
     function clear(): void {
@@ -226,8 +397,8 @@ export const useBillingStore = defineStore('billing', () => {
         state.creditCards = [];
         state.paymentsHistory = new PaymentHistoryPage([]);
         state.nativePaymentsHistory = [];
-        state.projectCharges = new ProjectCharges();
-        state.usagePriceModel = new ProjectUsagePriceModel();
+        state.usagePriceModel = new UsagePriceModel();
+        state.productCharges = new ProductCharges();
         state.pendingPaymentsWithConfirmations = [];
         state.startDate = new Date();
         state.endDate = new Date();
@@ -236,16 +407,26 @@ export const useBillingStore = defineStore('billing', () => {
         state.billingInformation = null;
         state.pricingPlansAvailable = false;
         state.pricingPlanInfo = null;
+        state.failedInvoice = null;
     }
 
     return {
         state,
         defaultCard,
+        freePlanInfo,
+        proPlanInfo,
+        storagePrice,
+        egressPrice,
+        segmentPrice,
+        upgradePayUpfrontAmount,
         getBalance,
         getWallet,
         getTaxCountries,
         getCountryTaxes,
         addTaxID,
+        addFunds,
+        createIntent,
+        getCardSetupSecret,
         removeTaxID,
         getBillingInformation,
         addInvoiceReference,
@@ -253,23 +434,26 @@ export const useBillingStore = defineStore('billing', () => {
         claimWallet,
         setupAccount,
         getCreditCards,
-        addCreditCard,
+        updateCreditCard,
         addCardByPaymentMethodID,
         attemptPayments,
         makeCardDefault,
         removeCreditCard,
         getPaymentsHistory,
+        getFailedInvoice,
         getNativePaymentsHistory,
-        getProjectUsageAndChargesCurrentRollup,
+        getProductUsageAndChargesCurrentRollup,
         startPaymentsPolling,
         stopPaymentsPolling,
-        clearPendingPayments,
         getProjectUsagePriceModel,
+        getPriceModelForPlacement,
         applyCouponCode,
         getCoupon,
         getPricingPackageAvailable,
         purchasePricingPackage,
+        purchaseUpgradedAccount,
         setPricingPlansAvailable,
+        startFreeTrial,
         clear,
     };
 });

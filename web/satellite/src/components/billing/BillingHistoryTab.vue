@@ -2,99 +2,128 @@
 // See LICENSE for copying information.
 
 <template>
-    <v-card variant="flat">
-        <v-data-table-server
-            :loading="isLoading"
-            :headers="headers"
-            :items="historyItems"
-            :items-length="historyItems.length"
-            :must-sort="false"
-            no-data-text="No results found"
-            hover
-        >
-            <template #item.amount="{ item }">
-                <span>
-                    {{ centsToDollars(item.amount) }}
-                </span>
-            </template>
-            <template #item.formattedStart="{ item }">
-                <span class="font-weight-bold">
-                    {{ item.formattedStart }}
-                </span>
-            </template>
-            <template #item.formattedStatus="{ item }">
-                <v-chip :color="getColor(item.formattedStatus)" variant="tonal" size="small" class="font-weight-bold">
-                    {{ item.formattedStatus }}
-                </v-chip>
-            </template>
-            <template #item.link="{ item }">
-                <v-btn v-if="item.link" variant="flat" size="small" :href="item.link">
-                    Download
+    <v-data-table-server
+        :loading="isLoading"
+        :headers="headers"
+        :items="historyItems"
+        :items-length="historyItems.length"
+        :must-sort="false"
+        no-data-text="No results found"
+        hover
+    >
+        <template #item.amount="{ item }">
+            <span>
+                {{ centsToDollars(item.amount) }}
+            </span>
+        </template>
+        <template #item.period="{ item }">
+            <span class="font-weight-bold">
+                {{ item.period }}
+            </span>
+        </template>
+        <template #item.formattedStatus="{ item }">
+            <v-chip :color="getColor(item.formattedStatus)" variant="tonal" size="small" class="font-weight-bold">
+                {{ item.formattedStatus }}
+            </v-chip>
+        </template>
+        <template #item.link="{ item }">
+            <div class="d-flex flex-wrap ga-1 justify-end">
+                <v-btn
+                    v-if="item.payLink && item.failed"
+                    :prepend-icon="Wallet2"
+                    variant="outlined"
+                    color="error"
+                    size="small"
+                    :loading="retryingInvoiceId === item.id"
+                    @click="retryPayment(item)"
+                >
+                    Retry Payment
                 </v-btn>
-            </template>
+                <v-btn
+                    v-if="item.link"
+                    :prepend-icon="DownloadIcon"
+                    variant="outlined"
+                    color="default"
+                    size="small"
+                    :href="item.link"
+                    @click="onDownloadInvoiceClicked"
+                >
+                    Invoice
+                </v-btn>
+                <v-btn
+                    v-if="item.link"
+                    :prepend-icon="DownloadIcon"
+                    variant="outlined"
+                    color="default"
+                    size="small"
+                    @click="downloadUsageReport(item)"
+                >
+                    Usage report
+                </v-btn>
+            </div>
+        </template>
 
-            <template #bottom>
-                <div class="v-data-table-footer">
-                    <v-row justify="end" align="center" class="pa-2">
-                        <v-col cols="auto">
-                            <span class="caption">Items per page:</span>
-                        </v-col>
-                        <v-col cols="auto">
-                            <v-select
-                                v-model="limit"
-                                density="compact"
-                                :items="pageSizes"
-                                variant="outlined"
-                                hide-details
-                                @update:model-value="sizeChanged"
-                            />
-                        </v-col>
-                        <v-col cols="auto">
-                            <v-btn-group density="compact">
-                                <v-btn :disabled="!historyPage.hasPrevious" :icon="ChevronLeft" @click="previousClicked" />
-                                <v-btn :disabled="!historyPage.hasNext" :icon="ChevronRight" @click="nextClicked" />
-                            </v-btn-group>
-                        </v-col>
-                    </v-row>
-                </div>
-            </template>
-        </v-data-table-server>
-    </v-card>
+        <template #bottom>
+            <div class="v-data-table-footer">
+                <v-row justify="end" align="center" class="pa-2">
+                    <v-col cols="auto">
+                        <span class="caption">Items per page:</span>
+                    </v-col>
+                    <v-col cols="auto">
+                        <v-select
+                            v-model="limit"
+                            density="compact"
+                            :items="pageSizes"
+                            variant="outlined"
+                            hide-details
+                            @update:model-value="sizeChanged"
+                        />
+                    </v-col>
+                    <v-col cols="auto">
+                        <v-btn-group density="compact">
+                            <v-btn :disabled="!historyPage.hasPrevious" :icon="ChevronLeft" @click="previousClicked" />
+                            <v-btn :disabled="!historyPage.hasNext" :icon="ChevronRight" @click="nextClicked" />
+                        </v-btn-group>
+                    </v-col>
+                </v-row>
+            </div>
+        </template>
+    </v-data-table-server>
 </template>
 
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue';
-import {
-    VBtn,
-    VBtnGroup,
-    VCard,
-    VChip,
-    VCol,
-    VRow,
-    VSelect,
-    VDataTableServer,
-} from 'vuetify/components';
-import { ChevronLeft, ChevronRight } from 'lucide-vue-next';
+import { VBtn, VBtnGroup, VChip, VCol, VDataTableServer, VRow, VSelect } from 'vuetify/components';
+import { ChevronLeft, ChevronRight, DownloadIcon, Wallet2 } from '@lucide/vue';
 
 import { centsToDollars } from '@/utils/strings';
 import { useBillingStore } from '@/store/modules/billingStore';
-import { useNotify } from '@/utils/hooks';
-import { AnalyticsErrorEventSource } from '@/utils/constants/analyticsEventNames';
-import { PaymentHistoryPage, PaymentsHistoryItem } from '@/types/payments';
+import { useNotify } from '@/composables/useNotify';
+import { AnalyticsErrorEventSource, AnalyticsEvent } from '@/utils/constants/analyticsEventNames';
+import type { PaymentHistoryPage, PaymentsHistoryItem } from '@/types/payments';
 import { useLoading } from '@/composables/useLoading';
 import { DEFAULT_PAGE_LIMIT } from '@/types/pagination';
+import type { DataTableHeader } from '@/types/common';
+import { useProjectsStore } from '@/store/modules/projectsStore';
+import { Download } from '@/utils/download';
+import { useAnalyticsStore } from '@/store/modules/analyticsStore';
 
 const billingStore = useBillingStore();
+const projectsStore = useProjectsStore();
+const analyticsStore = useAnalyticsStore();
+
 const notify = useNotify();
 
 const { isLoading, withLoading } = useLoading();
 
 const limit = ref(DEFAULT_PAGE_LIMIT);
-const headers = [
-    { title: 'Date', key: 'formattedStart', sortable: false },
+const retryingInvoiceId = ref<string | null>(null);
+
+const headers: DataTableHeader[] = [
+    { title: 'Usage Period', key: 'period', sortable: false },
     { title: 'Amount', key: 'amount', sortable: false },
     { title: 'Status', key: 'formattedStatus', sortable: false },
-    { title: '', key: 'link', sortable: false, width: 0 },
+    { title: '', key: 'link', sortable: false, width: 450 },
 ];
 const pageSizes = [DEFAULT_PAGE_LIMIT, 25, 50, 100];
 
@@ -145,6 +174,39 @@ async function previousClicked(): Promise<void> {
 async function sizeChanged(size: number) {
     limit.value = size;
     fetchHistory();
+}
+
+function onDownloadInvoiceClicked(): void {
+    analyticsStore.eventTriggered(AnalyticsEvent.INVOICE_DOWNLOAD_CLICKED);
+}
+
+function downloadUsageReport(item: PaymentsHistoryItem): void {
+    try {
+        const link = projectsStore.getUsageReportLink(item.start, item.end, true, true);
+        Download.fileByLink(link);
+        notify.success('Usage report download started successfully.');
+    } catch (error) {
+        notify.notifyError(error, AnalyticsErrorEventSource.BILLING_HISTORY_TAB);
+    }
+}
+
+async function retryPayment(item: PaymentsHistoryItem): Promise<void> {
+    retryingInvoiceId.value = item.id;
+    try {
+        await billingStore.attemptPayments();
+        notify.success('Payment successful');
+        fetchHistory();
+    } catch (error) {
+        // API payment failed, open external Stripe payment page
+        if (item.payLink) {
+            window.open(item.payLink, '_blank', 'noopener,noreferrer');
+            return;
+        }
+
+        notify.notifyError(error, AnalyticsErrorEventSource.BILLING_HISTORY_TAB);
+    } finally {
+        retryingInvoiceId.value = null;
+    }
 }
 
 onMounted(() => {

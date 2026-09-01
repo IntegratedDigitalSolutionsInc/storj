@@ -29,12 +29,18 @@
 <script setup lang="ts">
 import { ref, computed } from 'vue';
 import { VCol, VBtn } from 'vuetify/components';
-import { Check, Copy, DownloadIcon } from 'lucide-vue-next';
+import { Check, Copy, DownloadIcon } from '@lucide/vue';
 
-import { SaveButtonsItem } from '@/types/common';
+import type { SaveButtonsItem } from '@/types/common';
 import { Download } from '@/utils/download';
 import { useAnalyticsStore } from '@/store/modules/analyticsStore';
 import { AnalyticsEvent } from '@/utils/constants/analyticsEventNames';
+import { useProjectsStore } from '@/store/modules/projectsStore';
+import { useConfigStore } from '@/store/modules/configStore';
+
+const analyticsStore = useAnalyticsStore();
+const projectStore = useProjectsStore();
+const configStore = useConfigStore();
 
 const props = defineProps<{
     items: SaveButtonsItem[];
@@ -48,8 +54,6 @@ const downloadedTimeout = ref<ReturnType<typeof setTimeout> | null>(null);
 
 const justCopied = computed<boolean>(() => copiedTimeout.value !== null);
 const justDownloaded = computed<boolean>(() => downloadedTimeout.value !== null);
-
-const analyticsStore = useAnalyticsStore();
 
 /**
  * Saves items to clipboard.
@@ -70,9 +74,9 @@ function onCopy(): void {
 function onDownload(): void {
     Download.file(
         props.items.map(item => typeof item === 'string' ? item : `${item.name}:\n${item.value}`).join('\n\n'),
-        `Storj-${props.type}-${props.name}-${new Date().toISOString()}.txt`,
+        `${configStore.brandName}-${props.type}-${props.name}-${new Date().toISOString()}.txt`,
     );
-    analyticsStore.eventTriggered(AnalyticsEvent.DOWNLOAD_TXT_CLICKED);
+    analyticsStore.eventTriggered(AnalyticsEvent.DOWNLOAD_TXT_CLICKED, { project_id: projectStore.state.selectedProject.id });
 
     if (downloadedTimeout.value) clearTimeout(downloadedTimeout.value);
     downloadedTimeout.value = setTimeout(() => {

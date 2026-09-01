@@ -1,0 +1,346 @@
+// Copyright (C) 2026 Storj Labs, Inc.
+// See LICENSE for copying information.
+
+package balancer_test
+
+import (
+	"crypto/sha256"
+	"slices"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/require"
+	"go.uber.org/zap/zaptest"
+
+	"storj.io/common/memory"
+	"storj.io/common/pb"
+	"storj.io/common/storj"
+	"storj.io/common/testcontext"
+	"storj.io/common/testrand"
+	"storj.io/storj/private/testplanet"
+	"storj.io/storj/satellite/balancer"
+	"storj.io/storj/satellite/metabase"
+	"storj.io/storj/satellite/nodeselection"
+	"storj.io/storj/satellite/taskqueue"
+	"storj.io/uplink/private/piecestore"
+)
+
+func TestWorkerProcessJob(t *testing.T) {
+	for _, hashAlgo := range []pb.PieceHashAlgorithm{
+		pb.PieceHashAlgorithm_SHA256,
+		pb.PieceHashAlgorithm_BLAKE3,
+	} {
+		hashAlgo := hashAlgo
+		t.Run(hashAlgo.String(), func(t *testing.T) {
+			testWorkerProcessJob(t, hashAlgo)
+		})
+	}
+}
+
+func testWorkerProcessJob(t *testing.T, hashAlgo pb.PieceHashAlgorithm) {
+	testplanet.Run(t, testplanet.Config{
+		SatelliteCount:   1,
+		StorageNodeCount: 6,
+		UplinkCount:      1,
+		Reconfigure: testplanet.Reconfigure{
+			Satellite: testplanet.ReconfigureRS(2, 3, 4, 4),
+		},
+	}, func(t *testing.T, ctx *testcontext.Context, planet *testplanet.Planet) {
+		sat := planet.Satellites[0]
+		uplinkPeer := planet.Uplinks[0]
+
+		// Upload test data with a specific hash algorithm.
+		testData := testrand.Bytes(8 * memory.KiB)
+		err := uplinkPeer.Upload(piecestore.WithPieceHashAlgo(ctx, hashAlgo), sat, "testbucket", "test/path", testData)
+		require.NoError(t, err)
+
+		// Get the uploaded segment.
+		segments, err := sat.Metabase.DB.TestingAllSegments(ctx)
+		require.NoError(t, err)
+		require.Len(t, segments, 1)
+		segment := segments[0]
+
+		// Pick a source node (first piece) and find a destination node not in the segment.
+		sourcePiece := segment.Pieces[0]
+
+		segmentNodeIDs := make(map[storj.NodeID]bool)
+		for _, p := range segment.Pieces {
+			segmentNodeIDs[p.StorageNode] = true
+		}
+
+		var destNodeID storj.NodeID
+		for _, node := range planet.StorageNodes {
+			if !segmentNodeIDs[node.ID()] {
+				destNodeID = node.ID()
+				break
+			}
+		}
+		require.False(t, destNodeID.IsZero(), "no available destination node")
+
+		placements := nodeselection.PlacementDefinitions{
+			storj.DefaultPlacement: {
+				ID:        storj.DefaultPlacement,
+				Invariant: nodeselection.AllGood(),
+			},
+		}
+
+		worker := balancer.NewWorker(
+			zaptest.NewLogger(t),
+			balancer.WorkerConfig{
+				DialTimeout:            5 * time.Second,
+				DownloadTimeout:        5 * time.Minute,
+				UploadTimeout:          5 * time.Minute,
+				MaxConcurrentTransfers: 10,
+			},
+			taskqueue.RunnerConfig{},
+			nil, // no redis client needed for direct processJob call
+			sat.Metabase.DB,
+			sat.Orders.Service,
+			sat.Overlay.UploadSelectionCache,
+			sat.Dialer,
+			placements,
+		)
+
+		job := balancer.Job{
+			StreamID:   segment.StreamID,
+			Position:   segment.Position.Encode(),
+			SourceNode: sourcePiece.StorageNode,
+			DestNode:   destNodeID,
+		}
+
+		err = worker.TestingProcessJob(ctx, job)
+		require.NoError(t, err)
+
+		// Verify: the segment should now have the destination node instead of the source.
+		updatedSegments, err := sat.Metabase.DB.TestingAllSegments(ctx)
+		require.NoError(t, err)
+		require.Len(t, updatedSegments, 1)
+
+		for _, p := range updatedSegments[0].Pieces {
+			require.NotEqual(t, sourcePiece.StorageNode, p.StorageNode, "source node should have been replaced")
+		}
+
+		require.True(t, slices.ContainsFunc(updatedSegments[0].Pieces, func(p metabase.Piece) bool {
+			return p.StorageNode == destNodeID
+		}), "destination node should be in updated segment pieces")
+
+		// Verify: we can still download the data correctly.
+		downloaded, err := uplinkPeer.Download(ctx, sat, "testbucket", "test/path")
+		require.NoError(t, err)
+		require.Equal(t, testData, downloaded)
+	})
+}
+
+func TestWorkerProcessJob_SegmentNotFound(t *testing.T) {
+	testplanet.Run(t, testplanet.Config{
+		SatelliteCount:   1,
+		StorageNodeCount: 4,
+		UplinkCount:      1,
+		Reconfigure: testplanet.Reconfigure{
+			Satellite: testplanet.ReconfigureRS(2, 3, 4, 4),
+		},
+	}, func(t *testing.T, ctx *testcontext.Context, planet *testplanet.Planet) {
+		sat := planet.Satellites[0]
+
+		placements := nodeselection.PlacementDefinitions{
+			storj.DefaultPlacement: {
+				ID:        storj.DefaultPlacement,
+				Invariant: nodeselection.AllGood(),
+			},
+		}
+
+		worker := balancer.NewWorker(
+			zaptest.NewLogger(t),
+			balancer.WorkerConfig{
+				DialTimeout:            5 * time.Second,
+				DownloadTimeout:        5 * time.Minute,
+				UploadTimeout:          5 * time.Minute,
+				MaxConcurrentTransfers: 10,
+			},
+			taskqueue.RunnerConfig{},
+			nil,
+			sat.Metabase.DB,
+			sat.Orders.Service,
+			sat.Overlay.UploadSelectionCache,
+			sat.Dialer,
+			placements,
+		)
+
+		// Job with a non-existent stream ID should be silently skipped.
+		job := balancer.Job{
+			StreamID:   testrand.UUID(),
+			Position:   0,
+			SourceNode: testrand.NodeID(),
+			DestNode:   testrand.NodeID(),
+		}
+
+		err := worker.TestingProcessJob(ctx, job)
+		require.NoError(t, err)
+	})
+}
+
+func TestWorkerProcessJob_SourceNotInSegment(t *testing.T) {
+	testplanet.Run(t, testplanet.Config{
+		SatelliteCount:   1,
+		StorageNodeCount: 4,
+		UplinkCount:      1,
+		Reconfigure: testplanet.Reconfigure{
+			Satellite: testplanet.ReconfigureRS(2, 3, 4, 4),
+		},
+	}, func(t *testing.T, ctx *testcontext.Context, planet *testplanet.Planet) {
+		sat := planet.Satellites[0]
+		uplinkPeer := planet.Uplinks[0]
+
+		testData := testrand.Bytes(8 * memory.KiB)
+		err := uplinkPeer.Upload(ctx, sat, "testbucket", "test/path", testData)
+		require.NoError(t, err)
+
+		segments, err := sat.Metabase.DB.TestingAllSegments(ctx)
+		require.NoError(t, err)
+		require.Len(t, segments, 1)
+		segment := segments[0]
+
+		placements := nodeselection.PlacementDefinitions{
+			storj.DefaultPlacement: {
+				ID:        storj.DefaultPlacement,
+				Invariant: nodeselection.AllGood(),
+			},
+		}
+
+		worker := balancer.NewWorker(
+			zaptest.NewLogger(t),
+			balancer.WorkerConfig{
+				DialTimeout:            5 * time.Second,
+				DownloadTimeout:        5 * time.Minute,
+				UploadTimeout:          5 * time.Minute,
+				MaxConcurrentTransfers: 10,
+			},
+			taskqueue.RunnerConfig{},
+			nil,
+			sat.Metabase.DB,
+			sat.Orders.Service,
+			sat.Overlay.UploadSelectionCache,
+			sat.Dialer,
+			placements,
+		)
+
+		// Job with a source node not in the segment should be silently skipped.
+		job := balancer.Job{
+			StreamID:   segment.StreamID,
+			Position:   segment.Position.Encode(),
+			SourceNode: testrand.NodeID(),
+			DestNode:   testrand.NodeID(),
+		}
+
+		err = worker.TestingProcessJob(ctx, job)
+		require.NoError(t, err)
+
+		// Segment should be unchanged.
+		updatedSegments, err := sat.Metabase.DB.TestingAllSegments(ctx)
+		require.NoError(t, err)
+		require.Equal(t, segment.Pieces, updatedSegments[0].Pieces)
+	})
+}
+
+func TestWorkerProcessJob_StalePiecesHash(t *testing.T) {
+	testplanet.Run(t, testplanet.Config{
+		SatelliteCount:   1,
+		StorageNodeCount: 6,
+		UplinkCount:      1,
+		Timeout:          10 * time.Minute,
+		Reconfigure: testplanet.Reconfigure{
+			Satellite: testplanet.ReconfigureRS(2, 3, 4, 4),
+		},
+	}, func(t *testing.T, ctx *testcontext.Context, planet *testplanet.Planet) {
+		sat := planet.Satellites[0]
+		uplinkPeer := planet.Uplinks[0]
+
+		testData := testrand.Bytes(8 * memory.KiB)
+		err := uplinkPeer.Upload(ctx, sat, "testbucket", "test/path", testData)
+		require.NoError(t, err)
+
+		segments, err := sat.Metabase.DB.TestingAllSegments(ctx)
+		require.NoError(t, err)
+		require.Len(t, segments, 1)
+		segment := segments[0]
+
+		// Compute pieces hash the same way the observer does.
+		aliasPieces, err := sat.Metabase.DB.TestingPiecesToAliasPieces(ctx, segment.Pieces)
+		require.NoError(t, err)
+		aliasBytes, err := aliasPieces.Bytes()
+		require.NoError(t, err)
+		piecesHash := sha256.Sum256(aliasBytes)
+
+		// Find source and two destination nodes.
+		sourcePiece := segment.Pieces[0]
+		segmentNodeIDs := make(map[storj.NodeID]bool)
+		for _, p := range segment.Pieces {
+			segmentNodeIDs[p.StorageNode] = true
+		}
+
+		var destNodes []storj.NodeID
+		for _, node := range planet.StorageNodes {
+			if !segmentNodeIDs[node.ID()] {
+				destNodes = append(destNodes, node.ID())
+			}
+		}
+		require.GreaterOrEqual(t, len(destNodes), 2)
+
+		placements := nodeselection.PlacementDefinitions{
+			storj.DefaultPlacement: {
+				ID:        storj.DefaultPlacement,
+				Invariant: nodeselection.AllGood(),
+			},
+		}
+
+		worker := balancer.NewWorker(
+			zaptest.NewLogger(t),
+			balancer.WorkerConfig{
+				DialTimeout:            5 * time.Second,
+				DownloadTimeout:        5 * time.Minute,
+				UploadTimeout:          5 * time.Minute,
+				MaxConcurrentTransfers: 10,
+			},
+			taskqueue.RunnerConfig{},
+			nil,
+			sat.Metabase.DB,
+			sat.Orders.Service,
+			sat.Overlay.UploadSelectionCache,
+			sat.Dialer,
+			placements,
+		)
+
+		// First job: transfer WITHOUT hash (old-style), which changes pieces.
+		job1 := balancer.Job{
+			StreamID:   segment.StreamID,
+			Position:   segment.Position.Encode(),
+			SourceNode: sourcePiece.StorageNode,
+			DestNode:   destNodes[0],
+		}
+		err = worker.TestingProcessJob(ctx, job1)
+		require.NoError(t, err)
+
+		// Pieces have changed. Now try a job with the ORIGINAL hash.
+		updatedSegments, err := sat.Metabase.DB.TestingAllSegments(ctx)
+		require.NoError(t, err)
+		require.Len(t, updatedSegments, 1)
+		// Confirm pieces actually changed.
+		require.NotEqual(t, segment.Pieces, updatedSegments[0].Pieces)
+
+		// Second job with stale hash — CAS should fail at DB level, job skipped.
+		job2 := balancer.Job{
+			StreamID:   segment.StreamID,
+			Position:   segment.Position.Encode(),
+			SourceNode: updatedSegments[0].Pieces[1].StorageNode,
+			DestNode:   destNodes[1],
+			PiecesHash: piecesHash, // OLD hash
+		}
+		err = worker.TestingProcessJob(ctx, job2)
+		require.NoError(t, err) // skipped silently
+
+		// Verify pieces didn't change (second job was skipped by DB CAS).
+		finalSegments, err := sat.Metabase.DB.TestingAllSegments(ctx)
+		require.NoError(t, err)
+		require.Equal(t, updatedSegments[0].Pieces, finalSegments[0].Pieces)
+	})
+}

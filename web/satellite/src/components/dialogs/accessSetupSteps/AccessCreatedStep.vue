@@ -5,7 +5,7 @@
     <v-form class="pa-6">
         <v-row>
             <v-col>
-                <p>Copy and save the access credentials {{ app ? `for ${app.name}` : '' }} as they will only appear once.</p>
+                <p>Save the access keys {{ app ? `for ${app.name}` : '' }} as they will only appear once.</p>
                 <v-row class="mt-2">
                     <save-buttons :items="saveItems" :name="name" :type="accessType" />
                 </v-row>
@@ -37,6 +37,13 @@
             </v-col>
 
             <template v-else>
+                <v-col v-if="credentials.freeTierRestrictedExpiration" cols="12">
+                    <v-alert type="warning" variant="tonal">
+                        These credentials will expire at {{ credentials.freeTierRestrictedExpiration.toLocaleString() }}.
+                        <a class="text-decoration-underline text-cursor-pointer" @click="appStore.toggleUpgradeFlow(true)">Upgrade</a> your account to avoid expiration limits on future credentials.
+                    </v-alert>
+                </v-col>
+
                 <v-col cols="12">
                     <text-output-area
                         label="Access Key"
@@ -55,16 +62,17 @@
                     <text-output-area
                         label="Endpoint"
                         :is-blurred="false"
-                        :value="credentials.endpoint"
+                        :value="configStore.gatewayUrl || credentials.endpoint"
                         show-copy
+                        extra-info="Tip: If you experience connection issues in some applications, try pasting the Endpoint URL without the 'https://' prefix."
                     />
                 </v-col>
             </template>
 
             <v-col>
-                <v-alert variant="tonal">
-                    <p class="text-subtitle-2 font-weight-bold">Next steps</p>
-                    <p class="text-subtitle-2">Please read the documentation to find where to enter the access you created.</p>
+                <v-alert v-if="configStore.isDefaultBrand" variant="tonal" color="success">
+                    <p class="text-title-small font-weight-bold">Next steps</p>
+                    <p class="text-title-small">Please read the documentation to find where to enter the access you created.</p>
                 </v-alert>
             </v-col>
         </v-row>
@@ -75,11 +83,12 @@
 import { VAlert, VCol, VForm, VRow } from 'vuetify/components';
 import { computed } from 'vue';
 
-import { EdgeCredentials } from '@/types/accessGrants';
+import type { EdgeCredentials } from '@/types/accessGrants';
 import { AccessType } from '@/types/setupAccess';
+import { useAppStore } from '@/store/modules/appStore';
 import { useConfigStore } from '@/store/modules/configStore';
-import { SaveButtonsItem } from '@/types/common';
-import { Application } from '@/types/applications';
+import type { SaveButtonsItem } from '@/types/common';
+import type { Application } from '@/types/applications';
 
 import SaveButtons from '@/components/dialogs/commonPassphraseSteps/SaveButtons.vue';
 import TextOutputArea from '@/components/dialogs/accessSetupSteps/TextOutputArea.vue';
@@ -95,6 +104,7 @@ const props = withDefaults(defineProps<{
     app: undefined,
 });
 
+const appStore = useAppStore();
 const configStore = useConfigStore();
 
 const satelliteAddress = computed<string>(() => configStore.state.config.satelliteNodeURL);
@@ -117,7 +127,7 @@ const saveItems = computed<SaveButtonsItem[]>(() => {
     return [
         { name: 'Access Key', value: props.credentials.accessKeyId },
         { name: 'Secret Key', value: props.credentials.secretKey },
-        { name: 'Endpoint', value: props.credentials.endpoint },
+        { name: 'Endpoint', value: configStore.gatewayUrl || props.credentials.endpoint },
     ];
 });
 </script>

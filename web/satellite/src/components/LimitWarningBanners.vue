@@ -9,20 +9,22 @@
         variant="tonal"
         :title="bannerText[threshold].title"
         :type="bannerText[threshold].hundred ? 'error' : 'warning'"
-        rounded="lg"
         class="my-2"
         border
     >
-        <template v-if="isPaidTier && !reachedThresholds[threshold].includes(LimitType.Segment)" #text>
+        <template v-if="!isProjectOwner" #text>
+            Contact project owner to upgrade to avoid any service interruptions.
+        </template>
+        <template v-else-if="hasPaidPrivileges && !reachedThresholds[threshold].includes(LimitType.Segment)" #text>
             You can increase your limits
             <a class="text-decoration-underline text-cursor-pointer" @click="openLimitDialog(bannerText[threshold].limitType)">here</a>
             or in the
             <a class="text-decoration-underline text-cursor-pointer" @click="goToProjectSettings">project settings page</a>.
         </template>
-        <template v-else-if="!isPaidTier && bannerText[threshold].hundred" #text>
+        <template v-else-if="!hasPaidPrivileges && bannerText[threshold].hundred" #text>
             <a class="text-decoration-underline text-cursor-pointer" @click="appStore.toggleUpgradeFlow(true)">Upgrade</a> to avoid any service interruptions.
         </template>
-        <template v-else-if="!isPaidTier && !bannerText[threshold].hundred" #text>
+        <template v-else-if="!hasPaidPrivileges && !bannerText[threshold].hundred" #text>
             Avoid interrupting your usage by
             <a class="text-decoration-underline text-cursor-pointer" @click="appStore.toggleUpgradeFlow(true)">upgrading</a>
             your account.
@@ -40,7 +42,7 @@ import { computed, ref } from 'vue';
 import { VAlert } from 'vuetify/components';
 import { useRouter } from 'vue-router';
 
-import { LimitThreshold, LimitThresholdsReached, LimitToChange, LimitType } from '@/types/projects';
+import { type LimitThresholdsReached, LimitThreshold, LimitToChange, LimitType  } from '@/types/projects';
 import { useUsersStore } from '@/store/modules/usersStore';
 import { useConfigStore } from '@/store/modules/configStore';
 import { humanizeArray } from '@/utils/strings';
@@ -57,6 +59,12 @@ type BannerText = {
     limitType: LimitType;
 };
 
+type LimitInfo = {
+    used: number;
+    currentLimit: number;
+    paidLimit?: number;
+};
+
 const appStore = useAppStore();
 const projectsStore = useProjectsStore();
 const usersStore = useUsersStore();
@@ -66,6 +74,13 @@ const router = useRouter();
 
 const isEditLimitDialogShown = ref(false);
 const limitToChange = ref(LimitToChange.Storage);
+
+/**
+ * Returns whether this project is owner by the current user
+ */
+const isProjectOwner = computed(() => {
+    return projectsStore.state.selectedProject.ownerId === usersStore.state.user.id;
+});
 
 /**
  * Returns which limit thresholds have been reached by which usage limit type.
@@ -83,36 +98,30 @@ const reachedThresholds = computed((): LimitThresholdsReached => {
 
     if (isAccountFrozen.value || currentLimits === DEFAULT_PROJECT_LIMITS) return reached;
 
-    type LimitInfo = {
-        used: number;
-        currentLimit: number;
-        paidLimit?: number;
-    };
-
     const info: Record<LimitType, LimitInfo> = {
-        Storage: {
+        [LimitType.Storage]: {
             used: currentLimits.storageUsed,
-            currentLimit: currentLimits.storageLimit,
+            currentLimit: currentLimits.userSetStorageLimit ?? currentLimits.storageLimit,
             paidLimit: parseConfigLimit(config.defaultPaidStorageLimit),
         },
-        Egress: {
+        [LimitType.Egress]: {
             used: currentLimits.bandwidthUsed,
-            currentLimit: currentLimits.bandwidthLimit,
+            currentLimit: currentLimits.userSetBandwidthLimit ?? currentLimits.bandwidthLimit,
             paidLimit: parseConfigLimit(config.defaultPaidBandwidthLimit),
         },
-        Segment: {
+        [LimitType.Segment]: {
             used: currentLimits.segmentUsed,
             currentLimit: currentLimits.segmentLimit,
         },
     };
 
     (Object.entries(info) as [LimitType, LimitInfo][]).forEach(([limitType, info]) => {
-        const maxLimit = (isPaidTier.value && info.paidLimit) ? Math.max(info.currentLimit, info.paidLimit) : info.currentLimit;
+        const maxLimit = (hasPaidPrivileges.value && info.paidLimit) ? Math.max(info.currentLimit, info.paidLimit) : info.currentLimit;
         if (info.used >= maxLimit) {
             reached.Hundred.push(limitType);
         } else if (info.used >= 0.8 * maxLimit) {
             reached.Eighty.push(limitType);
-        } else if (isPaidTier.value) {
+        } else if (hasPaidPrivileges.value) {
             if (info.used >= info.currentLimit) {
                 reached.CustomHundred.push(limitType);
             } else if (info.used >= 0.8 * info.currentLimit) {
@@ -127,7 +136,10 @@ const reachedThresholds = computed((): LimitThresholdsReached => {
 /**
  * Indicates if account was frozen due to billing issues.
  */
-const isAccountFrozen = computed<boolean>(() => usersStore.state.user.freezeStatus.frozen);
+const isAccountFrozen = computed<boolean>(() => {
+    return usersStore.state.user.freezeStatus.frozen
+        || usersStore.state.user.freezeStatus.optOutFrozen;
+});
 
 /**
  * Returns the limit thresholds that have been reached by at least 1 usage type.
@@ -137,10 +149,10 @@ const activeThresholds = computed<LimitThreshold[]>(() => {
 });
 
 /**
- * Returns whether user is in the paid tier.
+ * Returns whether user has paid privileges.
  */
-const isPaidTier = computed<boolean>(() => {
-    return usersStore.state.user.paidTier;
+const hasPaidPrivileges = computed<boolean>(() => {
+    return usersStore.state.user.hasPaidPrivileges;
 });
 
 /**

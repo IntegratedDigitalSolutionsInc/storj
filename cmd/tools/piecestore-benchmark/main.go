@@ -8,6 +8,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -40,6 +41,7 @@ import (
 	"storj.io/storj/storagenode/bandwidth"
 	"storj.io/storj/storagenode/collector"
 	"storj.io/storj/storagenode/contact"
+	"storj.io/storj/storagenode/hashstore"
 	"storj.io/storj/storagenode/monitor"
 	"storj.io/storj/storagenode/orders"
 	"storj.io/storj/storagenode/pieces"
@@ -64,6 +66,8 @@ var (
 	flatFileTTLStore   = flag.Bool("flat-ttl-store", true, "use flat-files ttl store")
 	flatFileTTLHandles = flag.Int("flat-ttl-max-handles", 1000, "max file handles to flat-file ttl store")
 	dedicatedDisk      = flag.Bool("dedicated-disk", false, "assume the test setup is a dedicated disk node")
+
+	backend = flag.String("backend", "", "empty|hash|hashstore")
 
 	cpuprofile = flag.String("cpuprofile", "", "write a cpu profile")
 	memprofile = flag.String("memprofile", "", "write a memory profile")
@@ -104,7 +108,7 @@ func createEndpoint(ctx context.Context, satIdent, snIdent *identity.FullIdentit
 		if url.ID == satIdent.ID {
 			return satIdent.PeerIdentity(), nil
 		}
-		return nil, fmt.Errorf("unknown peer id")
+		return nil, errors.New("unknown peer id")
 	})
 
 	try.E(cfg.Storage2.Trust.Sources.Set(fmt.Sprintf("%s@localhost:0", satIdent.ID)))
@@ -133,7 +137,7 @@ func createEndpoint(ctx context.Context, satIdent, snIdent *identity.FullIdentit
 	var expirationStore pieces.PieceExpirationDB
 	if *flatFileTTLStore {
 		cfg.Pieces.EnableFlatExpirationStore = true
-		expirationStore = try.E1(pieces.NewPieceExpirationStore(log.Named("piece-expiration"), nil, pieces.PieceExpirationConfig{
+		expirationStore = try.E1(pieces.NewPieceExpirationStore(log.Named("piece-expiration"), pieces.PieceExpirationConfig{
 			DataDir:               filepath.Join(cfg.Storage2.DatabaseDir, "pieceexpiration"),
 			ConcurrentFileHandles: *flatFileTTLHandles,
 		}))
@@ -150,28 +154,43 @@ func createEndpoint(ctx context.Context, satIdent, snIdent *identity.FullIdentit
 
 	contactService := contact.NewService(log, dialer, self, trustPool, contact.NewQUICStats(false), &pb.SignedNodeTagSets{})
 
-	var spaceReport monitor.SpaceReport
-
-	if *dedicatedDisk {
-		spaceReport = monitor.NewDedicatedDisk(log, piecesStore, cfg.Storage2.Monitor.MinimumDiskSpace.Int64(), 100_000_000)
-	} else {
-		spaceReport = monitor.NewSharedDisk(log, piecesStore, cfg.Storage2.Monitor.MinimumDiskSpace.Int64(), 1<<40)
-	}
-
-	monitorService := monitor.NewService(log, piecesStore, contactService, time.Hour, spaceReport, cfg.Storage2.Monitor)
-
 	retainService := retain.NewService(log, piecesStore, cfg.Retain)
 
 	trashChore := pieces.NewTrashChore(log, 24*time.Hour, 7*24*time.Hour, trustPool, piecesStore)
-
-	pieceDeleter := pieces.NewDeleter(log, piecesStore, cfg.Storage2.DeleteWorkers, cfg.Storage2.DeleteQueueSize)
 
 	ordersStore := try.E1(orders.NewFileStore(log, cfg.Storage2.Orders.Path, cfg.Storage2.OrderLimitGracePeriod))
 
 	usedSerials := usedserials.NewTable(cfg.Storage2.MaxUsedSerialsSize)
 
 	bandwidthdbCache := bandwidth.NewCache(snDB.Bandwidth())
-	endpoint := try.E1(piecestore.NewEndpoint(log, snIdent, trustPool, monitorService, retainService, new(contact.PingStats), piecesStore, trashChore, pieceDeleter, ordersStore, bandwidthdbCache, usedSerials, cfg.Storage2))
+
+	bfm := try.E1(retain.NewBloomFilterManager("bfm", cfg.Retain.MaxTimeSkew))
+
+	rtm := retain.NewRestoreTimeManager("rtm")
+	// TODO: use injected configuration
+	hsb := try.E1(piecestore.NewHashStoreBackend(ctx, hashstore.CreateDefaultConfig(hashstore.TableKind_HashTbl, false), "hashstore", "", bfm, rtm, log, nil))
+	mon.Chain(hsb)
+
+	var spaceReport monitor.SpaceReport
+	if *dedicatedDisk {
+		spaceReport = try.E1(monitor.NewDedicatedDisk(ctx, log, cfg.Storage.Path, cfg.Storage2.Monitor.MinimumDiskSpace.Int64(), 100_000_000))
+	} else {
+		spaceReport = try.E1(monitor.NewSharedDisk(ctx, log, storagenode.NewPieceStoreSpaceUsageAdapter(piecesStore), hsb, cfg.Storage2.Monitor.MinimumDiskSpace.Int64(), 1<<40))
+	}
+
+	monitorService := monitor.NewService(log, piecesStore, contactService, spaceReport, cfg.Storage2.Monitor, cfg.Contact.CheckInTimeout)
+
+	opb := piecestore.NewOldPieceBackend(piecesStore, trashChore, monitorService)
+
+	var pieceBackend piecestore.PieceBackend
+	switch *backend {
+	case "hashstore", "hash":
+		pieceBackend = hsb
+	default:
+		pieceBackend = opb
+	}
+
+	endpoint := try.E1(piecestore.NewEndpoint(log, snIdent, trustPool, monitorService, []piecestore.QueueRetain{retainService, bfm}, new(contact.PingStats), pieceBackend, ordersStore, bandwidthdbCache, usedSerials, nil, cfg.Storage2))
 	collectorService := collector.NewService(log, piecesStore, usedSerials, collector.Config{Interval: 1000 * time.Hour})
 
 	return endpoint, collectorService
@@ -378,8 +397,11 @@ func main() {
 			}
 		})
 
-		fmt.Printf("uploaded %d %s pieces in %s (%0.02f MiB/s, %0.02f pieces/s)\n",
-			*piecesToUpload, memory.Size(*pieceSize).Base10String(), duration,
+		fmt.Printf("BenchmarkUpload/%s-%d\t%d\t%0.02f ns/op\t%0.02f MiB/s\t%0.02f pieces/s\n",
+			strings.ReplaceAll(memory.Size(*pieceSize).Base10String(), " ", ""),
+			*workers,
+			*piecesToUpload,
+			float64(duration)/float64(*piecesToUpload),
 			float64((*pieceSize)*(*piecesToUpload))/(1024*1024*duration.Seconds()),
 			float64(*piecesToUpload)/duration.Seconds())
 	}
@@ -419,8 +441,11 @@ func main() {
 			}
 		})
 
-		fmt.Printf("downloaded %d %s pieces in %s (%0.02f MiB/s, %0.02f pieces/s)\n",
-			*piecesToUpload, memory.Size(*pieceSize).Base10String(), duration,
+		fmt.Printf("BenchmarkDownload/%s-%d\t%d\t%0.02f ns/op\t%0.02f MiB/s\t%0.02f pieces/s\n",
+			strings.ReplaceAll(memory.Size(*pieceSize).Base10String(), " ", ""),
+			*workers,
+			*piecesToUpload,
+			float64(duration)/float64(*piecesToUpload),
 			float64((*pieceSize)*(*piecesToUpload))/(1024*1024*duration.Seconds()),
 			float64(*piecesToUpload)/duration.Seconds())
 	}
@@ -430,8 +455,12 @@ func main() {
 			allSpans = append(allSpans, runCollector(ctx, collector))
 		})
 
-		fmt.Printf("collected %d pieces in %s (%0.02f MiB/s)\n", *piecesToUpload, duration,
-			float64((*pieceSize)*(*piecesToUpload))/(1024*1024*duration.Seconds()))
+		fmt.Printf("BenchmarkCollect/%s\t%d\t%0.04f ns/op\t%0.02f MiB/s\t%0.02f pieces/s\n",
+			strings.ReplaceAll(memory.Size(*pieceSize).Base10String(), " ", ""),
+			*piecesToUpload,
+			float64(duration)/float64(*piecesToUpload),
+			float64((*pieceSize)*(*piecesToUpload))/(1024*1024*duration.Seconds()),
+			float64(*piecesToUpload)/duration.Seconds())
 	}
 
 	if !*notrace {

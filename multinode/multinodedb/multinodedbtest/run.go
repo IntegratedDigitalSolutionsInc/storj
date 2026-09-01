@@ -60,7 +60,7 @@ func SchemaName(testname, category string, index int, schemaSuffix string) strin
 
 	indexStr := strconv.Itoa(index)
 
-	var maxTestNameLen = 64 - len(category) - len(indexStr) - len(schemaSuffix) - 2
+	maxTestNameLen := 64 - len(category) - len(indexStr) - len(schemaSuffix) - 2
 	if len(testname) > maxTestNameLen {
 		testname = testname[:maxTestNameLen]
 	}
@@ -82,7 +82,7 @@ func CreateMasterDB(ctx context.Context, log *zap.Logger, name string, category 
 	log.Debug("creating", zap.String("suffix", schemaSuffix))
 	schema := SchemaName(name, category, index, schemaSuffix)
 
-	tempDB, err := tempdb.OpenUnique(ctx, dbInfo.URL, schema)
+	tempDB, err := tempdb.OpenUnique(ctx, log, dbInfo.URL, schema)
 	if err != nil {
 		return nil, err
 	}
@@ -100,6 +100,8 @@ func CreateMasterDBOnTopOf(ctx context.Context, log *zap.Logger, tempDB *dbutil.
 // Run method will iterate over all supported databases. Will establish
 // connection and will create tables for each DB.
 func Run(t *testing.T, test func(ctx *testcontext.Context, t *testing.T, db multinode.DB)) {
+	t.Parallel()
+
 	databases := []Database{
 		{
 			Name:    "Postgres",

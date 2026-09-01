@@ -6,14 +6,35 @@
         <v-row>
             <v-col cols="12">
                 <p>Confirm that the access details are correct before creating.</p>
-                <v-list lines="one">
+                <v-list>
                     <v-list-item
                         v-for="item in items"
                         :key="item.title"
                         :title="item.title"
                         :subtitle="item.value"
-                        class="pl-0"
-                    />
+                        class="mb-2 pl-0"
+                    >
+                        <template #title>
+                            <p class="text-medium-emphasis text-body-medium mb-1">{{ item.title }}</p>
+                        </template>
+                        <template #subtitle>
+                            <p v-if="item.title === 'Object Lock Permissions'" class="text-body-medium">
+                                <span v-if="hasBypass">
+                                    <v-tooltip width="300" activator="parent">
+                                        Warning: <b><i>BypassGovernanceRetention</i></b> allows users to delete or
+                                        modify objects even when under retention policies. Only grant
+                                        this permission when necessary, as it may lead to premature
+                                        data deletion or compliance issues.
+                                    </v-tooltip>
+                                    ⚠️ {{ ObjectLockPermission.BypassGovernanceRetention }}
+                                </span>
+                                <!-- Add a comma if there are multiple object lock permissions -->
+                                <span v-if="hasBypass && objectLockPermissions.length > 1">,</span>
+                                {{ item.value }}
+                            </p>
+                            <p v-else class="text-body-medium">{{ item.value }}</p>
+                        </template>
+                    </v-list-item>
                 </v-list>
             </v-col>
         </v-row>
@@ -22,9 +43,10 @@
 
 <script setup lang="ts">
 import { computed } from 'vue';
-import { VRow, VCol, VList, VListItem } from 'vuetify/components';
+import { VCol, VList, VListItem, VRow, VTooltip } from 'vuetify/components';
 
-import { Permission, AccessType, ObjectLockPermission } from '@/types/setupAccess';
+import { type AccessType, type BucketNotificationPermission, type Permission, ObjectLockPermission  } from '@/types/setupAccess';
+import { useConfigStore } from '@/store/modules/configStore';
 
 interface Item {
     title: string;
@@ -36,9 +58,12 @@ const props = defineProps<{
     type: AccessType;
     permissions: Permission[];
     objectLockPermissions: ObjectLockPermission[];
+    bucketNotificationPermissions: BucketNotificationPermission[];
     buckets: string[];
     endDate: Date | null;
 }>();
+
+const configStore = useConfigStore();
 
 /**
  * Returns the data used to generate the info rows.
@@ -52,12 +77,24 @@ const items = computed<Item[]>(() => {
         { title: 'Expiration Date', value: props.endDate ? props.endDate.toLocaleString() : 'No expiration date' },
     ];
 
-    if (props.objectLockPermissions.length) {
-        its.splice(2, 0, { title: 'Object Lock Permissions', value: props.objectLockPermissions.join(', ') });
+    let insertIdx = 2;
+
+    if (objectLockUIEnabled.value && props.objectLockPermissions.length) {
+        const lockPermissions = props.objectLockPermissions.filter(p => p !== ObjectLockPermission.BypassGovernanceRetention);
+        its.splice(insertIdx, 0, { title: 'Object Lock Permissions', value: lockPermissions.join(', ') });
+        insertIdx++;
+    }
+
+    if (bucketEventingEnabled.value && props.bucketNotificationPermissions.length) {
+        its.splice(insertIdx, 0, { title: 'Bucket Notification Permissions', value: props.bucketNotificationPermissions.join(', ') });
     }
 
     return its;
 });
+
+const hasBypass = computed(() => props.objectLockPermissions.includes(ObjectLockPermission.BypassGovernanceRetention));
+const objectLockUIEnabled = computed<boolean>(() => configStore.state.config.objectLockUIEnabled);
+const bucketEventingEnabled = computed<boolean>(() => configStore.state.config.bucketEventingUIEnabled);
 </script>
 
 <style scoped>

@@ -58,6 +58,38 @@ type ExpiredInfo struct {
 	InPieceInfo bool
 }
 
+// ExpirationLimits contains limits used when getting and/or deleting expired pieces.
+type ExpirationLimits struct {
+	// FlatFileLimit is the maximum number of flat files to read in a single call.
+	// This is only used for the flat file expiration store.
+	FlatFileLimit int
+	// BatchSize is the maximum number of pieces to return or delete in a single call.
+	// This is ignored by the flat file store, as it does not make sense for the current implementation.
+	BatchSize int
+}
+
+// ExpirationOptions contains options used when getting and/or deleting expired pieces.
+type ExpirationOptions struct {
+	Limits       ExpirationLimits
+	ReverseOrder bool
+}
+
+// DefaultExpirationLimits returns the default values for ExpirationLimits.
+func DefaultExpirationLimits() ExpirationLimits {
+	return ExpirationLimits{
+		FlatFileLimit: -1,
+		BatchSize:     -1,
+	}
+}
+
+// DefaultExpirationOptions returns the default values for ExpirationOptions.
+func DefaultExpirationOptions() ExpirationOptions {
+	return ExpirationOptions{
+		Limits:       DefaultExpirationLimits(),
+		ReverseOrder: false,
+	}
+}
+
 // PieceExpirationDB stores information about pieces with expiration dates.
 //
 // architecture: Database
@@ -67,11 +99,11 @@ type PieceExpirationDB interface {
 	// os.Stat on the piece.
 	SetExpiration(ctx context.Context, satellite storj.NodeID, pieceID storj.PieceID, expiresAt time.Time, pieceSize int64) error
 	// GetExpired gets piece IDs that expire or have expired before the given time
-	GetExpired(ctx context.Context, expiresBefore time.Time, batchSize int) ([]ExpiredInfo, error)
+	GetExpired(ctx context.Context, expiresBefore time.Time, opts ExpirationOptions) ([]*ExpiredInfoRecords, error)
 	// DeleteExpirations deletes approximately all the expirations that happen before the given time
 	DeleteExpirations(ctx context.Context, expiresAt time.Time) error
 	// DeleteExpirationsBatch deletes the pieces in the batch
-	DeleteExpirationsBatch(ctx context.Context, now time.Time, limit int) error
+	DeleteExpirationsBatch(ctx context.Context, now time.Time, opts ExpirationOptions) error
 }
 
 // V0PieceInfoDB stores meta information about pieces stored with storage format V0 (where
@@ -86,7 +118,7 @@ type V0PieceInfoDB interface {
 	Delete(ctx context.Context, satelliteID storj.NodeID, pieceID storj.PieceID) error
 	// GetExpired gets piece IDs stored with storage format V0 that expire or have expired
 	// before the given time
-	GetExpired(ctx context.Context, expiredAt time.Time) ([]ExpiredInfo, error)
+	GetExpired(ctx context.Context, expiredAt time.Time) ([]*ExpiredInfoRecords, error)
 	// DeleteExpirations deletes approximately all the expirations that happen before the given time
 	DeleteExpirations(ctx context.Context, expiresAt time.Time) error
 	// WalkSatelliteV0Pieces executes walkFunc for each locally stored piece, stored
@@ -164,7 +196,7 @@ type Config struct {
 	FileStatCache        string      `help:"optional type of file stat cache. Might be useful for slow disk and limited memory. Available options: badger (EXPERIMENTAL)"`
 	WritePreallocSize    memory.Size `help:"deprecated" default:"4MiB"`
 	DeleteToTrash        bool        `help:"move pieces to trash upon deletion. Warning: if set to false, you risk disqualification for failed audits if a satellite database is restored from backup." default:"true"`
-	EnableLazyFilewalker bool        `help:"run garbage collection and used-space calculation filewalkers as a separate subprocess with lower IO priority" default:"true"`
+	EnableLazyFilewalker bool        `help:"run garbage collection and used-space calculation filewalkers as a separate subprocess with lower IO priority" default:"true" testDefault:"false"`
 
 	EnableFlatExpirationStore        bool          `help:"use flat files for the piece expiration store instead of a sqlite database" default:"true"`
 	FlatExpirationStoreFileHandles   int           `help:"number of concurrent file handles to use for the flat expiration store" default:"1000"`
@@ -172,7 +204,7 @@ type Config struct {
 	FlatExpirationStoreMaxBufferTime time.Duration `help:"maximum time to buffer writes to the flat expiration store before flushing" default:"5m"`
 	FlatExpirationIncludeSQLite      bool          `help:"use and remove piece expirations from the sqlite database _also_ when the flat expiration store is enabled" default:"true"`
 
-	TrashChoreInterval time.Duration `help:"how often to empty check the trash, and delete old files" default:"24h"`
+	TrashChoreInterval time.Duration `help:"how often to empty check the trash, and delete old files" default:"24h" testDefault:"-1s"`
 }
 
 // DefaultConfig is the default value for the Config.
@@ -394,9 +426,9 @@ func (store *Store) DeleteExpiredV0(ctx context.Context, expiresAt time.Time) (e
 }
 
 // DeleteExpiredBatchSkipV0 deletes the pieces in the batch skipping V0 format and pieceinfo database.
-func (store *Store) DeleteExpiredBatchSkipV0(ctx context.Context, expireAt time.Time, limit int) (err error) {
+func (store *Store) DeleteExpiredBatchSkipV0(ctx context.Context, expireAt time.Time, opts ExpirationOptions) (err error) {
 	defer mon.Task()(&ctx)(&err)
-	return Error.Wrap(store.expirationInfo.DeleteExpirationsBatch(ctx, expireAt, limit))
+	return Error.Wrap(store.expirationInfo.DeleteExpirationsBatch(ctx, expireAt, opts))
 }
 
 // DeleteSatelliteBlobs deletes blobs folder of specific satellite after successful GE.
@@ -573,6 +605,13 @@ func (store *Store) WalkSatellitePieces(ctx context.Context, satellite storj.Nod
 	return store.WalkSatellitePiecesWithSkipPrefix(ctx, satellite, nil, walkFunc)
 }
 
+// WalkSatellitePiecesMigration wraps FileWalker.WalkSatellitePiecesMigration.
+func (store *Store) WalkSatellitePiecesMigration(ctx context.Context, satellite storj.NodeID, walkFunc func(StoredPieceAccess) error) (err error) {
+	defer mon.Task()(&ctx)(&err)
+
+	return store.Filewalker.WalkSatellitePiecesMigration(ctx, satellite, walkFunc)
+}
+
 // WalkSatellitePiecesWithSkipPrefix is like WalkSatellitePieces, but accepts a skipPrefixFn.
 func (store *Store) WalkSatellitePiecesWithSkipPrefix(ctx context.Context, satellite storj.NodeID, skipPrefixFn blobstore.SkipPrefixFn, walkFunc func(StoredPieceAccess) error) (err error) {
 	defer mon.Task()(&ctx)(&err)
@@ -601,10 +640,10 @@ func (store *Store) WalkSatellitePiecesToTrash(ctx context.Context, satelliteID 
 }
 
 // GetExpired gets piece IDs that are expired and were created before the given time.
-func (store *Store) GetExpired(ctx context.Context, expiredAt time.Time) (info []ExpiredInfo, err error) {
+func (store *Store) GetExpired(ctx context.Context, expiredAt time.Time) (info []*ExpiredInfoRecords, err error) {
 	defer mon.Task()(&ctx)(&err)
 
-	info, err = store.GetExpiredBatchSkipV0(ctx, expiredAt, 0)
+	info, err = store.GetExpiredBatchSkipV0(ctx, expiredAt, DefaultExpirationOptions())
 	if err != nil {
 		return nil, Error.Wrap(err)
 	}
@@ -624,10 +663,10 @@ func (store *Store) GetExpired(ctx context.Context, expiredAt time.Time) (info [
 // GetExpiredBatchSkipV0 gets piece IDs that are expired and were created before the given time
 // limiting the number of pieces returned to the batch size.
 // This method skips V0 pieces.
-func (store *Store) GetExpiredBatchSkipV0(ctx context.Context, expiredAt time.Time, batchSize int) (batch []ExpiredInfo, err error) {
+func (store *Store) GetExpiredBatchSkipV0(ctx context.Context, expiredAt time.Time, opts ExpirationOptions) (batch []*ExpiredInfoRecords, err error) {
 	defer mon.Task()(&ctx)(&err)
 
-	batch, err = store.expirationInfo.GetExpired(ctx, expiredAt, batchSize)
+	batch, err = store.expirationInfo.GetExpired(ctx, expiredAt, opts)
 	if err != nil {
 		return nil, Error.Wrap(err)
 	}
@@ -669,7 +708,7 @@ func (store *Store) SpaceUsedForPieces(ctx context.Context) (piecesTotal int64, 
 	return piecesTotal, piecesContentSize, nil
 }
 
-// SpaceUsedForTrash returns the total space used by the the piece store's
+// SpaceUsedForTrash returns the total space used by the piece store's
 // trash, including all headers.
 func (store *Store) SpaceUsedForTrash(ctx context.Context) (int64, error) {
 	// If the blobs is cached, it will return the cached value
@@ -733,7 +772,7 @@ func (store *Store) WalkAndComputeSpaceUsedBySatellite(ctx context.Context, sate
 	var satPiecesContentSize int64
 	var satPiecesCount int64
 
-	log := store.log.With(zap.Stringer("Satellite ID", satelliteID))
+	log := store.log.With(zap.Stringer("satellite_id", satelliteID))
 
 	log.Info("used-space-filewalker started")
 
@@ -741,7 +780,7 @@ func (store *Store) WalkAndComputeSpaceUsedBySatellite(ctx context.Context, sate
 	if lowerIOPriority {
 		satPiecesTotal, satPiecesContentSize, satPiecesCount, err = store.lazyFilewalker.WalkAndComputeSpaceUsedBySatellite(ctx, satelliteID)
 		if err != nil {
-			log.Error("used-space-filewalker failed", zap.Bool("Lazy File Walker", true), zap.Error(err))
+			log.Error("used-space-filewalker failed", zap.Bool("lazy_file_walker", true), zap.Error(err))
 		} else {
 			failover = false
 		}
@@ -750,7 +789,7 @@ func (store *Store) WalkAndComputeSpaceUsedBySatellite(ctx context.Context, sate
 	if failover {
 		satPiecesTotal, satPiecesContentSize, satPiecesCount, err = store.Filewalker.WalkAndComputeSpaceUsedBySatellite(ctx, satelliteID)
 		if err != nil {
-			log.Error("used-space-filewalker failed", zap.Bool("Lazy File Walker", false), zap.Error(err))
+			log.Error("used-space-filewalker failed", zap.Bool("lazy_file_walker", false), zap.Error(err))
 		}
 	}
 
@@ -759,11 +798,11 @@ func (store *Store) WalkAndComputeSpaceUsedBySatellite(ctx context.Context, sate
 	}
 
 	log.Info("used-space-filewalker completed",
-		zap.Bool("Lazy File Walker", !failover),
-		zap.Int64("Total Pieces Size", satPiecesTotal),
-		zap.Int64("Total Pieces Content Size", satPiecesContentSize),
-		zap.Int64("Total Pieces Count", satPiecesCount),
-		zap.Duration("Duration", time.Since(start)),
+		zap.Bool("lazy_file_walker", !failover),
+		zap.Int64("total_pieces_size", satPiecesTotal),
+		zap.Int64("total_pieces_content_size", satPiecesContentSize),
+		zap.Int64("total_pieces_count", satPiecesCount),
+		zap.Duration("duration", time.Since(start)),
 	)
 
 	return satPiecesTotal, satPiecesContentSize, nil

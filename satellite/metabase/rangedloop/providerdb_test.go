@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
 
 	"storj.io/common/testcontext"
 	"storj.io/common/testrand"
@@ -15,7 +16,6 @@ import (
 	"storj.io/storj/satellite/metabase"
 	"storj.io/storj/satellite/metabase/metabasetest"
 	"storj.io/storj/satellite/metabase/rangedloop"
-	"storj.io/storj/shared/dbutil"
 )
 
 type in struct {
@@ -31,11 +31,6 @@ type expected struct {
 
 func TestMetabaseSegementProvider(t *testing.T) {
 	metabasetest.Run(t, func(ctx *testcontext.Context, t *testing.T, db *metabase.DB) {
-		if db.Implementation() == dbutil.Spanner {
-			// TODO(spanner): seems to be flaky
-			t.Skip("not correct for spanner")
-		}
-
 		inouts := []struct {
 			in       in
 			expected expected
@@ -80,6 +75,22 @@ func TestMetabaseSegementProvider(t *testing.T) {
 				},
 			},
 			{
+				// a batch size above the iterator's maximum is capped rather than
+				// rejected, so a misconfigured satellite keeps making progress
+				in: in{
+					streamIDs: []string{
+						"00000000-0000-0000-0000-000000000001",
+						"00000000-0000-0000-0000-000000000002",
+					},
+					nRanges:   1,
+					batchSize: metabase.MaxLoopIteratorBatchSize + 1,
+				},
+				expected: expected{
+					nBatches:  1,
+					nSegments: 2,
+				},
+			},
+			{
 				in: in{
 					streamIDs: []string{
 						"00000000-0000-0000-0000-000000000001",
@@ -111,8 +122,18 @@ func runTest(ctx *testcontext.Context, t *testing.T, db *metabase.DB, in in, exp
 		createSegment(ctx, t, db, u)
 	}
 
-	provider := rangedloop.NewMetabaseRangeSplitter(db, -1*time.Microsecond, -1*time.Microsecond, in.batchSize)
-	ranges, err := provider.CreateRanges(in.nRanges, in.batchSize)
+	// Use a staleness interval large enough to exercise the AS OF SYSTEM TIME
+	// path (on TiDB sub-second staleness is disabled), and sleep so that the
+	// table and the created segments predate the staleness window and remain
+	// visible to the stale read.
+	time.Sleep(2 * time.Second)
+
+	provider := rangedloop.NewMetabaseRangeSplitter(zap.NewNop(), db, rangedloop.Config{
+		AsOfSystemInterval: -1 * time.Second,
+		StaleInterval:      -1 * time.Microsecond,
+		BatchSize:          in.batchSize,
+	})
+	ranges, err := provider.CreateRanges(ctx, in.nRanges, in.batchSize)
 	require.NoError(t, err)
 
 	nBatches := 0
@@ -161,12 +182,9 @@ func createSegment(ctx *testcontext.Context, t testing.TB, db *metabase.DB, stre
 		},
 	}.Check(ctx, t, db)
 
-	metabasetest.CommitObjectWithSegments{
-		Opts: metabase.CommitObjectWithSegments{
+	metabasetest.CommitObject{
+		Opts: metabase.CommitObject{
 			ObjectStream: obj,
-			Segments: []metabase.SegmentPosition{
-				{Part: 0, Index: 0},
-			},
 		},
 	}.Check(ctx, t, db)
 }

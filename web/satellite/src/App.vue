@@ -7,7 +7,7 @@
     <template v-else>
         <router-view />
         <trial-expiration-dialog
-            v-if="!user.paidTier"
+            v-if="!user.isPaid"
             v-model="appStore.state.isExpirationDialogShown"
             :expired="user.freezeStatus.trialExpiredFrozen"
         />
@@ -20,32 +20,33 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onBeforeMount, onBeforeUnmount, ref, watch } from 'vue';
-import { useTheme } from 'vuetify';
+import { computed, onBeforeMount, onBeforeUnmount, onUnmounted, ref, watch } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
+import { useTheme } from 'vuetify';
 
 import { useConfigStore } from '@/store/modules/configStore';
 import { useAppStore } from '@/store/modules/appStore';
-import { APIError, ObjectDeleteError } from '@/utils/error';
+import { type APIError, ObjectDeleteError  } from '@/utils/error';
 import { ErrorUnauthorized } from '@/api/errors/ErrorUnauthorized';
 import { useABTestingStore } from '@/store/modules/abTestingStore';
 import { useUsersStore } from '@/store/modules/usersStore';
 import { useProjectsStore } from '@/store/modules/projectsStore';
 import { useAnalyticsStore } from '@/store/modules/analyticsStore';
-import { useNotify } from '@/utils/hooks';
+import { useNotify } from '@/composables/useNotify';
 import { useBillingStore } from '@/store/modules/billingStore';
 import { AnalyticsErrorEventSource, AnalyticsEvent } from '@/utils/constants/analyticsEventNames';
-import { RouteConfig } from '@/types/router';
 import { ROUTES } from '@/router';
-import { User } from '@/types/users';
+import { OptInStatus, type User } from '@/types/users';
+import { popupAutoShowCutoff } from '@/types/pricingOptIn';
 import { useBucketsStore } from '@/store/modules/bucketsStore';
-import { PricingPlanInfo } from '@/types/common';
 import { EdgeCredentials } from '@/types/accessGrants';
 import { useObjectBrowserStore } from '@/store/modules/objectBrowserStore';
-import { ProjectConfig } from '@/types/projects';
-import { PaymentStatus, PaymentWithConfirmations } from '@/types/payments';
+import type { ProjectConfig } from '@/types/projects';
+import { type PaymentWithConfirmations, PaymentStatus  } from '@/types/payments';
+import { DARK_THEME_QUERY, useThemeStore } from '@/store/modules/themeStore';
+import { type FrontendConfig, ColorKey, FaviconKey  } from '@/types/config';
 
-import Notifications from '@/layouts/default/Notifications.vue';
+import Notifications from '@/layouts/shared/Notifications.vue';
 import ErrorPage from '@/components/ErrorPage.vue';
 import BrandedLoader from '@/components/utils/BrandedLoader.vue';
 import TrialExpirationDialog from '@/components/dialogs/TrialExpirationDialog.vue';
@@ -56,6 +57,7 @@ const abTestingStore = useABTestingStore();
 const billingStore = useBillingStore();
 const bucketsStore = useBucketsStore();
 const configStore = useConfigStore();
+const themeStore = useThemeStore();
 const usersStore = useUsersStore();
 const obStore = useObjectBrowserStore();
 const projectsStore = useProjectsStore();
@@ -63,10 +65,12 @@ const analyticsStore = useAnalyticsStore();
 
 const notify = useNotify();
 const router = useRouter();
-const theme = useTheme();
 const route = useRoute();
+const theme = useTheme();
 
 const isLoading = ref<boolean>(true);
+
+const darkThemeMediaQuery = window.matchMedia(DARK_THEME_QUERY);
 
 /**
  * Returns pending payments from store.
@@ -90,13 +94,13 @@ const user = computed<User>(() => usersStore.state.user);
 /**
  * Determine whether the current user is eligible for pricing plans.
  */
-async function getPricingPlansAvailable() {
-    if (!configStore.getBillingEnabled(usersStore.state.user.hasVarPartner)
+async function getPricingPlansAvailable(): Promise<void> {
+    if (!configStore.getBillingEnabled(usersStore.state.user)
         || !configStore.state.config.pricingPackagesEnabled) {
         return;
     }
     const user: User = usersStore.state.user;
-    if (user.paidTier || !user.partner) {
+    if (user.hasPaidPrivileges || !user.partner) {
         return;
     }
 
@@ -110,48 +114,54 @@ async function getPricingPlansAvailable() {
         return;
     }
 
-    let config;
     try {
-        config = (await import('@/configs/pricingPlanConfig.json')).default;
+        const config = await configStore.getPartnerPricingPlanConfig(user.partner);
+        billingStore.setPricingPlansAvailable(true, config);
     } catch {
         return;
     }
-
-    const info = (config[user.partner] as PricingPlanInfo);
-    if (!info) {
-        notify.error(`No pricing plan configuration for partner '${user.partner}'.`, null);
-        return;
-    }
-    billingStore.setPricingPlansAvailable(true, info);
 }
 
 /**
  * Sets up the app by fetching all necessary data.
  */
-async function setup() {
+async function setup(): Promise<void> {
     isLoading.value = true;
     const source = new URLSearchParams(window.location.search).get('source');
     try {
-        await usersStore.getUser();
+        const user = await usersStore.getUser();
         const promises: Promise<void | object | string>[] = [
             usersStore.getSettings(),
             projectsStore.getProjects(),
             projectsStore.getUserInvitations(),
             abTestingStore.fetchValues(),
         ];
-        if (configStore.state.config.billingFeaturesEnabled) {
+        if (configStore.billingEnabled && !user.isMember) {
             promises.push(billingStore.setupAccount().catch((e) => {
                 notify.notifyError(e, AnalyticsErrorEventSource.OVERALL_APP_WRAPPER_ERROR);
-            }));
-            promises.push(getPricingPlansAvailable());
+            }), getPricingPlansAvailable());
         }
         await Promise.all(promises);
+
+        if (configStore.state.config.optInPopupEnabled) {
+            const optInStatus = usersStore.state.settings.optInStatus;
+
+            const cutoff = popupAutoShowCutoff(configStore.state.config.optOutFreezeDate);
+            const pastAutoShowWindow = !!cutoff && new Date() >= cutoff;
+
+            const shouldShowPopup = appStore.state.hasJustLoggedIn
+                && optInStatus === OptInStatus.NoAction
+                && !usersStore.state.user.freezeStatus.optOutFrozen
+                && !pastAutoShowWindow;
+
+            if (shouldShowPopup) appStore.togglePricingOptInDialog(true);
+        }
 
         const invites = projectsStore.state.invitations;
         const projects = projectsStore.state.projects;
 
         if (source) {
-            analyticsStore.eventTriggered(AnalyticsEvent.ARRIVED_FROM_SOURCE, { source: source });
+            analyticsStore.eventTriggered(AnalyticsEvent.ARRIVED_FROM_SOURCE, { source });
         }
 
         if (appStore.state.hasJustLoggedIn && !invites.length && projects.length === 1) {
@@ -169,7 +179,14 @@ async function setup() {
             appStore.setErrorPage((error as APIError).status ?? 500, true);
         } else {
             await new Promise(resolve => setTimeout(resolve, 1000));
-            if (!RouteConfig.AuthRoutes.includes(route.path)) await router.push(ROUTES.Login.path);
+            if (!ROUTES.AuthRoutes.includes(route.path)) {
+                const loginURL = configStore.state.config.primaryAuthLoginURL;
+                if (loginURL) {
+                    window.location.href = loginURL;
+                } else {
+                    await router.push(ROUTES.Login.path);
+                }
+            }
         }
     }
     isLoading.value = false;
@@ -181,18 +198,96 @@ function totalValueCounter(list: PaymentWithConfirmations[], field: keyof Paymen
     }, 0);
 }
 
+function onThemeChange(e: MediaQueryListEvent) {
+    themeStore.setThemeLightness(!e.matches);
+}
+
+function setFavicons(): void {
+    const branding = configStore.state.branding;
+
+    const faviconDefs = [
+        { rel: 'icon', type: 'image/png', sizes: '16x16', href: branding.getFavicon(FaviconKey.Small) },
+        { rel: 'icon', type: 'image/png', sizes: '32x32', href: branding.getFavicon(FaviconKey.Large) },
+        { rel: 'apple-touch-icon', sizes: '180x180', href: branding.getFavicon(FaviconKey.AppleTouch) },
+    ];
+
+    for (const { rel, type, sizes, href } of faviconDefs) {
+        if (!href) continue;
+
+        // Try to find an existing tag with the same rel and sizes.
+        const selector = `link[rel="${rel}"][sizes="${sizes}"]`;
+        let tag = document.querySelector(selector) as HTMLLinkElement;
+
+        if (tag) {
+            tag.href = href;
+        } else {
+            tag = document.createElement('link');
+            tag.rel = rel;
+            if (type) tag.type = type;
+            tag.sizes = sizes;
+            tag.href = href;
+            document.head.appendChild(tag);
+        }
+    }
+}
+
+function applyBrandingTheme(): void {
+    const branding = configStore.state.branding;
+    const primaryLightColor = branding.getColor(ColorKey.PrimaryLight);
+    const primaryDarkColor = branding.getColor(ColorKey.PrimaryDark);
+    const onPrimaryLightColor = branding.getColor(ColorKey.OnPrimaryLight);
+    const onPrimaryDarkColor = branding.getColor(ColorKey.OnPrimaryDark);
+    const secondaryLightColor = branding.getColor(ColorKey.SecondaryLight);
+    const secondaryDarkColor = branding.getColor(ColorKey.SecondaryDark);
+    const onSecondaryLightColor = branding.getColor(ColorKey.OnSecondaryLight);
+    const onSecondaryDarkColor = branding.getColor(ColorKey.OnSecondaryDark);
+    const backgroundLightColor = branding.getColor(ColorKey.BackgroundLight);
+    const backgroundDarkColor = branding.getColor(ColorKey.BackgroundDark);
+    const surfaceLightColor = branding.getColor(ColorKey.SurfaceLight);
+    const surfaceDarkColor = branding.getColor(ColorKey.SurfaceDark);
+    const onSurfaceLightColor = branding.getColor(ColorKey.OnSurfaceLight);
+    const onSurfaceDarkColor = branding.getColor(ColorKey.OnSurfaceDark);
+    const successLightColor = branding.getColor(ColorKey.SuccessLight);
+    const successDarkColor = branding.getColor(ColorKey.SuccessDark);
+    const infoLightColor = branding.getColor(ColorKey.InfoLight);
+    const infoDarkColor = branding.getColor(ColorKey.InfoDark);
+    const warningLightColor = branding.getColor(ColorKey.WarningLight);
+    const warningDarkColor = branding.getColor(ColorKey.WarningDark);
+
+    if (primaryLightColor) theme.themes.value.light.colors.primary = primaryLightColor;
+    if (primaryDarkColor) theme.themes.value.dark.colors.primary = primaryDarkColor;
+    if (onPrimaryLightColor) theme.themes.value.light.colors['on-primary'] = onPrimaryLightColor;
+    if (onPrimaryDarkColor) theme.themes.value.dark.colors['on-primary'] = onPrimaryDarkColor;
+    if (secondaryLightColor) theme.themes.value.light.colors.secondary = secondaryLightColor;
+    if (secondaryDarkColor) theme.themes.value.dark.colors.secondary = secondaryDarkColor;
+    if (onSecondaryLightColor) theme.themes.value.light.colors['on-secondary'] = onSecondaryLightColor;
+    if (onSecondaryDarkColor) theme.themes.value.dark.colors['on-secondary'] = onSecondaryDarkColor;
+    if (backgroundLightColor) theme.themes.value.light.colors.background = backgroundLightColor;
+    if (backgroundDarkColor) theme.themes.value.dark.colors.background = backgroundDarkColor;
+    if (surfaceLightColor) theme.themes.value.light.colors.surface = surfaceLightColor;
+    if (surfaceDarkColor) theme.themes.value.dark.colors.surface = surfaceDarkColor;
+    if (onSurfaceLightColor) theme.themes.value.light.colors['on-surface'] = onSurfaceLightColor;
+    if (onSurfaceDarkColor) theme.themes.value.dark.colors['on-surface'] = onSurfaceDarkColor;
+    if (successLightColor) theme.themes.value.light.colors.success = successLightColor;
+    if (successDarkColor) theme.themes.value.dark.colors.success = successDarkColor;
+    if (infoLightColor) theme.themes.value.light.colors.info = infoLightColor;
+    if (infoDarkColor) theme.themes.value.dark.colors.info = infoDarkColor;
+    if (warningLightColor) theme.themes.value.light.colors.warning = warningLightColor;
+    if (warningDarkColor) theme.themes.value.dark.colors.warning = warningDarkColor;
+}
+
+function handleBeforeUnload(event: BeforeUnloadEvent): void {
+    if (obStore.uploadingLength > 0) event.preventDefault();
+}
+
 /**
  * Lifecycle hook before initial render.
  * Sets up variables from meta tags from config such satellite name, etc.
  */
 onBeforeMount(async (): Promise<void> => {
-    const savedTheme = localStorage.getItem('theme') || 'light';
-    if ((savedTheme === 'dark' && !theme.global.current.value.dark) || (savedTheme === 'light' && theme.global.current.value.dark)) {
-        theme.global.name.value = savedTheme;
-    }
-
+    let cfg: FrontendConfig;
     try {
-        await configStore.getConfig();
+        cfg = await configStore.getConfig();
     } catch (error) {
         isLoading.value = false;
         notify.notifyError(error, AnalyticsErrorEventSource.OVERALL_APP_WRAPPER_ERROR);
@@ -200,12 +295,35 @@ onBeforeMount(async (): Promise<void> => {
         return;
     }
 
+    try {
+        await configStore.getBranding();
+    } catch (error) {
+        // If branding fetch fails, log error but continue with defaults.
+        // This ensures the app still works even if custom branding is unavailable.
+        configStore.setFallbackBranding(cfg);
+        console.error('Failed to load branding config, using defaults:', error);
+    }
+
+    setFavicons();
+    applyBrandingTheme();
+
+    const isErrorPage = window.location.pathname === ROUTES.AuthError.path
+        || window.location.pathname === ROUTES.RateLimited.path;
+    if (isErrorPage) {
+        isLoading.value = false;
+        return;
+    }
+
     await setup();
 
-    isLoading.value = false;
+    // Add beforeunload event listener for ongoing uploads warning.
+    window.addEventListener('beforeunload', handleBeforeUnload);
 
     if (configStore.state.config.analyticsEnabled) {
-        analyticsStore.pageVisit(route.matched[route.matched.length - 1].path, configStore.state.config.satelliteName);
+        const path = route.matched[route.matched.length - 1]?.path;
+        if (path) {
+            analyticsStore.pageVisit(path, configStore.state.config.satelliteName);
+        }
     }
 });
 
@@ -213,7 +331,7 @@ usersStore.$onAction(({ name, after }) => {
     if (name === 'login') {
         after((_) => {
             setup().then(() => {
-                if (user.value.paidTier || route.name !== ROUTES.Dashboard.name || projectsStore.state.selectedProject.ownerId !== user.value.id) return;
+                if (user.value.hasPaidPrivileges || route.name !== ROUTES.Dashboard.name || projectsStore.state.selectedProject.ownerId !== user.value.id) return;
 
                 const expirationInfo = user.value.getExpirationInfo(configStore.state.config.daysBeforeTrialEndNotification);
                 if (user.value.freezeStatus.trialExpiredFrozen || expirationInfo.isCloseToExpiredTrial) {
@@ -231,7 +349,7 @@ bucketsStore.$onAction(({ name, after, args }) => {
             const request = args[1];
             try {
                 await request;
-                analyticsStore.eventTriggered(AnalyticsEvent.BUCKET_DELETED);
+                analyticsStore.eventTriggered(AnalyticsEvent.BUCKET_DELETED, { project_id: projectsStore.state.selectedProject.id });
                 notify.success(`Successfully deleted ${bucketName}.`, 'Bucket Deleted');
             } catch (error) {
                 let message = `Failed to delete ${bucketName}.`;
@@ -255,7 +373,7 @@ obStore.$onAction(({ name, after, args }) => {
         after(async (_) => {
             const request = args[0];
             let label = args[1] ?? 'object';
-            let deletedCount = 0;
+            let deletedCount;
             try {
                 deletedCount = await request;
             } catch (error) {
@@ -278,20 +396,17 @@ obStore.$onAction(({ name, after, args }) => {
     }
 });
 
-const unwatch = watch(pendingPayments, async newPayments => {
-    if (user.value.paidTier) {
-        unwatch();
-        return;
-    }
+const processedTXs = new Set<string>();
 
-    if (!newPayments.length) return;
+watch(pendingPayments, async newPayments => {
+    if (!(newPayments.length && configStore.isDefaultBrand)) return;
 
-    const newConfirmedPayments = newPayments.some(p => p.status === PaymentStatus.Confirmed);
-    if (!newConfirmedPayments) return;
+    const unprocessedConfirmedPayments = newPayments.filter(p => p.status === PaymentStatus.Confirmed && !processedTXs.has(p.transaction));
+    if (!unprocessedConfirmedPayments.length) return;
 
-    const tokensSum = totalValueCounter(newPayments, 'tokenValue');
+    const tokensSum = totalValueCounter(unprocessedConfirmedPayments, 'tokenValue');
     if (tokensSum > 0) {
-        const bonusSum = totalValueCounter(newPayments, 'bonusTokens');
+        const bonusSum = totalValueCounter(unprocessedConfirmedPayments, 'bonusTokens');
 
         notify.success(`Successful deposit of ${tokensSum} STORJ tokens. You received an additional bonus of ${bonusSum} STORJ tokens.`);
 
@@ -301,27 +416,26 @@ const unwatch = watch(pendingPayments, async newPayments => {
         ]).catch((_) => {});
     }
 
-    await usersStore.getUser();
+    unprocessedConfirmedPayments.forEach(p => processedTXs.add(p.transaction));
 
-    if (user.value.paidTier) {
-        await Promise.all([
-            projectsStore.getProjectConfig(),
-            projectsStore.getProjectLimits(projectsStore.state.selectedProject.id),
-        ]).catch((_) => {});
+    if (user.value.isFree) {
+        await usersStore.getUser();
 
-        notify.success('Account was successfully upgraded!');
+        if (user.value.isPaid) {
+            await Promise.all([
+                projectsStore.getProjectConfig(),
+                projectsStore.getProjectLimits(projectsStore.state.selectedProject.id),
+            ]).catch((_) => {});
 
-        billingStore.stopPaymentsPolling();
-        billingStore.clearPendingPayments();
-
-        unwatch();
+            notify.success('Account was successfully upgraded!');
+        }
     }
 }, { deep: true, immediate: true });
 
 /**
  * reset pricing plans available when user upgrades to paid tier.
  */
-watch(() => user.value.paidTier, (paidTier) => {
+watch(() => user.value.hasPaidPrivileges, (paidTier) => {
     if (paidTier) {
         billingStore.setPricingPlansAvailable(false, null);
     }
@@ -361,7 +475,20 @@ watch(() => projectsStore.state.selectedProject, async (project, oldProject) => 
     }
 });
 
+watch(() => themeStore.state.name, (theme) => {
+    if (theme === 'auto') {
+        darkThemeMediaQuery.addEventListener('change', onThemeChange);
+        return;
+    }
+    darkThemeMediaQuery.removeEventListener('change', onThemeChange);
+}, { immediate: true });
+
+onUnmounted(() => {
+    window.removeEventListener('beforeunload', handleBeforeUnload);
+});
+
 onBeforeUnmount(() => {
     billingStore.stopPaymentsPolling();
+    darkThemeMediaQuery.removeEventListener('change', onThemeChange);
 });
 </script>

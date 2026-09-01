@@ -7,7 +7,6 @@ import (
 	"context"
 	"time"
 
-	"cloud.google.com/go/spanner"
 	"go.uber.org/zap"
 
 	"storj.io/common/storj"
@@ -16,9 +15,38 @@ import (
 	"storj.io/storj/shared/tagsql"
 )
 
+// TransactionOptions contains options for transaction.
+type TransactionOptions struct {
+	MaxCommitDelay *time.Duration
+	TransactionTag string
+	TransmitEvent  bool
+}
+
+// Shard represents methods that are specific to a particular database implementation.
+// Right now it contains only methods that were fully moved under a specific DB implementation.
+type Shard interface {
+	BeginObjectExactVersion(ctx context.Context, opts BeginObjectExactVersion) (object Object, err error)
+	BeginObjectNextVersion(ctx context.Context, opts BeginObjectNextVersion) (object Object, err error)
+
+	CommitObject(ctx context.Context, opts CommitObject) (object Object, err error)
+	CommitInlineObject(ctx context.Context, opts CommitInlineObject) (object Object, err error)
+
+	GetObjectLastCommitted(ctx context.Context, opts GetObjectLastCommitted) (object Object, err error)
+	GetObjectExactVersion(ctx context.Context, opts GetObjectExactVersion) (object Object, err error)
+	GetObjectExactVersionRetention(ctx context.Context, opts GetObjectExactVersionRetention) (retention Retention, err error)
+	GetObjectLastCommittedRetention(ctx context.Context, opts GetObjectLastCommittedRetention) (retention Retention, err error)
+	GetObjectExactVersionLegalHold(ctx context.Context, opts GetObjectExactVersionLegalHold) (enabled bool, err error)
+	GetObjectLastCommittedLegalHold(ctx context.Context, opts GetObjectLastCommittedLegalHold) (enabled bool, err error)
+	GetLatestObjectLastSegment(ctx context.Context, opts GetLatestObjectLastSegment) (segment Segment, err error)
+
+	BucketEmpty(ctx context.Context, opts BucketEmpty) (empty bool, err error)
+}
+
 // Adapter is a low level extension point to use datasource related queries.
 // TODO: we may need separated adapter for segments/objects/etc.
 type Adapter interface {
+	Shard
+
 	Name() string
 	Now(ctx context.Context) (time.Time, error)
 	Ping(ctx context.Context) error
@@ -26,57 +54,58 @@ type Adapter interface {
 	CheckVersion(ctx context.Context) error
 	Implementation() dbutil.Implementation
 
-	BeginObjectNextVersion(context.Context, BeginObjectNextVersion, *Object) error
-	GetObjectLastCommitted(ctx context.Context, opts GetObjectLastCommitted) (Object, error)
 	IterateLoopSegments(ctx context.Context, aliasCache *NodeAliasCache, opts IterateLoopSegments, fn func(context.Context, LoopSegmentsIterator) error) error
 	PendingObjectExists(ctx context.Context, opts BeginSegment) (exists bool, err error)
 	CommitPendingObjectSegment(ctx context.Context, opts CommitSegment, aliasPieces AliasPieces) error
 	CommitInlineSegment(ctx context.Context, opts CommitInlineSegment) error
-	TestingBeginObjectExactVersion(ctx context.Context, opts BeginObjectExactVersion, object *Object) error
 
-	GetObjectExactVersionRetention(ctx context.Context, opts GetObjectExactVersionRetention) (retention Retention, err error)
-	GetObjectLastCommittedRetention(ctx context.Context, opts GetObjectLastCommittedRetention) (retention Retention, err error)
 	SetObjectExactVersionRetention(ctx context.Context, opts SetObjectExactVersionRetention) error
 	SetObjectLastCommittedRetention(ctx context.Context, opts SetObjectLastCommittedRetention) error
 
-	GetObjectExactVersionLegalHold(ctx context.Context, opts GetObjectExactVersionLegalHold) (enabled bool, err error)
-	GetObjectLastCommittedLegalHold(ctx context.Context, opts GetObjectLastCommittedLegalHold) (enabled bool, err error)
 	SetObjectExactVersionLegalHold(ctx context.Context, opts SetObjectExactVersionLegalHold) error
 	SetObjectLastCommittedLegalHold(ctx context.Context, opts SetObjectLastCommittedLegalHold) error
 
 	GetTableStats(ctx context.Context, opts GetTableStats) (result TableStats, err error)
+	CountSegments(ctx context.Context, checkTimestamp time.Time) (result int64, err error)
 	UpdateTableStats(ctx context.Context) error
-	BucketEmpty(ctx context.Context, opts BucketEmpty) (empty bool, err error)
 
-	WithTx(ctx context.Context, f func(context.Context, TransactionAdapter) error) error
+	WithTx(ctx context.Context, opts TransactionOptions, f func(context.Context, TransactionAdapter) error) error
 
 	CollectBucketTallies(ctx context.Context, opts CollectBucketTallies) (result []BucketTally, err error)
 
 	GetSegmentByPosition(ctx context.Context, opts GetSegmentByPosition) (segment Segment, aliasPieces AliasPieces, err error)
-	GetObjectExactVersion(ctx context.Context, opts GetObjectExactVersion) (_ Object, err error)
+	GetSegmentsByPosition(ctx context.Context, opts GetSegmentsByPosition) (segments map[SegmentPositionKey]Segment, aliasPiecesMap map[SegmentPositionKey]AliasPieces, err error)
+	GetSegmentByPositionForAudit(ctx context.Context, opts GetSegmentByPosition) (segment SegmentForAudit, aliasPieces AliasPieces, err error)
+	GetSegmentByPositionForRepair(ctx context.Context, opts GetSegmentByPosition) (segment SegmentForRepair, aliasPieces AliasPieces, err error)
+	CheckSegmentPiecesAlteration(ctx context.Context, streamID uuid.UUID, position SegmentPosition, aliasPieces AliasPieces) (altered bool, err error)
+
 	GetSegmentPositionsAndKeys(ctx context.Context, streamID uuid.UUID) (keysNonces []EncryptedKeyAndNonce, err error)
-	GetLatestObjectLastSegment(ctx context.Context, opts GetLatestObjectLastSegment) (segment Segment, aliasPieces AliasPieces, err error)
 
 	ListObjects(ctx context.Context, opts ListObjects) (result ListObjectsResult, err error)
 	ListSegments(ctx context.Context, opts ListSegments, aliasCache *NodeAliasCache) (result ListSegmentsResult, err error)
 	ListStreamPositions(ctx context.Context, opts ListStreamPositions) (result ListStreamPositionsResult, err error)
-	ListBucketsStreamIDs(ctx context.Context, opts ListBucketsStreamIDs, bucketNamesBytes [][]byte, projectIDs []uuid.UUID) (result ListBucketsStreamIDsResult, err error)
+	ListVerifySegments(ctx context.Context, opts ListVerifySegments) (segments []VerifySegment, err error)
+	ListBucketStreamIDs(ctx context.Context, opts ListBucketStreamIDs, process func(ctx context.Context, streamIDs []uuid.UUID) error) (err error)
 
 	UpdateSegmentPieces(ctx context.Context, opts UpdateSegmentPieces, oldPieces, newPieces AliasPieces) (resultPieces AliasPieces, err error)
-	UpdateObjectLastCommittedMetadata(ctx context.Context, opts UpdateObjectLastCommittedMetadata) (affected int64, err error)
+	BatchUpdateSegmentPieces(ctx context.Context, opts BatchUpdateSegmentPieces, newAliasPieces []AliasPieces) (results []bool, err error)
+
+	GetPendingObjectMetadata(ctx context.Context, opts GetPendingObjectMetadata) (result GetPendingObjectMetadataResult, err error)
+	UpdateObjectLastCommittedMetadata(ctx context.Context, opts UpdateObjectLastCommittedMetadata) error
+	UpdateObjectLastCommittedClearMetadata(ctx context.Context, opts UpdateObjectLastCommittedClearMetadata) error
 
 	DeleteObjectExactVersion(ctx context.Context, opts DeleteObjectExactVersion) (result DeleteObjectResult, err error)
 	DeletePendingObject(ctx context.Context, opts DeletePendingObject) (result DeleteObjectResult, err error)
 
 	DeleteObjectLastCommittedPlain(ctx context.Context, opts DeleteObjectLastCommitted) (result DeleteObjectResult, err error)
-	DeleteObjectLastCommittedSuspended(ctx context.Context, opts DeleteObjectLastCommitted, deleterMarkerStreamID uuid.UUID) (result DeleteObjectResult, err error)
 	DeleteObjectLastCommittedVersioned(ctx context.Context, opts DeleteObjectLastCommitted, deleterMarkerStreamID uuid.UUID) (result DeleteObjectResult, err error)
 
-	FindExpiredObjects(ctx context.Context, opts DeleteExpiredObjects, startAfter ObjectStream, batchSize int) (expiredObjects []ObjectStream, err error)
-	DeleteObjectsAndSegments(ctx context.Context, objects []ObjectStream) (objectsDeleted, segmentsDeleted int64, err error)
-	FindZombieObjects(ctx context.Context, opts DeleteZombieObjects, startAfter ObjectStream, batchSize int) (objects []ObjectStream, err error)
-	DeleteInactiveObjectsAndSegments(ctx context.Context, objects []ObjectStream, opts DeleteZombieObjects) (objectsDeleted, segmentsDeleted int64, err error)
+	IterateExpiredObjects(ctx context.Context, opts DeleteExpiredObjects, process func(context.Context, []ObjectStream) error) (err error)
+	DeleteObjectsAndSegmentsNoVerify(ctx context.Context, opts DeleteObjectsAndSegmentsNoVerify) (objectsDeleted, segmentsDeleted int64, err error)
+	IterateZombieObjects(ctx context.Context, opts DeleteZombieObjects, process func(context.Context, []ObjectStream) error) (err error)
+	DeleteInactiveObjectsAndSegments(ctx context.Context, opts DeleteInactiveObjectsAndSegments) (objectsDeleted, segmentsDeleted int64, err error)
 	DeleteAllBucketObjects(ctx context.Context, opts DeleteAllBucketObjects) (deletedObjectCount, deletedSegmentCount int64, err error)
+	UncoordinatedDeleteAllBucketObjects(ctx context.Context, opts UncoordinatedDeleteAllBucketObjects) (deletedObjectCount, deletedSegmentCount int64, err error)
 
 	FindObjectsByClearMetadata(ctx context.Context, opts FindObjectsByClearMetadata, startAfter ObjectStream, batchSize int) (result FindObjectsByClearMetadataResult, err error)
 
@@ -85,9 +114,7 @@ type Adapter interface {
 	GetNodeAliasEntries(ctx context.Context, opts GetNodeAliasEntries) (entries []NodeAliasEntry, err error)
 	GetStreamPieceCountByAlias(ctx context.Context, opts GetStreamPieceCountByNodeID) (result map[NodeAlias]int64, err error)
 
-	doNextQueryAllVersionsWithStatus(ctx context.Context, it *objectsIterator) (_ tagsql.Rows, err error)
-	doNextQueryAllVersionsWithStatusAscending(ctx context.Context, it *objectsIterator) (_ tagsql.Rows, err error)
-	doNextQueryPendingObjectsByKey(ctx context.Context, it *objectsIterator) (_ tagsql.Rows, err error)
+	ObjectIterator(ctx context.Context, opts ObjectIteratorOptions) (ObjectIterator, error)
 
 	TestingBatchInsertSegments(ctx context.Context, aliasCache *NodeAliasCache, segments []RawSegment) (err error)
 	TestingGetAllObjects(ctx context.Context) (_ []RawObject, err error)
@@ -96,18 +123,26 @@ type Adapter interface {
 	TestingBatchInsertObjects(ctx context.Context, objects []RawObject) (err error)
 	TestingSetObjectVersion(ctx context.Context, object ObjectStream, randomVersion Version) (rowsAffected int64, err error)
 	TestingSetPlacementAllSegments(ctx context.Context, placement storj.PlacementConstraint) (err error)
+	TestingSetObjectCreatedAt(ctx context.Context, object ObjectStream, createdAt time.Time) (rowsAffected int64, err error)
 
 	// TestMigrateToLatest creates a database and applies all the migration for test purposes.
 	TestMigrateToLatest(ctx context.Context) error
+
+	copyObjectAdapter
+
+	Config() *Config
 }
 
 // PostgresAdapter uses Cockroach related SQL queries.
 type PostgresAdapter struct {
-	log                      *zap.Logger
-	db                       tagsql.DB
-	impl                     dbutil.Implementation
-	connstr                  string
-	testingUniqueUnversioned bool
+	log     *zap.Logger
+	db      tagsql.DB
+	impl    dbutil.Implementation
+	connstr string
+
+	config *Config
+
+	aliasCache *NodeAliasCache
 }
 
 // Name returns the name of the adapter.
@@ -120,9 +155,20 @@ func (p *PostgresAdapter) UnderlyingDB() tagsql.DB {
 	return p.db
 }
 
+// Close closes the underlying connection pool. It is picked up by DB.Close via
+// the io.Closer assertion; CockroachAdapter inherits it through embedding.
+func (p *PostgresAdapter) Close() error {
+	return p.db.Close()
+}
+
 // Implementation returns the dbutil.Implementation code for this adapter.
 func (p *PostgresAdapter) Implementation() dbutil.Implementation {
 	return p.impl
+}
+
+// Config returns the metabase configuration.
+func (p *PostgresAdapter) Config() *Config {
+	return p.config
 }
 
 var _ Adapter = &PostgresAdapter{}
@@ -145,7 +191,6 @@ type TransactionAdapter interface {
 	commitObjectWithSegmentsTransactionAdapter
 	copyObjectTransactionAdapter
 	moveObjectTransactionAdapter
-	deleteTransactionAdapter
 }
 
 type postgresTransactionAdapter struct {
@@ -154,10 +199,3 @@ type postgresTransactionAdapter struct {
 }
 
 var _ TransactionAdapter = &postgresTransactionAdapter{}
-
-type spannerTransactionAdapter struct {
-	spannerAdapter *SpannerAdapter
-	tx             *spanner.ReadWriteTransaction
-}
-
-var _ TransactionAdapter = &spannerTransactionAdapter{}

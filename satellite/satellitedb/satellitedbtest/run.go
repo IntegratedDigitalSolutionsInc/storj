@@ -57,7 +57,7 @@ type Database struct {
 }
 
 // Databases returns default databases.
-func Databases() []SatelliteDatabases {
+func Databases[T dbtest.TB](t T) []SatelliteDatabases {
 	var dbs []SatelliteDatabases
 
 	postgresConnStr := dbtest.PickPostgresNoSkip()
@@ -78,13 +78,24 @@ func Databases() []SatelliteDatabases {
 		})
 	}
 
-	spanner := dbtest.PickSpannerNoSkip()
-	if !strings.EqualFold(spanner, "omit") {
-		dbs = append(dbs, SatelliteDatabases{
-			Name:       "Spanner",
-			MasterDB:   Database{"Spanner", spanner, "Spanner flag missing, example: -spanner-test-db=" + dbtest.DefaultSpanner + " or use STORJ_TEST_SPANNER environment variable."},
-			MetabaseDB: Database{"Spanner", spanner, ""},
-		})
+	tidbConnStr := dbtest.PickTiDBNoSkip()
+	if !strings.EqualFold(tidbConnStr, "omit") {
+		databases := SatelliteDatabases{
+			Name:       "TiDB",
+			MasterDB:   Database{"TiDB", "", "TiDB master flag missing, example: -tidb-test-db=" + dbtest.DefaultTiDB + " or use STORJ_TEST_TIDB environment variable."},
+			MetabaseDB: Database{"TiDB", "", "TiDB flag missing, example: -tidb-test-db=" + dbtest.DefaultTiDB + " or use STORJ_TEST_TIDB environment variable."},
+		}
+		if tidbConnStr != "" {
+			// We'll use a hack to specify the TiDB master connection string,
+			// because the TiDB doesn't support satellitedb yet.
+			metabaseConnStr, masterConnStr, ok := strings.Cut(tidbConnStr, "!!master=")
+			if !ok {
+				t.Fatal("Invalid TiDB connection string, it requires `!!master=` to specify the master connection string.")
+			}
+			databases.MasterDB.URL = masterConnStr
+			databases.MetabaseDB.URL = metabaseConnStr
+		}
+		dbs = append(dbs, databases)
 	}
 
 	return dbs
@@ -105,14 +116,14 @@ func SchemaName(testname, category string, index int, schemaSuffix string) strin
 	category = nameCleaner.ReplaceAllString(category, "_")
 	schemaSuffix = nameCleaner.ReplaceAllString(schemaSuffix, "_")
 
-	// spanner has a maximum database length of 30 while postgres has a maximum schema length of 64
+	// some backends have a maximum database length of 30 while postgres has a maximum schema length of 64
 	// we need additional 6 bytes for the random suffix and 4 bytes for the satellite index "/S0/""
 	// additionally, we will leave 5 bytes for a delimiter and any randomness that need to be added for testing or
 	// other purposes
 
 	indexStr := strconv.Itoa(index)
 
-	var maxTestNameLen = 30 - len(category) - len(indexStr) - len(schemaSuffix) - 2 - 5
+	maxTestNameLen := 30 - len(category) - len(indexStr) - len(schemaSuffix) - 2 - 5
 	if len(testname) > maxTestNameLen {
 		testname = testname[:maxTestNameLen]
 	}
@@ -136,7 +147,7 @@ func (db *tempMasterDB) Close() error {
 }
 
 // CreateMasterDB creates a new satellite database for testing.
-func CreateMasterDB(ctx context.Context, log *zap.Logger, name string, category string, index int, dbInfo Database, applicationName string) (db satellite.DB, err error) {
+func CreateMasterDB(ctx context.Context, log *zap.Logger, name string, category string, index int, dbInfo Database, options satellitedb.Options) (db satellite.DB, err error) {
 	if dbInfo.URL == "" {
 		return nil, fmt.Errorf("Database %s connection string not provided. %s", dbInfo.Name, dbInfo.Message)
 	}
@@ -145,7 +156,7 @@ func CreateMasterDB(ctx context.Context, log *zap.Logger, name string, category 
 	log.Debug("creating", zap.String("suffix", schemaSuffix))
 	schema := SchemaName(name, category, index, schemaSuffix)
 
-	tempDB, err := tempdb.OpenUnique(ctx, dbInfo.URL, schema)
+	tempDB, err := tempdb.OpenUnique(ctx, log, dbInfo.URL, schema)
 	if err != nil {
 		return nil, err
 	}
@@ -153,13 +164,13 @@ func CreateMasterDB(ctx context.Context, log *zap.Logger, name string, category 
 		tempDB.Cleanup = func(d tagsql.DB) error { return nil }
 	}
 
-	return CreateMasterDBOnTopOf(ctx, log, tempDB, applicationName)
+	return CreateMasterDBOnTopOf(ctx, log, tempDB, options)
 }
 
 // CreateMasterDBOnTopOf creates a new satellite database on top of an already existing
 // temporary database.
-func CreateMasterDBOnTopOf(ctx context.Context, log *zap.Logger, tempDB *dbutil.TempDatabase, applicationName string) (db satellite.DB, err error) {
-	masterDB, err := satellitedb.Open(ctx, log.Named("db"), tempDB.ConnStr, satellitedb.Options{ApplicationName: applicationName})
+func CreateMasterDBOnTopOf(ctx context.Context, log *zap.Logger, tempDB *dbutil.TempDatabase, options satellitedb.Options) (db satellite.DB, err error) {
+	masterDB, err := satellitedb.Open(ctx, log.Named("db"), tempDB.ConnStr, options)
 	return &tempMasterDB{DB: masterDB, tempDB: tempDB}, err
 }
 
@@ -181,7 +192,7 @@ func CreateTempDB(ctx context.Context, log *zap.Logger, tcfg TempDBSchemaConfig,
 
 	schema := SchemaName(tcfg.Name, tcfg.Category, tcfg.Index, schemaSuffix)
 
-	tempDB, err := tempdb.OpenUnique(ctx, dbInfo.URL, schema)
+	tempDB, err := tempdb.OpenUnique(ctx, log, dbInfo.URL, schema)
 	if err != nil {
 		return nil, err
 	}
@@ -219,10 +230,26 @@ func CreateMetabaseDBOnTopOf(ctx context.Context, log *zap.Logger, tempDB *dbuti
 // Run method will iterate over all supported databases. Will establish
 // connection and will create tables for each DB.
 func Run(t *testing.T, test func(ctx *testcontext.Context, t *testing.T, db satellite.DB)) {
-	for _, dbInfo := range Databases() {
+	RunWithConfig(t, Config{}, test)
+}
+
+// Config allows customizing Run behaviour.
+type Config struct {
+	NonParallel bool
+}
+
+// RunWithConfig method will iterate over all supported databases. Will establish
+// connection and will create tables for each DB.
+func RunWithConfig(t *testing.T, cfg Config, test func(ctx *testcontext.Context, t *testing.T, db satellite.DB)) {
+	if !cfg.NonParallel {
+		t.Parallel()
+	}
+	for _, dbInfo := range Databases(t) {
 		dbInfo := dbInfo
 		t.Run(dbInfo.Name, func(t *testing.T) {
-			t.Parallel()
+			if !cfg.NonParallel {
+				t.Parallel()
+			}
 
 			ctx := testcontext.New(t)
 			defer ctx.Cleanup()
@@ -233,7 +260,10 @@ func Run(t *testing.T, test func(ctx *testcontext.Context, t *testing.T, db sate
 
 			logger := zaptest.NewLogger(t)
 			applicationName := "satellite-satellitedb-test-" + pgutil.CreateRandomTestingSchemaName(6)
-			db, err := CreateMasterDB(ctx, logger, t.Name(), "T", 0, dbInfo.MasterDB, applicationName)
+
+			db, err := CreateMasterDB(ctx, logger, t.Name(), "T", 0, dbInfo.MasterDB, satellitedb.Options{
+				ApplicationName: applicationName,
+			})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -257,7 +287,7 @@ func Run(t *testing.T, test func(ctx *testcontext.Context, t *testing.T, db sate
 // Bench method will iterate over all supported databases. Will establish
 // connection and will create tables for each DB.
 func Bench(b *testing.B, bench func(ctx *testcontext.Context, b *testing.B, db satellite.DB)) {
-	for _, dbInfo := range Databases() {
+	for _, dbInfo := range Databases(b) {
 		dbInfo := dbInfo
 		b.Run(dbInfo.Name, func(b *testing.B) {
 			if dbInfo.MasterDB.URL == "" {
@@ -267,7 +297,9 @@ func Bench(b *testing.B, bench func(ctx *testcontext.Context, b *testing.B, db s
 			ctx := testcontext.NewWithTimeout(b, 30*time.Minute)
 			defer ctx.Cleanup()
 
-			db, err := CreateMasterDB(ctx, zap.NewNop(), b.Name(), "X", 0, dbInfo.MasterDB, "satellite-satellitedb-bench")
+			db, err := CreateMasterDB(ctx, zap.NewNop(), b.Name(), "X", 0, dbInfo.MasterDB, satellitedb.Options{
+				ApplicationName: "satellite-satellitedb-bench",
+			})
 			if err != nil {
 				b.Fatal(err)
 			}

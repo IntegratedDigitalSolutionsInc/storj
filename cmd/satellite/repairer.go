@@ -15,6 +15,7 @@ import (
 	"storj.io/common/version"
 	"storj.io/storj/private/revocation"
 	"storj.io/storj/satellite"
+	"storj.io/storj/satellite/jobq"
 	"storj.io/storj/satellite/metabase"
 	"storj.io/storj/satellite/satellitedb"
 )
@@ -54,12 +55,20 @@ func cmdRepairerRun(cmd *cobra.Command, args []string) (err error) {
 		err = errs.Combine(err, revocationDB.Close())
 	}()
 
+	if runCfg.JobQueue.ServerNodeURL.IsZero() {
+		return errs.New("job queue server node URL is required")
+	}
+	repairQueue, err := jobq.OpenJobQueue(ctx, identity, runCfg.Config.JobQueue)
+	if err != nil {
+		return errs.New("Error connecting to job queue: %+v", err)
+	}
+
 	peer, err := satellite.NewRepairer(
 		log,
 		identity,
 		metabaseDB,
 		revocationDB,
-		db.RepairQueue(),
+		repairQueue,
 		db.Buckets(),
 		db.OverlayCache(),
 		db.NodeEvents(),
@@ -82,16 +91,8 @@ func cmdRepairerRun(cmd *cobra.Command, args []string) (err error) {
 		log.Warn("Failed to initialize telemetry batcher on repairer", zap.Error(err))
 	}
 
-	err = metabaseDB.CheckVersion(ctx)
-	if err != nil {
-		log.Error("Failed metabase database version check.", zap.Error(err))
-		return errs.New("failed metabase version check: %+v", err)
-	}
-
-	err = db.CheckVersion(ctx)
-	if err != nil {
-		log.Error("Failed satellite database version check.", zap.Error(err))
-		return errs.New("Error checking version for satellitedb: %+v", err)
+	if err := checkDBVersions(ctx, log, runCfg, db, metabaseDB); err != nil {
+		return err
 	}
 
 	runError := peer.Run(ctx)

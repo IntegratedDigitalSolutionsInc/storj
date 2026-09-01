@@ -25,18 +25,25 @@ func TestReliabilityCache_Concurrent(t *testing.T) {
 	ctx := testcontext.New(t)
 	defer ctx.Cleanup()
 
-	overlayCache, err := overlay.NewService(zap.NewNop(), fakeOverlayDB{}, fakeNodeEvents{}, nodeselection.TestPlacementDefinitionsWithFraction(1), "", "", overlay.Config{
+	placements := nodeselection.TestPlacementDefinitionsWithFraction(1)
+	overlayConfig := overlay.Config{
 		NodeSelectionCache: overlay.UploadSelectionCacheConfig{
 			Staleness: 2 * time.Nanosecond,
 		},
-	})
+	}
+	uploadSelectionCache, err := overlay.NewUploadSelectionCacheFromConfig(zap.NewNop(), fakeOverlayDB{}, overlayConfig, placements)
+	require.NoError(t, err)
+	downloadSelectionCache, err := overlay.NewDownloadSelectionCacheFromConfig(zap.NewNop(), fakeOverlayDB{}, overlayConfig, placements)
+	require.NoError(t, err)
+	overlayCache, err := overlay.NewService(zap.NewNop(), fakeOverlayDB{}, fakeNodeEvents{}, uploadSelectionCache, downloadSelectionCache, placements, "", "", overlayConfig, nodeevents.Config{})
 	require.NoError(t, err)
 	cacheCtx, cacheCancel := context.WithCancel(ctx)
 	defer cacheCancel()
-	ctx.Go(func() error { return overlayCache.Run(cacheCtx) })
+	ctx.Go(func() error { return uploadSelectionCache.Run(cacheCtx) })
+	ctx.Go(func() error { return downloadSelectionCache.Run(cacheCtx) })
 	defer ctx.Check(overlayCache.Close)
 
-	cache := checker.NewReliabilityCache(overlayCache, time.Millisecond)
+	cache := checker.NewReliabilityCache(overlayCache, time.Millisecond, 5*time.Minute)
 	var group errgroup.Group
 	for i := 0; i < 10; i++ {
 		group.Go(func() error {
@@ -56,7 +63,7 @@ func TestReliabilityCache_Concurrent(t *testing.T) {
 type fakeOverlayDB struct{ overlay.DB }
 type fakeNodeEvents struct{ nodeevents.DB }
 
-func (fakeOverlayDB) GetParticipatingNodes(context.Context, time.Duration, time.Duration) ([]nodeselection.SelectedNode, error) {
+func (fakeOverlayDB) GetAllParticipatingNodes(context.Context, time.Duration, time.Duration) ([]nodeselection.SelectedNode, error) {
 	return []nodeselection.SelectedNode{
 		{ID: testrand.NodeID(), Online: true},
 		{ID: testrand.NodeID(), Online: true},

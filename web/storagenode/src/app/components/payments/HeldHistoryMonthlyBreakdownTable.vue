@@ -24,13 +24,13 @@
                     <p class="held-history-table-container--large__info-area__months">{{ item.monthsWithNode }} month</p>
                 </div>
                 <div class="column justify-end column-2">
-                    <p class="held-history-table-container--large__info-area__text">{{ item.holdForFirstPeriod | centsToDollars }}</p>
+                    <p class="held-history-table-container--large__info-area__text">{{ centsToDollars(item.holdForFirstPeriod) }}</p>
                 </div>
                 <div class="column justify-end column-3">
-                    <p class="held-history-table-container--large__info-area__text">{{ item.holdForSecondPeriod | centsToDollars }}</p>
+                    <p class="held-history-table-container--large__info-area__text">{{ centsToDollars(item.holdForSecondPeriod) }}</p>
                 </div>
                 <div class="column justify-end column-4">
-                    <p class="held-history-table-container--large__info-area__text">{{ item.holdForThirdPeriod | centsToDollars }}</p>
+                    <p class="held-history-table-container--large__info-area__text">{{ centsToDollars(item.holdForThirdPeriod) }}</p>
                 </div>
             </div>
         </div>
@@ -44,26 +44,18 @@
     </div>
 </template>
 
-<script lang="ts">
-import { Component } from 'vue-property-decorator';
+<script setup lang="ts">
+import { computed } from 'vue';
 
 import { SatelliteHeldHistory } from '@/storagenode/payouts/payouts';
+import { centsToDollars } from '@/app/utils/payout';
+import { usePayoutStore } from '@/app/store/modules/payoutStore';
 
-import BaseHeldHistoryTable from '@/app/components/payments/BaseHeldHistoryTable.vue';
 import HeldHistoryMonthlyBreakdownTableItemSmall from '@/app/components/payments/HeldHistoryMonthlyBreakdownTableItemSmall.vue';
 
-// @vue/component
-@Component({
-    components: {
-        HeldHistoryMonthlyBreakdownTableItemSmall,
-    },
-})
-export default class HeldHistoryMonthlyBreakdownTable extends BaseHeldHistoryTable {
-    /**
-     * Returns list of satellite held history items by periods from store.
-     */
-    public get allSatellitesHeldHistory(): SatelliteHeldHistory[] {
-        return this.$store.state.payoutModule.heldHistory;
-    }
-}
+const payoutStore = usePayoutStore();
+
+const allSatellitesHeldHistory = computed<SatelliteHeldHistory[]>(() => {
+    return payoutStore.state.heldHistory as SatelliteHeldHistory[];
+});
 </script>

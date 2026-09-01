@@ -17,7 +17,6 @@
             <SNONotification
                 v-for="notification in latest"
                 :key="notification.id"
-                is-small="true"
                 :notification="notification"
             />
         </div>
@@ -28,40 +27,22 @@
     </div>
 </template>
 
-<script lang="ts">
-import { Component, Vue } from 'vue-property-decorator';
+<script setup lang="ts">
+import { computed, ref } from 'vue';
 
 import { RouteConfig } from '@/app/router';
 import { UINotification } from '@/app/types/notifications';
+import { useNotificationsStore } from '@/app/store/modules/notificationsStore';
 
 import SNONotification from '@/app/components/notifications/SNONotification.vue';
 
-// @vue/component
-@Component({
-    components: {
-        SNONotification,
-    },
-})
-export default class NotificationsPopup extends Vue {
-    /**
-     * Path to notifications route.
-     */
-    public readonly notificationsPath: string = RouteConfig.Notifications.path;
+const notificationsStore = useNotificationsStore();
 
-    /**
-     * Represents first page of notifications.
-     */
-    public get latest(): UINotification[] {
-        return this.$store.state.notificationsModule.latestNotifications;
-    }
+const notificationsPath = ref<string>(RouteConfig.Notifications.path);
 
-    /**
-     * Indicates if popup is smaller than with scroll.
-     */
-    public get isCollapsed(): boolean {
-        return this.latest.length < 4;
-    }
-}
+const latest = computed<UINotification[]>(() => notificationsStore.state.latestNotifications);
+
+const isCollapsed = computed<boolean>(() => latest.value.length < 4);
 </script>
 
 <style scoped lang="scss">
@@ -124,7 +105,7 @@ export default class NotificationsPopup extends Vue {
         height: auto !important;
     }
 
-    @media screen and (max-width: 460px) {
+    @media screen and (width <= 460px) {
 
         .notification-popup-container {
             width: 100%;

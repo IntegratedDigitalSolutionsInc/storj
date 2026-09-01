@@ -163,7 +163,7 @@ func TestAccountBillingFreeze(t *testing.T) {
 		user, err := sat.AddUser(ctx, console.CreateUser{
 			FullName: "Test User",
 			Email:    "user@mail.test",
-			PaidTier: true,
+			Kind:     console.PaidUser,
 		}, 2)
 		require.NoError(t, err)
 		require.NoError(t, usersDB.UpdateUserProjectLimits(ctx, user.ID, userLimits))
@@ -187,6 +187,7 @@ func TestAccountBillingFreeze(t *testing.T) {
 		require.Error(t, service.BillingFreezeUser(ctx, user.ID))
 		require.NoError(t, service.LegalUnfreezeUser(ctx, user.ID))
 
+		// Test automatic billing freeze
 		require.NoError(t, service.BillingFreezeUser(ctx, user.ID))
 
 		user, err = usersDB.Get(ctx, user.ID)
@@ -213,6 +214,14 @@ func TestAccountBillingFreeze(t *testing.T) {
 		frozen, err = service.IsUserBillingFrozen(ctx, user.ID)
 		require.NoError(t, err)
 		require.True(t, frozen)
+
+		require.NoError(t, service.BillingUnfreezeUser(ctx, user.ID))
+		frozen, err = service.IsUserBillingFrozen(ctx, user.ID)
+		require.NoError(t, err)
+		require.False(t, frozen)
+
+		// Test admin billing freeze
+		require.NoError(t, service.AdminBillingFreezeUser(ctx, user.ID))
 
 		freezes, err := service.GetAll(ctx, user.ID)
 		require.NoError(t, err)
@@ -694,6 +703,7 @@ func TestFreezeEffects(t *testing.T) {
 				// disable limit caching
 				config.Metainfo.RateLimiter.CacheCapacity = 0
 			},
+			SatelliteDBOptions: testplanet.SatelliteDBDisableCaches,
 		},
 	}, func(t *testing.T, ctx *testcontext.Context, planet *testplanet.Planet) {
 		sat := planet.Satellites[0]
@@ -1167,25 +1177,25 @@ func TestGetTrialExpirationFreezesToEscalate(t *testing.T) {
 
 		limit := 1
 		var next *console.FreezeEventsByEventAndUserStatusCursor
-		events, next, err := accountFreezeRepo.GetTrialExpirationFreezesToEscalate(ctx, limit, next)
+		events, next, err := accountFreezeRepo.GetTrialExpirationFreezesToEscalate(ctx, nil, limit, next)
 		require.NoError(t, err)
 		require.Len(t, events, 1, "expected 1 expired user")
 		require.Equal(t, uuids[0], events[0].UserID.String())
 		require.NotNil(t, next, "expected next to not be nil")
 
-		events, next, err = accountFreezeRepo.GetTrialExpirationFreezesToEscalate(ctx, limit, next)
+		events, next, err = accountFreezeRepo.GetTrialExpirationFreezesToEscalate(ctx, nil, limit, next)
 		require.NoError(t, err)
 		require.Len(t, events, 1, "expected 1 expired user")
 		require.Equal(t, uuids[1], events[0].UserID.String())
 		require.NotNil(t, next, "expected next to not be nil")
 
-		events, next, err = accountFreezeRepo.GetTrialExpirationFreezesToEscalate(ctx, limit, next)
+		events, next, err = accountFreezeRepo.GetTrialExpirationFreezesToEscalate(ctx, nil, limit, next)
 		require.NoError(t, err)
-		require.Len(t, events, 0, "expected 0 expired user")
+		require.Len(t, events, 0, "expected 0 expired users")
 		require.Nil(t, next, "expected next to be nil")
 
 		limit = 50
-		events, _, err = accountFreezeRepo.GetTrialExpirationFreezesToEscalate(ctx, limit, next)
+		events, _, err = accountFreezeRepo.GetTrialExpirationFreezesToEscalate(ctx, nil, limit, next)
 		require.NoError(t, err)
 		require.Len(t, events, len(uuids), fmt.Sprintf("expected %d expired users", len(uuids)))
 		require.Equal(t, uuids[0], events[0].UserID.String())
@@ -1196,10 +1206,213 @@ func TestGetTrialExpirationFreezesToEscalate(t *testing.T) {
 		})
 		require.NoError(t, err)
 
-		events, _, err = accountFreezeRepo.GetTrialExpirationFreezesToEscalate(ctx, limit, nil)
+		events, _, err = accountFreezeRepo.GetTrialExpirationFreezesToEscalate(ctx, nil, limit, nil)
 		require.NoError(t, err)
 		require.Len(t, events, 1, "expected 1 expired user")
 		require.Equal(t, uuids[1], events[0].UserID.String())
+
+		// tenant isolation: create freeze events for tenant users.
+		tenantID := "acme"
+		otherTenantID := "other"
+		tenantUser, err := usersRepo.Insert(ctx, &console.User{
+			ID:           testrand.UUID(),
+			FullName:     "acme tenant",
+			Email:        email + "acme",
+			PasswordHash: []byte("123a123"),
+			TenantID:     &tenantID,
+		})
+		require.NoError(t, err)
+		_, err = accountFreezeRepo.Upsert(ctx, &console.AccountFreezeEvent{
+			UserID: tenantUser.ID,
+			Type:   console.TrialExpirationFreeze,
+		})
+		require.NoError(t, err)
+
+		otherTenantUser, err := usersRepo.Insert(ctx, &console.User{
+			ID:           testrand.UUID(),
+			FullName:     "other tenant",
+			Email:        email + "other",
+			PasswordHash: []byte("123a123"),
+			TenantID:     &otherTenantID,
+		})
+		require.NoError(t, err)
+		_, err = accountFreezeRepo.Upsert(ctx, &console.AccountFreezeEvent{
+			UserID: otherTenantUser.ID,
+			Type:   console.TrialExpirationFreeze,
+		})
+		require.NoError(t, err)
+
+		// nil returns only non-tenant users.
+		events, _, err = accountFreezeRepo.GetTrialExpirationFreezesToEscalate(ctx, nil, limit, nil)
+		require.NoError(t, err)
+		for _, e := range events {
+			require.NotEqual(t, tenantUser.ID, e.UserID, "acme tenant user should not appear in nil query")
+			require.NotEqual(t, otherTenantUser.ID, e.UserID, "other tenant user should not appear in nil query")
+		}
+
+		// acme tenantID returns only acme users.
+		events, _, err = accountFreezeRepo.GetTrialExpirationFreezesToEscalate(ctx, &tenantID, limit, nil)
+		require.NoError(t, err)
+		require.Len(t, events, 1, "expected 1 acme tenant freeze event")
+		require.Equal(t, tenantUser.ID, events[0].UserID)
+
+		// other tenantID returns only other tenant users.
+		events, _, err = accountFreezeRepo.GetTrialExpirationFreezesToEscalate(ctx, &otherTenantID, limit, nil)
+		require.NoError(t, err)
+		require.Len(t, events, 1, "expected 1 other tenant freeze event")
+		require.Equal(t, otherTenantUser.ID, events[0].UserID)
+	})
+}
+
+func TestGetEscalatedEventsBefore(t *testing.T) {
+	testplanet.Run(t, testplanet.Config{
+		SatelliteCount: 1,
+	}, func(t *testing.T, ctx *testcontext.Context, planet *testplanet.Planet) {
+		sat := planet.Satellites[0]
+		usersRepo := sat.DB.Console().Users()
+		accountFreezeRepo := sat.DB.Console().AccountFreezeEvents()
+
+		now := time.Now()
+		oldTime := now.Add(-2 * time.Hour)
+		recentTime := now.Add(-30 * time.Minute)
+
+		// Create users with different freeze types and escalation times
+		oldBillingFrozen, err := sat.AddUser(ctx, console.CreateUser{
+			FullName: "Old Billing User", Email: "oldbilling@test.com",
+		}, 1)
+		require.NoError(t, err)
+
+		oldTrialFrozen, err := sat.AddUser(ctx, console.CreateUser{
+			FullName: "Old Trial User", Email: "oldtrial@test.com",
+		}, 1)
+		require.NoError(t, err)
+
+		recentlyEscalated, err := sat.AddUser(ctx, console.CreateUser{
+			FullName: "Recent User", Email: "recent@test.com",
+		}, 1)
+		require.NoError(t, err)
+
+		nonEscalatedUser, err := sat.AddUser(ctx, console.CreateUser{
+			FullName: "Active User", Email: "active@test.com",
+		}, 1)
+		require.NoError(t, err)
+
+		// Create freeze events
+		_, err = accountFreezeRepo.Upsert(ctx, &console.AccountFreezeEvent{
+			UserID: oldBillingFrozen.ID,
+			Type:   console.BillingFreeze,
+		})
+		require.NoError(t, err)
+
+		_, err = accountFreezeRepo.Upsert(ctx, &console.AccountFreezeEvent{
+			UserID: oldTrialFrozen.ID,
+			Type:   console.TrialExpirationFreeze,
+		})
+		require.NoError(t, err)
+
+		_, err = accountFreezeRepo.Upsert(ctx, &console.AccountFreezeEvent{
+			UserID: recentlyEscalated.ID,
+			Type:   console.BillingFreeze,
+		})
+		require.NoError(t, err)
+
+		_, err = accountFreezeRepo.Upsert(ctx, &console.AccountFreezeEvent{
+			UserID: nonEscalatedUser.ID,
+			Type:   console.BillingFreeze,
+		})
+		require.NoError(t, err)
+
+		// mark users as escalated at different times
+		usersRepo.TestSetNow(func() time.Time { return oldTime })
+		pendingStatus := console.PendingDeletion
+		err = usersRepo.Update(ctx, oldBillingFrozen.ID, console.UpdateUserRequest{Status: &pendingStatus})
+		require.NoError(t, err)
+
+		err = usersRepo.Update(ctx, oldTrialFrozen.ID, console.UpdateUserRequest{Status: &pendingStatus})
+		require.NoError(t, err)
+
+		usersRepo.TestSetNow(func() time.Time { return recentTime })
+		err = usersRepo.Update(ctx, recentlyEscalated.ID, console.UpdateUserRequest{Status: &pendingStatus})
+		require.NoError(t, err)
+
+		usersRepo.TestSetNow(time.Now)
+
+		// test getting single event type - get old billing freeze
+		params := console.GetEscalatedEventsBeforeParams{
+			Limit: 10,
+			EventTypes: []console.EventTypeAndTime{
+				{EventType: console.BillingFreeze, OlderThan: now.Add(-time.Hour)},
+			},
+		}
+		events, err := accountFreezeRepo.GetEscalatedEventsBefore(ctx, params)
+		require.NoError(t, err)
+		require.Len(t, events, 1)
+		require.Equal(t, oldBillingFrozen.ID, events[0].UserID)
+		require.Equal(t, console.BillingFreeze, events[0].Type)
+
+		// test get multiple event types - get old billing and trial freezes
+		params = console.GetEscalatedEventsBeforeParams{
+			Limit: 10,
+			EventTypes: []console.EventTypeAndTime{
+				{EventType: console.BillingFreeze, OlderThan: now.Add(-time.Hour)},
+				{EventType: console.TrialExpirationFreeze, OlderThan: now.Add(-time.Hour)},
+			},
+		}
+		events, err = accountFreezeRepo.GetEscalatedEventsBefore(ctx, params)
+		require.NoError(t, err)
+		require.Len(t, events, 2)
+		for _, event := range events {
+			require.True(t, event.Type == console.BillingFreeze || event.Type == console.TrialExpirationFreeze)
+			require.True(t, event.UserID == oldBillingFrozen.ID || event.UserID == oldTrialFrozen.ID)
+		}
+
+		// test different time bounds for different event types
+		params = console.GetEscalatedEventsBeforeParams{
+			Limit: 10,
+			EventTypes: []console.EventTypeAndTime{
+				{EventType: console.BillingFreeze, OlderThan: now.Add(-3 * time.Hour)},
+				{EventType: console.TrialExpirationFreeze, OlderThan: now.Add(-time.Hour)},
+			},
+		}
+		events, err = accountFreezeRepo.GetEscalatedEventsBefore(ctx, params)
+		require.NoError(t, err)
+		require.Len(t, events, 1)
+		require.Equal(t, oldTrialFrozen.ID, events[0].UserID)
+		require.Equal(t, console.TrialExpirationFreeze, events[0].Type)
+
+		// test limit
+		params = console.GetEscalatedEventsBeforeParams{
+			Limit: 1,
+			EventTypes: []console.EventTypeAndTime{
+				{EventType: console.BillingFreeze, OlderThan: now.Add(-time.Hour)},
+				{EventType: console.TrialExpirationFreeze, OlderThan: now.Add(-time.Hour)},
+			},
+		}
+		events, err = accountFreezeRepo.GetEscalatedEventsBefore(ctx, params)
+		require.NoError(t, err)
+		require.Len(t, events, 1)
+
+		// test non-existent event type
+		params = console.GetEscalatedEventsBeforeParams{
+			Limit: 10,
+			EventTypes: []console.EventTypeAndTime{
+				{EventType: console.ViolationFreeze, OlderThan: now.Add(-time.Hour)},
+			},
+		}
+		events, err = accountFreezeRepo.GetEscalatedEventsBefore(ctx, params)
+		require.NoError(t, err)
+		require.Len(t, events, 0)
+
+		params = console.GetEscalatedEventsBeforeParams{
+			Limit: 10,
+			EventTypes: []console.EventTypeAndTime{
+				{EventType: console.BillingFreeze, OlderThan: now.Add(-time.Hour)},
+			},
+		}
+		events, err = accountFreezeRepo.GetEscalatedEventsBefore(ctx, params)
+		require.NoError(t, err)
+		require.Len(t, events, 1)
+		require.Equal(t, oldBillingFrozen.ID, events[0].UserID)
 	})
 }
 

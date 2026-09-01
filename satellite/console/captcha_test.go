@@ -26,7 +26,7 @@ const validResponseToken = "myResponseToken"
 
 type mockRecaptcha struct{}
 
-func (r mockRecaptcha) Verify(ctx context.Context, responseToken string, userIP string) (bool, *float64, error) {
+func (r mockRecaptcha) Verify(_ context.Context, responseToken string, _ string) (bool, *float64, error) {
 	score := 1.0
 	return responseToken == validResponseToken, &score, nil
 }
@@ -47,33 +47,13 @@ func TestRegistrationRecaptcha(t *testing.T) {
 		require.NotNil(t, service)
 		service.TestSwapCaptchaHandler(mockRecaptcha{})
 
-		regToken1, err := service.CreateRegToken(ctx, 1)
+		valid, score, err := service.VerifyRegistrationCaptcha(ctx, validResponseToken, "127.0.0.1")
 		require.NoError(t, err)
+		require.True(t, valid)
+		require.Equal(t, 1.0, *score)
 
-		user, err := service.CreateUser(ctx, console.CreateUser{
-			FullName:        "User",
-			Email:           "u@mail.test",
-			Password:        "password",
-			CaptchaResponse: validResponseToken,
-		}, regToken1.Secret)
-
-		require.NotNil(t, user)
-		require.NoError(t, err)
-		require.NotNil(t, user.SignupCaptcha)
-		require.Equal(t, 1.0, *user.SignupCaptcha)
-
-		regToken2, err := service.CreateRegToken(ctx, 1)
-		require.NoError(t, err)
-
-		user, err = service.CreateUser(ctx, console.CreateUser{
-			FullName:        "User2",
-			Email:           "u2@mail.test",
-			Password:        "password",
-			CaptchaResponse: "wrong",
-		}, regToken2.Secret)
-
-		require.Nil(t, user)
-		require.True(t, console.ErrCaptcha.Has(err))
+		valid, _, _ = service.VerifyRegistrationCaptcha(ctx, "wrong", "127.0.0.1")
+		require.False(t, valid)
 	})
 }
 
@@ -105,7 +85,7 @@ func TestLoginRecaptcha(t *testing.T) {
 			Email:           email,
 			Password:        password,
 			CaptchaResponse: validResponseToken,
-		}, regToken.Secret)
+		}, regToken)
 
 		require.NotNil(t, user)
 		require.NoError(t, err)

@@ -1,0 +1,560 @@
+// Copyright (C) 2026 Storj Labs, Inc.
+// See LICENSE for copying information.
+
+package accountfreeze_test
+
+import (
+	"fmt"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
+
+	"storj.io/common/testcontext"
+	"storj.io/common/uuid"
+	"storj.io/storj/private/testplanet"
+	"storj.io/storj/satellite"
+	"storj.io/storj/satellite/console"
+)
+
+func TestOptOutFreezeChore(t *testing.T) {
+	freezeDate := time.Now().UTC().Truncate(time.Minute).Add(-time.Hour)
+	const freezeGrace = 1080 * time.Hour // 45 days.
+
+	testplanet.Run(t, testplanet.Config{
+		SatelliteCount: 1, StorageNodeCount: 0, UplinkCount: 1,
+		Reconfigure: testplanet.Reconfigure{
+			Satellite: func(log *zap.Logger, index int, config *satellite.Config) {
+				config.AccountFreeze.Enabled = true
+				config.AccountFreeze.EmailsEnabled = true
+				config.AccountFreeze.OptOutFreezeOptedOutOnly = false
+				config.Console.AccountFreeze.OptOutFreezeDate = freezeDate.Format(time.RFC3339)
+				config.Console.AccountFreeze.OptOutFreezeGracePeriod = freezeGrace
+				// This date must be set to some time in the future. Otherwise, the user
+				// will be found to have been created after the pricing cutoff and will
+				// subsequently be excluded from the opt in/out flow.
+				config.Console.NewPricingEffectiveDate = time.Now().Add(time.Hour).Format(time.RFC3339)
+			},
+		},
+	}, func(t *testing.T, ctx *testcontext.Context, planet *testplanet.Planet) {
+		sat := planet.Satellites[0]
+		usersDB := sat.DB.Console().Users()
+		service := console.NewAccountFreezeService(sat.DB.Console(), newFreezeTrackerMock(t), sat.Config.Console.AccountFreeze)
+		chore := sat.Core.AccountFreeze.OptOutFreezeChore
+
+		chore.Loop.Pause()
+		chore.TestSetFreezeService(service)
+
+		setOptInStatus := func(t *testing.T, userID uuid.UUID, status console.OptInStatus) {
+			t.Helper()
+			require.NoError(t, usersDB.UpsertSettings(ctx, userID, console.UpsertUserSettingsRequest{
+				OptInStatus: &status,
+			}))
+		}
+
+		t.Run("freeze -> escalate", func(t *testing.T) {
+			service.TestChangeFreezeTracker(newFreezeTrackerMock(t))
+			chore.TestSetNow(func() time.Time { return freezeDate.Add(time.Hour) })
+
+			user, err := sat.AddUser(ctx, console.CreateUser{
+				FullName: "OptOut User",
+				Email:    "optout@mail.test",
+			}, 1)
+			require.NoError(t, err)
+
+			paidKind := console.PaidUser
+			require.NoError(t, usersDB.Update(ctx, user.ID, console.UpdateUserRequest{Kind: &paidKind}))
+
+			// Stage 1: freeze.
+			chore.Loop.TriggerWait()
+
+			freezes, err := service.GetAll(ctx, user.ID)
+			require.NoError(t, err)
+			require.NotNil(t, freezes.OptOutFreeze, "user should be frozen")
+			require.Equal(t, 1, freezes.OptOutFreeze.NotificationsCount, "expected freeze email to be sent on freeze")
+
+			frozenUser, err := usersDB.Get(ctx, user.ID)
+			require.NoError(t, err)
+			require.EqualValues(t, 0, frozenUser.ProjectStorageLimit)
+			require.EqualValues(t, 0, frozenUser.ProjectBandwidthLimit)
+			require.EqualValues(t, 0, frozenUser.ProjectSegmentLimit)
+			require.NotEqual(t, console.PendingDeletion, frozenUser.Status)
+
+			// Stage 2: escalate. Advance past the freeze grace.
+			chore.TestSetNow(func() time.Time { return freezeDate.Add(3 * freezeGrace) })
+			chore.Loop.TriggerWait()
+
+			escalatedUser, err := usersDB.Get(ctx, user.ID)
+			require.NoError(t, err)
+			require.Equal(t, console.PendingDeletion, escalatedUser.Status, "user should be marked for deletion")
+
+			freezes, err = service.GetAll(ctx, user.ID)
+			require.NoError(t, err)
+			require.NotNil(t, freezes.OptOutFreeze)
+			require.Equal(t, 2, freezes.OptOutFreeze.NotificationsCount, "expected escalation email to be sent on escalate")
+		})
+
+		t.Run("non-active user is not escalated", func(t *testing.T) {
+			service.TestChangeFreezeTracker(newFreezeTrackerMock(t))
+			chore.TestSetNow(func() time.Time { return freezeDate.Add(time.Hour) })
+
+			user, err := sat.AddUser(ctx, console.CreateUser{
+				FullName: "Non-Active OptOut User",
+				Email:    "non-active-optout@mail.test",
+			}, 1)
+			require.NoError(t, err)
+
+			paidKind := console.PaidUser
+			require.NoError(t, usersDB.Update(ctx, user.ID, console.UpdateUserRequest{Kind: &paidKind}))
+
+			// Stage 1: freeze.
+			chore.Loop.TriggerWait()
+
+			freezes, err := service.GetAll(ctx, user.ID)
+			require.NoError(t, err)
+			require.NotNil(t, freezes.OptOutFreeze, "user should be frozen")
+			require.Equal(t, 1, freezes.OptOutFreeze.NotificationsCount)
+
+			// Set the user's status to a non-active one before the escalation stage.
+			legalHold := console.LegalHold
+			require.NoError(t, usersDB.Update(ctx, user.ID, console.UpdateUserRequest{Status: &legalHold}))
+
+			// Stage 2: advance past the freeze grace. The user should not be escalated or emailed.
+			chore.TestSetNow(func() time.Time { return freezeDate.Add(3 * freezeGrace) })
+			chore.Loop.TriggerWait()
+
+			nonActiveUser, err := usersDB.Get(ctx, user.ID)
+			require.NoError(t, err)
+			require.Equal(t, console.LegalHold, nonActiveUser.Status, "non-active user should not be marked for deletion")
+
+			freezes, err = service.GetAll(ctx, user.ID)
+			require.NoError(t, err)
+			require.NotNil(t, freezes.OptOutFreeze)
+			require.Equal(t, 1, freezes.OptOutFreeze.NotificationsCount, "no escalation email should be sent to a non-active user")
+		})
+
+		t.Run("no-op before freeze date", func(t *testing.T) {
+			service.TestChangeFreezeTracker(newFreezeTrackerMock(t))
+			chore.TestSetNow(func() time.Time { return freezeDate.Add(-time.Hour) })
+
+			user, err := sat.AddUser(ctx, console.CreateUser{
+				FullName: "Before Cutoff User",
+				Email:    "before-cutoff@mail.test",
+			}, 1)
+			require.NoError(t, err)
+
+			paidKind := console.PaidUser
+			require.NoError(t, usersDB.Update(ctx, user.ID, console.UpdateUserRequest{Kind: &paidKind}))
+
+			chore.Loop.TriggerWait()
+
+			freezes, err := service.GetAll(ctx, user.ID)
+			require.NoError(t, err)
+			require.Nil(t, freezes.OptOutFreeze, "no freeze should be issued before OptOutFreezeDate")
+		})
+
+		t.Run("user already in another freeze flow is skipped", func(t *testing.T) {
+			service.TestChangeFreezeTracker(newFreezeTrackerMock(t))
+			chore.TestSetNow(func() time.Time { return freezeDate.Add(time.Hour) })
+
+			user, err := sat.AddUser(ctx, console.CreateUser{
+				FullName: "Billing-Frozen User",
+				Email:    "billing-frozen-optout@mail.test",
+			}, 1)
+			require.NoError(t, err)
+
+			paidKind := console.PaidUser
+			require.NoError(t, usersDB.Update(ctx, user.ID, console.UpdateUserRequest{Kind: &paidKind}))
+
+			require.NoError(t, service.BillingFreezeUser(ctx, user.ID))
+
+			chore.Loop.TriggerWait()
+
+			freezes, err := service.GetAll(ctx, user.ID)
+			require.NoError(t, err)
+			require.NotNil(t, freezes.BillingFreeze)
+			require.Nil(t, freezes.OptOutFreeze, "user with BillingFreeze should not be opt-out frozen")
+		})
+
+		t.Run("opted-in user is not frozen", func(t *testing.T) {
+			service.TestChangeFreezeTracker(newFreezeTrackerMock(t))
+			chore.TestSetNow(func() time.Time { return freezeDate.Add(time.Hour) })
+
+			user, err := sat.AddUser(ctx, console.CreateUser{
+				FullName: "Opted-In User",
+				Email:    "optedin@mail.test",
+			}, 1)
+			require.NoError(t, err)
+
+			paidKind := console.PaidUser
+			require.NoError(t, usersDB.Update(ctx, user.ID, console.UpdateUserRequest{Kind: &paidKind}))
+
+			optedIn := console.OptedIn
+			require.NoError(t, usersDB.UpsertSettings(ctx, user.ID, console.UpsertUserSettingsRequest{
+				OptInStatus: &optedIn,
+			}))
+
+			chore.Loop.TriggerWait()
+
+			freezes, err := service.GetAll(ctx, user.ID)
+			require.NoError(t, err)
+			require.Nil(t, freezes.OptOutFreeze, "OptedIn user should not be opt-out frozen")
+		})
+
+		t.Run("non-paid user kinds are not frozen", func(t *testing.T) {
+			service.TestChangeFreezeTracker(newFreezeTrackerMock(t))
+			chore.TestSetNow(func() time.Time { return freezeDate.Add(time.Hour) })
+
+			for _, kind := range []console.UserKind{console.FreeUser, console.NFRUser, console.MemberUser} {
+				user, err := sat.AddUser(ctx, console.CreateUser{
+					FullName: "Non-Paid User",
+					Email:    fmt.Sprintf("%d@mail.test", kind),
+				}, 1)
+				require.NoError(t, err)
+
+				require.NoError(t, usersDB.Update(ctx, user.ID, console.UpdateUserRequest{Kind: &kind}))
+
+				chore.Loop.TriggerWait()
+
+				freezes, err := service.GetAll(ctx, user.ID)
+				require.NoError(t, err)
+				require.Nil(t, freezes.OptOutFreeze, kind.String()+" user should not be opt-out frozen")
+			}
+		})
+
+		t.Run("excluded user is not frozen", func(t *testing.T) {
+			service.TestChangeFreezeTracker(newFreezeTrackerMock(t))
+			chore.TestSetNow(func() time.Time { return freezeDate.Add(time.Hour) })
+
+			user, err := sat.AddUser(ctx, console.CreateUser{
+				FullName: "Excluded User",
+				Email:    "excluded@mail.test",
+			}, 1)
+			require.NoError(t, err)
+
+			paidKind := console.PaidUser
+			require.NoError(t, usersDB.Update(ctx, user.ID, console.UpdateUserRequest{Kind: &paidKind}))
+
+			excluded := console.Excluded
+			require.NoError(t, usersDB.UpsertSettings(ctx, user.ID, console.UpsertUserSettingsRequest{
+				OptInStatus: &excluded,
+			}))
+
+			chore.Loop.TriggerWait()
+
+			freezes, err := service.GetAll(ctx, user.ID)
+			require.NoError(t, err)
+			require.Nil(t, freezes.OptOutFreeze, "Excluded user should not be opt-out frozen")
+		})
+
+		t.Run("frozen user opts in and is unfrozen", func(t *testing.T) {
+			service.TestChangeFreezeTracker(newFreezeTrackerMock(t))
+			chore.TestSetNow(func() time.Time { return freezeDate.Add(time.Hour) })
+
+			user, err := sat.AddUser(ctx, console.CreateUser{
+				FullName: "Reopt-In Frozen User",
+				Email:    "reoptin-frozen@mail.test",
+			}, 1)
+			require.NoError(t, err)
+
+			paidKind := console.PaidUser
+			require.NoError(t, usersDB.Update(ctx, user.ID, console.UpdateUserRequest{Kind: &paidKind}))
+
+			origStorage := user.ProjectStorageLimit
+			origBandwidth := user.ProjectBandwidthLimit
+			origSegment := user.ProjectSegmentLimit
+			require.Positive(t, origStorage)
+
+			chore.Loop.TriggerWait() // freeze
+
+			freezes, err := service.GetAll(ctx, user.ID)
+			require.NoError(t, err)
+			require.NotNil(t, freezes.OptOutFreeze)
+			frozenUser, err := usersDB.Get(ctx, user.ID)
+			require.NoError(t, err)
+			require.EqualValues(t, 0, frozenUser.ProjectStorageLimit)
+
+			setOptInStatus(t, user.ID, console.OptedIn)
+			chore.Loop.TriggerWait()
+
+			freezes, err = service.GetAll(ctx, user.ID)
+			require.NoError(t, err)
+			require.Nil(t, freezes.OptOutFreeze, "freeze should be cleared once user is OptedIn")
+
+			restoredUser, err := usersDB.Get(ctx, user.ID)
+			require.NoError(t, err)
+			require.Equal(t, origStorage, restoredUser.ProjectStorageLimit, "user storage limit should be restored")
+			require.Equal(t, origBandwidth, restoredUser.ProjectBandwidthLimit, "user bandwidth limit should be restored")
+			require.Equal(t, origSegment, restoredUser.ProjectSegmentLimit, "user segment limit should be restored")
+		})
+
+		t.Run("escalated user opts in and reverts PendingDeletion", func(t *testing.T) {
+			service.TestChangeFreezeTracker(newFreezeTrackerMock(t))
+			chore.TestSetNow(func() time.Time { return freezeDate.Add(time.Hour) })
+
+			user, err := sat.AddUser(ctx, console.CreateUser{
+				FullName: "Escalated Reopt-In User",
+				Email:    "escalated-reoptin@mail.test",
+			}, 1)
+			require.NoError(t, err)
+
+			paidKind := console.PaidUser
+			require.NoError(t, usersDB.Update(ctx, user.ID, console.UpdateUserRequest{Kind: &paidKind}))
+
+			chore.Loop.TriggerWait() // freeze
+			chore.TestSetNow(func() time.Time { return freezeDate.Add(3 * freezeGrace) })
+			chore.Loop.TriggerWait() // escalate
+
+			escalated, err := usersDB.Get(ctx, user.ID)
+			require.NoError(t, err)
+			require.Equal(t, console.PendingDeletion, escalated.Status)
+
+			setOptInStatus(t, user.ID, console.OptedIn)
+			chore.Loop.TriggerWait()
+
+			restored, err := usersDB.Get(ctx, user.ID)
+			require.NoError(t, err)
+			require.Equal(t, console.Active, restored.Status, "PendingDeletion should be reverted to Active on unfreeze")
+			freezes, err := service.GetAll(ctx, user.ID)
+			require.NoError(t, err)
+			require.Nil(t, freezes.OptOutFreeze)
+		})
+
+		t.Run("frozen user marked excluded is unfrozen", func(t *testing.T) {
+			service.TestChangeFreezeTracker(newFreezeTrackerMock(t))
+			chore.TestSetNow(func() time.Time { return freezeDate.Add(time.Hour) })
+
+			user, err := sat.AddUser(ctx, console.CreateUser{
+				FullName: "Excluded Frozen User",
+				Email:    "excluded-frozen@mail.test",
+			}, 1)
+			require.NoError(t, err)
+
+			paidKind := console.PaidUser
+			require.NoError(t, usersDB.Update(ctx, user.ID, console.UpdateUserRequest{Kind: &paidKind}))
+
+			chore.Loop.TriggerWait()
+
+			freezes, err := service.GetAll(ctx, user.ID)
+			require.NoError(t, err)
+			require.NotNil(t, freezes.OptOutFreeze)
+
+			setOptInStatus(t, user.ID, console.Excluded)
+			chore.Loop.TriggerWait()
+
+			freezes, err = service.GetAll(ctx, user.ID)
+			require.NoError(t, err)
+			require.Nil(t, freezes.OptOutFreeze, "freeze should be cleared for Excluded user")
+		})
+
+		t.Run("post-cutoff user not picked up by freeze chore", func(t *testing.T) {
+			service.TestChangeFreezeTracker(newFreezeTrackerMock(t))
+			chore.TestSetNow(func() time.Time { return freezeDate.Add(time.Hour) })
+
+			cutoff, err := time.Parse(time.RFC3339, sat.Config.Console.NewPricingEffectiveDate)
+			require.NoError(t, err)
+
+			user, err := sat.AddUser(ctx, console.CreateUser{
+				FullName: "Post-Cutoff User",
+				Email:    "post-cutoff@mail.test",
+			}, 1)
+			require.NoError(t, err)
+
+			paidKind := console.PaidUser
+			require.NoError(t, usersDB.Update(ctx, user.ID, console.UpdateUserRequest{Kind: &paidKind}))
+
+			// Forward-date the user's created_at past the cutoff so they fall in the
+			// post-cutoff exempt cohort.
+			_, err = sat.DB.Testing().RawDB().ExecContext(ctx,
+				sat.DB.Testing().Rebind("UPDATE users SET created_at = ? WHERE id = ?"),
+				cutoff.Add(time.Hour), user.ID)
+			require.NoError(t, err)
+
+			chore.Loop.TriggerWait()
+
+			freezes, err := service.GetAll(ctx, user.ID)
+			require.NoError(t, err)
+			require.Nil(t, freezes.OptOutFreeze, "post-cutoff user must not be opt-out frozen")
+		})
+
+		t.Run("pre-cutoff user upgraded post-cutoff not picked up by freeze chore", func(t *testing.T) {
+			service.TestChangeFreezeTracker(newFreezeTrackerMock(t))
+			chore.TestSetNow(func() time.Time { return freezeDate.Add(time.Hour) })
+
+			cutoff, err := time.Parse(time.RFC3339, sat.Config.Console.NewPricingEffectiveDate)
+			require.NoError(t, err)
+
+			user, err := sat.AddUser(ctx, console.CreateUser{
+				FullName: "Pre-Cutoff Upgraded User",
+				Email:    "pre-cutoff-upgraded@mail.test",
+			}, 1)
+			require.NoError(t, err)
+
+			paidKind := console.PaidUser
+			require.NoError(t, usersDB.Update(ctx, user.ID, console.UpdateUserRequest{Kind: &paidKind}))
+
+			// Created before the cutoff, but upgraded to paid after it: this user joined the
+			// new pricing on upgrade and must be exempt from the opt-out freeze.
+			_, err = sat.DB.Testing().RawDB().ExecContext(ctx,
+				sat.DB.Testing().Rebind("UPDATE users SET created_at = ?, upgrade_time = ? WHERE id = ?"),
+				cutoff.Add(-time.Hour), cutoff.Add(time.Hour), user.ID)
+			require.NoError(t, err)
+
+			chore.Loop.TriggerWait()
+
+			freezes, err := service.GetAll(ctx, user.ID)
+			require.NoError(t, err)
+			require.Nil(t, freezes.OptOutFreeze, "user upgraded after the cutoff must not be opt-out frozen")
+		})
+
+		t.Run("pre-cutoff user upgraded pre-cutoff is frozen", func(t *testing.T) {
+			service.TestChangeFreezeTracker(newFreezeTrackerMock(t))
+			chore.TestSetNow(func() time.Time { return freezeDate.Add(time.Hour) })
+
+			cutoff, err := time.Parse(time.RFC3339, sat.Config.Console.NewPricingEffectiveDate)
+			require.NoError(t, err)
+
+			user, err := sat.AddUser(ctx, console.CreateUser{
+				FullName: "Pre-Cutoff Legacy Paid User",
+				Email:    "pre-cutoff-legacy-paid@mail.test",
+			}, 1)
+			require.NoError(t, err)
+
+			paidKind := console.PaidUser
+			require.NoError(t, usersDB.Update(ctx, user.ID, console.UpdateUserRequest{Kind: &paidKind}))
+
+			// Created and upgraded before the cutoff: a legacy paid user who should opt in,
+			// and is therefore subject to the opt-out freeze.
+			_, err = sat.DB.Testing().RawDB().ExecContext(ctx,
+				sat.DB.Testing().Rebind("UPDATE users SET created_at = ?, upgrade_time = ? WHERE id = ?"),
+				cutoff.Add(-2*time.Hour), cutoff.Add(-time.Hour), user.ID)
+			require.NoError(t, err)
+
+			chore.Loop.TriggerWait()
+
+			freezes, err := service.GetAll(ctx, user.ID)
+			require.NoError(t, err)
+			require.NotNil(t, freezes.OptOutFreeze, "legacy paid user upgraded before the cutoff must be opt-out frozen")
+		})
+
+		t.Run("tenant user is not picked up by freeze chore", func(t *testing.T) {
+			service.TestChangeFreezeTracker(newFreezeTrackerMock(t))
+			chore.TestSetNow(func() time.Time { return freezeDate.Add(time.Hour) })
+
+			user, err := sat.AddUser(ctx, console.CreateUser{
+				FullName: "Tenant User",
+				Email:    "tenant-user@mail.test",
+			}, 1)
+			require.NoError(t, err)
+
+			paidKind := console.PaidUser
+			tenantID := "test-tenant"
+			tenantIDPtr := &tenantID
+			require.NoError(t, usersDB.Update(ctx, user.ID, console.UpdateUserRequest{
+				TenantID: &tenantIDPtr,
+				Kind:     &paidKind,
+			}))
+
+			chore.Loop.TriggerWait()
+
+			freezes, err := service.GetAll(ctx, user.ID)
+			require.NoError(t, err)
+			require.Nil(t, freezes.OptOutFreeze, "tenant user must not be opt-out frozen")
+		})
+	})
+}
+
+// TestOptOutFreezeChoreOptedOutOnly tests the opted-out-only mode,
+// where the chore freezes only users who have explicitly opted out.
+func TestOptOutFreezeChoreOptedOutOnly(t *testing.T) {
+	freezeDate := time.Now().UTC().Truncate(time.Minute).Add(-time.Hour)
+	const freezeGrace = 1080 * time.Hour // 45 days.
+
+	testplanet.Run(t, testplanet.Config{
+		SatelliteCount: 1, StorageNodeCount: 0, UplinkCount: 1,
+		Reconfigure: testplanet.Reconfigure{
+			Satellite: func(log *zap.Logger, index int, config *satellite.Config) {
+				config.AccountFreeze.Enabled = true
+				config.AccountFreeze.EmailsEnabled = true
+				config.AccountFreeze.OptOutFreezeOptedOutOnly = true
+				config.Console.AccountFreeze.OptOutFreezeDate = freezeDate.Format(time.RFC3339)
+				config.Console.AccountFreeze.OptOutFreezeGracePeriod = freezeGrace
+				config.Console.NewPricingEffectiveDate = time.Now().Add(time.Hour).Format(time.RFC3339)
+			},
+		},
+	}, func(t *testing.T, ctx *testcontext.Context, planet *testplanet.Planet) {
+		sat := planet.Satellites[0]
+		usersDB := sat.DB.Console().Users()
+		service := console.NewAccountFreezeService(sat.DB.Console(), newFreezeTrackerMock(t), sat.Config.Console.AccountFreeze)
+		chore := sat.Core.AccountFreeze.OptOutFreezeChore
+
+		chore.Loop.Pause()
+		chore.TestSetFreezeService(service)
+
+		makePaidUser := func(t *testing.T, name, email string) *console.User {
+			t.Helper()
+			user, err := sat.AddUser(ctx, console.CreateUser{FullName: name, Email: email}, 1)
+			require.NoError(t, err)
+			paidKind := console.PaidUser
+			require.NoError(t, usersDB.Update(ctx, user.ID, console.UpdateUserRequest{Kind: &paidKind}))
+			return user
+		}
+		setOptInStatus := func(t *testing.T, userID uuid.UUID, status console.OptInStatus) {
+			t.Helper()
+			require.NoError(t, usersDB.UpsertSettings(ctx, userID, console.UpsertUserSettingsRequest{
+				OptInStatus: &status,
+			}))
+		}
+
+		t.Run("no-action user is not frozen, opted-out user is frozen", func(t *testing.T) {
+			service.TestChangeFreezeTracker(newFreezeTrackerMock(t))
+			chore.TestSetNow(func() time.Time { return freezeDate.Add(time.Hour) })
+
+			// A NoAction/unset user must be left alone in opted-out-only mode.
+			noActionUser := makePaidUser(t, "No-Action User", "optedoutonly-noaction@mail.test")
+
+			nilOptInUser := makePaidUser(t, "Nil-Opt-In User", "nil-optin@mail.test")
+			setOptInStatus(t, nilOptInUser.ID, console.NoAction)
+
+			// An explicitly opted-out user must be frozen.
+			optedOutUser := makePaidUser(t, "Opted-Out User", "optedoutonly-optedout@mail.test")
+			setOptInStatus(t, optedOutUser.ID, console.OptedOut)
+
+			chore.Loop.TriggerWait()
+
+			freezes, err := service.GetAll(ctx, noActionUser.ID)
+			require.NoError(t, err)
+			require.Nil(t, freezes.OptOutFreeze, "no-action user must not be frozen in opted-out-only mode")
+
+			freezes, err = service.GetAll(ctx, optedOutUser.ID)
+			require.NoError(t, err)
+			require.NotNil(t, freezes.OptOutFreeze, "opted-out user must be frozen in opted-out-only mode")
+		})
+
+		t.Run("frozen opted-out user reverting to no-action is unfrozen", func(t *testing.T) {
+			service.TestChangeFreezeTracker(newFreezeTrackerMock(t))
+			chore.TestSetNow(func() time.Time { return freezeDate.Add(time.Hour) })
+
+			user := makePaidUser(t, "Reverting User", "optedoutonly-reverting@mail.test")
+			setOptInStatus(t, user.ID, console.OptedOut)
+
+			chore.Loop.TriggerWait() // freeze
+
+			freezes, err := service.GetAll(ctx, user.ID)
+			require.NoError(t, err)
+			require.NotNil(t, freezes.OptOutFreeze)
+
+			setOptInStatus(t, user.ID, console.NoAction)
+			chore.Loop.TriggerWait()
+
+			freezes, err = service.GetAll(ctx, user.ID)
+			require.NoError(t, err)
+			require.Nil(t, freezes.OptOutFreeze, "freeze should be cleared once the user is no longer OptedOut")
+
+			restored, err := usersDB.Get(ctx, user.ID)
+			require.NoError(t, err)
+			require.NotEqual(t, console.PendingDeletion, restored.Status, "user must not be escalated to deletion")
+		})
+	})
+}

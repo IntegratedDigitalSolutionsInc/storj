@@ -22,10 +22,9 @@ import (
 )
 
 func TestNodeAliasCache(t *testing.T) {
-	ctx := testcontext.New(t)
-	defer ctx.Cleanup()
-
 	t.Run("missing aliases", func(t *testing.T) {
+		ctx := testcontext.New(t)
+
 		cache := metabase.NewNodeAliasCache(&NodeAliasDB{}, false)
 		nodes, err := cache.Nodes(ctx, []metabase.NodeAlias{1, 2, 3})
 		require.EqualError(t, err, "metabase: aliases missing in database: [1 2 3]")
@@ -33,6 +32,8 @@ func TestNodeAliasCache(t *testing.T) {
 	})
 
 	t.Run("auto add nodes", func(t *testing.T) {
+		ctx := testcontext.New(t)
+
 		cache := metabase.NewNodeAliasCache(&NodeAliasDB{}, false)
 
 		n1, n2 := testrand.NodeID(), testrand.NodeID()
@@ -56,6 +57,8 @@ func TestNodeAliasCache(t *testing.T) {
 	})
 
 	t.Run("db error", func(t *testing.T) {
+		ctx := testcontext.New(t)
+
 		aliasDB := &NodeAliasDB{}
 		aliasDB.SetFail(errors.New("io.EOF"))
 		cache := metabase.NewNodeAliasCache(aliasDB, false)
@@ -72,6 +75,8 @@ func TestNodeAliasCache(t *testing.T) {
 	})
 
 	t.Run("EnsureAliases refresh once", func(t *testing.T) {
+		ctx := testcontext.New(t)
+
 		for repeat := 0; repeat < 3; repeat++ {
 			database := &NodeAliasDB{}
 			cache := metabase.NewNodeAliasCache(database, false)
@@ -102,6 +107,8 @@ func TestNodeAliasCache(t *testing.T) {
 	})
 
 	t.Run("Nodes refresh once", func(t *testing.T) {
+		ctx := testcontext.New(t)
+
 		for repeat := 0; repeat < 3; repeat++ {
 			n1, n2 := testrand.NodeID(), testrand.NodeID()
 
@@ -176,7 +183,7 @@ func TestNodeAliasCache_DB(t *testing.T) {
 }
 
 func BenchmarkNodeAliasCache_ConvertAliasesToPieces(b *testing.B) {
-	ctx := context.Background()
+	ctx := b.Context()
 
 	aliasDB := &NodeAliasDB{}
 	cache := metabase.NewNodeAliasCache(aliasDB, false)
@@ -214,9 +221,9 @@ type NodeAliasDB struct {
 	last    metabase.NodeAlias
 	entries []metabase.NodeAliasEntry
 
-	ensureNodeAliasesCount   int64
-	listNodeAliasesCount     int64
-	getNodeAliasEntriesCount int64
+	ensureNodeAliasesCount   atomic.Int64
+	listNodeAliasesCount     atomic.Int64
+	getNodeAliasEntriesCount atomic.Int64
 }
 
 func (db *NodeAliasDB) SetFail(err error) {
@@ -249,7 +256,7 @@ func (db *NodeAliasDB) Ensure(id storj.NodeID) {
 }
 
 func (db *NodeAliasDB) EnsureNodeAliases(ctx context.Context, opts metabase.EnsureNodeAliases) error {
-	atomic.AddInt64(&db.ensureNodeAliasesCount, 1)
+	db.ensureNodeAliasesCount.Add(1)
 
 	if err := db.ShouldFail(); err != nil {
 		return err
@@ -261,11 +268,11 @@ func (db *NodeAliasDB) EnsureNodeAliases(ctx context.Context, opts metabase.Ensu
 }
 
 func (db *NodeAliasDB) EnsureNodeAliasesCount() int64 {
-	return atomic.LoadInt64(&db.ensureNodeAliasesCount)
+	return db.ensureNodeAliasesCount.Load()
 }
 
 func (db *NodeAliasDB) ListNodeAliases(ctx context.Context) (_ []metabase.NodeAliasEntry, err error) {
-	atomic.AddInt64(&db.listNodeAliasesCount, 1)
+	db.listNodeAliasesCount.Add(1)
 
 	if err := db.ShouldFail(); err != nil {
 		return nil, err
@@ -278,7 +285,7 @@ func (db *NodeAliasDB) ListNodeAliases(ctx context.Context) (_ []metabase.NodeAl
 	return xs, nil
 }
 func (db *NodeAliasDB) GetNodeAliasEntries(ctx context.Context, opts metabase.GetNodeAliasEntries) (_ []metabase.NodeAliasEntry, err error) {
-	atomic.AddInt64(&db.getNodeAliasEntriesCount, 1)
+	db.getNodeAliasEntriesCount.Add(1)
 
 	if err := db.ShouldFail(); err != nil {
 		return nil, err
@@ -298,11 +305,11 @@ func (db *NodeAliasDB) GetNodeAliasEntries(ctx context.Context, opts metabase.Ge
 }
 
 func (db *NodeAliasDB) GetNodeAliasEntriesCount() int64 {
-	return atomic.LoadInt64(&db.getNodeAliasEntriesCount)
+	return db.getNodeAliasEntriesCount.Load()
 }
 
 func (db *NodeAliasDB) ListNodeAliasesCount() int64 {
-	return atomic.LoadInt64(&db.listNodeAliasesCount)
+	return db.listNodeAliasesCount.Load()
 }
 
 func aliasesContains(aliases []metabase.NodeAlias, v metabase.NodeAlias) bool {

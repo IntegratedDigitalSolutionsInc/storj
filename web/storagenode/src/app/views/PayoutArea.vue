@@ -14,8 +14,8 @@
             <p class="payout-area-container__section-title">Balance</p>
             <section class="payout-area-container__balance-area">
                 <div class="row">
-                    <SingleInfo width="48%" label="Undistributed payout" :value="balance | centsToDollars" info-text="You need to earn the minimum withdrawal amount so that we can transfer the entire amount to the wallet at the end of the month, otherwise it will remain on your balance for the next month or until you accumulate the minimum withdrawal amount" />
-                    <SingleInfo width="48%" label="Estimated earning this month" :value="currentMonthExpectations | centsToDollars" info-text="Estimated payout at the end of the month. This is only an estimate and may not reflect actual payout amount." />
+                    <SingleInfo width="48%" label="Undistributed payout" :value="centsToDollars(balance)" info-text="You need to earn the minimum withdrawal amount so that we can transfer the entire amount to the wallet at the end of the month, otherwise it will remain on your balance for the next month or until you accumulate the minimum withdrawal amount" />
+                    <SingleInfo width="48%" label="Estimated earning this month" :value="centsToDollars(currentMonthExpectations)" info-text="Estimated payout at the end of the month. This is only an estimate and may not reflect actual payout amount." />
                 </div>
             </section>
             <p class="payout-area-container__section-title">Payout</p>
@@ -36,8 +36,8 @@
             <section class="payout-area-container__held-info-area">
                 <TotalHeldArea v-if="isSatelliteSelected" />
                 <div v-else class="row">
-                    <SingleInfo width="48%" label="Total Held Amount" :value="totalPayments.held | centsToDollars" />
-                    <SingleInfo width="48%" label="Total Held Returned" :value="totalPayments.disposed | centsToDollars" />
+                    <SingleInfo width="48%" label="Total Held Amount" :value="centsToDollars(totalPayments.held)" />
+                    <SingleInfo width="48%" label="Total Held Returned" :value="centsToDollars(totalPayments.disposed)" />
                 </div>
             </section>
             <HeldProgress v-if="isSatelliteSelected" class="payout-area-container__process-area" />
@@ -46,14 +46,16 @@
     </div>
 </template>
 
-<script lang="ts">
-import { Component, Vue } from 'vue-property-decorator';
+<script setup lang="ts">
+import { computed, onMounted } from 'vue';
 
-import { APPSTATE_ACTIONS } from '@/app/store/modules/appState';
-import { NODE_ACTIONS } from '@/app/store/modules/node';
-import { NOTIFICATIONS_ACTIONS } from '@/app/store/modules/notifications';
-import { PAYOUT_ACTIONS } from '@/app/store/modules/payout';
 import { PayoutPeriod, SatelliteHeldHistory, TotalPayments } from '@/storagenode/payouts/payouts';
+import { centsToDollars } from '@/app/utils/payout';
+import { usePayoutStore } from '@/app/store/modules/payoutStore';
+import { useNodeStore } from '@/app/store/modules/nodeStore';
+import { useAppStore } from '@/app/store/modules/appStore';
+import { useNotificationsStore } from '@/app/store/modules/notificationsStore';
+import BackArrowIcon from '@/../static/images/notifications/backArrow.svg';
 
 import EstimationArea from '@/app/components/payments/EstimationArea.vue';
 import HeldHistoryArea from '@/app/components/payments/HeldHistoryArea.vue';
@@ -63,101 +65,84 @@ import SingleInfo from '@/app/components/payments/SingleInfo.vue';
 import TotalHeldArea from '@/app/components/payments/TotalHeldArea.vue';
 import SatelliteSelection from '@/app/components/SatelliteSelection.vue';
 
-import BackArrowIcon from '@/../static/images/notifications/backArrow.svg';
+const payoutStore = usePayoutStore();
+const nodeStore = useNodeStore();
+const appStore = useAppStore();
+const notificationsStore = useNotificationsStore();
 
-// @vue/component
-@Component ({
-    components: {
-        TotalHeldArea,
-        PayoutHistoryTable,
-        HeldHistoryArea,
-        HeldProgress,
-        SingleInfo,
-        SatelliteSelection,
-        EstimationArea,
-        BackArrowIcon,
-    },
-})
-export default class PayoutArea extends Vue {
-    /**
-     * Lifecycle hook after initial render.
-     * Fetches payout information.
-     */
-    public async mounted(): Promise<void> {
-        await this.$store.dispatch(APPSTATE_ACTIONS.SET_LOADING, true);
+const totalPayments = computed<TotalPayments>(() => {
+    return payoutStore.state.totalPayments as TotalPayments;
+});
 
-        try {
-            await this.$store.dispatch(NODE_ACTIONS.SELECT_SATELLITE, null);
-        } catch (error) {
-            console.error(error);
-        }
+const isSatelliteSelected = computed<boolean>(() => {
+    return !!nodeStore.state.selectedSatellite.id;
+});
 
-        try {
-            await this.$store.dispatch(NOTIFICATIONS_ACTIONS.GET_NOTIFICATIONS, 1);
-        } catch (error) {
-            console.error(error);
-        }
+const payoutPeriods = computed<PayoutPeriod[]>(() => {
+    return payoutStore.state.payoutPeriods;
+});
 
-        try {
-            await this.$store.dispatch(PAYOUT_ACTIONS.GET_ESTIMATION, this.$store.state.node.selectedSatellite.id);
-        } catch (error) {
-            console.error(error);
-        }
+const currentMonthExpectations = computed<number>(() => {
+    return payoutStore.state.estimation.currentMonthExpectations;
+});
 
-        try {
-            await this.$store.dispatch(PAYOUT_ACTIONS.GET_PRICING_MODEL, this.$store.state.node.selectedSatellite.id);
-        } catch (error) {
-            console.error(error);
-        }
+const balance = computed<number>(() => {
+    return payoutStore.state.totalPayments.balance;
+});
 
-        try {
-            await this.$store.dispatch(PAYOUT_ACTIONS.GET_TOTAL);
-        } catch (error) {
-            console.error(error);
-        }
+const heldHistory = computed<SatelliteHeldHistory[]>(() => {
+    return payoutStore.state.heldHistory as SatelliteHeldHistory[];
+});
 
-        try {
-            await this.$store.dispatch(PAYOUT_ACTIONS.GET_PERIODS);
-        } catch (error) {
-            console.error(error);
-        }
+onMounted(async () => {
+    appStore.setLoading(true);
 
-        try {
-            await this.$store.dispatch(PAYOUT_ACTIONS.GET_HELD_HISTORY);
-        } catch (error) {
-            console.error(error);
-        }
-
-        await this.$store.dispatch(APPSTATE_ACTIONS.SET_LOADING, false);
+    try {
+        await nodeStore.selectSatellite();
+    } catch (error) {
+        console.error(error);
     }
 
-    public get totalPayments(): TotalPayments {
-        return this.$store.state.payoutModule.totalPayments;
+    try {
+        await notificationsStore.fetchNotifications(1);
+    } catch (error) {
+        console.error(error);
     }
 
-    /**
-     * Indicates if satellite is selected.
-     */
-    public get isSatelliteSelected(): boolean {
-        return !!this.$store.state.node.selectedSatellite.id;
+    const selectedSatelliteId = nodeStore.state.selectedSatellite.id;
+
+    try {
+        await payoutStore.fetchEstimation(selectedSatelliteId);
+    } catch (error) {
+        console.error(error);
     }
 
-    public get payoutPeriods(): PayoutPeriod[] {
-        return this.$store.state.payoutModule.payoutPeriods;
+    try {
+        await payoutStore.fetchPricingModel(selectedSatelliteId);
+    } catch (error) {
+        console.error(error);
     }
 
-    public get currentMonthExpectations(): number {
-        return this.$store.state.payoutModule.estimation.currentMonthExpectations;
+    try {
+        await payoutStore.fetchTotalPayments();
+    } catch (error) {
+        console.error(error);
     }
 
-    public get balance(): number {
-        return this.$store.state.payoutModule.totalPayments.balance;
+    try {
+        await payoutStore.getPeriods();
+    } catch (error) {
+        console.error(error);
     }
 
-    public get heldHistory(): SatelliteHeldHistory[] {
-        return this.$store.state.payoutModule.heldHistory;
+    try {
+        await payoutStore.fetchHeldHistory();
+    } catch (error) {
+        console.error(error);
     }
-}
+
+    appStore.setLoading(false);
+});
 </script>
 
 <style scoped lang="scss">
@@ -165,8 +150,7 @@ export default class PayoutArea extends Vue {
         position: relative;
         padding: 0 36px;
         width: calc(100% - 72px);
-        overflow-y: scroll;
-        overflow-x: hidden;
+        overflow: hidden scroll;
         display: flex;
         justify-content: center;
     }
@@ -257,7 +241,7 @@ export default class PayoutArea extends Vue {
         width: 100%;
     }
 
-    @media screen and (max-width: 890px) {
+    @media screen and (width <= 890px) {
 
         .payout-area-container {
             width: calc(100% - 36px - 36px);
@@ -266,7 +250,7 @@ export default class PayoutArea extends Vue {
         }
     }
 
-    @media screen and (max-width: 640px) {
+    @media screen and (width <= 640px) {
 
         .payout-area-container-overflow {
             padding: 0 15px 80px;

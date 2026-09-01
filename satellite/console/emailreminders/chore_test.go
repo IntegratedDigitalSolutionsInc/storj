@@ -21,7 +21,7 @@ import (
 
 func TestEmailChoreUpdatesVerificationReminders(t *testing.T) {
 	testplanet.Run(t, testplanet.Config{
-		SatelliteCount: 1, StorageNodeCount: 0, UplinkCount: 0,
+		SatelliteCount: 1,
 		Reconfigure: testplanet.Reconfigure{
 			Satellite: func(log *zap.Logger, index int, config *satellite.Config) {
 				config.EmailReminders.FirstVerificationReminder = 0
@@ -138,7 +138,7 @@ func TestEmailChoreUpdatesVerificationReminders(t *testing.T) {
 
 func TestEmailChoreLinkActivatesAccount(t *testing.T) {
 	testplanet.Run(t, testplanet.Config{
-		SatelliteCount: 1, StorageNodeCount: 0, UplinkCount: 0,
+		SatelliteCount: 1,
 		Reconfigure: testplanet.Reconfigure{
 			Satellite: func(log *zap.Logger, index int, config *satellite.Config) {
 				config.EmailReminders.FirstVerificationReminder = 0
@@ -175,7 +175,7 @@ func TestEmailChoreLinkActivatesAccount(t *testing.T) {
 
 func TestEmailChoreUpdatesTrialNotifications(t *testing.T) {
 	testplanet.Run(t, testplanet.Config{
-		SatelliteCount: 1, StorageNodeCount: 0, UplinkCount: 0,
+		SatelliteCount: 1,
 		Reconfigure: testplanet.Reconfigure{
 			Satellite: func(log *zap.Logger, index int, config *satellite.Config) {
 				config.EmailReminders.EnableTrialExpirationReminders = true
@@ -195,12 +195,14 @@ func TestEmailChoreUpdatesTrialNotifications(t *testing.T) {
 			PasswordHash: []byte("password"),
 		})
 		require.NoError(t, err)
-		paidTier := true
-		require.NoError(t, users.Update(ctx, id1, console.UpdateUserRequest{PaidTier: &paidTier}))
+		kind := console.PaidUser
+		require.NoError(t, users.Update(ctx, id1, console.UpdateUserRequest{Kind: &kind}))
 
 		now := time.Now()
 		tomorrow := now.Add(24 * time.Hour)
 		yesterday := now.Add(-24 * time.Hour)
+
+		active := console.Active
 
 		// one expiring user
 		id2 := testrand.UUID()
@@ -212,6 +214,10 @@ func TestEmailChoreUpdatesTrialNotifications(t *testing.T) {
 			TrialExpiration: &tomorrow,
 		})
 		require.NoError(t, err)
+
+		require.NoError(t, users.Update(ctx, id2, console.UpdateUserRequest{
+			Status: &active,
+		}))
 
 		// one expired user who was already reminded
 		id3 := testrand.UUID()
@@ -229,23 +235,24 @@ func TestEmailChoreUpdatesTrialNotifications(t *testing.T) {
 
 		require.NoError(t, users.Update(ctx, id3, console.UpdateUserRequest{
 			TrialNotifications: &reminded,
+			Status:             &active,
 		}))
 
 		user1, err := users.Get(ctx, id1)
 		require.NoError(t, err)
-		require.True(t, user1.PaidTier)
+		require.Equal(t, console.PaidUser, user1.Kind)
 		require.Nil(t, user1.TrialExpiration)
 		require.Equal(t, int(console.NoTrialNotification), user1.TrialNotifications)
 
 		user2, err := users.Get(ctx, id2)
 		require.NoError(t, err)
-		require.False(t, user2.PaidTier)
+		require.Equal(t, console.FreeUser, user2.Kind)
 		require.Zero(t, cmp.Diff(user2.TrialExpiration.Truncate(time.Millisecond), tomorrow.Truncate(time.Millisecond), cmpopts.EquateApproxTime(0)))
 		require.Equal(t, int(console.NoTrialNotification), user2.TrialNotifications)
 
 		user3, err := users.Get(ctx, id3)
 		require.NoError(t, err)
-		require.False(t, user3.PaidTier)
+		require.Equal(t, console.FreeUser, user3.Kind)
 		require.Zero(t, cmp.Diff(user3.TrialExpiration.Truncate(time.Millisecond), yesterday.Truncate(time.Millisecond), cmpopts.EquateApproxTime(0)))
 		require.Equal(t, int(console.TrialExpirationReminder), user3.TrialNotifications)
 

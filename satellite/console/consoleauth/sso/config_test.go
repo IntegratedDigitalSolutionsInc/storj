@@ -13,7 +13,7 @@ import (
 	"storj.io/storj/satellite/console/consoleauth/sso"
 )
 
-func TestSamlInfoConfigValidation(t *testing.T) {
+func TestOidcInfoConfigValidation(t *testing.T) {
 	url1, err := url.Parse("https://metadata1.com")
 	require.NoError(t, err)
 	url2, err := url.Parse("https://metadata2.com")
@@ -66,5 +66,42 @@ func TestSamlInfoConfigValidation(t *testing.T) {
 			require.NoError(t, err)
 			require.EqualValues(t, tt.expectedConfig.Values, info.Values)
 		}
+	}
+}
+
+func TestGeneralProvidersConfigValidation(t *testing.T) {
+	tests := []struct {
+		description  string
+		configString string
+		expected     []string
+		expectError  bool
+	}{
+		{
+			description:  "valid providers",
+			configString: "provider1;provider2",
+			expected:     []string{"provider1", "provider2"},
+		},
+		{
+			description:  "empty string",
+			configString: "",
+			expected:     nil,
+		},
+		{
+			description:  "duplicate provider",
+			configString: "provider1;provider1",
+			expectError:  true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Log(tt.description)
+		gp := sso.GeneralProviders{}
+		err := gp.Set(tt.configString)
+		if tt.expectError {
+			require.Error(t, err)
+			continue
+		}
+		require.NoError(t, err)
+		require.Equal(t, tt.expected, gp.Values)
 	}
 }

@@ -5,6 +5,7 @@ package metainfo_test
 
 import (
 	"crypto/tls"
+	"fmt"
 	"testing"
 	"time"
 
@@ -23,6 +24,7 @@ import (
 	"storj.io/common/testrand"
 	"storj.io/storj/private/testplanet"
 	"storj.io/storj/satellite"
+	"storj.io/storj/satellite/console"
 	"storj.io/storj/satellite/internalpb"
 	"storj.io/storj/satellite/metainfo"
 	"storj.io/uplink"
@@ -35,8 +37,31 @@ var (
 )
 
 func TestEndpoint_NoStorageNodes(t *testing.T) {
+	var (
+		authUrl             = "auth.storj.io"
+		publicLinksharing   = "public-link.storj.io"
+		internalLinksharing = "link.storj.io"
+	)
+
 	testplanet.Run(t, testplanet.Config{
 		SatelliteCount: 1, UplinkCount: 3,
+		Reconfigure: testplanet.Reconfigure{
+			SatelliteDBOptions: testplanet.SatelliteDBDisableCaches,
+			Satellite: func(log *zap.Logger, index int, config *satellite.Config) {
+				config.Metainfo.SendEdgeUrlOverrides = true
+				config.Metainfo.APIKeyTailsConfig.CombinerQueueEnabled = true
+				err := config.Console.PlacementEdgeURLOverrides.Set(
+					fmt.Sprintf(`{
+						"1": {
+							"authService": "%s",
+							"publicLinksharing": "%s",
+							"internalLinksharing": "%s"
+						}
+					}`, authUrl, publicLinksharing, internalLinksharing),
+				)
+				require.NoError(t, err)
+			},
+		},
 	}, func(t *testing.T, ctx *testcontext.Context, planet *testplanet.Planet) {
 		t.Run("revoke access", func(t *testing.T) {
 			accessIssuer := planet.Uplinks[0].Access[planet.Satellites[0].ID()]
@@ -309,25 +334,44 @@ func TestEndpoint_NoStorageNodes(t *testing.T) {
 		})
 
 		t.Run("get project info", func(t *testing.T) {
-			apiKey0 := planet.Uplinks[0].APIKey[planet.Satellites[0].ID()]
-			apiKey1 := planet.Uplinks[1].APIKey[planet.Satellites[0].ID()]
+			sat := planet.Satellites[0]
+			upl1 := planet.Uplinks[0]
+			apiKey0 := upl1.APIKey[sat.ID()]
+			apiKey1 := planet.Uplinks[1].APIKey[sat.ID()]
 
-			metainfo0, err := planet.Uplinks[0].DialMetainfo(ctx, planet.Satellites[0], apiKey0)
+			project, err := sat.DB.Console().Projects().Get(ctx, planet.Uplinks[0].Projects[0].ID)
 			require.NoError(t, err)
 
-			metainfo1, err := planet.Uplinks[0].DialMetainfo(ctx, planet.Satellites[0], apiKey1)
+			metainfo0, err := upl1.DialMetainfo(ctx, sat, apiKey0)
+			require.NoError(t, err)
+
+			metainfo1, err := upl1.DialMetainfo(ctx, sat, apiKey1)
 			require.NoError(t, err)
 
 			info0, err := metainfo0.GetProjectInfo(ctx)
 			require.NoError(t, err)
 			require.NotNil(t, info0.ProjectSalt)
+			require.Nil(t, info0.EdgeUrlOverrides)
 
 			info1, err := metainfo1.GetProjectInfo(ctx)
 			require.NoError(t, err)
 			require.NotNil(t, info1.ProjectSalt)
+			require.Nil(t, info0.EdgeUrlOverrides)
 
 			// Different projects should have different salts
 			require.NotEqual(t, info0.ProjectSalt, info1.ProjectSalt)
+
+			err = sat.API.DB.Console().Projects().UpdateDefaultPlacement(ctx, upl1.Projects[0].ID, storj.PlacementConstraint(1))
+			require.NoError(t, err)
+
+			info0, err = metainfo0.GetProjectInfo(ctx)
+			require.NoError(t, err)
+			require.NotNil(t, info0.ProjectSalt)
+			require.NotNil(t, info0.EdgeUrlOverrides)
+			require.WithinDuration(t, info0.ProjectCreatedAt, project.CreatedAt, time.Nanosecond)
+			require.Equal(t, authUrl, string(info0.EdgeUrlOverrides.AuthService))
+			require.Equal(t, publicLinksharing, string(info0.EdgeUrlOverrides.PublicLinksharing))
+			require.Equal(t, internalLinksharing, string(info0.EdgeUrlOverrides.PrivateLinksharing))
 		})
 
 		t.Run("check IDs", func(t *testing.T) {
@@ -422,6 +466,182 @@ func assertInvalidArgument(t *testing.T, err error, allowed bool) {
 	}
 }
 
+func TestAPIKeyTails(t *testing.T) {
+	testplanet.Run(t, testplanet.Config{
+		SatelliteCount: 1, UplinkCount: 1,
+		Reconfigure: testplanet.Reconfigure{
+			Satellite: func(log *zap.Logger, index int, config *satellite.Config) {
+				config.Metainfo.APIKeyTailsConfig.CombinerQueueEnabled = true
+			},
+		},
+	}, func(t *testing.T, ctx *testcontext.Context, planet *testplanet.Planet) {
+		sat := planet.Satellites[0]
+		upl := planet.Uplinks[0]
+
+		secret, err := macaroon.NewSecret()
+		require.NoError(t, err)
+		apiKey, err := macaroon.NewAPIKey(secret)
+		require.NoError(t, err)
+
+		keyInfo, err := sat.DB.Console().APIKeys().Create(ctx, apiKey.Head(), console.APIKeyInfo{
+			Name:      "test-key",
+			ProjectID: upl.Projects[0].ID,
+			Secret:    secret,
+			Version:   macaroon.APIKeyVersionMin,
+		})
+		require.NoError(t, err)
+
+		caveat0 := macaroon.Caveat{DisallowDeletes: true}
+		macaroon0, err := apiKey.Restrict(caveat0)
+		require.NoError(t, err)
+		require.NotNil(t, macaroon0)
+
+		caveat1 := macaroon.Caveat{DisallowWrites: true}
+		macaroon1, err := macaroon0.Restrict(caveat1)
+		require.NoError(t, err)
+		require.NotNil(t, macaroon1)
+
+		metainfoClient, err := upl.DialMetainfo(ctx, sat, macaroon1)
+		require.NoError(t, err)
+		defer ctx.Check(metainfoClient.Close)
+
+		_, err = metainfoClient.ListBuckets(ctx, metaclient.ListBucketsParams{
+			ListOpts: metaclient.BucketListOptions{
+				Cursor:    "",
+				Direction: metaclient.Forward,
+				Limit:     10,
+			},
+		})
+		require.NoError(t, err)
+
+		err = sat.Metainfo.Endpoint.TestWaitForTailsCombinerWorkers(ctx)
+		require.NoError(t, err)
+
+		tailsDB := sat.DB.Console().APIKeyTails()
+
+		tail0, err := tailsDB.GetByTail(ctx, macaroon0.Tail())
+		require.NoError(t, err)
+		require.NotNil(t, tail0)
+		require.EqualValues(t, keyInfo.ID, tail0.RootKeyID)
+		require.EqualValues(t, macaroon0.Tail(), tail0.Tail)
+		require.EqualValues(t, apiKey.Tail(), tail0.ParentTail)
+		require.WithinDuration(t, time.Now(), tail0.LastUsed, time.Minute)
+
+		parsedCaveat, err := macaroon.ParseCaveat(tail0.Caveat)
+		require.NoError(t, err)
+		require.NotNil(t, parsedCaveat)
+		require.EqualValues(t, caveat0, *parsedCaveat)
+
+		tail1, err := tailsDB.GetByTail(ctx, macaroon1.Tail())
+		require.NoError(t, err)
+		require.NotNil(t, tail1)
+		require.EqualValues(t, keyInfo.ID, tail1.RootKeyID)
+		require.EqualValues(t, macaroon1.Tail(), tail1.Tail)
+		require.EqualValues(t, macaroon0.Tail(), tail1.ParentTail)
+		require.WithinDuration(t, time.Now(), tail1.LastUsed, time.Minute)
+
+		parsedCaveat, err = macaroon.ParseCaveat(tail1.Caveat)
+		require.NoError(t, err)
+		require.NotNil(t, parsedCaveat)
+		require.EqualValues(t, caveat1, *parsedCaveat)
+	})
+}
+
+func TestAuditableAPIKeyValidation(t *testing.T) {
+	testplanet.Run(t, testplanet.Config{
+		SatelliteCount: 1, UplinkCount: 1,
+		Reconfigure: testplanet.Reconfigure{
+			Satellite: func(log *zap.Logger, index int, config *satellite.Config) {
+				config.Metainfo.APIKeyTailsConfig.CombinerQueueEnabled = true
+			},
+		},
+	}, func(t *testing.T, ctx *testcontext.Context, planet *testplanet.Planet) {
+		sat := planet.Satellites[0]
+		upl := planet.Uplinks[0]
+
+		t.Run("auditable key with unregistered tail should be rejected", func(t *testing.T) {
+			secret, err := macaroon.NewSecret()
+			require.NoError(t, err)
+			apiKey, err := macaroon.NewAPIKey(secret)
+			require.NoError(t, err)
+
+			_, err = sat.DB.Console().APIKeys().Create(ctx, apiKey.Head(), console.APIKeyInfo{
+				Name:      "auditable-key",
+				ProjectID: upl.Projects[0].ID,
+				Secret:    secret,
+				Version:   macaroon.APIKeyVersionAuditable,
+			})
+			require.NoError(t, err)
+
+			caveat := macaroon.Caveat{DisallowDeletes: true}
+			restrictedKey, err := apiKey.Restrict(caveat)
+			require.NoError(t, err)
+
+			metainfoClient, err := upl.DialMetainfo(ctx, sat, restrictedKey)
+			require.NoError(t, err)
+			defer ctx.Check(metainfoClient.Close)
+
+			_, err = metainfoClient.ListBuckets(ctx, metaclient.ListBucketsParams{
+				ListOpts: metaclient.BucketListOptions{
+					Cursor:    "",
+					Direction: metaclient.Forward,
+					Limit:     10,
+				},
+			})
+			require.Error(t, err)
+			require.True(t, errs2.IsRPC(err, rpcstatus.PermissionDenied))
+		})
+
+		t.Run("auditable key with registered tail should work", func(t *testing.T) {
+			secret, err := macaroon.NewSecret()
+			require.NoError(t, err)
+			apiKey, err := macaroon.NewAPIKey(secret)
+			require.NoError(t, err)
+
+			keyInfo, err := sat.DB.Console().APIKeys().Create(ctx, apiKey.Head(), console.APIKeyInfo{
+				Name:      "auditable-key-registered",
+				ProjectID: upl.Projects[0].ID,
+				Secret:    secret,
+				Version:   macaroon.APIKeyVersionAuditable,
+			})
+			require.NoError(t, err)
+
+			caveat := macaroon.Caveat{DisallowDeletes: true}
+			restrictedKey, err := apiKey.Restrict(caveat)
+			require.NoError(t, err)
+
+			mac, err := macaroon.ParseMacaroon(restrictedKey.SerializeRaw())
+			require.NoError(t, err)
+			tails := mac.Tails(keyInfo.Secret)
+			caveats := mac.Caveats()
+
+			restrictedTail := &console.APIKeyTail{
+				RootKeyID:  keyInfo.ID,
+				Tail:       tails[1],
+				ParentTail: tails[0],
+				Caveat:     caveats[0],
+				LastUsed:   time.Now(),
+			}
+
+			_, err = sat.DB.Console().APIKeyTails().Upsert(ctx, restrictedTail)
+			require.NoError(t, err)
+
+			metainfoClient, err := upl.DialMetainfo(ctx, sat, restrictedKey)
+			require.NoError(t, err)
+			defer ctx.Check(metainfoClient.Close)
+
+			_, err = metainfoClient.ListBuckets(ctx, metaclient.ListBucketsParams{
+				ListOpts: metaclient.BucketListOptions{
+					Cursor:    "",
+					Direction: metaclient.Forward,
+					Limit:     10,
+				},
+			})
+			require.NoError(t, err)
+		})
+	})
+}
+
 func TestRateLimit(t *testing.T) {
 	rateLimit := 2
 	testplanet.Run(t, testplanet.Config{
@@ -443,7 +663,8 @@ func TestRateLimit(t *testing.T) {
 		var group errs2.Group
 		for i := 0; i <= rateLimit; i++ {
 			group.Go(func() error {
-				return ul.CreateBucket(ctx, satellite, testrand.BucketName())
+				_, err := ul.ListBuckets(ctx, satellite)
+				return err
 			})
 		}
 		groupErrs := group.Wait()
@@ -467,7 +688,7 @@ func TestDisableRateLimit(t *testing.T) {
 		apiKey := planet.Uplinks[0].APIKey[planet.Satellites[0].ID()]
 		satellite := planet.Satellites[0]
 
-		require.NoError(t, planet.Uplinks[0].CreateBucket(ctx, planet.Satellites[0], "test-bucket"))
+		require.NoError(t, planet.Uplinks[0].TestingCreateBucket(ctx, planet.Satellites[0], "test-bucket"))
 
 		peerctx := rpcpeer.NewContext(ctx, &rpcpeer.Peer{
 			State: tls.ConnectionState{
@@ -525,7 +746,7 @@ func TestRateLimit_Disabled(t *testing.T) {
 		var group errs2.Group
 		for i := 0; i <= rateLimit; i++ {
 			group.Go(func() error {
-				return ul.CreateBucket(ctx, satellite, testrand.BucketName())
+				return ul.TestingCreateBucket(ctx, satellite, testrand.BucketName())
 			})
 		}
 		groupErrs := group.Wait()
@@ -563,7 +784,8 @@ func TestRateLimit_ProjectRateLimitOverride(t *testing.T) {
 		var group errs2.Group
 		for i := 0; i <= rateLimit; i++ {
 			group.Go(func() error {
-				return ul.CreateBucket(ctx, satellite, testrand.BucketName())
+				_, err := ul.ListBuckets(ctx, satellite)
+				return err
 			})
 		}
 		groupErrs := group.Wait()
@@ -573,20 +795,18 @@ func TestRateLimit_ProjectRateLimitOverride(t *testing.T) {
 
 func TestRateLimit_ProjectRateLimitOverrideCachedExpired(t *testing.T) {
 	testplanet.Run(t, testplanet.Config{
-		SatelliteCount: 1, StorageNodeCount: 0, UplinkCount: 1,
+		SatelliteCount: 1, UplinkCount: 1,
 		Reconfigure: testplanet.Reconfigure{
 			Satellite: func(log *zap.Logger, index int, config *satellite.Config) {
 				config.Metainfo.RateLimiter.Rate = 2
-				config.Metainfo.RateLimiter.CacheExpiration = time.Second
+				config.Metainfo.RateLimiter.CacheExpiration = 2 * time.Second
 			},
+			SatelliteDBOptions: testplanet.SatelliteDBDisableCaches,
 		},
 	}, func(t *testing.T, ctx *testcontext.Context, planet *testplanet.Planet) {
-		ul := planet.Uplinks[0]
-		satellite := planet.Satellites[0]
+		apiKey := planet.Uplinks[0].APIKey[planet.Satellites[0].ID()]
 
-		// TODO find a way to reset limiter before test is executed, currently
-		// testplanet is doing one additional request to get access
-		time.Sleep(2 * time.Second)
+		satellite := planet.Satellites[0]
 
 		projects, err := satellite.DB.Console().Projects().GetAll(ctx)
 		require.NoError(t, err)
@@ -598,11 +818,28 @@ func TestRateLimit_ProjectRateLimitOverrideCachedExpired(t *testing.T) {
 		err = satellite.DB.Console().Projects().Update(ctx, &projects[0])
 		require.NoError(t, err)
 
-		var group1 errs2.Group
+		limiter := satellite.Metainfo.Endpoint.TestingGetLimiterCache()
+		limiter.Reset()
 
-		for i := 0; i <= rateLimit; i++ {
+		rateLimiterTime := time.Now()
+		satellite.Metainfo.Endpoint.TestingSetRateLimiterTime(func() time.Time {
+			return rateLimiterTime
+		})
+
+		listBuckets := func() error {
+			_, err := satellite.Metainfo.Endpoint.ListBuckets(ctx, &pb.ListBucketsRequest{
+				Header: &pb.RequestHeader{
+					ApiKey: apiKey.SerializeRaw(),
+				},
+				Direction: pb.ListDirection_AFTER,
+			})
+			return err
+		}
+
+		var group1 errs2.Group
+		for range rateLimit + 1 {
 			group1.Go(func() error {
-				return ul.CreateBucket(ctx, satellite, testrand.BucketName())
+				return listBuckets()
 			})
 		}
 		group1Errs := group1.Wait()
@@ -614,13 +851,12 @@ func TestRateLimit_ProjectRateLimitOverrideCachedExpired(t *testing.T) {
 		err = satellite.DB.Console().Projects().Update(ctx, &projects[0])
 		require.NoError(t, err)
 
-		time.Sleep(2 * time.Second)
+		time.Sleep(4 * time.Second)
 
 		var group2 errs2.Group
-
-		for i := 0; i <= rateLimit; i++ {
+		for range rateLimit + 1 {
 			group2.Go(func() error {
-				return ul.CreateBucket(ctx, satellite, testrand.BucketName())
+				return listBuckets()
 			})
 		}
 		group2Errs := group2.Wait()
@@ -637,6 +873,7 @@ func TestRateLimit_ExceededBurstLimit(t *testing.T) {
 				config.Metainfo.RateLimiter.Rate = float64(burstLimit)
 				config.Metainfo.RateLimiter.CacheExpiration = 500 * time.Millisecond
 			},
+			SatelliteDBOptions: testplanet.SatelliteDBDisableCaches,
 		},
 	}, func(t *testing.T, ctx *testcontext.Context, planet *testplanet.Planet) {
 		ul := planet.Uplinks[0]
@@ -649,7 +886,8 @@ func TestRateLimit_ExceededBurstLimit(t *testing.T) {
 		var group errs2.Group
 		for i := 0; i <= burstLimit; i++ {
 			group.Go(func() error {
-				return ul.CreateBucket(ctx, satellite, testrand.BucketName())
+				_, err := ul.ListBuckets(ctx, satellite)
+				return err
 			})
 		}
 		groupErrs := group.Wait()
@@ -668,7 +906,8 @@ func TestRateLimit_ExceededBurstLimit(t *testing.T) {
 		var group2 errs2.Group
 		for i := 0; i <= burstLimit; i++ {
 			group2.Go(func() error {
-				return ul.CreateBucket(ctx, satellite, testrand.BucketName())
+				_, err := ul.ListBuckets(ctx, satellite)
+				return err
 			})
 		}
 		group2Errs := group2.Wait()

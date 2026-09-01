@@ -2,28 +2,17 @@
 // See LICENSE for copying information.
 
 <template>
-    <v-container class="fill-height">
+    <v-container class="fill-height align-content-center">
         <v-row justify="center">
-            <v-col cols="12" sm="9" md="7" lg="5" xl="4" xxl="3">
-                <v-card v-if="!isMFARequired" title="Welcome back" subtitle="Log in to your Storj account" class="pa-2 pa-sm-6 pb-sm-7">
+            <v-col cols="12" sm="9" md="7" lg="5" xl="5" xxl="3">
+                <v-card v-if="!isMFARequired" title="Welcome back" :subtitle="subtitle" class="pa-2 pa-sm-6 pb-sm-7">
                     <v-card-text>
-                        <v-alert
-                            v-if="captchaError"
-                            variant="tonal"
-                            color="error"
-                            text="hCaptcha is required. If you are using a VPN, try disabling it."
-                            rounded="lg"
-                            density="comfortable"
-                            class="mt-2 mb-3"
-                            border
-                        />
                         <v-alert
                             v-if="isActivatedBannerShown"
                             variant="tonal"
                             :color="isActivatedError ? 'error' : 'success'"
                             :title="isActivatedError ? 'Oops!' :'Success!'"
                             :text="isActivatedError ? 'This account has already been verified.' : 'Account verified.'"
-                            rounded="lg"
                             density="comfortable"
                             class="mt-1 mb-3"
                             border
@@ -34,7 +23,6 @@
                             color="error"
                             title="Oops!"
                             text="The invite link you used has expired or is invalid."
-                            rounded="lg"
                             density="comfortable"
                             class="mt-1 mb-3"
                             border
@@ -45,7 +33,6 @@
                             color="error"
                             title="Single Sign-on Failed"
                             text="Single sign-on failed. Please check with your administrator."
-                            rounded="lg"
                             density="comfortable"
                             class="mt-1 mb-3"
                             border
@@ -58,15 +45,15 @@
                             text="Login failed. Please check if this is the correct satellite for your account. If you are
                             sure your credentials are correct, please check your email inbox for a notification with
                             further instructions."
-                            rounded="lg"
                             density="comfortable"
                             class="mt-1 mb-3"
                             border
                         />
                         <v-form ref="form" v-model="formValid" class="pt-4" @submit.prevent="onLoginClick">
                             <v-select
+                                v-if="configStore.isDefaultBrand"
                                 v-model="satellite"
-                                label="Satellite"
+                                label="Satellite (Metadata Region)"
                                 :items="satellites"
                                 item-title="satellite"
                                 :hint="satellite.hint"
@@ -77,29 +64,33 @@
                             />
 
                             <v-text-field
-                                id="Email Address"
+                                id="email"
                                 v-model="email"
                                 class="mb-2"
                                 label="Email address"
                                 placeholder="Enter your email"
                                 name="email"
                                 type="email"
+                                autocomplete="username"
                                 :rules="emailRules"
                                 flat
                                 clearable
                                 required
+                                :disabled="!!pathEmail"
                                 @update:model-value="checkSSO"
                             />
 
                             <v-text-field
-                                id="Password"
+                                id="password"
                                 v-model="password"
                                 :class="{ hidden: !ssoUnavailable }"
                                 class="mb-2"
                                 label="Password"
                                 placeholder="Enter your password"
+                                name="password"
                                 color="secondary"
                                 :type="showPassword ? 'text' : 'password'"
+                                autocomplete="current-password"
                                 :rules="passwordRules"
                                 required
                             >
@@ -107,7 +98,7 @@
                                     <password-input-eye-icons
                                         :is-visible="showPassword"
                                         type="password"
-                                        @toggleVisibility="showPassword = !showPassword"
+                                        @toggle-visibility="showPassword = !showPassword"
                                     />
                                 </template>
                             </v-text-field>
@@ -119,7 +110,7 @@
                                         v-model="rememberForOneWeek"
                                         label="Remember Me"
                                         density="compact"
-                                        class="mt-n4 mb-3 text-body-2"
+                                        class="mt-n4 mb-3 text-body-medium"
                                         hide-details
                                     >
                                         <v-tooltip
@@ -131,7 +122,7 @@
                                     </v-checkbox>
                                 </v-col>
 
-                                <v-col>
+                                <v-col v-if="ssoUnavailable">
                                     <p class="text-right mt-n2 mb-4">
                                         <router-link class="link" :to="ROUTES.ForgotPassword.path">
                                             Forgot Password
@@ -150,6 +141,21 @@
                             >
                                 Continue
                             </v-btn>
+
+                            <template v-if="generalSsoEnabled">
+                                <v-btn
+                                    v-for="provider in generalSsoProviders"
+                                    :key="provider"
+                                    color="secondary"
+                                    variant="outlined"
+                                    size="large"
+                                    block
+                                    class="mt-4"
+                                    @click="onGeneralSsoClick(provider)"
+                                >
+                                    Sign in with&nbsp;<span class="text-capitalize">{{ provider }}</span>
+                                </v-btn>
+                            </template>
                         </v-form>
                     </v-card-text>
                 </v-card>
@@ -170,9 +176,24 @@
                     size="invisible"
                     @verify="onCaptchaVerified"
                     @expired="onCaptchaError"
+                    @challenge-expired="onCaptchaError"
+                    @error="onCaptchaError"
+                    @closed="onCaptchaClosed"
+                />
+                <TurnstileWidget
+                    v-if="captchaConfig.turnstile.enabled"
+                    ref="turnstile"
+                    class="mt-3"
+                    :site-key="captchaConfig.turnstile.siteKey"
+                    @verify="onCaptchaVerified"
+                    @expired="onCaptchaError"
                     @error="onCaptchaError"
                 />
-                <p class="mt-5 text-center text-body-2">Don't have an account? <router-link class="link font-weight-bold" :to="ROUTES.Signup.path">Sign Up</router-link></p>
+                <p v-if="configStore.state.config.openRegistrationEnabled" class="mt-5 text-center text-body-medium">Don't have an account? <router-link class="link font-weight-bold" :to="ROUTES.Signup.path">Sign Up</router-link></p>
+                <template v-else>
+                    <p class="mt-5 text-center text-body-medium">Don't have an account? <a class="link font-weight-bold" :href="configStore.supportUrl" target="_blank" rel="noopener noreferrer">Contact Support</a></p>
+                    <p class="mt-3 text-center text-body-medium">Need to verify your email? <router-link class="link font-weight-bold" :to="ROUTES.SignupConfirmation.path"> Complete activation</router-link></p>
+                </template>
             </v-col>
         </v-row>
     </v-container>
@@ -189,10 +210,10 @@ import { AuthHttpApi } from '@/api/auth';
 import { useConfigStore } from '@/store/modules/configStore';
 import { useAppStore } from '@/store/modules/appStore';
 import { useUsersStore } from '@/store/modules/usersStore';
-import { useNotify } from '@/utils/hooks';
-import { MultiCaptchaConfig } from '@/types/config.gen';
+import { useNotify } from '@/composables/useNotify';
+import type { MultiCaptchaConfig } from '@/types/config.gen';
 import { LocalData } from '@/utils/localData';
-import { SsoCheckState, TokenInfo } from '@/types/users';
+import { type TokenInfo, SsoCheckState } from '@/types/users';
 import { ErrorMFARequired } from '@/api/errors/ErrorMFARequired';
 import { ErrorUnauthorized } from '@/api/errors/ErrorUnauthorized';
 import { ErrorTooManyRequests } from '@/api/errors/ErrorTooManyRequests';
@@ -202,6 +223,7 @@ import { APIError } from '@/utils/error';
 
 import MfaComponent from '@/views/MfaComponent.vue';
 import PasswordInputEyeIcons from '@/components/PasswordInputEyeIcons.vue';
+import TurnstileWidget from '@/components/TurnstileWidget.vue';
 
 const auth = new AuthHttpApi();
 
@@ -221,7 +243,6 @@ const ssoFailed = ref(false);
 const inviteInvalid = ref(false);
 const isActivatedBannerShown = ref(false);
 const isActivatedError = ref(false);
-const captchaError = ref(false);
 const useOTP = ref(true);
 const isMFARequired = ref(false);
 const isMFAError = ref(false);
@@ -238,7 +259,15 @@ const returnURL = ref(ROUTES.Projects.path);
 
 const ssoCheckTimeout = ref<NodeJS.Timeout>();
 const hcaptcha = ref<VueHcaptcha | null>(null);
+const turnstile = ref<InstanceType<typeof TurnstileWidget> | null>(null);
 const form = ref<VForm | null>(null);
+
+/**
+ * Returns the active captcha widget instance (hCaptcha or Turnstile), whichever is mounted.
+ */
+function getCaptcha(): { execute(): void; reset(): void } | null {
+    return (hcaptcha.value ?? turnstile.value) as { execute(): void; reset(): void } | null;
+}
 
 const satellitesHints = [
     { satellite: 'Storj', hint: 'Recommended satellite.' },
@@ -253,7 +282,13 @@ const emailRules: ((_: string) => boolean | string)[] = [
     EmailRule,
 ];
 
+const subtitle = computed<string>(() => `Log in to your ${configStore.brandName} account`);
+
 const ssoEnabled = computed(() => configStore.state.config.ssoEnabled);
+const generalSsoEnabled = computed(() => configStore.state.config.generalSsoEnabled);
+const generalSsoProviders = computed(() => configStore.state.config.generalSsoProviders ?? []);
+
+const csrfToken = computed<string>(() => configStore.state.config.csrfToken);
 
 const passwordRules = computed(() => {
     if (!ssoEnabled.value) {
@@ -316,7 +351,6 @@ const captchaConfig = computed((): MultiCaptchaConfig => {
  */
 function onCaptchaVerified(response: string): void {
     captchaResponseToken.value = response;
-    captchaError.value = false;
     login();
 }
 
@@ -324,8 +358,19 @@ function onCaptchaVerified(response: string): void {
  * Handles captcha error and expiry.
  */
 function onCaptchaError(): void {
+    getCaptcha()?.reset();
     captchaResponseToken.value = '';
-    captchaError.value = true;
+    notify.error('Captcha verification failed. If you are using a VPN, try disabling it.', null);
+    isLoading.value = false;
+}
+
+/**
+ * Handles the captcha challenge being closed without completion.
+ */
+function onCaptchaClosed(): void {
+    if (captchaResponseToken.value) return;
+    getCaptcha()?.reset();
+    isLoading.value = false;
 }
 
 function checkSSO(mail: string) {
@@ -357,7 +402,7 @@ function checkSSO(mail: string) {
             // check if the URL is valid.
             new URL(urlStr);
             ssoUrl.value = urlStr;
-        } catch (_) {
+        } catch {
             ssoUrl.value = SsoCheckState.Failed;
         }
     }, 1000);
@@ -373,8 +418,9 @@ async function onLoginClick(): Promise<void> {
     }
 
     async function triggerLogin() {
-        if (!isMFARequired.value && hcaptcha.value && !captchaResponseToken.value) {
-            hcaptcha.value?.execute();
+        const captcha = getCaptcha();
+        if (!isMFARequired.value && captcha && !captchaResponseToken.value) {
+            captcha.execute();
             return;
         }
         await login();
@@ -399,13 +445,20 @@ async function onLoginClick(): Promise<void> {
     }
 }
 
+function onGeneralSsoClick(provider: string): void {
+    if (!generalSsoEnabled.value || !provider) {
+        return;
+    }
+    window.open(`/sso/${provider}`, '_self');
+}
+
 /**
  * Performs login action.
  * Then changes location to project dashboard page.
  */
 async function login(): Promise<void> {
     try {
-        const tokenInfo: TokenInfo = await auth.token(email.value, password.value, captchaResponseToken.value, passcode.value, recoveryCode.value, rememberForOneWeek.value);
+        const tokenInfo: TokenInfo = await auth.token(email.value, password.value, captchaResponseToken.value, passcode.value, recoveryCode.value, csrfToken.value, rememberForOneWeek.value);
         LocalData.setSessionExpirationDate(tokenInfo.expiresAt);
         if (rememberForOneWeek.value) {
             LocalData.setCustomSessionDuration(604800); // 7 days in seconds.
@@ -413,8 +466,9 @@ async function login(): Promise<void> {
             LocalData.removeCustomSessionDuration();
         }
     } catch (error) {
-        if (hcaptcha.value) {
-            hcaptcha.value?.reset();
+        const captcha = getCaptcha();
+        if (captcha) {
+            captcha.reset();
             captchaResponseToken.value = '';
         }
 
@@ -426,7 +480,7 @@ async function login(): Promise<void> {
 
         if (isMFARequired.value && !(error instanceof ErrorTooManyRequests)) {
             if (error instanceof ErrorBadRequest || error instanceof ErrorUnauthorized) {
-                notify.error(error.message);
+                notify.notifyError(error);
             }
 
             isMFAError.value = true;
@@ -434,7 +488,10 @@ async function login(): Promise<void> {
             return;
         }
 
-        if (error instanceof ErrorUnauthorized) {
+        if (
+            error instanceof ErrorUnauthorized ||
+            (error instanceof APIError && error.status === 403 && error.message.includes('login credentials'))
+        ) {
             isBadLoginMessageShown.value = true;
             isLoading.value = false;
             return;
@@ -461,6 +518,7 @@ onMounted(() => {
     pathEmail.value = route.query.email as string ?? null;
     if (pathEmail.value) {
         email.value = pathEmail.value.trim();
+        checkSSO(email.value);
     }
 
     ssoFailed.value = !!route.query.sso_failed;

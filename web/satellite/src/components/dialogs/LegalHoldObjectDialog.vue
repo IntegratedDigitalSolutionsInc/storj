@@ -28,7 +28,7 @@
                     </v-card-title>
                     <template #append>
                         <v-btn
-                            icon="$close"
+                            :icon="X"
                             variant="text"
                             size="small"
                             color="default"
@@ -54,7 +54,7 @@
                         requirements have been met before proceeding.
                     </p>
 
-                    <p class="mt-4 mb-2 font-weight-bold text-body-2">
+                    <p class="mt-4 mb-2 font-weight-bold text-body-medium">
                         Name:
                     </p>
 
@@ -69,7 +69,7 @@
                     </v-chip>
 
                     <template v-if="file?.VersionId">
-                        <p class="my-2 font-weight-bold text-body-2">
+                        <p class="my-2 font-weight-bold text-body-medium">
                             Version:
                         </p>
 
@@ -132,11 +132,11 @@ import {
     VRow,
     VSheet,
 } from 'vuetify/components';
-import { FileLock2 } from 'lucide-vue-next';
+import { FileLock2, X } from '@lucide/vue';
 
-import { BrowserObject, useObjectBrowserStore } from '@/store/modules/objectBrowserStore';
+import { type BrowserObject, useObjectBrowserStore  } from '@/store/modules/objectBrowserStore';
 import { useLoading } from '@/composables/useLoading';
-import { useNotify } from '@/utils/hooks';
+import { useNotify } from '@/composables/useNotify';
 import { AnalyticsErrorEventSource } from '@/utils/constants/analyticsEventNames';
 import { LEGAL_HOLD_OFF, LEGAL_HOLD_ON } from '@/types/objectLock';
 
@@ -186,7 +186,7 @@ watch(innerContent, comp => {
         }
         try {
             hasLegalHold.value = await obStore.getObjectLegalHold(props.file);
-        } catch (_) {
+        } catch {
             /* empty */
         }
     });

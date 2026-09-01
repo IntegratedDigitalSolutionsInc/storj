@@ -15,7 +15,7 @@
 
                 <template #append>
                     <v-btn
-                        icon="$close"
+                        :icon="X"
                         variant="text"
                         size="small"
                         color="default"
@@ -50,7 +50,7 @@
                             :loading="isAccepting"
                             @click="respondToInvitation(ProjectInvitationResponse.Accept)"
                         >
-                            Join Project
+                            Join
                         </v-btn>
                     </v-col>
                 </v-row>
@@ -73,12 +73,13 @@ import {
     VCol,
     VBtn,
 } from 'vuetify/components';
+import { X } from '@lucide/vue';
 
 import { ProjectInvitationResponse } from '@/types/projects';
 import { useProjectsStore } from '@/store/modules/projectsStore';
 import { AnalyticsErrorEventSource, AnalyticsEvent } from '@/utils/constants/analyticsEventNames';
 import { useAnalyticsStore } from '@/store/modules/analyticsStore';
-import { useNotify } from '@/utils/hooks';
+import { useNotify } from '@/composables/useNotify';
 import { ROUTES } from '@/router';
 
 const props = defineProps<{
@@ -127,6 +128,7 @@ async function respondToInvitation(response: ProjectInvitationResponse): Promise
             accepted ?
                 AnalyticsEvent.PROJECT_INVITATION_ACCEPTED :
                 AnalyticsEvent.PROJECT_INVITATION_DECLINED,
+            { project_id: props.id },
         );
     } catch (error) {
         const action = accepted ? 'accept' : 'decline';

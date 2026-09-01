@@ -183,8 +183,14 @@ func transformFloat64(x string) (float64, error) {
 	return strconv.ParseFloat(x, 64)
 }
 
-func (ex *external) AccessInfoFile() string   { return filepath.Join(ex.dirs.current, "access.json") }
-func (ex *external) ConfigFile() string       { return filepath.Join(ex.dirs.current, "config.ini") }
+func (ex *external) AccessInfoFile() (string, error) {
+	return filepath.Join(ex.dirs.current, "access.json"), nil
+}
+
+func (ex *external) ConfigFile() (string, error) {
+	return filepath.Join(ex.dirs.current, "config.ini"), nil
+}
+
 func (ex *external) legacyConfigFile() string { return filepath.Join(ex.dirs.legacy, "config.yaml") }
 
 // Dynamic is called by clingy to look up values for global flags not specified on the command
@@ -255,7 +261,8 @@ func (ex *external) analyticsEnabled() bool {
 
 // Wrap is called by clingy with the command to be executed.
 func (ex *external) Wrap(ctx context.Context, cmd clingy.Command) (err error) {
-	defer mon.Task()(&ctx)(&err)
+	// Please don't put mon.Task()(&ctx)(&err) to here. We need to create the first trace/span after we initialized
+	// all the reporters / observers. First span can be created in cmd.Execute.
 
 	if err = ex.migrate(); err != nil {
 		return err
@@ -324,11 +331,11 @@ func (ex *external) Wrap(ctx context.Context, cmd clingy.Command) (err error) {
 	// in this if statement. If we do ever start turning on trace samples by default, we
 	// will need to make sure we only do so if ex.analyticsEnabled().
 	if ex.tracing.traceAddress != "" && (ex.tracing.sample > 0 || ex.tracing.traceID > 0) {
-		versionName := fmt.Sprintf("uplink-release-%s", version.Build.Version.String())
+		versionName := "uplink-release-" + version.Build.Version.VString()
 		if !version.Build.Release {
 			versionName = "uplink-dev"
 		}
-		collector, err := jaeger.NewUDPCollector(zap.L(), ex.tracing.traceAddress, versionName, nil, 0, 0, 0)
+		collector, err := jaeger.NewThriftCollector(zap.L(), ex.tracing.traceAddress, versionName, nil, 0, 0, 0)
 		if err != nil {
 			return err
 		}
@@ -381,7 +388,7 @@ func (ex *external) Wrap(ctx context.Context, cmd clingy.Command) (err error) {
 			// TODO: eventkit should probably think through
 			// application and application version more carefully.
 			appname = "uplink-release"
-			appversion = version.Build.Version.String()
+			appversion = version.Build.Version.VString()
 		} else {
 			appname = "uplink-dev"
 			appversion = version.Build.Timestamp.Format(time.RFC3339)

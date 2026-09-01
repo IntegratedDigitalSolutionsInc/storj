@@ -12,6 +12,12 @@ model project (
 		fields owner_id
 	)
 
+	index (
+		name projects_status_status_updated_at_index
+		fields status status_updated_at
+		where project.status_updated_at != null
+	)
+
 	// id is a UUID used for identifying the project.
 	field id                                blob
 	// public_id is a UUID that's used in web requests.
@@ -73,6 +79,13 @@ model project (
 	// salt is used for salting the user passphrase for the content.
 	field salt                              blob      ( nullable )
 
+	// status is used to indicate status of the user's project.
+	// 0 - disabled or deleted by the user
+	// 1 - active
+	field status                            int       ( nullable, updatable, default 1 )
+	// status_updated_at indicates the time at which the status last changed
+	field status_updated_at timestamp ( updatable, nullable )
+
 	// created_at indicates when the project was created.
 	field created_at                        timestamp ( autoinsert )
 
@@ -86,6 +99,7 @@ model project (
 	// note: suspended is not a valid state for new buckets
 	field default_versioning int (updatable, default 1)
 
+	// TODO: drop this column after we're out of schema freeze.
 	// whether a user has been prompted to join versioning open beta
 	field prompted_for_versioning_beta bool ( updatable, default false )
 
@@ -95,6 +109,11 @@ model project (
 	field passphrase_enc_key_id int ( nullable, updatable )
 	// whether path encryption is enabled for the project
 	field path_encryption bool ( updatable, default true )
+
+	// notification_flags is a bitfield encoding which limit notification emails are
+	// enabled for the project and which threshold emails have already been sent.
+	// See satellite/projectlimitevents for the bit layout.
+	field notification_flags int ( nullable, updatable )
 )
 
 create project ( )
@@ -117,6 +136,10 @@ read one (
 read one (
 	select project
 	where project.id = ?
+)
+read one (
+	select project
+	where (project.id = ?, project.public_id = ?)
 )
 read one (
 	select project.usage_limit
@@ -172,6 +195,10 @@ read one (
 	select project.user_agent
 	where project.id = ?
 )
+read one (
+	select project.public_id
+	where project.id = ?
+)
 
 read all (
 	select project
@@ -188,6 +215,12 @@ read all (
 )
 read all (
 	select project
+	where project.owner_id = ?
+	where project.status = ?
+	orderby asc project.created_at
+)
+read all (
+	select project
 	join project.id = project_member.project_id
 	where project_member.member_id = ?
 	orderby asc project.name
@@ -197,6 +230,13 @@ read limitoffset (
 	select project
 	where project.created_at < ?
 	orderby asc project.created_at
+)
+
+read limitoffset (
+	select project.id project.public_id project.owner_id
+	where project.status = ?
+	where project.status_updated_at < ?
+	orderby (asc project.status_updated_at, asc project.id)
 )
 
 // project_member is an association table between projects and users.
@@ -273,6 +313,22 @@ read all (
 
 read all (
 	select project_invitation
+	join project_invitation.project_id = project.id
+	where project.status = ?
+	where project_invitation.email = ?
+)
+
+read all (
+	select project_invitation
+	join project_invitation.project_id = project.id
+	join project_invitation.inviter_id = user.id
+	where project.status = ?
+	where project_invitation.email = ?
+	where user.tenant_id = ?
+)
+
+read all (
+	select project_invitation
 	where project_invitation.project_id = ?
 )
 
@@ -284,6 +340,40 @@ update project_invitation (
 delete project_invitation (
 	where project_invitation.project_id = ?
 	where project_invitation.email = ?
+)
+
+// project_limit_event table contains a queue of project limit threshold events
+// that require either sending a notification email or resetting a threshold flag.
+model project_limit_event (
+	key id
+
+	index (
+		name project_limit_events_project_id_created_at_index
+		fields project_id created_at
+		where project_limit_event.email_sent = null
+	)
+
+	// id is a UUID for this event.
+	field id             blob
+	// project_id is the project associated with this event.
+	field project_id     blob
+	// event is the threshold kind, whose value matches a bit in project.notification_flags.
+	field event          int
+	// is_reset indicates this event should clear the threshold flag rather than send an email.
+	field is_reset       bool ( default false )
+	// created_at is when this event was added.
+	field created_at     timestamp ( default current_timestamp )
+	// last_attempted is when the chore last tried to process this event.
+	field last_attempted timestamp ( nullable, updatable )
+	// email_sent is when processing of this event succeeded.
+	field email_sent     timestamp ( nullable, updatable )
+)
+
+create project_limit_event ( )
+
+read one (
+	select project_limit_event
+	where project_limit_event.id = ?
 )
 
 // api_key is used to authenticate in requests.
@@ -322,6 +412,11 @@ delete api_key ( where api_key.id = ? )
 
 delete api_key ( where api_key.project_id = ? )
 
+delete api_key (
+	where api_key.project_id = ?
+	where api_key.created_by = ?
+)
+
 read one (
 	select api_key project.public_id
 	join project.id = api_key.project_id
@@ -347,7 +442,8 @@ read one (
 		*/ project.usage_limit /*
 		*/ project.bandwidth_limit /*
 		*/ project.user_specified_usage_limit /*
-		*/ project.user_specified_bandwidth_limit
+		*/ project.user_specified_bandwidth_limit /*
+		*/ project.notification_flags
 	join project.id = api_key.project_id
 	where api_key.head = ?
 )
@@ -356,4 +452,26 @@ read one (
 	join project.id = api_key.project_id
 	where api_key.name = ?
 	where api_key.project_id = ?
+)
+
+// api_key_tail is the tail of an auditable api_key's children.
+model api_key_tail (
+	key tail
+
+	// root_key_id is the id of the root api_key that this tail is a child of.
+	field root_key_id  api_key.id cascade ( nullable )
+	// tail of the current macaroon.
+	field  tail        blob
+	// parent_tail is a tail of the parent macaroon.
+	field  parent_tail blob
+	// caveat is restriction applied to a macaroon.
+	field  caveat      blob
+	// last_used indicates when the macaroon was last used.
+	field  last_used   timestamp ( updatable )
+)
+
+create api_key_tail ( replace )
+read one (
+	select api_key_tail
+	where api_key_tail.tail = ?
 )

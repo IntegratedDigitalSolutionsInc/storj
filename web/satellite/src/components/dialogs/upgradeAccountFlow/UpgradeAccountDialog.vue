@@ -4,26 +4,26 @@
 <template>
     <v-dialog
         v-model="model"
-        scrollable
         min-width="320px"
         :max-width="maxWidth"
         transition="fade-transition"
         persistent
         :scrim="scrim"
     >
-        <v-card ref="content">
+        <v-card>
             <v-card-item class="pa-6">
                 <template v-if="step === UpgradeAccountStep.Success" #prepend>
-                    <img class="d-block" src="@/assets/icon-success.svg" alt="success">
+                    <img v-if="configStore.isDefaultBrand" class="d-block" src="@/assets/icon-success.svg" alt="success">
+                    <v-icon v-else color="success" size="24" :icon="CircleCheckBig" />
                 </template>
                 <v-card-title class="font-weight-bold">{{ stepTitles[step] }}</v-card-title>
                 <template #append>
                     <v-btn
-                        icon="$close"
+                        :icon="X"
                         variant="text"
                         size="small"
                         color="default"
-                        :disabled="loading"
+                        :disabled="isLoading"
                         @click="model = false"
                     />
                 </template>
@@ -31,52 +31,62 @@
 
             <v-divider />
 
-            <v-card-item class="py-4">
-                <v-window v-model="step">
+            <v-card-item>
+                <v-window v-model="step" :touch="false" class="no-overflow">
                     <v-window-item :value="UpgradeAccountStep.Info">
                         <UpgradeInfoStep
-                            :loading="loading"
-                            @upgrade="setSecondStep"
+                            :loading="isLoading"
+                            :is-member-upgrade="isMemberUpgrade"
+                            @upgrade="upgrade"
+                            @start-free-trial="onStartFreeTrial"
                         />
                     </v-window-item>
 
                     <v-window-item :value="UpgradeAccountStep.Options">
-                        <UpgradeOptionsStep
-                            :loading="loading"
-                            @add-card="() => setStep(UpgradeAccountStep.AddCC)"
-                            @add-tokens="onAddTokens"
-                        />
-                    </v-window-item>
-
-                    <v-window-item :value="UpgradeAccountStep.AddCC">
-                        <AddCreditCardStep
-                            v-model:loading="loading"
-                            @success="() => setStep(UpgradeAccountStep.Success)"
-                            @back="() => setStep(UpgradeAccountStep.Options)"
-                        />
-                    </v-window-item>
-
-                    <v-window-item :value="UpgradeAccountStep.AddTokens">
-                        <AddTokensStep
-                            @back="() => setStep(UpgradeAccountStep.Options)"
-                            @success="() => setStep(UpgradeAccountStep.Success)"
-                        />
+                        <v-tabs
+                            v-model="paymentTab"
+                            color="primary"
+                            show-arrows
+                            class="border-b-thin mb-3"
+                        >
+                            <v-tab>
+                                Credit Card
+                            </v-tab>
+                            <v-tab v-if="nativeTokenPaymentsEnabled">
+                                STORJ Tokens
+                            </v-tab>
+                        </v-tabs>
+                        <v-window v-model="paymentTab" :touch="false">
+                            <v-window-item :value="PaymentOption.CreditCard">
+                                <PricingPlanStep
+                                    v-model:loading="isLoading"
+                                    :plan="plan"
+                                    @back="setStep(UpgradeAccountStep.Info)"
+                                    @success="() => setStep(UpgradeAccountStep.Success)"
+                                />
+                            </v-window-item>
+                            <v-window-item v-if="nativeTokenPaymentsEnabled" :value="PaymentOption.StorjTokens">
+                                <v-card :loading="isLoading" class="pa-1" variant="flat" :class="{'no-border pa-0': !isLoading}">
+                                    <AddTokensStep
+                                        v-if="!isLoading"
+                                        @back="() => setStep(UpgradeAccountStep.Info)"
+                                        @success="onAddTokensSuccess"
+                                    />
+                                </v-card>
+                            </v-window-item>
+                        </v-window>
                     </v-window-item>
 
                     <v-window-item :value="UpgradeAccountStep.Success">
-                        <SuccessStep @continue="model = false" />
-                    </v-window-item>
-
-                    <v-window-item :value="UpgradeAccountStep.PricingPlanSelection">
-                        <PricingPlanSelectionStep @select="onSelectPricingPlan" />
+                        <SuccessStep @continue="handleMemberAndClose" />
                     </v-window-item>
 
                     <v-window-item :value="UpgradeAccountStep.PricingPlan">
                         <PricingPlanStep
-                            v-model:loading="loading"
+                            v-model:loading="isLoading"
                             :plan="plan"
-                            @close="model = false"
-                            @back="setStep(UpgradeAccountStep.PricingPlanSelection)"
+                            @close="handleMemberAndClose"
+                            @back="setStep(UpgradeAccountStep.Info)"
                         />
                     </v-window-item>
                 </v-window>
@@ -87,20 +97,36 @@
 
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue';
-import { VBtn, VCard, VCardItem, VCardTitle, VDialog, VDivider, VWindow, VWindowItem } from 'vuetify/components';
+import {
+    VBtn,
+    VCard,
+    VCardItem,
+    VCardTitle,
+    VDialog,
+    VDivider,
+    VTab,
+    VTabs,
+    VWindow,
+    VWindowItem,
+    VIcon,
+} from 'vuetify/components';
+import { useDisplay } from 'vuetify';
+import { CircleCheckBig, X } from '@lucide/vue';
 
 import { useBillingStore } from '@/store/modules/billingStore';
-import { useNotify } from '@/utils/hooks';
+import { useConfigStore } from '@/store/modules/configStore';
+import { useNotify } from '@/composables/useNotify';
 import { AnalyticsErrorEventSource, AnalyticsEvent } from '@/utils/constants/analyticsEventNames';
 import { useAnalyticsStore } from '@/store/modules/analyticsStore';
-import { PricingPlanInfo } from '@/types/common';
+import { type PricingPlanInfo, PricingPlanType  } from '@/types/common';
+import type { Wallet } from '@/types/payments';
+import { useUsersStore } from '@/store/modules/usersStore';
+import { useLoading } from '@/composables/useLoading';
+import { useAppStore } from '@/store/modules/appStore';
 
 import UpgradeInfoStep from '@/components/dialogs/upgradeAccountFlow/UpgradeInfoStep.vue';
-import UpgradeOptionsStep from '@/components/dialogs/upgradeAccountFlow/UpgradeOptionsStep.vue';
-import AddCreditCardStep from '@/components/dialogs/upgradeAccountFlow/AddCreditCardStep.vue';
 import AddTokensStep from '@/components/dialogs/upgradeAccountFlow/AddTokensStep.vue';
 import SuccessStep from '@/components/dialogs/upgradeAccountFlow/SuccessStep.vue';
-import PricingPlanSelectionStep from '@/components/dialogs/upgradeAccountFlow/PricingPlanSelectionStep.vue';
 import PricingPlanStep from '@/components/dialogs/upgradeAccountFlow/PricingPlanStep.vue';
 
 enum UpgradeAccountStep {
@@ -109,69 +135,128 @@ enum UpgradeAccountStep {
     AddCC = 'addCCStep',
     AddTokens = 'addTokensStep',
     Success = 'successStep',
-    PricingPlanSelection = 'pricingPlanSelectionStep',
     PricingPlan = 'pricingPlanStep',
 }
 
 const analyticsStore = useAnalyticsStore();
 const billingStore = useBillingStore();
+const configStore = useConfigStore();
+const usersStore = useUsersStore();
+const appStore = useAppStore();
+
+const { smAndDown, md } = useDisplay();
 const notify = useNotify();
 
 const step = ref<UpgradeAccountStep>(UpgradeAccountStep.Info);
-const loading = ref<boolean>(false);
 const plan = ref<PricingPlanInfo>();
-const content = ref<HTMLElement | null>(null);
+const wallet = computed<Wallet>(() => billingStore.state.wallet as Wallet);
 
-withDefaults(defineProps<{
+enum PaymentOption {
+    CreditCard,
+    StorjTokens,
+}
+
+const props = withDefaults(defineProps<{
     scrim?: boolean,
+    isMemberUpgrade?: boolean,
 }>(), {
     scrim: true,
+    isMemberUpgrade: false,
 });
 
+const emit = defineEmits<{
+    (e: 'memberUpgrade'): void;
+}>();
+
+const { isLoading, withLoading } = useLoading();
+
 const model = defineModel<boolean>({ required: true });
+
+const paymentTab = ref<PaymentOption>(PaymentOption.CreditCard);
+
+const memberUpgrade = ref<boolean>(false);
 
 const stepTitles = computed(() => {
     return {
         [UpgradeAccountStep.Info]: 'Upgrade',
-        [UpgradeAccountStep.Options]: 'Upgrade to Pro',
+        [UpgradeAccountStep.Options]: 'Add Payment Method',
         [UpgradeAccountStep.AddCC]: 'Add Credit Card',
         [UpgradeAccountStep.AddTokens]: 'Add Storj Tokens',
         [UpgradeAccountStep.Success]: 'Success',
-        [UpgradeAccountStep.PricingPlanSelection]: 'Upgrade',
-        [UpgradeAccountStep.PricingPlan]: plan.value?.title || '',
+        [UpgradeAccountStep.PricingPlan]: plan.value?.planTitle || '',
     };
 });
 
 const maxWidth = computed(() => {
     switch (step.value) {
     case UpgradeAccountStep.Info:
-    case UpgradeAccountStep.PricingPlanSelection:
+        if (billingStore.state.pricingPlansAvailable) {
+            return smAndDown.value ? '' : md.value ? '90%' : '65%';
+        }
+        return smAndDown.value ? '' : md.value ? '80%' : '55%';
+    case UpgradeAccountStep.PricingPlan:
     case UpgradeAccountStep.AddTokens:
+    case UpgradeAccountStep.Options:
         return '720px';
     default:
         return '460px';
     }
 });
 
+const nativeTokenPaymentsEnabled = computed<boolean>(() => configStore.state.config.nativeTokenPaymentsEnabled);
+
+/**
+ * Returns whether the user is in paid tier.
+ */
+const isPaidTier = computed((): boolean => usersStore.state.user.isPaid);
+
+const isMember = computed((): boolean => usersStore.state.user.isMember);
+
+/**
+ * Handles starting free trial for Member accounts.
+ */
+function onStartFreeTrial(): void {
+    withLoading(async () => {
+        try {
+            await billingStore.startFreeTrial();
+            await usersStore.getUser();
+
+            notify.success('Your free trial has started!');
+            handleMemberAndClose();
+        } catch (error) {
+            notify.notifyError(error, AnalyticsErrorEventSource.UPGRADE_ACCOUNT_MODAL);
+        }
+    });
+}
+
+function handleMemberAndClose(): void {
+    model.value = false;
+
+    if (memberUpgrade.value && !isMember.value) emit('memberUpgrade');
+}
+
 /**
  * Claims wallet and sets add token step.
  */
-async function onAddTokens(): Promise<void> {
-    if (loading.value) return;
+function onAddTokens(): void {
+    withLoading(async () => {
+        try {
+            await billingStore.claimWallet();
 
-    loading.value = true;
+            analyticsStore.eventTriggered(AnalyticsEvent.ADD_FUNDS_CLICKED);
+        } catch (error) {
+            notify.notifyError(error, AnalyticsErrorEventSource.UPGRADE_ACCOUNT_MODAL);
+        }
+    });
+}
 
-    try {
-        await billingStore.claimWallet();
-
-        analyticsStore.eventTriggered(AnalyticsEvent.ADD_FUNDS_CLICKED);
-
-        setStep(UpgradeAccountStep.AddTokens);
-    } catch (error) {
-        notify.notifyError(error, AnalyticsErrorEventSource.UPGRADE_ACCOUNT_MODAL);
+function onAddTokensSuccess(): void {
+    if (isPaidTier.value) {
+        setStep(UpgradeAccountStep.Success);
+        return;
     }
 
-    loading.value = false;
+    model.value = false;
 }
 
 /**
@@ -181,27 +266,43 @@ function setStep(s: UpgradeAccountStep) {
     step.value = s;
 }
 
-function onSelectPricingPlan(p: PricingPlanInfo) {
+function upgrade(p: PricingPlanInfo) {
+    if (isLoading.value) return;
+
     plan.value = p;
-    setStep(UpgradeAccountStep.PricingPlan);
+
+    setStep(p.type === PricingPlanType.PARTNER ? UpgradeAccountStep.PricingPlan : UpgradeAccountStep.Options);
 }
 
-/**
- * Sets second step in the flow (after user clicks to upgrade).
- * Most users will go to the Options step, but if a user is eligible for a
- * pricing plan (and pricing plans are enabled), they will be sent to the PricingPlan step.
- */
-async function setSecondStep() {
-    const newStep = billingStore.state.pricingPlansAvailable ? UpgradeAccountStep.PricingPlanSelection : UpgradeAccountStep.Options;
-    setStep(newStep);
-}
+watch(paymentTab, newTab => {
+    if (newTab === PaymentOption.StorjTokens && !wallet.value.address) onAddTokens();
+});
 
-watch(content, (value) => {
+watch(model, (value) => {
     if (!value) {
+        if (configStore.state.config.optInPopupEnabled && isPaidTier.value) {
+            appStore.togglePricingOptInDialog(true);
+        }
+
+        memberUpgrade.value = false;
         setStep(UpgradeAccountStep.Info);
         return;
     }
-});
 
-defineExpose({ setSecondStep });
+    // We must cache this prop value to know if we are in member upgrade flow
+    // because user kind can update after a successful upgrade.
+    if (props.isMemberUpgrade) {
+        memberUpgrade.value = true;
+    }
+});
 </script>
+
+<style scoped lang="scss">
+.no-border {
+    border: 0 !important;
+}
+
+.v-overlay .v-card .no-overflow {
+    overflow-y: hidden !important;
+}
+</style>

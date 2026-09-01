@@ -1,7 +1,7 @@
 // Copyright (C) 2023 Storj Labs, Inc.
 // See LICENSE for copying information.
 
-import { createVuetify } from 'vuetify';
+import type { createVuetify } from 'vuetify';
 
 type ThemeOptions = NonNullable<NonNullable<Parameters<typeof createVuetify>[0]>['theme']>;
 
@@ -12,12 +12,15 @@ export const THEME_OPTIONS: ThemeOptions = {
             dark: false,
             colors: {
                 primary: '#0052FF',
+                'on-primary': '#FFFFFF',
                 secondary: '#091C45',
+                'on-secondary': '#FFFFFF',
                 background: '#fcfcfd',
                 surface: '#FFF',
+                'on-surface': '#000000',
                 info: '#0059D0',
                 help: '#FFA800',
-                success: '#00AC26',
+                success: '#00B661',
                 warning: '#FF7F00',
                 error: '#FF0149',
                 purple: '#7B61FF',
@@ -38,11 +41,16 @@ export const THEME_OPTIONS: ThemeOptions = {
             dark: true,
             colors: {
                 primary: '#0052FF',
+                'on-primary': '#FFFFFF',
                 secondary: '#537CFF',
+                'on-secondary': '#FFFFFF',
                 background: '#000a20',
                 surface: '#000b21',
-                success: '#00AC26',
+                'on-surface': '#FFFFFF',
+                info: '#2196f3',
+                success: '#00E366',
                 help: '#FFC600',
+                warning: '#FF8A00',
                 error: '#FF0149',
                 purple: '#A18EFF',
                 purple2: '#A18EFF',
@@ -54,7 +62,6 @@ export const THEME_OPTIONS: ThemeOptions = {
                 yellow: '#FFC600',
                 yellow2: '#FFB018',
                 orange: '#FFA800',
-                warning: '#FF8A00',
                 green: '#00E366',
             },
         },

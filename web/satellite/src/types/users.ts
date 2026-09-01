@@ -2,9 +2,10 @@
 // See LICENSE for copying information.
 
 import { Duration } from '@/utils/time';
-import { ChangeEmailStep, DeleteAccountStep } from '@/types/accountActions';
+import type { ChangeEmailStep, DeleteAccountStep } from '@/types/accountActions';
 import { SortDirection } from '@/types/common';
 import { DEFAULT_PAGE_LIMIT } from '@/types/pagination';
+import type { UserAccount } from '@/api/private.gen';
 
 /**
  * Exposes all user-related functionality.
@@ -14,9 +15,10 @@ export interface UsersApi {
      * Updates users full name and short name.
      *
      * @param user - contains information that should be updated
+     * @param csrfProtectionToken - CSRF protection token
      * @throws Error
      */
-    update(user: UpdatedUser): Promise<void>;
+    update(user: UpdatedUser, csrfProtectionToken: string): Promise<void>;
 
     /**
      * Fetch user.
@@ -27,12 +29,12 @@ export interface UsersApi {
     get(): Promise<User>;
 
     /**
-     * Fetches user frozen status.
+     * Fetches a list of encoded bad passwords.
      *
-     * @returns boolean
+     * @returns Set<string>
      * @throws Error
      */
-    getFrozenStatus(): Promise<FreezeStatus>;
+    getBadPasswords(): Promise<Set<string>>;
 
     /**
      * Fetches user frozen status.
@@ -54,62 +56,68 @@ export interface UsersApi {
      *
      * @throws Error
      */
-    invalidateSession(sessionID: string): Promise<void>
+    invalidateSession(sessionID: string, csrfProtectionToken: string): Promise<void>
 
     /**
      * Changes user's settings.
      *
      * @param data
+     * @param csrfProtectionToken
+     *
      * @returns UserSettings
      * @throws Error
      */
-    updateSettings(data: SetUserSettingsData): Promise<UserSettings>;
+    updateSettings(data: SetUserSettingsData, csrfProtectionToken: string): Promise<UserSettings>;
 
     /**
      * Changes user's email.
      *
      * @param step
      * @param data
+     * @param csrfProtectionToken
+     *
      * @throws Error
      */
-    changeEmail(step: ChangeEmailStep, data: string): Promise<void>;
+    changeEmail(step: ChangeEmailStep, data: string, csrfProtectionToken: string): Promise<void>;
 
     /**
      * Marks user's account for deletion.
      *
      * @param step
      * @param data
+     * @param csrfProtectionToken
+     *
      * @throws Error
      */
-    deleteAccount(step: DeleteAccountStep, data: string): Promise<AccountDeletionData | null>;
+    deleteAccount(step: DeleteAccountStep, data: string, csrfProtectionToken: string): Promise<AccountDeletionData | null>;
 
     /**
      * Enable user's MFA.
      *
      * @throws Error
      */
-    enableUserMFA(passcode: string): Promise<string[]>;
+    enableUserMFA(passcode: string, csrfProtectionToken: string): Promise<string[]>;
 
     /**
      * Disable user's MFA.
      *
      * @throws Error
      */
-    disableUserMFA(passcode: string, recoveryCode: string): Promise<void>;
+    disableUserMFA(passcode: string, recoveryCode: string, csrfProtectionToken: string): Promise<void>;
 
     /**
      * Generate user's MFA secret.
      *
      * @throws Error
      */
-    generateUserMFASecret(): Promise<string>;
+    generateUserMFASecret(csrfProtectionToken: string): Promise<string>;
 
     /**
      * Generate user's MFA recovery codes requiring a code.
      *
      * @throws Error
      */
-    regenerateUserMFARecoveryCodes(passcode?: string, recoveryCode?: string): Promise<string[]>;
+    regenerateUserMFARecoveryCodes(csrfProtectionToken: string, passcode?: string, recoveryCode?: string): Promise<string[]>;
 
     /**
      * Request increase for user's project limit.
@@ -135,7 +143,7 @@ export class User {
         public projectStorageLimit: number = 0,
         public projectBandwidthLimit: number = 0,
         public projectSegmentLimit: number = 0,
-        public paidTier: boolean = false,
+        public kind: KindInfo = new KindInfo(),
         public isMFAEnabled: boolean = false,
         public isProfessional: boolean = false,
         public position: string = '',
@@ -149,7 +157,28 @@ export class User {
         public hasVarPartner: boolean = false,
         public signupPromoCode: string = '',
         public freezeStatus: FreezeStatus = new FreezeStatus(),
+        public defaultPlacement: number = 0,
     ) { }
+
+    public get isPaid(): boolean {
+        return this.kind.value === UserKind.Paid;
+    }
+
+    public get isFree(): boolean {
+        return this.kind.value === UserKind.Free;
+    }
+
+    public get isNFR(): boolean {
+        return this.kind.value === UserKind.NFR;
+    }
+
+    public get isMember(): boolean {
+        return this.kind.value === UserKind.Member;
+    }
+
+    public get hasPaidPrivileges(): boolean {
+        return this.kind.hasPaidPrivileges;
+    }
 
     public get createdAt(): Date | null {
         if (!this._createdAt) {
@@ -179,12 +208,53 @@ export class User {
             days: Math.round(Math.abs(diff) / millisecondsInDay),
         };
     }
+
+    public static fromUserAccount(account: UserAccount): User {
+        const user = new User(
+            account.id,
+            account.externalID,
+            account.fullName,
+            account.shortName,
+            account.email,
+            account.partner,
+            '', // password is empty when coming from API.
+            account.projectLimit,
+            account.projectStorageLimit,
+            account.projectBandwidthLimit,
+            account.projectSegmentLimit,
+            account.kindInfo,
+            account.isMFAEnabled,
+            account.isProfessional,
+            account.position,
+            account.companyName,
+            account.employeeCount,
+            account.haveSalesContact,
+            account.mfaRecoveryCodeCount,
+            account.createdAt,
+            account.pendingVerification,
+            account.trialExpiration ? new Date(account.trialExpiration) : null,
+            account.hasVarPartner,
+        );
+        if (account.freezeStatus) {
+            user.freezeStatus = new FreezeStatus(
+                account.freezeStatus.frozen,
+                account.freezeStatus.warned,
+                account.freezeStatus.trialExpiredFrozen,
+                account.freezeStatus.trialExpirationGracePeriod,
+                account.freezeStatus.optOutFrozen,
+                account.freezeStatus.optOutGracePeriod,
+            );
+        }
+        user.defaultPlacement = account.defaultPlacement ?? 0;
+
+        return user;
+    }
 }
 
 export type ExpirationInfo = {
     isCloseToExpiredTrial: boolean;
     days: number;
-}
+};
 
 /**
  * User class holds info for updating User.
@@ -194,14 +264,6 @@ export class UpdatedUser {
         public fullName: string = '',
         public shortName: string = '',
     ) { }
-
-    public setFullName(value: string): void {
-        this.fullName = value.trim();
-    }
-
-    public setShortName(value: string): void {
-        this.shortName = value.trim();
-    }
 
     public isValid(): boolean {
         return !!this.fullName;
@@ -233,6 +295,7 @@ export interface AccountSetupData {
 export class AccountDeletionData {
     public constructor(
         public ownedProjects: number,
+        public lockEnabledBuckets: number,
         public buckets: number,
         public apiKeys: number,
         public unpaidInvoices: number,
@@ -263,6 +326,13 @@ export class TokenInfo {
     ) { }
 }
 
+export enum OptInStatus {
+    NoAction = 0,
+    OptedIn = 1,
+    OptedOut = 2,
+    Excluded = 3,
+}
+
 /**
  * UserSettings represents response from GET /auth/account/settings.
  */
@@ -273,7 +343,17 @@ export class UserSettings {
         public onboardingEnd = false,
         public passphrasePrompt = true,
         public onboardingStep: string | null = null,
-        public noticeDismissal: NoticeDismissal = { fileGuide: false, serverSideEncryption: false, partnerUpgradeBanner: false, projectMembersPassphrase: false },
+        public noticeDismissal: NoticeDismissal = {
+            fileGuide: false,
+            serverSideEncryption: false,
+            partnerUpgradeBanner: false,
+            projectMembersPassphrase: false,
+            cunoFSBetaJoined: false,
+            objectMountConsultationRequested: false,
+            placementWaitlistsJoined: [],
+            announcements: null,
+        },
+        public optInStatus: OptInStatus = OptInStatus.NoAction,
     ) { }
 
     public get sessionDuration(): Duration | null {
@@ -281,6 +361,10 @@ export class UserSettings {
             return new Duration(this._sessionDuration);
         }
         return null;
+    }
+
+    public getAnnouncementStatus(announcement: string): boolean | undefined {
+        return this.noticeDismissal.announcements?.[announcement];
     }
 }
 
@@ -336,8 +420,12 @@ export interface NoticeDismissal {
     serverSideEncryption: boolean
     partnerUpgradeBanner: boolean
     projectMembersPassphrase: boolean
+    cunoFSBetaJoined: boolean;
+    objectMountConsultationRequested: boolean
     uploadOverwriteWarning?: boolean;
     versioningBetaBanner?: boolean;
+    placementWaitlistsJoined: number[];
+    announcements: Record<string, boolean> | null;
 }
 
 export interface SetUserSettingsData {
@@ -347,6 +435,22 @@ export interface SetUserSettingsData {
     onboardingStep?: string | null;
     sessionDuration?: number;
     noticeDismissal?: NoticeDismissal;
+    optInStatus?: OptInStatus;
+}
+
+/**
+ * KindInfo represents info about UserKind.
+ */
+export class KindInfo {
+    public constructor(
+        public value = UserKind.Free,
+        public name = 'Free Trial',
+        public hasPaidPrivileges = false,
+    ) { }
+}
+
+export enum UserKind {
+    Free, Paid, NFR, Member,
 }
 
 /**
@@ -358,6 +462,8 @@ export class FreezeStatus {
         public warned = false,
         public trialExpiredFrozen = false,
         public trialExpirationGracePeriod = 0,
+        public optOutFrozen = false,
+        public optOutGracePeriod = 0,
     ) { }
 }
 
@@ -365,13 +471,12 @@ export class FreezeStatus {
  * OnboardingStep are the steps in the account setup dialog and onboarding stepper.
  */
 export enum OnboardingStep {
-    AccountTypeSelection = 'AccountTypeSelection',
-    PersonalAccountForm = 'PersonalAccountForm',
+    AccountInfo = 'AccountInfo',
+    CreateProject = 'CreateProject',
     PlanTypeSelection = 'PlanTypeSelection',
     PaymentMethodSelection = 'PaymentMethodSelection',
-    PricingPlanSelection = 'PricingPlanSelection',
-    ManagedPassphraseOptIn = 'ManagedPassphraseOptIn',
-    BusinessAccountForm = 'BusinessAccountForm',
+    PricingPlanSelection = 'PricingPlanSelection', // left here for backward compatibility.
+    ManagedPassphraseOptIn = 'ManagedPassphraseOptIn', // left here for backward compatibility.
     SetupComplete = 'SetupComplete',
     EncryptionPassphrase = 'EncryptionPassphrase',
     CreateBucket = 'CreateBucket',
@@ -387,13 +492,12 @@ export const ONBOARDING_STEPPER_STEPS = [
 ];
 
 export const ACCOUNT_SETUP_STEPS = [
-    OnboardingStep.AccountTypeSelection,
-    OnboardingStep.PersonalAccountForm,
-    OnboardingStep.ManagedPassphraseOptIn,
+    OnboardingStep.AccountInfo,
+    OnboardingStep.CreateProject,
+    OnboardingStep.ManagedPassphraseOptIn, // left here for backward compatibility.
     OnboardingStep.PlanTypeSelection,
     OnboardingStep.PaymentMethodSelection,
-    OnboardingStep.PricingPlanSelection,
-    OnboardingStep.BusinessAccountForm,
+    OnboardingStep.PricingPlanSelection, // left here for backward compatibility.
     OnboardingStep.SetupComplete,
 ];
 
@@ -402,4 +506,10 @@ export enum SsoCheckState {
     None = 'None', // email is not associated with an SSO account
     Failed = 'Failed', // email is not associated with an SSO account
     // a valid sso url represents a successful check
+}
+
+export enum AccountSetupStorageNeeds {
+    UP_TO_100TB = 'Up to 100 TB',
+    _100TB_TO_1PB = '100 TB to 1 PB',
+    OVER_1PB = 'Over 1 PB',
 }

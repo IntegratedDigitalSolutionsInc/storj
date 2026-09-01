@@ -9,13 +9,11 @@ import (
 	"fmt"
 	"io"
 	"strconv"
-	"strings"
 	"time"
 
-	"cloud.google.com/go/spanner"
-	_ "github.com/googleapis/go-sql-spanner" // registers spanner as a tagsql driver.
-	_ "github.com/jackc/pgx/v5"              // registers pgx as a tagsql driver.
-	_ "github.com/jackc/pgx/v5/stdlib"       // registers pgx as a tagsql driver.
+	_ "github.com/go-sql-driver/mysql" // registers mysql as a tagsql driver (used for TiDB).
+	_ "github.com/jackc/pgx/v5"        // registers pgx as a tagsql driver.
+	_ "github.com/jackc/pgx/v5/stdlib" // registers pgx as a tagsql driver.
 	"github.com/spacemonkeygo/monkit/v3"
 	"github.com/zeebo/errs"
 	"go.uber.org/zap"
@@ -26,7 +24,7 @@ import (
 	"storj.io/storj/private/migrate"
 	"storj.io/storj/shared/dbutil"
 	"storj.io/storj/shared/dbutil/pgutil"
-	"storj.io/storj/shared/dbutil/spannerutil"
+	"storj.io/storj/shared/flightrecorder"
 	"storj.io/storj/shared/tagsql"
 )
 
@@ -43,19 +41,30 @@ type Config struct {
 	// TODO remove this flag when server-side copy implementation will be finished
 	ServerSideCopy         bool
 	ServerSideCopyDisabled bool
-	UseListObjectsIterator bool
 
-	NodeAliasCacheFullRefresh bool
+	TestingUniqueUnversioned bool
+	TestingWrapAdapter       func(Adapter) Adapter
+	// TestingTimestampVersioning uses timestamps for assigning version numbers.
+	TestingTimestampVersioning bool
 
-	TestingUniqueUnversioned   bool
-	TestingPrecommitDeleteMode TestingPrecommitDeleteMode
-	TestingSpannerProjects     map[uuid.UUID]struct{}
+	// ProjectToAdapter assigns projects to a metabase backend by its label. A
+	// backend is labeled in the connection string ("label=tidb://...") and
+	// defaults to its position in that list, so an index still names it.
+	ProjectToAdapter map[uuid.UUID]string
+
+	// DefaultListMode selects the ListObjects query strategy for projects
+	// without a ProjectListMode override. Empty behaves as ListModePlain.
+	DefaultListMode ListMode
+	// ProjectListMode overrides the ListObjects query strategy per project.
+	ProjectListMode map[uuid.UUID]ListMode
+
+	FlightRecorder *flightrecorder.Box
+	*dbutil.ConnParams
 }
 
 // DB implements a database for storing objects and segments.
 type DB struct {
 	log *zap.Logger
-	db  tagsql.DB
 
 	aliasCache *NodeAliasCache
 
@@ -64,93 +73,160 @@ type DB struct {
 	config Config
 
 	adapters []Adapter
-
-	projectsAdapters map[uuid.UUID]Adapter
+	// labels names each adapter, index-aligned with adapters.
+	labels []string
+	// projectToAdapter is config.ProjectToAdapter with the labels resolved to
+	// adapter positions.
+	projectToAdapter map[uuid.UUID]int
 }
 
 // Open opens a connection to metabase.
-func Open(ctx context.Context, log *zap.Logger, connstr string, config Config) (*DB, error) {
+//
+// connstr is a semicolon-separated list of connection strings, one per backend.
+// Each may be prefixed with "label=" to name that backend; without one it is
+// labeled with its position in the list. Anything referring to a backend, such
+// as Config.ProjectToAdapter, does so by label.
+func Open(ctx context.Context, log *zap.Logger, connstr string, config Config) (_ *DB, err error) {
 	db := &DB{
 		log:         log,
 		testCleanup: func() error { return nil },
 		config:      config,
 	}
-	db.aliasCache = NewNodeAliasCache(db, config.NodeAliasCacheFullRefresh)
+	db.aliasCache = NewNodeAliasCache(db, false)
 
-	connStrs := strings.Split(connstr, ";")
+	// Failing partway through leaves the backends opened so far holding
+	// connection pools that nobody has a handle to any more. Close skips the
+	// adapter slots that are still nil.
+	defer func() {
+		if err != nil {
+			err = errs.Combine(err, db.Close())
+		}
+	}()
+
+	connStrs, err := dbutil.SplitLabeled(connstr, ";")
+	if err != nil {
+		return nil, Error.Wrap(err)
+	}
 	if len(connStrs) == 0 {
 		return nil, Error.New("no connection strings provided")
 	}
 
 	db.adapters = make([]Adapter, len(connStrs))
-	db.projectsAdapters = make(map[uuid.UUID]Adapter)
+	db.labels = make([]string, len(connStrs))
 
-	for i, connstr := range connStrs {
-		_, source, impl, err := dbutil.SplitConnStr(connstr)
-		if err != nil {
-			return nil, Error.Wrap(err)
+	for i, labeled := range connStrs {
+		connstr := labeled.Value
+		db.labels[i] = labeled.Label
+
+		// A single adapter is the common case and its label carries no
+		// information, so leave the db_stats series untagged there. With
+		// several adapters the label is what keeps their series apart.
+		var statTags []monkit.SeriesTag
+		if len(connStrs) > 1 {
+			statTags = append(statTags, monkit.NewSeriesTag("adapter", labeled.Label))
 		}
 
-		connstr, err = pgutil.EnsureApplicationName(connstr, config.ApplicationName)
+		_, source, impl, err := dbutil.SplitConnStr(connstr)
 		if err != nil {
 			return nil, Error.Wrap(err)
 		}
 
 		switch impl {
 		case dbutil.Postgres:
-			rawdb, err := tagsql.Open(ctx, "pgx", connstr)
+			connstr, err = pgutil.EnsureApplicationName(connstr, config.ApplicationName)
 			if err != nil {
 				return nil, Error.Wrap(err)
 			}
-			dbutil.Configure(ctx, rawdb, "metabase", mon)
 
-			db.db = postgresRebind{rawdb}
+			rawdb, err := tagsql.Open(ctx, "pgx", connstr, config.FlightRecorder)
+			if err != nil {
+				return nil, Error.Wrap(err)
+			}
+			dbutil.ConfigureParameters(rawdb, config.ConnParams, "metabase", mon, statTags...)
+
+			db_db := postgresRebind{rawdb}
 			db.adapters[i] = &PostgresAdapter{
-				log:                      log,
-				db:                       db.db,
-				impl:                     impl,
-				connstr:                  connstr,
-				testingUniqueUnversioned: config.TestingUniqueUnversioned,
+				log:        log,
+				db:         db_db,
+				impl:       impl,
+				connstr:    connstr,
+				config:     &config,
+				aliasCache: db.aliasCache,
 			}
 		case dbutil.Cockroach:
-			rawdb, err := tagsql.Open(ctx, "cockroach", connstr)
+			connstr, err = pgutil.EnsureApplicationName(connstr, config.ApplicationName)
 			if err != nil {
 				return nil, Error.Wrap(err)
 			}
-			dbutil.Configure(ctx, rawdb, "metabase", mon)
 
-			db.db = postgresRebind{rawdb}
+			rawdb, err := tagsql.Open(ctx, "cockroach", connstr, config.FlightRecorder)
+			if err != nil {
+				return nil, Error.Wrap(err)
+			}
+			dbutil.ConfigureParameters(rawdb, config.ConnParams, "metabase", mon, statTags...)
+
+			db_db := postgresRebind{rawdb}
 			db.adapters[i] = &CockroachAdapter{
 				PostgresAdapter{
-					log:                      log,
-					db:                       db.db,
-					impl:                     impl,
-					connstr:                  connstr,
-					testingUniqueUnversioned: config.TestingUniqueUnversioned,
+					log:        log,
+					db:         db_db,
+					impl:       impl,
+					connstr:    connstr,
+					config:     &config,
+					aliasCache: db.aliasCache,
 				},
 			}
-		case dbutil.Spanner:
-			adapter, err := NewSpannerAdapter(ctx, SpannerConfig{
-				Database:        source,
-				ApplicationName: config.ApplicationName,
-			}, log)
+		case dbutil.TiDB:
+			rawdb, err := tagsql.Open(ctx, tagsql.TiDBName, source, config.FlightRecorder)
 			if err != nil {
-				return nil, err
+				return nil, Error.Wrap(err)
 			}
-			db.adapters[i] = adapter
-			for projectID := range config.TestingSpannerProjects {
-				db.projectsAdapters[projectID] = adapter
-			}
+			dbutil.ConfigureParameters(rawdb, config.ConnParams, "metabase", mon, statTags...)
+
+			db.adapters[i] = NewTiDBAdapter(log, rawdb, connstr, &config, db.aliasCache)
 		default:
 			return nil, Error.New("unsupported implementation: %s", connstr)
 		}
 
 		if log.Level() == zap.DebugLevel {
-			log.Debug("Connected", zap.String("db source", logging.Redacted(connstr)), zap.Int("db adapter ordinal", i))
+			log.Debug("Connected", zap.String("db_source", logging.Redacted(connstr)),
+				zap.Int("db_adapter_ordinal", i), zap.String("db_adapter_label", labeled.Label))
 		}
 	}
 
+	if db.config.TestingWrapAdapter != nil {
+		for i, adapter := range db.adapters {
+			db.adapters[i] = db.config.TestingWrapAdapter(adapter)
+		}
+	}
+
+	db.projectToAdapter, err = resolveLabels(config.ProjectToAdapter, db.labels)
+	if err != nil {
+		return nil, err
+	}
+
 	return db, nil
+}
+
+// resolveLabels maps every project override to the position of the backend it
+// names. An unknown label fails to open: falling back to the default backend
+// would look up the project's metadata in the wrong database, where it is
+// simply not there.
+func resolveLabels(overrides map[uuid.UUID]string, labels []string) (map[uuid.UUID]int, error) {
+	position := make(map[string]int, len(labels))
+	for i, label := range labels {
+		position[label] = i
+	}
+
+	resolved := make(map[uuid.UUID]int, len(overrides))
+	for projectID, label := range overrides {
+		i, ok := position[label]
+		if !ok {
+			return nil, Error.New("project %s is assigned to unknown metabase backend %q (have %v)", projectID, label, labels)
+		}
+		resolved[projectID] = i
+	}
+	return resolved, nil
 }
 
 // Implementation returns the implementation for the first db adapter.
@@ -159,17 +235,22 @@ func (db *DB) Implementation() dbutil.Implementation {
 	return db.adapters[0].Implementation()
 }
 
+// Implementations returns the implementation of every backend, keyed by its label.
+func (db *DB) Implementations() map[string]dbutil.Implementation {
+	impls := make(map[string]dbutil.Implementation, len(db.adapters))
+	for i, adapter := range db.adapters {
+		impls[db.labels[i]] = adapter.Implementation()
+	}
+	return impls
+}
+
 // ChooseAdapter selects the right adapter based on configuration.
 func (db *DB) ChooseAdapter(projectID uuid.UUID) Adapter {
-	if adapter, ok := db.projectsAdapters[projectID]; ok {
-		return adapter
+	if adapterIndex, ok := db.projectToAdapter[projectID]; ok {
+		return db.adapters[adapterIndex]
 	}
 	return db.adapters[0]
 }
-
-// UnderlyingTagSQL returns *tagsql.DB.
-// TODO: remove.
-func (db *DB) UnderlyingTagSQL() tagsql.DB { return db.db }
 
 // Ping checks whether connection has been established to all adapters.
 func (db *DB) Ping(ctx context.Context) error {
@@ -187,21 +268,6 @@ func (p *PostgresAdapter) Ping(ctx context.Context) error {
 	return p.db.PingContext(ctx)
 }
 
-// Ping checks whether connection has been established.
-func (s *SpannerAdapter) Ping(ctx context.Context) error {
-	ok, err := spannerutil.CollectRow(s.client.Single().Query(ctx, spanner.Statement{SQL: `SELECT true`}),
-		func(row *spanner.Row, item *bool) error {
-			return row.Columns(item)
-		})
-	if err != nil {
-		return Error.Wrap(err)
-	}
-	if !ok {
-		return Error.New("up is down, left is right, true is false, and forwards is backwards")
-	}
-	return nil
-}
-
 // TestingSetCleanup is used to set the callback for cleaning up test database.
 func (db *DB) TestingSetCleanup(cleanup func() error) {
 	db.testCleanup = cleanup
@@ -210,30 +276,12 @@ func (db *DB) TestingSetCleanup(cleanup func() error) {
 // Close closes the connection to database.
 func (db *DB) Close() error {
 	var err error
-	if db.db != nil {
-		err = Error.Wrap(db.db.Close())
-	}
 	for _, adapter := range db.adapters {
 		if c, isCloser := adapter.(io.Closer); isCloser {
 			err = errs.Combine(err, Error.Wrap(c.Close()))
 		}
 	}
 	return errs.Combine(err, db.testCleanup())
-}
-
-// DestroyTables deletes all tables.
-//
-// TODO: remove this, only for bootstrapping.
-func (db *DB) DestroyTables(ctx context.Context) error {
-	_, err := db.db.ExecContext(ctx, `
-		DROP TABLE IF EXISTS objects;
-		DROP TABLE IF EXISTS segments;
-		DROP TABLE IF EXISTS node_aliases;
-		DROP TABLE IF EXISTS metabase_versions;
-		DROP SEQUENCE IF EXISTS node_alias_seq;
-	`)
-	db.aliasCache.reset()
-	return Error.Wrap(err)
 }
 
 // TestMigrateToLatest replaces the migration steps with only one step to create metabase db.
@@ -297,12 +345,6 @@ func (c *CockroachAdapter) MigrateToLatest(ctx context.Context) error {
 	return migration.Run(ctx, c.log.Named("migrate"))
 }
 
-// MigrateToLatest migrates database to the latest version.
-func (s *SpannerAdapter) MigrateToLatest(ctx context.Context) error {
-	migration := s.SpannerMigration()
-	return migration.Run(ctx, s.log.Named("migrate"))
-}
-
 // CheckVersion checks the database is the correct version.
 func (db *DB) CheckVersion(ctx context.Context) error {
 	for _, a := range db.adapters {
@@ -318,12 +360,6 @@ func (db *DB) CheckVersion(ctx context.Context) error {
 func (p *PostgresAdapter) CheckVersion(ctx context.Context) error {
 	migration := p.PostgresMigration()
 	return migration.ValidateVersions(ctx, p.log)
-}
-
-// CheckVersion checks the database is the correct version.
-func (s *SpannerAdapter) CheckVersion(ctx context.Context) error {
-	migration := s.SpannerMigration()
-	return migration.ValidateVersions(ctx, s.log)
 }
 
 // PostgresMigration returns steps needed for migrating postgres database.
@@ -649,39 +685,76 @@ func (p *PostgresAdapter) PostgresMigration() *migrate.Migration {
 			},
 			{
 				DB:          &db,
-				Description: "add clear_metadata field to objects table",
+				Description: "add column product_id to objects",
 				Version:     21,
 				Action: migrate.SQL{
-					`ALTER TABLE objects ADD COLUMN clear_metadata JSONB`,
-					`CREATE INDEX ON objects USING GIN (project_id, bucket_name, clear_metadata)`,
+					`ALTER TABLE objects ADD COLUMN IF NOT EXISTS product_id INTEGER`,
+					`COMMENT ON COLUMN objects.product_id is 'product_id specifies which product the object is.';`,
+				},
+			},
+			{
+				DB:          &db,
+				Description: "add column encrypted_etag to objects",
+				Version:     22,
+				Action: migrate.SQL{
+					`ALTER TABLE objects ADD COLUMN IF NOT EXISTS encrypted_etag BYTEA`,
+					`COMMENT ON COLUMN objects.encrypted_etag is 'encrypted_etag is the etag, which has been encrypted.';`,
+				},
+			},
+			{
+				DB:          &db,
+				Description: "create change stream for bucket eventing",
+				Version:     23,
+				Action:      migrate.SQL{},
+			},
+			{
+				DB:          &db,
+				Description: "watch stream_id in bucket eventing change stream",
+				Version:     24,
+				Action:      migrate.SQL{},
+			},
+			{
+				DB:          &db,
+				Description: "change value capture type for the bucket eventing change stream",
+				Version:     25,
+				Action:      migrate.SQL{},
+			},
+			{
+				DB:          &db,
+				Description: "add table for change stream metadata",
+				Version:     26,
+				Action:      migrate.SQL{},
+			},
+			{
+				DB:          &db,
+				Description: "add index for node_alias",
+				Version:     27,
+				Action: migrate.SQL{
+					`CREATE INDEX IF NOT EXISTS node_aliases_node_alias_order ON node_aliases(node_alias DESC)`,
+				},
+			},
+			{
+				DB:          &db,
+				Description: "add checksum column to objects table and encrypted_checksum to segments table",
+				Version:     28,
+				Action: migrate.SQL{
+					`ALTER TABLE objects ADD COLUMN IF NOT EXISTS checksum BYTEA`,
+					`ALTER TABLE segments ADD COLUMN IF NOT EXISTS encrypted_checksum BYTEA`,
+
+					`COMMENT ON COLUMN objects.checksum            IS 'checksum is the serialized set of checksum properties (checksum algorithm, checksum type, and encrypted checksum value) for an object.';`,
+					`COMMENT ON COLUMN segments.encrypted_checksum IS 'encrypted_checksum is the encrypted checksum value of the object part that the segment belongs to.';`,
+				},
+			},
+			{
+				DB:          &db,
+				Description: "add clear_metadata field to objects table",
+				Version:     29,
+				Action: migrate.SQL{
+					`ALTER TABLE objects ADD COLUMN IF NOT EXISTS clear_metadata JSONB`,
+					`CREATE INDEX IF NOT EXISTS objects_clear_metadata_idx ON objects USING GIN (project_id, bucket_name, clear_metadata)`,
 					`
 					COMMENT ON COLUMN objects.clear_metadata is 'clear_metadata contains unencrypted metadata that indexed for efficient metadata search.';
 				`},
-			},
-		},
-	}
-}
-
-// SpannerMigration returns steps needed for migrating spanner database.
-func (s *SpannerAdapter) SpannerMigration() *migrate.Migration {
-	db := s.sqlClient
-
-	var firstStepDDL []string
-	for _, statement := range strings.Split(spannerDDL, ";") {
-		if strings.TrimSpace(statement) != "" {
-			firstStepDDL = append(firstStepDDL, statement)
-		}
-	}
-
-	// TODO: merge this with satellite migration code or a way to keep them in sync.
-	return &migrate.Migration{
-		Table: "spanner_metabase_versions",
-		Steps: []*migrate.Step{
-			{
-				DB:          &db,
-				Description: "initial setup",
-				Version:     1,
-				Action:      migrate.SQL(firstStepDDL),
 			},
 		},
 	}
@@ -755,16 +828,6 @@ func (p *PostgresAdapter) Now(ctx context.Context) (time.Time, error) {
 	return t, Error.Wrap(err)
 }
 
-// Now returns the current time according to the database.
-func (s *SpannerAdapter) Now(ctx context.Context) (time.Time, error) {
-	return spannerutil.CollectRow(
-		s.client.Single().Query(ctx, spanner.Statement{SQL: `SELECT CURRENT_TIMESTAMP`}),
-		func(row *spanner.Row, now *time.Time) error {
-			return row.Columns(now)
-		},
-	)
-}
-
 // LimitedAsOfSystemTime returns a SQL query clause for AS OF SYSTEM TIME.
 func LimitedAsOfSystemTime(impl dbutil.Implementation, now, baseline time.Time, maxInterval time.Duration) string {
 	if baseline.IsZero() || now.IsZero() {
@@ -779,5 +842,32 @@ func LimitedAsOfSystemTime(impl dbutil.Implementation, now, baseline time.Time, 
 	if maxInterval < 0 && interval > -maxInterval {
 		return impl.AsOfSystemInterval(maxInterval)
 	}
+	// A baseline too close to now is unreliable on some databases (e.g. TiDB,
+	// where it can resolve to a future timestamp); fall back to a consistent read.
+	if interval < impl.MinAsOfSystemInterval() {
+		return ""
+	}
 	return impl.AsOfSystemTime(baseline)
+}
+
+// LimitedAsOfSystemTimeBounded returns a SQL query clause for AS OF SYSTEM TIME.
+func LimitedAsOfSystemTimeBounded(impl dbutil.Implementation, now, baseline time.Time, maxInterval time.Duration) string {
+	if baseline.IsZero() || now.IsZero() {
+		return impl.AsOfSystemIntervalBounded(maxInterval)
+	}
+
+	interval := now.Sub(baseline)
+	if interval < 0 {
+		return ""
+	}
+	// maxInterval is negative
+	if maxInterval < 0 && interval > -maxInterval {
+		return impl.AsOfSystemIntervalBounded(maxInterval)
+	}
+	// A baseline too close to now is unreliable on some databases (e.g. TiDB,
+	// where it can resolve to a future timestamp); fall back to a consistent read.
+	if interval < impl.MinAsOfSystemInterval() {
+		return ""
+	}
+	return impl.AsOfSystemTimeBounded(baseline)
 }

@@ -7,21 +7,28 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"time"
-
-	"cloud.google.com/go/spanner"
 
 	"storj.io/common/storj"
 	"storj.io/common/uuid"
+	"storj.io/storj/shared/dbutil/dx"
 	"storj.io/storj/shared/dbutil/pgutil"
-	"storj.io/storj/shared/dbutil/spannerutil"
+	"storj.io/storj/shared/s3event"
 	"storj.io/storj/shared/tagsql"
 )
 
-type copyObjectTransactionAdapter interface {
+type copyObjectAdapter interface {
 	getSegmentsForCopy(ctx context.Context, object Object) (segments transposedSegmentList, err error)
-	finalizeObjectCopy(ctx context.Context, opts FinishCopyObject, nextVersion Version, newStatus ObjectStatus, sourceObject Object, copyMetadata []byte, newSegments transposedSegmentList) (newObject Object, err error)
 	getObjectNonPendingExactVersion(ctx context.Context, opts FinishCopyObject) (_ Object, err error)
+	finalizeSegmentsCopy(ctx context.Context, opts FinishCopyObject, newSegments transposedSegmentList) (err error)
+	insertPendingCopyObject(ctx context.Context, opts FinishCopyObject, sourceObject Object, encryptedUserData EncryptedUserData) (newObject Object, err error)
+	deleteObjectExactVersion(ctx context.Context, opts DeleteObjectExactVersion) (result DeleteObjectResult, err error)
+}
+
+type copyObjectTransactionAdapter interface {
+	commitPendingCopyObject(ctx context.Context, object *Object, highestVersion Version) (err error)
+	commitPendingCopyObject2(ctx context.Context, opts commitPendingCopyObject) (err error)
 }
 
 // BeginCopyObjectResult holds data needed to begin copy object.
@@ -32,6 +39,8 @@ type BeginCopyObject struct {
 	ObjectLocation
 	Version Version
 
+	SegmentLimit int64
+
 	// VerifyLimits holds a callback by which the caller can interrupt the copy
 	// if it turns out the copy would exceed a limit.
 	VerifyLimits func(encryptedObjectSize int64, nSegments int64) error
@@ -39,7 +48,7 @@ type BeginCopyObject struct {
 
 // BeginCopyObject collects all data needed to begin object copy procedure.
 func (db *DB) BeginCopyObject(ctx context.Context, opts BeginCopyObject) (_ BeginCopyObjectResult, err error) {
-	result, err := db.beginMoveCopyObject(ctx, opts.ObjectLocation, opts.Version, CopySegmentLimit, opts.VerifyLimits)
+	result, err := db.beginMoveCopyObject(ctx, opts.ObjectLocation, opts.Version, opts.SegmentLimit, opts.VerifyLimits)
 	if err != nil {
 		return BeginCopyObjectResult{}, err
 	}
@@ -54,10 +63,12 @@ type FinishCopyObject struct {
 	NewEncryptedObjectKey ObjectKey
 	NewStreamID           uuid.UUID
 
-	OverrideMetadata             bool
-	NewEncryptedMetadata         []byte
-	NewEncryptedMetadataKeyNonce storj.Nonce
-	NewEncryptedMetadataKey      []byte
+	// OverrideMetadata indicates whether the copied object's metadata should be entirely sourced
+	// from NewEncryptedUserData, preventing any of the source object's metadata from being applied.
+	// If false, only the provided EncryptedMetadataNonce and EncryptedMetadataEncryptedKey will be
+	// used, and the rest of the metadata will come from the source object.
+	OverrideMetadata     bool
+	NewEncryptedUserData EncryptedUserData
 
 	NewSegmentKeys []EncryptedKeyAndNonce
 
@@ -76,6 +87,11 @@ type FinishCopyObject struct {
 	// if it turns out completing the copy would exceed a limit.
 	// It will be called only once.
 	VerifyLimits func(encryptedObjectSize int64, nSegments int64) error
+
+	// IfNoneMatch is an optional field for conditional writes.
+	IfNoneMatch IfNoneMatch
+
+	TransmitEvent bool
 }
 
 // NewLocation returns the new object location.
@@ -105,17 +121,19 @@ func (finishCopy FinishCopyObject) Verify() error {
 	}
 
 	if finishCopy.OverrideMetadata {
-		if finishCopy.NewEncryptedMetadata == nil && (!finishCopy.NewEncryptedMetadataKeyNonce.IsZero() || finishCopy.NewEncryptedMetadataKey != nil) {
-			return ErrInvalidRequest.New("EncryptedMetadataNonce and EncryptedMetadataEncryptedKey must be not set if EncryptedMetadata is not set")
-		} else if finishCopy.NewEncryptedMetadata != nil && (finishCopy.NewEncryptedMetadataKeyNonce.IsZero() || finishCopy.NewEncryptedMetadataKey == nil) {
-			return ErrInvalidRequest.New("EncryptedMetadataNonce and EncryptedMetadataEncryptedKey must be set if EncryptedMetadata is set")
+		// check whether new metadata is valid
+		err := finishCopy.NewEncryptedUserData.Verify()
+		if err != nil {
+			return err
 		}
 	} else {
+		// otherwise check that we are setting reencrypted keys
+		// TODO: this should validate against the database that it matches it
 		switch {
-		case finishCopy.NewEncryptedMetadataKeyNonce.IsZero() && len(finishCopy.NewEncryptedMetadataKey) != 0:
-			return ErrInvalidRequest.New("EncryptedMetadataKeyNonce is missing")
-		case len(finishCopy.NewEncryptedMetadataKey) == 0 && !finishCopy.NewEncryptedMetadataKeyNonce.IsZero():
-			return ErrInvalidRequest.New("EncryptedMetadataKey is missing")
+		case len(finishCopy.NewEncryptedUserData.EncryptedMetadataNonce) == 0 && len(finishCopy.NewEncryptedUserData.EncryptedMetadataEncryptedKey) != 0:
+			return ErrInvalidRequest.New("EncryptedMetadataNonce is missing")
+		case len(finishCopy.NewEncryptedUserData.EncryptedMetadataEncryptedKey) == 0 && len(finishCopy.NewEncryptedUserData.EncryptedMetadataNonce) != 0:
+			return ErrInvalidRequest.New("EncryptedMetadataEncryptedKey is missing")
 		}
 	}
 
@@ -123,10 +141,16 @@ func (finishCopy FinishCopyObject) Verify() error {
 		return ErrObjectStatus.New(noLockOnUnversionedErrMsg)
 	}
 
+	if err := finishCopy.IfNoneMatch.Verify(); err != nil {
+		return err
+	}
+
 	return ErrInvalidRequest.Wrap(finishCopy.Retention.Verify())
 }
 
 type transposedSegmentList struct {
+	StreamID uuid.UUID
+
 	Positions []int64
 
 	CreatedAts  []time.Time // non-nillable
@@ -152,6 +176,64 @@ type transposedSegmentList struct {
 	Placements []storj.PlacementConstraint
 }
 
+func transposeSegments(segments []*Segment, convertPieces func(Pieces) ([]byte, error)) (transposedSegmentList, error) {
+	if len(segments) == 0 {
+		return transposedSegmentList{}, nil
+	}
+	var t transposedSegmentList
+	t.StreamID = segments[0].StreamID
+
+	t.Positions = make([]int64, len(segments))
+	t.CreatedAts = make([]time.Time, len(segments))
+	t.RepairedAts = make([]*time.Time, len(segments))
+	t.ExpiresAts = make([]*time.Time, len(segments))
+	t.RootPieceIDs = make([][]byte, len(segments))
+	t.EncryptedKeyNonces = make([][]byte, len(segments))
+	t.EncryptedKeys = make([][]byte, len(segments))
+	t.EncryptedSizes = make([]int32, len(segments))
+	t.PlainSizes = make([]int32, len(segments))
+	t.PlainOffsets = make([]int64, len(segments))
+	t.EncryptedETags = make([][]byte, len(segments))
+	t.RedundancySchemes = make([]int64, len(segments))
+	t.InlineDatas = make([][]byte, len(segments))
+	t.PiecesLists = make([][]byte, len(segments))
+	t.Placements = make([]storj.PlacementConstraint, len(segments))
+
+	for i, segment := range segments {
+		if t.StreamID != segment.StreamID {
+			return t, Error.New("inconsistent segments")
+		}
+
+		t.Positions[i] = int64(segment.Position.Encode())
+		t.CreatedAts[i] = segment.CreatedAt
+		t.RepairedAts[i] = segment.RepairedAt
+		t.ExpiresAts[i] = segment.ExpiresAt
+		t.RootPieceIDs[i] = segment.RootPieceID.Bytes()
+		t.EncryptedKeyNonces[i] = segment.EncryptedKeyNonce
+		t.EncryptedKeys[i] = segment.EncryptedKey
+		t.EncryptedSizes[i] = segment.EncryptedSize
+		t.PlainSizes[i] = segment.PlainSize
+		t.PlainOffsets[i] = segment.PlainOffset
+		t.EncryptedETags[i] = segment.EncryptedETag
+		redundancy, err := segment.Redundancy.EncodeInt64()
+		if err != nil {
+			return t, Error.New("unable to encode redundancy: %w", err)
+		}
+		t.RedundancySchemes[i] = redundancy
+		t.InlineDatas[i] = segment.InlineData
+
+		piecesData, err := convertPieces(segment.Pieces)
+		if err != nil {
+			return t, Error.New("unable to convert pieces")
+		}
+
+		t.PiecesLists[i] = piecesData
+		t.Placements[i] = segment.Placement
+	}
+
+	return t, nil
+}
+
 // FinishCopyObject accepts new encryption keys for copied object and insert the corresponding new object ObjectKey and segments EncryptedKey.
 // It returns the object at the destination location.
 func (db *DB) FinishCopyObject(ctx context.Context, opts FinishCopyObject) (object Object, err error) {
@@ -161,98 +243,157 @@ func (db *DB) FinishCopyObject(ctx context.Context, opts FinishCopyObject) (obje
 		return Object{}, err
 	}
 
-	newObject := Object{}
-	var copyMetadata []byte
+	adapter := db.ChooseAdapter(opts.ProjectID)
 
-	var precommit PrecommitConstraintResult
-	err = db.ChooseAdapter(opts.ProjectID).WithTx(ctx, func(ctx context.Context, adapter TransactionAdapter) error {
-		sourceObject, err := adapter.getObjectNonPendingExactVersion(ctx, opts)
+	sourceObject, err := adapter.getObjectNonPendingExactVersion(ctx, opts)
+	if err != nil {
+		if ErrObjectNotFound.Has(err) {
+			return Object{}, ErrObjectNotFound.New("source object not found")
+		}
+		return Object{}, err
+	}
+	if sourceObject.StreamID != opts.StreamID {
+		return Object{}, ErrObjectNotFound.New("object was changed during copy")
+	}
+	if sourceObject.Status.IsDeleteMarker() {
+		return Object{}, ErrMethodNotAllowed.New("copying delete marker is not allowed")
+	}
+
+	if opts.VerifyLimits != nil {
+		err := opts.VerifyLimits(sourceObject.TotalEncryptedSize, int64(sourceObject.SegmentCount))
 		if err != nil {
-			if ErrObjectNotFound.Has(err) {
-				return ErrObjectNotFound.New("source object not found")
-			}
-			return err
+			return Object{}, err
 		}
-		if sourceObject.StreamID != opts.StreamID {
-			return ErrObjectNotFound.New("object was changed during copy")
-		}
-		if sourceObject.Status.IsDeleteMarker() {
-			return ErrMethodNotAllowed.New("copying delete marker is not allowed")
-		}
+	}
 
-		if opts.VerifyLimits != nil {
-			err := opts.VerifyLimits(sourceObject.TotalEncryptedSize, int64(sourceObject.SegmentCount))
-			if err != nil {
-				return err
-			}
-		}
+	if int(sourceObject.SegmentCount) != len(opts.NewSegmentKeys) {
+		return Object{}, ErrInvalidRequest.New("wrong number of segments keys received (received %d, need %d)", len(opts.NewSegmentKeys), sourceObject.SegmentCount)
+	}
 
-		if int(sourceObject.SegmentCount) != len(opts.NewSegmentKeys) {
-			return ErrInvalidRequest.New("wrong number of segments keys received (received %d, need %d)", len(opts.NewSegmentKeys), sourceObject.SegmentCount)
-		}
+	newSegments, err := adapter.getSegmentsForCopy(ctx, sourceObject)
+	if err != nil {
+		return Object{}, Error.New("unable to copy object: %w", err)
+	}
 
-		newSegments, err := adapter.getSegmentsForCopy(ctx, sourceObject)
-		if err != nil {
-			return Error.New("unable to copy object: %w", err)
-		}
+	if err = checkExpiresAtWithObjectLock(sourceObject, newSegments, opts.Retention, opts.LegalHold); err != nil {
+		return Object{}, err
+	}
 
-		if err = checkExpiresAtWithObjectLock(sourceObject, newSegments, opts.Retention, opts.LegalHold); err != nil {
-			return err
+	newSegments.EncryptedKeys = make([][]byte, len(opts.NewSegmentKeys))
+	newSegments.EncryptedKeyNonces = make([][]byte, len(opts.NewSegmentKeys))
+	for index, u := range opts.NewSegmentKeys {
+		if int64(u.Position.Encode()) != newSegments.Positions[index] {
+			return Object{}, Error.New("missing new segment keys for segment %d", newSegments.Positions[index])
 		}
+		newSegments.EncryptedKeys[index] = u.EncryptedKey
+		newSegments.EncryptedKeyNonces[index] = u.EncryptedKeyNonce
+	}
 
-		newSegments.EncryptedKeys = make([][]byte, len(opts.NewSegmentKeys))
-		newSegments.EncryptedKeyNonces = make([][]byte, len(opts.NewSegmentKeys))
-		for index, u := range opts.NewSegmentKeys {
-			if int64(u.Position.Encode()) != newSegments.Positions[index] {
-				return Error.New("missing new segment keys for segment %d", newSegments.Positions[index])
-			}
-			newSegments.EncryptedKeys[index] = u.EncryptedKey
-			newSegments.EncryptedKeyNonces[index] = u.EncryptedKeyNonce
-		}
+	var finalEncryptedUserData EncryptedUserData
+	if opts.OverrideMetadata {
+		finalEncryptedUserData = opts.NewEncryptedUserData
+	} else {
+		finalEncryptedUserData = sourceObject.EncryptedUserData
+		finalEncryptedUserData.EncryptedMetadataEncryptedKey = opts.NewEncryptedUserData.EncryptedMetadataEncryptedKey
+		finalEncryptedUserData.EncryptedMetadataNonce = opts.NewEncryptedUserData.EncryptedMetadataNonce
+	}
 
-		if opts.OverrideMetadata {
-			copyMetadata = opts.NewEncryptedMetadata
-		} else {
-			copyMetadata = sourceObject.EncryptedMetadata
-		}
+	// TODO(optimize): inserting pending copy object and segments can be done as a single
+	// batch write.
+	//
+	// TODO(optimize): move inserting encrypted user data into commit. This in some scenarios
+	// can avoid some extra data moving (e.g. when the version needs to change).
+	// this should also allow use to reuse `finalizeCommitObject` rather than having a separate commitPendingCopyObject.
+	newObject, err := adapter.insertPendingCopyObject(ctx, opts, sourceObject, finalEncryptedUserData)
+	if err != nil {
+		return Object{}, err
+	}
+	newObject.StreamID = opts.NewStreamID
+	newObject.BucketName = opts.NewBucket
+	newObject.ObjectKey = opts.NewEncryptedObjectKey
+	newObject.EncryptedUserData = finalEncryptedUserData
+	newObject.Retention = opts.Retention
+	newObject.LegalHold = opts.LegalHold
+	newObject.Status = committedWhereVersioned(opts.NewVersioned)
 
-		precommit, err = db.PrecommitConstraint(ctx, PrecommitConstraint{
-			Location:       opts.NewLocation(),
-			Versioned:      opts.NewVersioned,
-			DisallowDelete: opts.NewDisallowDelete,
+	if err := adapter.finalizeSegmentsCopy(ctx, opts, newSegments); err != nil {
+		_, errCleanup := adapter.deleteObjectExactVersion(ctx,
+			DeleteObjectExactVersion{
+				Version:        newObject.Version,
+				ObjectLocation: newObject.Location(),
+			})
+		return Object{}, errors.Join(err, errCleanup)
+	}
+
+	var metrics commitMetrics
+	var insertedObject Object
+
+	mainAdapter := db.ChooseAdapter(opts.ProjectID)
+	txBody := func(ctx context.Context, adapter TransactionAdapter) error {
+		// Reset metrics in case the transaction is retried.
+		metrics = commitMetrics{}
+		insertedObject = newObject
+		query, err := db.PrecommitQuery(ctx, PrecommitQuery{
+			ObjectStream:   newObject.ObjectStream,
+			Pending:        false, // the pending object is already created
+			Unversioned:    !opts.NewVersioned,
+			HighestVisible: opts.IfNoneMatch.All(),
 		}, adapter)
 		if err != nil {
 			return err
 		}
 
-		newStatus := committedWhereVersioned(opts.NewVersioned)
+		// We should only commit when an object already doesn't exist.
+		if opts.IfNoneMatch.All() {
+			if query.HighestVisible.IsCommitted() {
+				return ErrFailedPrecondition.New("object already exists")
+			}
+		}
 
-		newObject, err = adapter.finalizeObjectCopy(ctx, opts, precommit.HighestVersion+1, newStatus, sourceObject, copyMetadata, newSegments)
-		return err
+		// When committing unversioned objects we need to delete any previous unversioned objects.
+		if !opts.NewVersioned {
+			if err := commonPrecommitDeleteUnversioned(ctx, adapter, query, &metrics, precommitDeleteUnversioned{
+				DisallowDelete:     opts.NewDisallowDelete,
+				BypassGovernance:   false,
+				DeleteOnlySegments: false,
+			}); err != nil {
+				return err
+			}
+		}
+
+		initial := insertedObject.ObjectStream
+		insertedObject.Version = nextVersion(insertedObject.Version, query.HighestVersion, query.TimestampVersion, mainAdapter.Config().TestingTimestampVersioning)
+
+		return adapter.commitPendingCopyObject2(ctx, commitPendingCopyObject{
+			Initial: initial,
+			Object:  &insertedObject,
+		})
+	}
+	// On TiDB a concurrent writer (e.g. another copy inserting its pending
+	// object) can take the computed version between the precommit query and
+	// the object write; retrying the transaction recomputes the version.
+	err = retryVersionConflict(ctx, func(ctx context.Context) error {
+		return mainAdapter.WithTx(ctx, TransactionOptions{
+			TransactionTag: "finish-copy-object",
+			TransmitEvent:  opts.TransmitEvent,
+		}, txBody)
 	})
-
 	if err != nil {
-		return Object{}, err
+		_, errCleanup := adapter.deleteObjectExactVersion(ctx,
+			DeleteObjectExactVersion{
+				Version:        insertedObject.Version,
+				ObjectLocation: insertedObject.Location(),
+			})
+		return Object{}, errors.Join(err, errCleanup)
 	}
 
-	newObject.StreamID = opts.NewStreamID
-	newObject.BucketName = opts.NewBucket
-	newObject.ObjectKey = opts.NewEncryptedObjectKey
-	newObject.EncryptedMetadata = copyMetadata
-	newObject.EncryptedMetadataEncryptedKey = opts.NewEncryptedMetadataKey
-	if !opts.NewEncryptedMetadataKeyNonce.IsZero() {
-		newObject.EncryptedMetadataNonce = opts.NewEncryptedMetadataKeyNonce[:]
-	}
-	newObject.Retention = opts.Retention
-	newObject.LegalHold = opts.LegalHold
-
-	precommit.submitMetrics()
+	metrics.submit()
 	mon.Meter("finish_copy_object").Mark(1)
 
-	return newObject, nil
+	return insertedObject, nil
 }
 
-func (ptx *postgresTransactionAdapter) getSegmentsForCopy(ctx context.Context, sourceObject Object) (segments transposedSegmentList, err error) {
+func (p *PostgresAdapter) getSegmentsForCopy(ctx context.Context, sourceObject Object) (segments transposedSegmentList, err error) {
 	segments.Positions = make([]int64, sourceObject.SegmentCount)
 
 	segments.RootPieceIDs = make([][]byte, sourceObject.SegmentCount)
@@ -267,7 +408,7 @@ func (ptx *postgresTransactionAdapter) getSegmentsForCopy(ctx context.Context, s
 
 	segments.RedundancySchemes = make([]int64, sourceObject.SegmentCount)
 
-	err = withRows(ptx.tx.QueryContext(ctx, `
+	err = withRows(p.db.QueryContext(ctx, `
 				SELECT
 					position,
 					expires_at,
@@ -313,11 +454,11 @@ func (ptx *postgresTransactionAdapter) getSegmentsForCopy(ctx context.Context, s
 	return segments, err
 }
 
-func (stx *spannerTransactionAdapter) getSegmentsForCopy(ctx context.Context, sourceObject Object) (segments transposedSegmentList, err error) {
+func (t *TiDBAdapter) getSegmentsForCopy(ctx context.Context, sourceObject Object) (segments transposedSegmentList, err error) {
+	defer mon.Task()(&ctx)(&err)
+
 	segments.Positions = make([]int64, sourceObject.SegmentCount)
-
 	segments.RootPieceIDs = make([][]byte, sourceObject.SegmentCount)
-
 	segments.ExpiresAts = make([]*time.Time, sourceObject.SegmentCount)
 	segments.EncryptedSizes = make([]int32, sourceObject.SegmentCount)
 	segments.PlainSizes = make([]int32, sourceObject.SegmentCount)
@@ -325,100 +466,48 @@ func (stx *spannerTransactionAdapter) getSegmentsForCopy(ctx context.Context, so
 	segments.InlineDatas = make([][]byte, sourceObject.SegmentCount)
 	segments.Placements = make([]storj.PlacementConstraint, sourceObject.SegmentCount)
 	segments.PiecesLists = make([][]byte, sourceObject.SegmentCount)
-
 	segments.RedundancySchemes = make([]int64, sourceObject.SegmentCount)
 
-	index := 0
-	err = stx.tx.Query(ctx, spanner.Statement{
-		SQL: `
-			SELECT
-				position,
-				expires_at,
-				root_piece_id,
-				encrypted_size, plain_offset, plain_size,
-				redundancy,
-				remote_alias_pieces,
-				placement,
-				COALESCE(inline_data, B'') AS inline_data
-			FROM segments
-			WHERE stream_id = @stream_id
-			ORDER BY position ASC
-			LIMIT @segment_count
-		`,
-		Params: map[string]interface{}{
-			"stream_id":     sourceObject.StreamID,
-			"segment_count": int64(sourceObject.SegmentCount),
-		},
-	}).Do(func(row *spanner.Row) error {
-		err := row.Columns(
-			&segments.Positions[index],
-			&segments.ExpiresAts[index],
-			&segments.RootPieceIDs[index],
-			spannerutil.Int(&segments.EncryptedSizes[index]), &segments.PlainOffsets[index], spannerutil.Int(&segments.PlainSizes[index]),
-			&segments.RedundancySchemes[index],
-			&segments.PiecesLists[index],
-			&segments.Placements[index],
-			&segments.InlineDatas[index],
-		)
-		if err != nil {
-			return Error.New("could not read segments for copy: %w", err)
+	err = withRows(t.db.QueryContext(ctx, `
+		SELECT
+			position, expires_at, root_piece_id,
+			encrypted_size, plain_offset, plain_size,
+			redundancy, remote_alias_pieces, placement, inline_data
+		FROM segments
+		WHERE stream_id = ?
+		ORDER BY position ASC
+		LIMIT ?
+	`, sourceObject.StreamID, sourceObject.SegmentCount))(func(rows tagsql.Rows) error {
+		index := 0
+		for rows.Next() {
+			err := rows.Scan(
+				&segments.Positions[index],
+				&segments.ExpiresAts[index],
+				&segments.RootPieceIDs[index],
+				&segments.EncryptedSizes[index], &segments.PlainOffsets[index], &segments.PlainSizes[index],
+				&segments.RedundancySchemes[index],
+				&segments.PiecesLists[index],
+				&segments.Placements[index],
+				&segments.InlineDatas[index],
+			)
+			if err != nil {
+				return err
+			}
+			index++
 		}
-		index++
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		if index != int(sourceObject.SegmentCount) {
+			return Error.New("could not load all of the segment information")
+		}
 		return nil
 	})
-
-	if err != nil {
-		return transposedSegmentList{}, Error.New("could not load segments for copy: %w", err)
-	}
-
-	if index != int(sourceObject.SegmentCount) {
-		return transposedSegmentList{}, Error.New("could not load all of the segment information (%d != %d)", index, sourceObject.SegmentCount)
-	}
-
 	return segments, err
 }
 
-func (ptx *postgresTransactionAdapter) finalizeObjectCopy(ctx context.Context, opts FinishCopyObject, nextVersion Version, newStatus ObjectStatus, sourceObject Object, copyMetadata []byte, newSegments transposedSegmentList) (newObject Object, err error) {
-	// TODO we need to handle metadata correctly (copy from original object or replace)
-	row := ptx.tx.QueryRowContext(ctx, `
-			INSERT INTO objects (
-				project_id, bucket_name, object_key, version, stream_id,
-				status, expires_at, segment_count,
-				encryption,
-				encrypted_metadata, encrypted_metadata_nonce, encrypted_metadata_encrypted_key,
-				total_plain_size, total_encrypted_size, fixed_segment_size,
-				zombie_deletion_deadline,
-				retention_mode, retain_until
-			) VALUES (
-				$1, $2, $3, $4, $5,
-				$6, $7, $8,
-				$9,
-				$10, $11, $12,
-				$13, $14, $15,
-				null,
-				$16, $17
-			)
-			RETURNING
-				created_at`,
-		opts.ProjectID, opts.NewBucket, opts.NewEncryptedObjectKey, nextVersion, opts.NewStreamID,
-		newStatus, sourceObject.ExpiresAt, sourceObject.SegmentCount,
-		encryptionParameters{&sourceObject.Encryption},
-		copyMetadata, opts.NewEncryptedMetadataKeyNonce, opts.NewEncryptedMetadataKey,
-		sourceObject.TotalPlainSize, sourceObject.TotalEncryptedSize, sourceObject.FixedSegmentSize,
-		lockModeWrapper{retentionMode: &opts.Retention.Mode, legalHold: &opts.LegalHold},
-		timeWrapper{&opts.Retention.RetainUntil},
-	)
-
-	newObject = sourceObject
-	newObject.Version = nextVersion
-	newObject.Status = newStatus
-
-	err = row.Scan(&newObject.CreatedAt)
-	if err != nil {
-		return Object{}, Error.New("unable to copy object: %w", err)
-	}
-
-	_, err = ptx.tx.ExecContext(ctx, `
+func (p *PostgresAdapter) finalizeSegmentsCopy(ctx context.Context, opts FinishCopyObject, newSegments transposedSegmentList) (err error) {
+	_, err = p.db.ExecContext(ctx, `
 			INSERT INTO segments (
 				stream_id, position, expires_at,
 				encrypted_key_nonce, encrypted_key,
@@ -444,118 +533,398 @@ func (ptx *postgresTransactionAdapter) finalizeObjectCopy(ctx context.Context, o
 		pgutil.ByteaArray(newSegments.InlineDatas),
 	)
 	if err != nil {
-		return Object{}, Error.New("unable to copy segments: %w", err)
+		return Error.New("unable to copy segments: %w", err)
+	}
+	return nil
+}
+
+func (p *PostgresAdapter) insertPendingCopyObject(ctx context.Context, opts FinishCopyObject, sourceObject Object, encryptedUserData EncryptedUserData) (newObject Object, err error) {
+	// TODO we need to handle metadata correctly (copy from original object or replace)
+
+	zombieDeletionDeadline := time.Now().Add(defaultZombieDeletionCopyObjectPeriod)
+
+	row := p.db.QueryRowContext(ctx, `
+			INSERT INTO objects (
+				project_id, bucket_name, object_key, version, stream_id,
+				status, expires_at, segment_count,
+				encryption,
+				encrypted_metadata, encrypted_metadata_nonce, encrypted_metadata_encrypted_key, encrypted_etag,
+				checksum,
+				total_plain_size, total_encrypted_size, fixed_segment_size,
+				zombie_deletion_deadline,
+				retention_mode, retain_until
+			) VALUES (
+				$1, $2, $3,`+p.generateVersion()+`, $4,
+				$5, $6, $7,
+				$8,
+				$9, $10, $11, $12,
+				$13,
+				$14, $15, $16,
+				$17,
+				$18, $19
+			)
+			RETURNING
+				version, created_at`,
+		opts.ProjectID, opts.NewBucket, opts.NewEncryptedObjectKey, opts.NewStreamID,
+		Pending, sourceObject.ExpiresAt, sourceObject.SegmentCount,
+		&sourceObject.Encryption,
+		encryptedUserData.EncryptedMetadata, encryptedUserData.EncryptedMetadataNonce, encryptedUserData.EncryptedMetadataEncryptedKey, encryptedUserData.EncryptedETag,
+		encryptedUserData.Checksum,
+		sourceObject.TotalPlainSize, sourceObject.TotalEncryptedSize, sourceObject.FixedSegmentSize,
+		&zombieDeletionDeadline,
+		lockModeWrapper{retentionMode: &opts.Retention.Mode, legalHold: &opts.LegalHold},
+		timeWrapper{&opts.Retention.RetainUntil},
+	)
+
+	newObject = sourceObject
+
+	err = row.Scan(&newObject.Version, &newObject.CreatedAt)
+	if err != nil {
+		return Object{}, Error.New("unable to copy object: %w", err)
 	}
 
 	return newObject, nil
 }
 
-func (stx *spannerTransactionAdapter) finalizeObjectCopy(ctx context.Context, opts FinishCopyObject, nextVersion Version, newStatus ObjectStatus, sourceObject Object, copyMetadata []byte, newSegments transposedSegmentList) (newObject Object, err error) {
-	// TODO we need to handle metadata correctly (copy from original object or replace)
+func (t *TiDBAdapter) finalizeSegmentsCopy(ctx context.Context, opts FinishCopyObject, newSegments transposedSegmentList) (err error) {
+	defer mon.Task()(&ctx)(&err)
 
-	newObject = sourceObject
-
-	err = stx.tx.Query(ctx, spanner.Statement{
-		SQL: `
-			INSERT INTO objects (
-				project_id, bucket_name, object_key, version, stream_id,
-				status, expires_at, segment_count,
-				encryption,
-				encrypted_metadata, encrypted_metadata_nonce, encrypted_metadata_encrypted_key,
-				total_plain_size, total_encrypted_size, fixed_segment_size,
-				zombie_deletion_deadline,
-				retention_mode, retain_until
-			) VALUES (
-				@project_id, @bucket_name, @object_key, @version, @stream_id,
-				@status, @expires_at, @segment_count,
-				@encryption,
-				@encrypted_metadata, @encrypted_metadata_nonce, @encrypted_metadata_encrypted_key,
-				@total_plain_size, @total_encrypted_size, @fixed_segment_size,
-				NULL,
-				@retention_mode, @retain_until
-			)
-			THEN RETURN
-				created_at
-		`,
-		Params: map[string]interface{}{
-			"project_id":                       opts.ProjectID,
-			"bucket_name":                      opts.NewBucket,
-			"object_key":                       opts.NewEncryptedObjectKey,
-			"version":                          nextVersion,
-			"stream_id":                        opts.NewStreamID,
-			"status":                           newStatus,
-			"expires_at":                       sourceObject.ExpiresAt,
-			"segment_count":                    int64(sourceObject.SegmentCount),
-			"encryption":                       encryptionParameters{&sourceObject.Encryption},
-			"encrypted_metadata":               copyMetadata,
-			"encrypted_metadata_nonce":         opts.NewEncryptedMetadataKeyNonce,
-			"encrypted_metadata_encrypted_key": opts.NewEncryptedMetadataKey,
-			"total_plain_size":                 sourceObject.TotalPlainSize,
-			"total_encrypted_size":             sourceObject.TotalEncryptedSize,
-			"fixed_segment_size":               int64(sourceObject.FixedSegmentSize),
-			"retention_mode":                   lockModeWrapper{retentionMode: &opts.Retention.Mode, legalHold: &opts.LegalHold},
-			"retain_until":                     timeWrapper{&opts.Retention.RetainUntil},
-		},
-	}).Do(func(row *spanner.Row) error {
-		err := row.Columns(&newObject.CreatedAt)
-		if err != nil {
-			return Error.New("unable to scan created_at: %w", err)
-		}
+	if len(newSegments.Positions) == 0 {
 		return nil
+	}
+
+	cols := []string{
+		"stream_id", "position", "expires_at",
+		"encrypted_key_nonce", "encrypted_key",
+		"root_piece_id",
+		"redundancy",
+		"encrypted_size", "plain_offset", "plain_size",
+		"remote_alias_pieces", "placement",
+		"inline_data",
+	}
+
+	for start, batch := range batched(newSegments.Positions, tidbMaxSegmentBatch) {
+		args := make([]any, 0, len(batch)*len(cols))
+		for j, p := range batch {
+			i := start + j
+			args = append(args,
+				opts.NewStreamID, p, newSegments.ExpiresAts[i],
+				newSegments.EncryptedKeyNonces[i], newSegments.EncryptedKeys[i],
+				newSegments.RootPieceIDs[i],
+				newSegments.RedundancySchemes[i],
+				newSegments.EncryptedSizes[i], newSegments.PlainOffsets[i], newSegments.PlainSizes[i],
+				newSegments.PiecesLists[i], newSegments.Placements[i],
+				newSegments.InlineDatas[i],
+			)
+		}
+
+		if _, err := t.db.ExecContext(ctx, tidbBatchInsertQuery("segments", cols, len(batch)), args...); err != nil {
+			return Error.New("unable to copy segments: %w", err)
+		}
+	}
+	return nil
+}
+
+func (t *TiDBAdapter) insertPendingCopyObject(ctx context.Context, opts FinishCopyObject, sourceObject Object, encryptedUserData EncryptedUserData) (newObject Object, err error) {
+	defer mon.Task()(&ctx)(&err)
+
+	zombieDeletionDeadline := time.Now().Add(defaultZombieDeletionCopyObjectPeriod)
+	newObject = sourceObject
+	// Compute created_at client-side to avoid a DB-assigned roundtrip.
+	newObject.CreatedAt = time.Now().Truncate(time.Microsecond)
+
+	insertSQL := `
+		INSERT INTO objects (
+			project_id, bucket_name, object_key, version, stream_id,
+			status, expires_at, segment_count,
+			created_at, encryption,
+			encrypted_metadata, encrypted_metadata_nonce, encrypted_metadata_encrypted_key, encrypted_etag,
+			checksum,
+			total_plain_size, total_encrypted_size, fixed_segment_size,
+			zombie_deletion_deadline,
+			retention_mode, retain_until
+		) VALUES (
+			?, ?, ?, %s, ?,
+			?, ?, ?,
+			?, ?,
+			?, ?, ?, ?,
+			?,
+			?, ?, ?,
+			?,
+			?, ?
+		)`
+
+	commonTail := []any{
+		opts.NewStreamID,
+		Pending, sourceObject.ExpiresAt, sourceObject.SegmentCount,
+		newObject.CreatedAt, &sourceObject.Encryption,
+		encryptedUserData.EncryptedMetadata, encryptedUserData.EncryptedMetadataNonce, encryptedUserData.EncryptedMetadataEncryptedKey, encryptedUserData.EncryptedETag,
+		encryptedUserData.Checksum,
+		sourceObject.TotalPlainSize, sourceObject.TotalEncryptedSize, sourceObject.FixedSegmentSize,
+		&zombieDeletionDeadline,
+		lockModeWrapper{retentionMode: &opts.Retention.Mode, legalHold: &opts.LegalHold},
+		timeWrapper{&opts.Retention.RetainUntil},
+	}
+
+	if t.config.TestingTimestampVersioning {
+		err := tidbRetryVersionConflict(ctx, func(ctx context.Context) error {
+			// Compute the version client-side to avoid a SELECT round trip.
+			newObject.Version = Version(time.Now().UnixMicro())
+			args := append([]any{opts.ProjectID, opts.NewBucket, opts.NewEncryptedObjectKey, newObject.Version}, commonTail...)
+			_, err := t.db.ExecContext(ctx, fmt.Sprintf(insertSQL, "?"), args...)
+			return err
+		})
+		if err != nil {
+			return Object{}, Error.New("unable to copy object: %w", err)
+		}
+		return newObject, nil
+	}
+
+	// Non-timestamp mode: combine INSERT + SELECT into one multi-statement
+	// query. The caller may legitimately reuse a stream_id that already
+	// exists at the destination location at a different version (tests seed
+	// rows this way), so ORDER BY version DESC pins us to the row we just
+	// inserted.
+	args := []any{
+		opts.ProjectID, opts.NewBucket, opts.NewEncryptedObjectKey,
+		opts.ProjectID, opts.NewBucket, opts.NewEncryptedObjectKey, // for tidbGenerateNextVersion subquery
+	}
+	args = append(args, commonTail...)
+	args = append(args, opts.ProjectID, opts.NewBucket, opts.NewEncryptedObjectKey, opts.NewStreamID)
+	err = tidbRetryVersionConflict(ctx, func(ctx context.Context) error {
+		return dx.ScanFirstRow(t.db.QueryContext(ctx, fmt.Sprintf(insertSQL, tidbGenerateNextVersion)+`;
+			SELECT version FROM objects
+			WHERE (project_id, bucket_name, object_key, stream_id) = (?, ?, ?, ?)
+			ORDER BY version DESC LIMIT 1;
+		`, args...))(&newObject.Version)
 	})
 	if err != nil {
 		return Object{}, Error.New("unable to copy object: %w", err)
 	}
-
-	newObject.Version = nextVersion
-	newObject.Status = newStatus
-
-	// Warning: these mutations will not be visible inside the transaction! Mutations only take
-	// effect when the transaction is closed. As the code is now, this is not a problem, but in
-	// case things are rearranged this may become an issue.
-	inserts := make([]*spanner.Mutation, len(newSegments.Positions))
-	for i := range newSegments.Positions {
-		inserts[i] = spanner.Insert("segments",
-			[]string{
-				"stream_id", "position", "expires_at",
-				"encrypted_key_nonce", "encrypted_key",
-				"root_piece_id",
-				"redundancy",
-				"encrypted_size", "plain_offset", "plain_size",
-				"remote_alias_pieces", "placement",
-				"inline_data",
-			}, []any{
-				opts.NewStreamID, newSegments.Positions[i], newSegments.ExpiresAts[i],
-				newSegments.EncryptedKeyNonces[i], newSegments.EncryptedKeys[i],
-				newSegments.RootPieceIDs[i],
-				newSegments.RedundancySchemes[i],
-				int64(newSegments.EncryptedSizes[i]), newSegments.PlainOffsets[i], int64(newSegments.PlainSizes[i]),
-				newSegments.PiecesLists[i], int64(newSegments.Placements[i]),
-				newSegments.InlineDatas[i],
-			},
-		)
-	}
-	err = stx.tx.BufferWrite(inserts)
-	if err != nil {
-		return Object{}, Error.New("unable to copy segments: %w", err)
-	}
-
 	return newObject, nil
+}
+
+func (ptx *postgresTransactionAdapter) commitPendingCopyObject(ctx context.Context, object *Object, highestVersion Version) (err error) {
+	if object.Version == highestVersion {
+		_, err = ptx.tx.ExecContext(ctx, `
+			UPDATE objects SET
+				status = $6,
+				zombie_deletion_deadline = NULL
+			WHERE
+				(project_id, bucket_name, object_key, version, stream_id) = ($1, $2, $3, $4, $5) AND
+				status       = `+statusPending,
+			object.ProjectID, object.BucketName, object.ObjectKey, object.Version, object.StreamID,
+			object.Status,
+		)
+		if err != nil {
+			return Error.New("unable to copy object: %w", err)
+		}
+		return nil
+	}
+
+	// When there was an insert during finish copy object we need to also update the version.
+	if !ptx.postgresAdapter.config.TestingTimestampVersioning {
+		oldVersion := object.Version
+		object.Version = highestVersion + 1
+		_, err = ptx.tx.ExecContext(ctx, `
+				UPDATE objects SET
+					status = $6,
+					version = $7,
+					zombie_deletion_deadline = NULL
+				WHERE
+					(project_id, bucket_name, object_key, version, stream_id) = ($1, $2, $3, $4, $5) AND
+					status       = `+statusPending,
+			object.ProjectID, object.BucketName, object.ObjectKey, oldVersion, object.StreamID,
+			object.Status,
+			object.Version,
+		)
+	} else {
+		err = ptx.tx.QueryRowContext(ctx, `
+				UPDATE objects SET
+					status = $6,
+					version = `+postgresGenerateTimestampVersion+`,
+					zombie_deletion_deadline = NULL
+				WHERE
+					(project_id, bucket_name, object_key, version, stream_id) = ($1, $2, $3, $4, $5) AND
+					status       = `+statusPending+`
+				RETURNING version
+			`,
+			object.ProjectID, object.BucketName, object.ObjectKey, object.Version, object.StreamID,
+			object.Status,
+		).Scan(&object.Version)
+	}
+	if err != nil {
+		return Error.New("unable to copy object: %w", err)
+	}
+
+	return nil
+}
+
+func (tx *tidbTransactionAdapter) commitPendingCopyObject(ctx context.Context, object *Object, highestVersion Version) (err error) {
+	defer mon.Task()(&ctx)(&err)
+
+	if tx.transmitEvent {
+		// object.Version is rewritten below when it differs from highestVersion,
+		// so emit the event on success once the final version is known.
+		defer func() {
+			if err == nil {
+				tx.enqueueBucketEvent(BucketEvent{
+					EventName:      s3event.ObjectCreatedCopy.Name(),
+					ObjectStream:   object.ObjectStream,
+					TotalPlainSize: object.TotalPlainSize,
+				})
+			}
+		}()
+	}
+
+	if object.Version == highestVersion {
+		_, err = tx.tx.ExecContext(ctx, `
+			UPDATE objects SET
+				status = ?,
+				zombie_deletion_deadline = NULL
+			WHERE
+				(project_id, bucket_name, object_key, version, stream_id) = (?, ?, ?, ?, ?)
+				AND status = `+statusPending,
+			object.Status,
+			object.ProjectID, object.BucketName, object.ObjectKey, object.Version, object.StreamID,
+		)
+		if err != nil {
+			return Error.New("unable to copy object: %w", err)
+		}
+		return nil
+	}
+
+	if !tx.tidbAdapter.config.TestingTimestampVersioning {
+		oldVersion := object.Version
+		object.Version = highestVersion + 1
+		_, err = tx.tx.ExecContext(ctx, `
+			UPDATE objects SET
+				status = ?,
+				version = ?,
+				zombie_deletion_deadline = NULL
+			WHERE
+				(project_id, bucket_name, object_key, version, stream_id) = (?, ?, ?, ?, ?)
+				AND status = `+statusPending,
+			object.Status,
+			object.Version,
+			object.ProjectID, object.BucketName, object.ObjectKey, oldVersion, object.StreamID,
+		)
+		if err != nil {
+			return Error.New("unable to copy object: %w", err)
+		}
+		return nil
+	}
+
+	// timestamp versioning: compute the version client-side to avoid a SELECT round trip.
+	oldVersion := object.Version
+	object.Version = Version(time.Now().UnixMicro())
+	_, err = tx.tx.ExecContext(ctx, `
+		UPDATE objects SET
+			status = ?,
+			version = ?,
+			zombie_deletion_deadline = NULL
+		WHERE
+			(project_id, bucket_name, object_key, version, stream_id) = (?, ?, ?, ?, ?)
+			AND status = `+statusPending,
+		object.Status,
+		object.Version,
+		object.ProjectID, object.BucketName, object.ObjectKey, oldVersion, object.StreamID,
+	)
+	if err != nil {
+		return Error.New("unable to copy object: %w", err)
+	}
+	return nil
+}
+
+type commitPendingCopyObject struct {
+	Initial ObjectStream
+	Object  *Object
+}
+
+func (ptx *postgresTransactionAdapter) commitPendingCopyObject2(ctx context.Context, opts commitPendingCopyObject) (err error) {
+	initial := opts.Initial
+	object := opts.Object
+
+	result, err := ptx.tx.ExecContext(ctx, `
+		UPDATE objects SET
+			version = $6,
+			status = $7,
+			zombie_deletion_deadline = NULL
+		WHERE
+			(project_id, bucket_name, object_key, version, stream_id) = ($1, $2, $3, $4, $5) AND
+			status       = `+statusPending,
+		initial.ProjectID, initial.BucketName, initial.ObjectKey, initial.Version, initial.StreamID,
+		object.Version, object.Status,
+	)
+	if err != nil {
+		return Error.New("failed to update object: %w", err)
+	}
+	if count, err := result.RowsAffected(); count != 1 || err != nil {
+		// This may happen when:
+		//
+		// 1. user starts copy object
+		// 2. user calls list pending objects
+		// 3. user invokes commit or abort pending object
+		// 4. the 1. copy object arrives here in commitPendingCopyObject2.
+		return Error.New("failed to update object %#v (changed %d rows): %w", initial, count, err)
+	}
+	return nil
+}
+
+func (tx *tidbTransactionAdapter) commitPendingCopyObject2(ctx context.Context, opts commitPendingCopyObject) (err error) {
+	defer mon.Task()(&ctx)(&err)
+
+	initial := opts.Initial
+	object := opts.Object
+
+	if tx.transmitEvent {
+		tx.enqueueBucketEvent(BucketEvent{
+			EventName:      s3event.ObjectCreatedCopy.Name(),
+			ObjectStream:   object.ObjectStream,
+			TotalPlainSize: object.TotalPlainSize,
+		})
+	}
+
+	result, err := tx.tx.ExecContext(ctx, `
+		UPDATE objects SET
+			version = ?,
+			status = ?,
+			zombie_deletion_deadline = NULL
+		WHERE
+			(project_id, bucket_name, object_key, version, stream_id) = (?, ?, ?, ?, ?)
+			AND status = `+statusPending,
+		object.Version, object.Status,
+		initial.ProjectID, initial.BucketName, initial.ObjectKey, initial.Version, initial.StreamID,
+	)
+	if err != nil {
+		return Error.New("failed to update object: %w", err)
+	}
+	if count, err := result.RowsAffected(); count != 1 || err != nil {
+		// This may happen when:
+		//
+		// 1. user starts copy object
+		// 2. user calls list pending objects
+		// 3. user invokes commit or abort pending object
+		// 4. the 1. copy object arrives here in commitPendingCopyObject2.
+		return Error.New("failed to update object %#v (changed %d rows): %w", initial, count, err)
+	}
+	return nil
 }
 
 // getObjectNonPendingExactVersion returns object information for exact version.
 //
 // Note: this returns both committed objects and delete markers.
-func (ptx *postgresTransactionAdapter) getObjectNonPendingExactVersion(ctx context.Context, opts FinishCopyObject) (_ Object, err error) {
+func (p *PostgresAdapter) getObjectNonPendingExactVersion(ctx context.Context, opts FinishCopyObject) (_ Object, err error) {
 	defer mon.Task()(&ctx)(&err)
 
 	object := Object{}
-	err = ptx.tx.QueryRowContext(ctx, `
+	err = p.db.QueryRowContext(ctx, `
 		SELECT
 			stream_id, status,
 			created_at, expires_at,
 			segment_count,
-			encrypted_metadata_nonce, encrypted_metadata, encrypted_metadata_encrypted_key,
+			encrypted_metadata_nonce, encrypted_metadata, encrypted_metadata_encrypted_key, encrypted_etag,
+			checksum,
 			total_plain_size, total_encrypted_size, fixed_segment_size,
 			encryption
 		FROM objects
@@ -568,9 +937,10 @@ func (ptx *postgresTransactionAdapter) getObjectNonPendingExactVersion(ctx conte
 			&object.StreamID, &object.Status,
 			&object.CreatedAt, &object.ExpiresAt,
 			&object.SegmentCount,
-			&object.EncryptedMetadataNonce, &object.EncryptedMetadata, &object.EncryptedMetadataEncryptedKey,
+			&object.EncryptedMetadataNonce, &object.EncryptedMetadata, &object.EncryptedMetadataEncryptedKey, &object.EncryptedETag,
+			&object.Checksum,
 			&object.TotalPlainSize, &object.TotalEncryptedSize, &object.FixedSegmentSize,
-			encryptionParameters{&object.Encryption},
+			&object.Encryption,
 		)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -587,51 +957,38 @@ func (ptx *postgresTransactionAdapter) getObjectNonPendingExactVersion(ctx conte
 	return object, nil
 }
 
-func (stx *spannerTransactionAdapter) getObjectNonPendingExactVersion(ctx context.Context, opts FinishCopyObject) (_ Object, err error) {
+func (t *TiDBAdapter) getObjectNonPendingExactVersion(ctx context.Context, opts FinishCopyObject) (_ Object, err error) {
 	defer mon.Task()(&ctx)(&err)
 
-	found := false
 	object := Object{}
-	err = stx.tx.Query(ctx, spanner.Statement{
-		SQL: `
-			SELECT
-				stream_id, status,
-				created_at, expires_at,
-				segment_count,
-				encrypted_metadata_nonce, encrypted_metadata, encrypted_metadata_encrypted_key,
-				total_plain_size, total_encrypted_size, fixed_segment_size,
-				encryption
-			FROM objects
-			WHERE
-				(project_id, bucket_name, object_key, version) = (@project_id, @bucket_name, @object_key, @version) AND
-				status <> ` + statusPending + ` AND
-				(expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP)`,
-		Params: map[string]interface{}{
-			"project_id":  opts.ProjectID,
-			"bucket_name": opts.BucketName,
-			"object_key":  opts.ObjectKey,
-			"version":     opts.Version,
-		},
-	}).Do(func(row *spanner.Row) error {
-		found = true
-		err := row.Columns(
-			&object.StreamID, &object.Status,
-			&object.CreatedAt, &object.ExpiresAt,
-			spannerutil.Int(&object.SegmentCount),
-			&object.EncryptedMetadataNonce, &object.EncryptedMetadata, &object.EncryptedMetadataEncryptedKey,
-			&object.TotalPlainSize, &object.TotalEncryptedSize, spannerutil.Int(&object.FixedSegmentSize),
-			encryptionParameters{&object.Encryption},
-		)
-		if err != nil {
-			return Error.New("unable to scan object: %w", err)
-		}
-		return nil
-	})
+	err = t.db.QueryRowContext(ctx, `
+		SELECT
+			stream_id, status,
+			created_at, expires_at,
+			segment_count,
+			encrypted_metadata_nonce, encrypted_metadata, encrypted_metadata_encrypted_key, encrypted_etag,
+			checksum,
+			total_plain_size, total_encrypted_size, fixed_segment_size,
+			encryption
+		FROM objects
+		WHERE
+			(project_id, bucket_name, object_key, version) = (?, ?, ?, ?)
+			AND status <> `+statusPending+`
+			AND (expires_at IS NULL OR expires_at > NOW(6))
+	`, opts.ProjectID, opts.BucketName, opts.ObjectKey, opts.Version).Scan(
+		&object.StreamID, &object.Status,
+		&object.CreatedAt, &object.ExpiresAt,
+		&object.SegmentCount,
+		&object.EncryptedMetadataNonce, &object.EncryptedMetadata, &object.EncryptedMetadataEncryptedKey, &object.EncryptedETag,
+		&object.Checksum,
+		&object.TotalPlainSize, &object.TotalEncryptedSize, &object.FixedSegmentSize,
+		&object.Encryption,
+	)
 	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return Object{}, ErrObjectNotFound.Wrap(Error.Wrap(err))
+		}
 		return Object{}, Error.New("unable to query object status: %w", err)
-	}
-	if !found {
-		return Object{}, ErrObjectNotFound.Wrap(Error.New("object does not exist"))
 	}
 
 	object.ProjectID = opts.ProjectID
@@ -640,19 +997,4 @@ func (stx *spannerTransactionAdapter) getObjectNonPendingExactVersion(ctx contex
 	object.Version = opts.Version
 
 	return object, nil
-}
-
-func checkExpiresAtWithObjectLock(object Object, segments transposedSegmentList, retention Retention, legalHold bool) error {
-	if !retention.Enabled() && !legalHold {
-		return nil
-	}
-	for _, e := range segments.ExpiresAts {
-		if e != nil {
-			return ErrObjectExpiration.New(noLockWithExpirationSegmentsErrMsg)
-		}
-	}
-	if object.ExpiresAt != nil && !object.ExpiresAt.IsZero() {
-		return ErrObjectExpiration.New(noLockWithExpirationErrMsg)
-	}
-	return nil
 }

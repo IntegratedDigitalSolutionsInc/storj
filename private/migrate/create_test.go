@@ -11,6 +11,7 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/zap/zaptest"
 
 	"storj.io/common/testcontext"
 	"storj.io/storj/private/migrate"
@@ -23,7 +24,7 @@ func TestCreate_Sqlite(t *testing.T) {
 	ctx := testcontext.New(t)
 	defer ctx.Cleanup()
 
-	db, err := tagsql.Open(ctx, "sqlite3", ":memory:")
+	db, err := tagsql.Open(ctx, "sqlite3", ":memory:", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -48,7 +49,7 @@ func TestCreate_Sqlite(t *testing.T) {
 
 func TestCreate(t *testing.T) {
 	dbtest.Run(t, func(ctx *testcontext.Context, t *testing.T, connstr string) {
-		db, err := tempdb.OpenUnique(ctx, connstr, "create-")
+		db, err := tempdb.OpenUnique(ctx, zaptest.NewLogger(t), connstr, "create-")
 		if err != nil {
 			t.Fatal(err)
 		}

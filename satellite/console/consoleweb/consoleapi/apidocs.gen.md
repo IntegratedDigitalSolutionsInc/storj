@@ -17,6 +17,10 @@
 * APIKeyManagement
   * [Create new macaroon API key](#apikeymanagement-create-new-macaroon-api-key)
   * [Delete API Key](#apikeymanagement-delete-api-key)
+* BucketManagement
+  * [Create Bucket](#bucketmanagement-create-bucket)
+* AccessGrantManagement
+  * [Create Restricted Access](#accessgrantmanagement-create-restricted-access)
 * UserManagement
   * [Get User](#usermanagement-get-user)
 
@@ -36,6 +40,7 @@ Creates new Project with given info
 	bandwidthLimit: string // Amount of memory formatted as `15 GB`
 	createdAt: string // Date timestamp formatted as `2006-01-02T15:00:00Z`
 	managePassphrase: boolean
+	placement: number
 }
 
 ```
@@ -53,6 +58,7 @@ Creates new Project with given info
 	maxBuckets: number
 	createdAt: string // Date timestamp formatted as `2006-01-02T15:00:00Z`
 	memberCount: number
+	status: number
 	storageLimit: string // Amount of memory formatted as `15 GB`
 	bandwidthLimit: string // Amount of memory formatted as `15 GB`
 	userSpecifiedStorageLimit: string // Amount of memory formatted as `15 GB`
@@ -72,6 +78,7 @@ Creates new Project with given info
 	burstLimitDelete: number
 	defaultPlacement: number
 	defaultVersioning: number
+	isClassic: boolean
 }
 
 ```
@@ -98,6 +105,7 @@ Updates project with given info
 	bandwidthLimit: string // Amount of memory formatted as `15 GB`
 	createdAt: string // Date timestamp formatted as `2006-01-02T15:00:00Z`
 	managePassphrase: boolean
+	placement: number
 }
 
 ```
@@ -115,6 +123,7 @@ Updates project with given info
 	maxBuckets: number
 	createdAt: string // Date timestamp formatted as `2006-01-02T15:00:00Z`
 	memberCount: number
+	status: number
 	storageLimit: string // Amount of memory formatted as `15 GB`
 	bandwidthLimit: string // Amount of memory formatted as `15 GB`
 	userSpecifiedStorageLimit: string // Amount of memory formatted as `15 GB`
@@ -134,6 +143,7 @@ Updates project with given info
 	burstLimitDelete: number
 	defaultPlacement: number
 	defaultVersioning: number
+	isClassic: boolean
 }
 
 ```
@@ -170,6 +180,7 @@ Gets all projects user has
 		maxBuckets: number
 		createdAt: string // Date timestamp formatted as `2006-01-02T15:00:00Z`
 		memberCount: number
+		status: number
 		storageLimit: string // Amount of memory formatted as `15 GB`
 		bandwidthLimit: string // Amount of memory formatted as `15 GB`
 		userSpecifiedStorageLimit: string // Amount of memory formatted as `15 GB`
@@ -189,6 +200,7 @@ Gets all projects user has
 		burstLimitDelete: number
 		defaultPlacement: number
 		defaultVersioning: number
+		isClassic: boolean
 	}
 
 ]
@@ -203,12 +215,12 @@ Gets project's single bucket usage by bucket ID
 
 **Query Params:**
 
-| name | type | elaboration |
-|---|---|---|
-| `projectID` | `string` | UUID formatted as `00000000-0000-0000-0000-000000000000` |
-| `bucket` | `string` |  |
-| `since` | `string` | Date timestamp formatted as `2006-01-02T15:00:00Z` |
-| `before` | `string` | Date timestamp formatted as `2006-01-02T15:00:00Z` |
+| name | type | required | elaboration |
+|---|---|---|---|
+| `projectID` | `string` | yes | UUID formatted as `00000000-0000-0000-0000-000000000000` |
+| `bucket` | `string` | yes |  |
+| `since` | `string` | yes | Date timestamp formatted as `2006-01-02T15:00:00Z` |
+| `before` | `string` | yes | Date timestamp formatted as `2006-01-02T15:00:00Z` |
 
 **Response body:**
 
@@ -237,11 +249,11 @@ Gets project's all buckets usage
 
 **Query Params:**
 
-| name | type | elaboration |
-|---|---|---|
-| `projectID` | `string` | UUID formatted as `00000000-0000-0000-0000-000000000000` |
-| `since` | `string` | Date timestamp formatted as `2006-01-02T15:00:00Z` |
-| `before` | `string` | Date timestamp formatted as `2006-01-02T15:00:00Z` |
+| name | type | required | elaboration |
+|---|---|---|---|
+| `projectID` | `string` | yes | UUID formatted as `00000000-0000-0000-0000-000000000000` |
+| `since` | `string` | yes | Date timestamp formatted as `2006-01-02T15:00:00Z` |
+| `before` | `string` | yes | Date timestamp formatted as `2006-01-02T15:00:00Z` |
 
 **Response body:**
 
@@ -273,13 +285,13 @@ Gets API keys by project ID
 
 **Query Params:**
 
-| name | type | elaboration |
-|---|---|---|
-| `search` | `string` |  |
-| `limit` | `number` |  |
-| `page` | `number` |  |
-| `order` | `number` |  |
-| `orderDirection` | `number` |  |
+| name | type | required | elaboration |
+|---|---|---|---|
+| `search` | `string` | yes |  |
+| `limit` | `number` | yes |  |
+| `page` | `number` | yes |  |
+| `order` | `number` | yes |  |
+| `orderDirection` | `number` | yes |  |
 
 **Path Params:**
 
@@ -297,6 +309,7 @@ Gets API keys by project ID
 			projectId: string // UUID formatted as `00000000-0000-0000-0000-000000000000`
 			projectPublicId: string // UUID formatted as `00000000-0000-0000-0000-000000000000`
 			createdBy: string // UUID formatted as `00000000-0000-0000-0000-000000000000`
+			creatorEmail: string
 			userAgent: 			string
 			name: string
 			createdAt: string // Date timestamp formatted as `2006-01-02T15:00:00Z`
@@ -354,6 +367,86 @@ Deletes macaroon API key by id
 | name | type | elaboration |
 |---|---|---|
 | `id` | `string` | UUID formatted as `00000000-0000-0000-0000-000000000000` |
+
+<h3 id='bucketmanagement-create-bucket'>Create Bucket (<a href='#list-of-endpoints'>go to full list</a>)</h3>
+
+Creates a new bucket with the given configuration
+
+`POST /public/v1/buckets/`
+
+**Request body:**
+
+```typescript
+{
+	projectID: string // UUID formatted as `00000000-0000-0000-0000-000000000000`
+	name: string
+	placement: string
+	objectLockEnabled: boolean
+	versioning: boolean
+	defaultRetention: unknown
+}
+
+```
+
+**Response body:**
+
+```typescript
+{
+	name: string
+	createdAt: string // Date timestamp formatted as `2006-01-02T15:00:00Z`
+	placement: string
+}
+
+```
+
+<h3 id='accessgrantmanagement-create-restricted-access'>Create Restricted Access (<a href='#list-of-endpoints'>go to full list</a>)</h3>
+
+Creates a restricted access grant (or API key / S3 credentials) with the given permissions and encryption passphrase applied server-side
+
+`POST /public/v1/accessgrants/`
+
+**Request body:**
+
+```typescript
+{
+	projectID: string // UUID formatted as `00000000-0000-0000-0000-000000000000`
+	name: string
+	permissions: 	{
+		allowDownload: boolean
+		allowUpload: boolean
+		allowList: boolean
+		allowDelete: boolean
+		allowPutObjectRetention: boolean
+		allowGetObjectRetention: boolean
+		allowBypassGovernanceRetention: boolean
+		allowPutObjectLegalHold: boolean
+		allowGetObjectLegalHold: boolean
+		allowPutBucketObjectLockConfiguration: boolean
+		allowGetBucketObjectLockConfiguration: boolean
+		allowPutBucketNotificationConfiguration: boolean
+		allowGetBucketNotificationConfiguration: boolean
+	}
+
+	buckets: 	[
+string
+	]
+
+	notBefore: string // Date timestamp formatted as `2006-01-02T15:00:00Z`
+	notAfter: string // Date timestamp formatted as `2006-01-02T15:00:00Z`
+	passphrase: string
+}
+
+```
+
+**Response body:**
+
+```typescript
+{
+	name: string
+	accessGrant: string
+}
+
+```
 
 <h3 id='usermanagement-get-user'>Get User (<a href='#list-of-endpoints'>go to full list</a>)</h3>
 

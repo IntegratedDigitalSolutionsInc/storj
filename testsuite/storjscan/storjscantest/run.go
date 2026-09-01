@@ -43,7 +43,9 @@ type Test func(t *testing.T, ctx *testcontext.Context, planet *testplanet.Planet
 
 // Run runs testplanet and storjscan and executes test function.
 func Run(t *testing.T, test Test) {
-	databases := satellitedbtest.Databases()
+	t.Parallel()
+
+	databases := satellitedbtest.Databases(t)
 	if len(databases) == 0 {
 		t.Fatal("Databases flag missing, set at least one:\n" +
 			"-postgres-test-db=" + dbtest.DefaultPostgres + "\n" +
@@ -179,7 +181,9 @@ func Run(t *testing.T, test Test) {
 				}
 				defer ctx.Check(planet.Shutdown)
 
-				planet.Start(ctx)
+				if err = planet.Start(ctx); err != nil {
+					t.Fatalf("%+v", err)
+				}
 				provisionUplinks(ctx, t, planet)
 
 				test(t, ctx, planet, &stack)

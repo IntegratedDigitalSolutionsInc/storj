@@ -19,15 +19,27 @@ type CookieSettings struct {
 
 // CookieAuth handles cookie authorization.
 type CookieAuth struct {
-	settings CookieSettings
-	domain   string
+	settings              CookieSettings
+	ssoStateSettings      CookieSettings
+	ssoEmailTokenSettings CookieSettings
+	ssoLinkSettings       CookieSettings
+	pkceVerifierSettings  CookieSettings
+	ssoNonceSettings      CookieSettings
+	sessionExpirySettings CookieSettings
+	domain                string
 }
 
 // NewCookieAuth create new cookie authorization with provided settings.
-func NewCookieAuth(settings CookieSettings, domain string) *CookieAuth {
+func NewCookieAuth(settings, ssoStateSettings, ssoEmailTokenSettings, ssoLinkSettings, sessionExpirySettings, ssoPkceVerifierSettings, ssoNonceSettings CookieSettings, domain string) *CookieAuth {
 	return &CookieAuth{
-		settings: settings,
-		domain:   domain,
+		settings:              settings,
+		ssoStateSettings:      ssoStateSettings,
+		ssoEmailTokenSettings: ssoEmailTokenSettings,
+		ssoLinkSettings:       ssoLinkSettings,
+		sessionExpirySettings: sessionExpirySettings,
+		pkceVerifierSettings:  ssoPkceVerifierSettings,
+		ssoNonceSettings:      ssoNonceSettings,
+		domain:                domain,
 	}
 }
 
@@ -49,7 +61,8 @@ func (auth *CookieAuth) GetToken(r *http.Request) (console.TokenInfo, error) {
 	}, nil
 }
 
-// SetTokenCookie sets parametrized token cookie that is not accessible from js.
+// SetTokenCookie sets parametrized token cookie that is not accessible from js,
+// and a companion JS-readable cookie containing the session expiry time.
 func (auth *CookieAuth) SetTokenCookie(w http.ResponseWriter, tokenInfo console.TokenInfo) {
 	http.SetCookie(w, &http.Cookie{
 		Domain:   auth.domain,
@@ -58,6 +71,15 @@ func (auth *CookieAuth) SetTokenCookie(w http.ResponseWriter, tokenInfo console.
 		Path:     auth.settings.Path,
 		Expires:  tokenInfo.ExpiresAt,
 		HttpOnly: true,
+		SameSite: http.SameSiteStrictMode,
+	})
+	http.SetCookie(w, &http.Cookie{
+		Domain:   auth.domain,
+		Name:     auth.sessionExpirySettings.Name,
+		Value:    tokenInfo.ExpiresAt.UTC().Format(time.RFC3339),
+		Path:     auth.settings.Path,
+		Expires:  tokenInfo.ExpiresAt,
+		HttpOnly: false,
 		SameSite: http.SameSiteStrictMode,
 	})
 }
@@ -73,9 +95,141 @@ func (auth *CookieAuth) RemoveTokenCookie(w http.ResponseWriter) {
 		HttpOnly: true,
 		SameSite: http.SameSiteStrictMode,
 	})
+	http.SetCookie(w, &http.Cookie{
+		Domain:  auth.domain,
+		Name:    auth.sessionExpirySettings.Name,
+		Value:   "",
+		Path:    auth.settings.Path,
+		Expires: time.Unix(0, 0),
+	})
 }
 
 // GetTokenCookieName returns the name of the cookie storing the session token.
 func (auth *CookieAuth) GetTokenCookieName() string {
 	return auth.settings.Name
+}
+
+// SetSSOCookies sets parametrized SSO cookies that are not accessible from js.
+func (auth *CookieAuth) SetSSOCookies(w http.ResponseWriter, state, emailToken, pkceVerifier, nonce string) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     auth.ssoStateSettings.Name,
+		Path:     auth.ssoStateSettings.Path,
+		Value:    state,
+		HttpOnly: true,
+		Expires:  time.Now().Add(1 * time.Hour),
+		SameSite: http.SameSiteLaxMode,
+	})
+	http.SetCookie(w, &http.Cookie{
+		Name:     auth.ssoEmailTokenSettings.Name,
+		Path:     auth.ssoEmailTokenSettings.Path,
+		Value:    emailToken,
+		HttpOnly: true,
+		Expires:  time.Now().Add(1 * time.Hour),
+		SameSite: http.SameSiteLaxMode,
+	})
+	if pkceVerifier != "" {
+		http.SetCookie(w, &http.Cookie{
+			Name:     auth.pkceVerifierSettings.Name,
+			Path:     auth.pkceVerifierSettings.Path,
+			Value:    pkceVerifier,
+			HttpOnly: true,
+			Expires:  time.Now().Add(1 * time.Hour),
+			SameSite: http.SameSiteLaxMode,
+		})
+	}
+	if nonce != "" {
+		http.SetCookie(w, &http.Cookie{
+			Name:     auth.ssoNonceSettings.Name,
+			Path:     auth.ssoNonceSettings.Path,
+			Value:    nonce,
+			HttpOnly: true,
+			Expires:  time.Now().Add(1 * time.Hour),
+			SameSite: http.SameSiteLaxMode,
+		})
+	}
+}
+
+// RemoveSSOCookies removes SSO cookies that are not accessible from js.
+func (auth *CookieAuth) RemoveSSOCookies(w http.ResponseWriter) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     auth.ssoStateSettings.Name,
+		Path:     auth.ssoStateSettings.Path,
+		Value:    "",
+		Expires:  time.Unix(0, 0),
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+	})
+	http.SetCookie(w, &http.Cookie{
+		Name:     auth.ssoEmailTokenSettings.Name,
+		Path:     auth.ssoEmailTokenSettings.Path,
+		Value:    "",
+		Expires:  time.Unix(0, 0),
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+	})
+	http.SetCookie(w, &http.Cookie{
+		Name:     auth.pkceVerifierSettings.Name,
+		Path:     auth.pkceVerifierSettings.Path,
+		Value:    "",
+		Expires:  time.Unix(0, 0),
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+	})
+	http.SetCookie(w, &http.Cookie{
+		Name:     auth.ssoNonceSettings.Name,
+		Path:     auth.ssoNonceSettings.Path,
+		Value:    "",
+		Expires:  time.Unix(0, 0),
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+	})
+}
+
+// SetSSOLinkCookie sets a short-lived cookie with the pending SSO link token.
+func (auth *CookieAuth) SetSSOLinkCookie(w http.ResponseWriter, token string, expiresAt time.Time) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     auth.ssoLinkSettings.Name,
+		Path:     auth.ssoLinkSettings.Path,
+		Value:    token,
+		HttpOnly: true,
+		Expires:  expiresAt,
+		SameSite: http.SameSiteLaxMode,
+	})
+}
+
+// RemoveSSOLinkCookie removes the pending SSO link cookie.
+func (auth *CookieAuth) RemoveSSOLinkCookie(w http.ResponseWriter) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     auth.ssoLinkSettings.Name,
+		Path:     auth.ssoLinkSettings.Path,
+		Value:    "",
+		Expires:  time.Unix(0, 0),
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+	})
+}
+
+// GetSSOLinkCookieName returns the name of the cookie storing the SSO link token.
+func (auth *CookieAuth) GetSSOLinkCookieName() string {
+	return auth.ssoLinkSettings.Name
+}
+
+// GetSSOStateCookieName returns the name of the cookie storing the SSO state.
+func (auth *CookieAuth) GetSSOStateCookieName() string {
+	return auth.ssoStateSettings.Name
+}
+
+// GetSSOEmailTokenCookieName returns the name of the cookie storing the SSO email token.
+func (auth *CookieAuth) GetSSOEmailTokenCookieName() string {
+	return auth.ssoEmailTokenSettings.Name
+}
+
+// GetPkceVerifierCookieName returns the name of the cookie storing the PKCE code verifier.
+func (auth *CookieAuth) GetPkceVerifierCookieName() string {
+	return auth.pkceVerifierSettings.Name
+}
+
+// GetSSONonceCookieName returns the name of the cookie storing the SSO nonce.
+func (auth *CookieAuth) GetSSONonceCookieName() string {
+	return auth.ssoNonceSettings.Name
 }

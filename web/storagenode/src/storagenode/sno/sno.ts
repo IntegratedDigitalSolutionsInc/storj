@@ -1,7 +1,7 @@
 // Copyright (C) 2020 Storj Labs, Inc.
 // See LICENSE for copying information.
 
-import { StatusOffline } from '@/app/store/modules/node';
+import { StatusOffline } from '@/app/store/modules/nodeStore';
 
 /**
  * Hold common node information.
@@ -29,7 +29,7 @@ export class Node {
 export class Utilization {
     public constructor(
         public bandwidth: Traffic = new Traffic(),
-        public diskSpace: Traffic = new Traffic(),
+        public diskSpace: DiskSpace = new DiskSpace(),
     ) {}
 }
 
@@ -39,9 +39,17 @@ export class Utilization {
 export class Traffic {
     public constructor(
         public used: number = 0,
-        public available: number = 1,
+    ) {}
+}
+
+export class DiskSpace {
+    public constructor(
+        public used: number = 0,
+        public allocated: number = 1,
         public trash: number = 0,
         public overused: number = 0,
+        public reclaimable: number = 0,
+        public reserved: number = 0,
     ) {}
 }
 
@@ -69,7 +77,7 @@ export class Dashboard {
         public wallet: string,
         public walletFeatures: string[],
         public satellites: SatelliteInfo[],
-        public diskSpace: Traffic,
+        public diskSpace: DiskSpace,
         public bandwidth: Traffic,
         public lastPinged: Date,
         public startedAt: Date,
@@ -91,6 +99,7 @@ export class SatelliteInfo {
         public url: string = '',
         public disqualified: Date | null = null,
         public suspended: Date | null = null,
+        public vettedAt: Date | null = null,
         public joinDate: Date = new Date(),
     ) { }
 }
@@ -112,6 +121,7 @@ export class Satellite {
         public ingressSummary: number = 0,
         public audits: SatelliteScores = new SatelliteScores(),
         public joinDate: Date = new Date(),
+        public vettedAt: Date | null = null,
     ) {}
 }
 
@@ -122,11 +132,13 @@ export class Stamp {
     public atRestTotal: number;
     public atRestTotalBytes: number;
     public intervalStart: Date;
+    public calculated: boolean;
 
-    public constructor(atRestTotal = 0, atRestTotalBytes = 0, intervalStart: Date = new Date()) {
+    public constructor(atRestTotal = 0, atRestTotalBytes = 0, intervalStart: Date = new Date(), calculated = false) {
         this.atRestTotal = atRestTotal;
         this.atRestTotalBytes = atRestTotalBytes;
         this.intervalStart = intervalStart;
+        this.calculated = calculated;
     }
 
     /**
@@ -139,7 +151,7 @@ export class Stamp {
         now.setUTCDate(date);
         now.setUTCHours(0, 0, 0, 0);
 
-        return new Stamp(0, 0, now);
+        return new Stamp(0, Number.NaN, now, true);
     }
 }
 
@@ -376,7 +388,7 @@ export class SatelliteByDayInfo {
         const bandwidthDailyJson = data.bandwidthDaily || [];
 
         this.storageDaily = storageDailyJson.map((stamp: any) => { // eslint-disable-line @typescript-eslint/no-explicit-any
-            return new Stamp(stamp.atRestTotal, stamp.atRestTotalBytes, new Date(stamp.intervalStart));
+            return new Stamp(stamp.atRestTotal, stamp.atRestTotalBytes, new Date(stamp.intervalStart), stamp.calculated);
         });
 
         this.bandwidthDaily = bandwidthDailyJson.map((bandwidth: any) => { // eslint-disable-line @typescript-eslint/no-explicit-any

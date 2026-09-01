@@ -9,7 +9,7 @@ import { useConfigStore } from '@/store/modules/configStore';
 import { useObjectBrowserStore } from '@/store/modules/objectBrowserStore';
 import { useUsersStore } from '@/store/modules/usersStore';
 import { AnalyticsErrorEventSource } from '@/utils/constants/analyticsEventNames';
-import { useNotify } from '@/utils/hooks';
+import { useNotify } from '@/composables/useNotify';
 import { LocalData } from '@/utils/localData';
 import { useLogout } from '@/composables/useLogout';
 
@@ -17,17 +17,25 @@ export interface UseSessionTimeoutOptions {
     showEditSessionTimeoutModal: () => void;
 }
 
+// Events that indicate user activity and should reset the inactivity timer.
 const RESET_ACTIVITY_EVENTS: readonly string[] = ['keypress', 'mousemove', 'mousedown', 'touchmove'];
+
+// Duration in milliseconds for which to show the inactivity warning before logout.
 export const INACTIVITY_MODAL_DURATION = 60000;
 
 export function useSessionTimeout(opts: UseSessionTimeoutOptions) {
+    // Flag to prevent double initialization.
     const initialized = ref<boolean>(false);
 
-    const inactivityTimerId = ref<ReturnType<typeof setTimeout> | null>(null);
-    const sessionRefreshTimerId = ref<ReturnType<typeof setTimeout> | null>(null);
-    const debugTimerId = ref<ReturnType<typeof setTimeout> | null>(null);
+    const inactivityTimerId = ref<NodeJS.Timeout>();
+    const sessionRefreshTimerId = ref<NodeJS.Timeout>();
+    const debugTimerId = ref<NodeJS.Timeout>();
+
     const debugTimerText = ref<string>('');
-    const isSessionActive = ref<boolean>(false);
+
+    // Indicates if user has shown activity recently.
+    const isUserActive = ref<boolean>(false);
+    // Indicates if session refresh is in progress.
     const isSessionRefreshing = ref<boolean>(false);
     const inactivityModalShown = ref<boolean>(false);
     const sessionExpiredModalShown = ref<boolean>(false);
@@ -43,10 +51,26 @@ export function useSessionTimeout(opts: UseSessionTimeoutOptions) {
 
     /**
      * Returns the session duration from the store.
+     * Prioritizes custom duration > user settings > global config.
+     * Ensures the duration doesn't exceed setTimeout's maximum value.
+     * In the case of the primary auth provider being configured, we
+     * return the max timeout. restartSessionTimers will use the
+     * Math.min between the server-provided expiry and this duration.
      */
     const sessionDuration = computed((): number => {
-        const duration = (LocalData.getCustomSessionDuration() || usersStore.state.settings.sessionDuration?.fullSeconds || configStore.state.config.inactivityTimerDuration) * 1000;
-        const maxTimeout = 2.1427e+9; // 24.8 days https://developer.mozilla.org/en-US/docs/Web/API/setTimeout#maximum_delay_value
+        // Maximum value setTimeout can handle (approximately 24.8 days).
+        const maxTimeout = 2.1427e+9;
+
+        if (configStore.externalAuthEnabled) {
+            return maxTimeout;
+        }
+
+        const duration = (
+            LocalData.getCustomSessionDuration() ||
+            usersStore.state.settings.sessionDuration?.fullSeconds ||
+            configStore.state.config.inactivityTimerDuration
+        ) * 1000;
+
         if (duration > maxTimeout) {
             return maxTimeout;
         }
@@ -54,7 +78,8 @@ export function useSessionTimeout(opts: UseSessionTimeoutOptions) {
     });
 
     /**
-     * Returns the session refresh interval from the store.
+     * Returns the session refresh interval - typically 75% of session duration.
+     * This ensures sessions are refreshed before they expire.
      */
     const sessionRefreshInterval = computed((): number => {
         return Math.floor(sessionDuration.value * 0.75);
@@ -68,8 +93,11 @@ export function useSessionTimeout(opts: UseSessionTimeoutOptions) {
     });
 
     /**
-     * Clears pinia stores and session timers, removes event listeners,
-     * and displays the session expired modal.
+     * Clears all state and timers when session has expired or user is logged out.
+     * - Clears Pinia stores
+     * - Removes event listeners
+     * - Clears all timers
+     * - Shows the session expired modal
      */
     async function clearStoresAndTimers(): Promise<void> {
         await clearStores();
@@ -77,6 +105,7 @@ export function useSessionTimeout(opts: UseSessionTimeoutOptions) {
         RESET_ACTIVITY_EVENTS.forEach((eventName: string) => {
             document.removeEventListener(eventName, onSessionActivity);
         });
+
         LocalData.removeCustomSessionDuration();
         clearSessionTimers();
         inactivityModalShown.value = false;
@@ -84,37 +113,59 @@ export function useSessionTimeout(opts: UseSessionTimeoutOptions) {
     }
 
     /**
-     * Performs logout and cleans event listeners and session timers.
+     * Handles user inactivity by logging them out and cleaning up.
+     * Called when inactivity timeout is reached.
      */
     async function handleInactive(): Promise<void> {
         await clearStoresAndTimers();
-
+        const logoutUrl = configStore.state.config.primaryAuthLogoutURL;
         try {
-            await auth.logout();
+            await auth.logout(configStore.state.config.csrfToken);
+            if (logoutUrl) {
+                window.location.href = logoutUrl;
+                return;
+            }
         } catch (error) {
-            if (error instanceof ErrorUnauthorized) return;
+            if (error instanceof ErrorUnauthorized || error.status === 403) {
+                // 403 comes from no CSRF cookie.
+                // logout of primary IdP anyway.
+                if (logoutUrl) {
+                    window.location.href = logoutUrl;
+                }
+                return;
+            }
 
             notify.notifyError(error, AnalyticsErrorEventSource.OVERALL_SESSION_EXPIRED_ERROR);
         }
     }
 
     /**
-     * Clears timers associated with session refreshing and inactivity.
+     * Clears all timers related to session management.
      */
     function clearSessionTimers(): void {
         [inactivityTimerId.value, sessionRefreshTimerId.value, debugTimerId.value].forEach(id => {
-            if (id !== null) clearTimeout(id);
+            if (id !== undefined) clearTimeout(id);
         });
+
+        inactivityTimerId.value = undefined;
+        sessionRefreshTimerId.value = undefined;
+        debugTimerId.value = undefined;
     }
 
     /**
-     * Adds DOM event listeners and starts session timers.
+     * Sets up event listeners and initializes session timers.
+     * Called when component is mounted.
      */
     async function setupSessionTimers(): Promise<void> {
+        // Skip if already initialized or if inactivity timer is disabled in config.
         if (initialized.value || !configStore.state.config.inactivityTimerEnabled) return;
 
-        const expiresAt = LocalData.getSessionExpirationDate();
-        if (!expiresAt || expiresAt.getTime() - sessionDuration.value + sessionRefreshInterval.value < Date.now()) {
+        const expiresAt = getExpiry();
+
+        // Refresh if:
+        // 1. No expiration date exists, or
+        // 2. The session is close to expiring (less than 25% of session duration remains)
+        if (!expiresAt || (expiresAt.getTime() - Date.now()) < sessionRefreshInterval.value) {
             await refreshSession();
         }
 
@@ -128,35 +179,65 @@ export function useSessionTimeout(opts: UseSessionTimeoutOptions) {
     }
 
     /**
-     * Restarts timers associated with session refreshing and inactivity.
+     * Restarts all timers related to session management.
+     * - Session refresh timer: refreshes session when 75% of duration has passed
+     * - Inactivity timer: checks for inactivity when session is about to expire
+     * - Debug timer (optional): updates the visual countdown
      */
     function restartSessionTimers(): void {
+        // Use the actual remaining time from the server response if it's shorter
+        // than the client-side session duration. This handles cases where the
+        // server doesn't extend the session to the full client-expected duration
+        // (e.g., "remember for one week" sessions where the server preserves the
+        // original expiry instead of extending by the standard inactivity duration).
+        const expiresAt = getExpiry();
+        const remainingMs = expiresAt ? Math.max(0, expiresAt.getTime() - Date.now()) : sessionDuration.value;
+        const effectiveDuration = Math.min(remainingMs, sessionDuration.value);
+
+        // Session refresh timer - refreshes session at 75% of effective duration.
         sessionRefreshTimerId.value = setTimeout(async () => {
-            sessionRefreshTimerId.value = null;
-            if (isSessionActive.value) {
+            sessionRefreshTimerId.value = undefined;
+
+            // Refresh session if there was activity or uploads are in progress.
+            if (isUserActive.value || obStore.uploadingLength > 0) {
+                // Reset activity flag only if it was active.
+                if (isUserActive.value) isUserActive.value = false;
+
                 await refreshSession();
             }
-        }, sessionRefreshInterval.value);
+        }, Math.floor(effectiveDuration * 0.75));
 
+        // Inactivity timer - shows warning before session expires.
         inactivityTimerId.value = setTimeout(async () => {
-            if (obStore.uploadingLength) {
+            // If there are uploads, always refresh regardless of activity.
+            if (obStore.uploadingLength > 0) {
                 await refreshSession();
                 return;
             }
 
-            if (isSessionActive.value) return;
+            // Check if there was activity since the last refresh.
+            if (isUserActive.value) {
+                isUserActive.value = false;
+                await refreshSession();
+                return;
+            }
+
+            // No activity and no uploads, show inactivity modal.
             inactivityModalShown.value = true;
+
+            // Set final timeout before logging out.
             inactivityTimerId.value = setTimeout(async () => {
-                await clearStoresAndTimers();
                 LocalData.setSessionHasExpired();
                 notify.notify('Your session was timed out.');
+                await handleInactive();
             }, INACTIVITY_MODAL_DURATION);
-        }, sessionDuration.value - INACTIVITY_MODAL_DURATION);
+        }, Math.max(0, effectiveDuration - INACTIVITY_MODAL_DURATION));
 
+        // Debug timer (optional feature) - shows countdown display.
         if (!configStore.state.config.inactivityTimerViewerEnabled) return;
 
         const debugTimer = () => {
-            const expiresAt = LocalData.getSessionExpirationDate();
+            const expiresAt = getExpiry();
 
             if (expiresAt) {
                 const ms = Math.max(0, expiresAt.getTime() - Date.now());
@@ -174,60 +255,97 @@ export function useSessionTimeout(opts: UseSessionTimeoutOptions) {
     }
 
     /**
-     * Refreshes session and resets session timers.
-     * @param manual - whether the user manually refreshed session. i.e.: clicked "Stay Logged In".
+     * Refreshes the session with the server and resets all timers.
+     * Called periodically or when user manually refreshes session.
+     *
+     * @param manual - whether the user manually refreshed session (e.g. clicked "Stay Logged In")
      */
     async function refreshSession(manual = false): Promise<void> {
+        // Prevent concurrent refreshes.
+        if (isSessionRefreshing.value) return;
+
         isSessionRefreshing.value = true;
 
         try {
-            LocalData.setSessionExpirationDate(await auth.refreshSession());
-            if (LocalData.getCustomSessionDuration()) {
-                LocalData.removeCustomSessionDuration();
+            storeExpiry(await auth.refreshSession(configStore.state.config.csrfToken));
+
+            clearSessionTimers();
+            restartSessionTimers();
+
+            inactivityModalShown.value = false;
+
+            if (isUserActive.value) isUserActive.value = false;
+
+            if (manual && !usersStore.state.settings.sessionDuration && !configStore.externalAuthEnabled) {
+                opts.showEditSessionTimeoutModal();
             }
         } catch (error) {
-            error.message = (error instanceof ErrorUnauthorized) ? 'Your session was timed out.' : error.message;
-            notify.notifyError(error, AnalyticsErrorEventSource.ALL_PROJECT_DASHBOARD);
+            error.message = (error instanceof ErrorUnauthorized)
+                ? 'Your session was timed out.'
+                : error.message;
+
+            notify.notifyError(error, AnalyticsErrorEventSource.OVERALL_SESSION_EXPIRED_ERROR);
             await handleInactive();
+        } finally {
             isSessionRefreshing.value = false;
-            return;
-        }
-
-        clearSessionTimers();
-        restartSessionTimers();
-        inactivityModalShown.value = false;
-        isSessionActive.value = false;
-        isSessionRefreshing.value = false;
-
-        if (manual && !usersStore.state.settings.sessionDuration) {
-            opts.showEditSessionTimeoutModal();
         }
     }
 
     /**
-     * Resets inactivity timer and refreshes session if necessary.
+     * Event handler for user activity events.
+     * Marks the session as active and refreshes if needed.
      */
     async function onSessionActivity(): Promise<void> {
-        if (inactivityModalShown.value || isSessionActive.value) return;
+        if (inactivityModalShown.value || sessionExpiredModalShown.value || isUserActive.value) return;
 
-        if (sessionRefreshTimerId.value === null && !isSessionRefreshing.value) {
+        // Mark that user is active.
+        isUserActive.value = true;
+
+        // If refresh timer is not running and we're not already refreshing,
+        // perform an immediate refresh (useful if session is close to expiring).
+        if (sessionRefreshTimerId.value === undefined && !isSessionRefreshing.value) {
             await refreshSession();
         }
-
-        isSessionActive.value = true;
     }
 
+    /**
+     * Returns the stored session expiry date.
+     * Reads from the server-set cookie when primary
+     * auth provider is configured, otherwise reads from localStorage.
+     */
+    function getExpiry(): Date | null {
+        if (configStore.state.config.primaryAuthLoginURL) {
+            return LocalData.getSessionExpirationDateFromCookie();
+        }
+        return LocalData.getSessionExpirationDate();
+    }
+
+    /**
+     * Persists the session expiry date.
+     * When a primary auth provider is configured, the server sets
+     * the expiry in a cookie, so we do not need to store it here.
+     */
+    function storeExpiry(date: Date): void {
+        if (!configStore.externalAuthEnabled) LocalData.setSessionExpirationDate(date);
+    }
+
+    // Initialize timers when this composable is used.
     setupSessionTimers();
 
+    // Watch for actions on the users store that might affect session.
     usersStore.$onAction(({ name, after, args }) => {
+        // Clear timers when user store is cleared (logout).
         if (name === 'clear') clearSessionTimers();
+        // Refresh session when session duration setting is updated.
         else if (name === 'updateSettings') {
-            if (args[0].sessionDuration && args[0].sessionDuration !== usersStore.state.settings.sessionDuration?.nanoseconds) {
+            if (args[0].sessionDuration &&
+                args[0].sessionDuration !== usersStore.state.settings.sessionDuration?.nanoseconds) {
                 after((_) => refreshSession());
             }
         }
     });
 
+    // Clean up when component is unmounted.
     onBeforeUnmount(() => {
         clearSessionTimers();
         RESET_ACTIVITY_EVENTS.forEach((eventName: string) => {
@@ -242,6 +360,5 @@ export function useSessionTimeout(opts: UseSessionTimeoutOptions) {
         debugTimerText,
         refreshSession,
         handleInactive,
-        clearStoresAndTimers,
     };
 }

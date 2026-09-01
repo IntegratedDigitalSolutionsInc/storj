@@ -19,9 +19,9 @@ const commonPath = "@/types/common"
 
 // commonClasses is a mapping of Go types to their corresponding TypeScript class names.
 var commonClasses = map[reflect.Type]string{
-	reflect.TypeOf(memory.Size(0)): "MemorySize",
-	reflect.TypeOf(time.Time{}):    "Time",
-	reflect.TypeOf(uuid.UUID{}):    "UUID",
+	reflect.TypeFor[memory.Size](): "MemorySize",
+	reflect.TypeFor[time.Time]():   "Time",
+	reflect.TypeFor[uuid.UUID]():   "UUID",
 }
 
 // NewTypes creates a new type definition generator.
@@ -38,7 +38,7 @@ type Types struct {
 func (types *Types) Register(t reflect.Type) {
 	if t.Name() == "" {
 		switch t.Kind() {
-		case reflect.Array, reflect.Slice, reflect.Ptr:
+		case reflect.Array, reflect.Slice, reflect.Pointer:
 			if t.Elem().Name() == "" {
 				panic(
 					fmt.Sprintf("register an %q of elements of an anonymous type is not supported", t.Name()),
@@ -67,9 +67,12 @@ func (types *Types) All() map[reflect.Type]string {
 		}
 
 		switch k := t.Kind(); k {
-		case reflect.Ptr:
+		case reflect.Pointer:
 			walk(t.Elem())
 		case reflect.Array, reflect.Slice:
+			walk(t.Elem())
+		case reflect.Map:
+			walk(t.Key())
 			walk(t.Elem())
 		case reflect.Struct:
 			if t.Name() == "" {
@@ -104,6 +107,8 @@ func (types *Types) All() map[reflect.Type]string {
 			reflect.Float32, reflect.Float64,
 			reflect.String:
 			all[t] = t.Name()
+		case reflect.Interface:
+			all[t] = "unknown"
 		default:
 			panic(fmt.Sprintf("type %q is not supported", t.Kind().String()))
 		}
@@ -172,7 +177,7 @@ func (types *Types) getTypescriptImports() string {
 		return strings.Compare(classes[i], classes[j]) < 0
 	})
 
-	return fmt.Sprintf("import { %s } from '%s';", strings.Join(classes, ", "), commonPath)
+	return fmt.Sprintf("import type { %s } from '%s';", strings.Join(classes, ", "), commonPath)
 }
 
 // TypescriptTypeName gets the corresponding TypeScript type for a provided reflect.Type.
@@ -183,7 +188,7 @@ func TypescriptTypeName(t reflect.Type) string {
 	}
 
 	switch t.Kind() {
-	case reflect.Ptr:
+	case reflect.Pointer:
 		return TypescriptTypeName(t.Elem())
 	case reflect.Array, reflect.Slice:
 		if t.Name() != "" {
@@ -197,6 +202,10 @@ func TypescriptTypeName(t reflect.Type) string {
 		}
 
 		return TypescriptTypeName(elem) + "[]"
+	case reflect.Map:
+		keyType := TypescriptTypeName(t.Key())
+		valueType := TypescriptTypeName(t.Elem())
+		return fmt.Sprintf("Record<%s, %s>", keyType, valueType)
 	case reflect.String:
 		return "string"
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
@@ -207,6 +216,8 @@ func TypescriptTypeName(t reflect.Type) string {
 		return "number"
 	case reflect.Bool:
 		return "boolean"
+	case reflect.Interface:
+		return "unknown"
 	case reflect.Struct:
 		if t.Name() == "" {
 			panic(fmt.Sprintf(`anonymous struct aren't accepted because their type doesn't have a name. Type="%+v"`, t))

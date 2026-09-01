@@ -14,7 +14,7 @@
                 <v-card-title class="font-weight-bold"> Add Tax ID </v-card-title>
                 <template #append>
                     <v-btn
-                        icon="$close"
+                        :icon="X"
                         variant="text"
                         size="small"
                         color="default"
@@ -109,10 +109,11 @@ import {
     VSelect,
     VTextField,
 } from 'vuetify/components';
+import { X } from '@lucide/vue';
 
-import { Tax, TaxCountry } from '@/types/payments';
+import type { Tax, TaxCountry } from '@/types/payments';
 import { useLoading } from '@/composables/useLoading';
-import { useNotify } from '@/utils/hooks';
+import { useNotify } from '@/composables/useNotify';
 import { useBillingStore } from '@/store/modules/billingStore';
 import { RequiredRule } from '@/types/common';
 
@@ -124,7 +125,7 @@ const notify = useNotify();
 const model = defineModel<boolean>({ required: true });
 
 const countryCode = ref<string>();
-const tax = ref<Tax | null>();
+const tax = ref<Tax>();
 const taxId = ref<string>();
 const formValid = ref(false);
 
@@ -139,12 +140,7 @@ function addTaxID() {
     }
     withLoading(async () => {
         try {
-            await billingStore.addTaxID({
-                value: taxId.value ?? '',
-                tax: {
-                    code: tax.value?.code ?? '',
-                },
-            });
+            await billingStore.addTaxID(tax.value?.code ?? '', taxId.value ?? '');
             notify.success('Tax ID added successfully');
             model.value = false;
         } catch (error) {
@@ -166,7 +162,7 @@ watch(countryCode, (code) => {
         if (!code) {
             return;
         }
-        tax.value = null;
+        tax.value = undefined;
         try {
             await billingStore.getCountryTaxes(code ?? '');
             if (taxes.value.length === 1) {
@@ -176,5 +172,14 @@ watch(countryCode, (code) => {
             notify.notifyError(e);
         }
     });
+});
+
+watch(model, val => {
+    if (!val) {
+        form.value?.reset();
+        countryCode.value = undefined;
+        tax.value = undefined;
+        taxId.value = undefined;
+    }
 });
 </script>

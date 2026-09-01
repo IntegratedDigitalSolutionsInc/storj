@@ -15,7 +15,7 @@ import (
 	"storj.io/common/testcontext"
 	"storj.io/storj/private/testplanet"
 	"storj.io/storj/satellite"
-	"storj.io/storj/satellite/admin"
+	legacyAdmin "storj.io/storj/satellite/admin/legacy"
 )
 
 // TestBasic tests authorization behaviour without oauth.
@@ -27,8 +27,8 @@ func TestBasic(t *testing.T) {
 		Reconfigure: testplanet.Reconfigure{
 			Satellite: func(_ *zap.Logger, _ int, config *satellite.Config) {
 				config.Admin.Address = "127.0.0.1:0"
+				config.Admin.BypassAuth = true
 				config.Admin.StaticDir = "ui"
-				config.Admin.BackOffice.StaticDir = "back-office/ui"
 			},
 		},
 	}, func(t *testing.T, ctx *testcontext.Context, planet *testplanet.Planet) {
@@ -37,34 +37,39 @@ func TestBasic(t *testing.T) {
 		baseURL := "http://" + address.String()
 
 		t.Run("UI", func(t *testing.T) {
-			testUI := func(t *testing.T, baseURL string) {
-				req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/package.json", nil)
+			t.Run("back-office", func(t *testing.T) {
+				// expect routed to back-office UI
+				req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL, nil)
 				require.NoError(t, err)
-
 				response, err := http.DefaultClient.Do(req)
 				require.NoError(t, err)
-
-				require.Equal(t, http.StatusOK, response.StatusCode)
-
-				content, err := io.ReadAll(response.Body)
+				require.Equal(t, http.StatusInternalServerError, response.StatusCode)
+				require.Equal(t, "text/html; charset=UTF-8", response.Header.Get("Content-Type"))
 				require.NoError(t, response.Body.Close())
-				require.NotEmpty(t, content)
-				require.Equal(t, byte('{'), content[0])
-				require.NoError(t, err)
-			}
 
-			t.Run("current", func(t *testing.T) {
-				testUI(t, baseURL)
-			})
-			t.Run("back-office", func(t *testing.T) {
-				testUI(t, baseURL+"/back-office")
+				req, err = http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/child", nil)
+				require.NoError(t, err)
+				response, err = http.DefaultClient.Do(req)
+				require.NoError(t, err)
+				require.Equal(t, http.StatusInternalServerError, response.StatusCode)
+				require.Equal(t, "text/html; charset=UTF-8", response.Header.Get("Content-Type"))
+				require.NoError(t, response.Body.Close())
+
+				// expect routed to back-office API
+				req, err = http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/api/v1/users/email/alice@storj.test", nil)
+				require.NoError(t, err)
+				response, err = http.DefaultClient.Do(req)
+				require.NoError(t, err)
+				require.Equal(t, http.StatusNotFound, response.StatusCode)
+				require.Equal(t, "application/json", response.Header.Get("Content-Type"))
+				require.NoError(t, response.Body.Close())
 			})
 		})
 
 		// Testing authorization behavior without Oauth from here on out.
 
 		t.Run("NoAccess", func(t *testing.T) {
-			req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/api/projects/some-id", nil)
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/legacy/api/projects/some-id", nil)
 			require.NoError(t, err)
 
 			// This request is not through the Oauth proxy and has no authorization token, it should fail.
@@ -81,7 +86,7 @@ func TestBasic(t *testing.T) {
 		})
 
 		t.Run("WrongAccess", func(t *testing.T) {
-			req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/api/users/alice@storj.test", nil)
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/legacy/api/users/alice@storj.test", nil)
 			require.NoError(t, err)
 			req.Header.Set("Authorization", "wrong-key")
 
@@ -98,7 +103,7 @@ func TestBasic(t *testing.T) {
 		})
 
 		t.Run("WithAccess", func(t *testing.T) {
-			req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/api", nil)
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/legacy/api", nil)
 			require.NoError(t, err)
 			req.Header.Set("Authorization", planet.Satellites[0].Config.Console.AuthToken)
 
@@ -126,8 +131,7 @@ func TestWithOAuth(t *testing.T) {
 		Reconfigure: testplanet.Reconfigure{
 			Satellite: func(log *zap.Logger, index int, config *satellite.Config) {
 				config.Admin.Address = "127.0.0.1:0"
-				config.Admin.StaticDir = "ui/build"
-				config.Admin.Groups = admin.Groups{LimitUpdate: "LimitUpdate"}
+				config.Admin.Legacy.Groups = legacyAdmin.Groups{LimitUpdate: "LimitUpdate"}
 			},
 		},
 	}, func(t *testing.T, ctx *testcontext.Context, planet *testplanet.Planet) {
@@ -137,14 +141,14 @@ func TestWithOAuth(t *testing.T) {
 		baseURL := "http://" + address
 
 		// Make this admin server the AllowedOauthHost so withAuth thinks it's Oauth.
-		sat.Admin.Admin.Server.SetAllowedOauthHost(address)
+		sat.Admin.Admin.Server.SetLegacyAllowedOauthHost(address)
 
 		// Requests that require full access should not be accessible through Oauth.
 		t.Run("UnauthorizedThroughOauth", func(t *testing.T) {
 			req, err := http.NewRequestWithContext(
 				ctx,
 				http.MethodGet,
-				fmt.Sprintf("%s/api/projects/%s/apikeys", baseURL, projectID.String()),
+				fmt.Sprintf("%s/legacy/api/projects/%s/apikeys", baseURL, projectID.String()),
 				nil,
 			)
 			require.NoError(t, err)
@@ -158,14 +162,14 @@ func TestWithOAuth(t *testing.T) {
 			body, err := io.ReadAll(response.Body)
 			require.NoError(t, response.Body.Close())
 			require.NoError(t, err)
-			require.Contains(t, string(body), fmt.Sprintf(admin.UnauthorizedNotInGroup,
-				[]string{planet.Satellites[0].Config.Admin.Groups.LimitUpdate}),
+			require.Contains(t, string(body), fmt.Sprintf(legacyAdmin.UnauthorizedNotInGroup,
+				[]string{planet.Satellites[0].Config.Admin.Legacy.Groups.LimitUpdate}),
 			)
 		})
 
 		//
 		t.Run("RequireLimitUpdateAccess", func(t *testing.T) {
-			targetURL := fmt.Sprintf("%s/api/projects/%s/limit", baseURL, projectID.String())
+			targetURL := fmt.Sprintf("%s/legacy/api/projects/%s/limit", baseURL, projectID.String())
 			req, err := http.NewRequestWithContext(ctx, http.MethodGet, targetURL, nil)
 			require.NoError(t, err)
 
@@ -180,8 +184,8 @@ func TestWithOAuth(t *testing.T) {
 			require.NoError(t, response.Body.Close())
 			require.NoError(t, err)
 			errDetail := fmt.Sprintf(
-				admin.UnauthorizedNotInGroup,
-				[]string{planet.Satellites[0].Config.Admin.Groups.LimitUpdate},
+				legacyAdmin.UnauthorizedNotInGroup,
+				[]string{planet.Satellites[0].Config.Admin.Legacy.Groups.LimitUpdate},
 			)
 			require.Contains(t, string(body), errDetail)
 
@@ -203,7 +207,7 @@ func TestWithOAuth(t *testing.T) {
 			req, err := http.NewRequestWithContext(
 				ctx,
 				http.MethodGet,
-				fmt.Sprintf("%s/api/projects/%s/apikeys", baseURL, projectID.String()),
+				fmt.Sprintf("%s/legacy/api/projects/%s/apikeys", baseURL, projectID.String()),
 				nil,
 			)
 			require.NoError(t, err)
@@ -253,6 +257,39 @@ func TestWithOAuth(t *testing.T) {
 
 			require.Equal(t, http.StatusOK, response.StatusCode)
 		})
+
+		// Test back-office API access through Oauth.
+		t.Run("BackOfficeThroughOauth", func(t *testing.T) {
+			t.Run("AllowedHost", func(t *testing.T) {
+				sat.Admin.Admin.Service.TestSetAllowedHost(address)
+				req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/api/v1/settings/", nil)
+				require.NoError(t, err)
+				req.Header.Set("X-Forwarded-Groups", "LimitUpdate")
+				req.Header.Add("X-Forwarded-Email", "test@example.com")
+
+				response, err := http.DefaultClient.Do(req)
+				require.NoError(t, err)
+				require.NoError(t, response.Body.Close())
+
+				require.Equal(t, http.StatusOK, response.StatusCode)
+			})
+
+			t.Run("NotAllowedHost", func(t *testing.T) {
+				sat.Admin.Admin.Service.TestSetAllowedHost("some-other-host")
+				req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/api/v1/settings/", nil)
+				require.NoError(t, err)
+				req.Header.Set("X-Forwarded-Groups", "LimitUpdate")
+
+				response, err := http.DefaultClient.Do(req)
+				require.NoError(t, err)
+				body, err := io.ReadAll(response.Body)
+				require.NoError(t, response.Body.Close())
+				require.NoError(t, err)
+
+				require.Equal(t, http.StatusForbidden, response.StatusCode)
+				require.Contains(t, string(body), "forbidden host")
+			})
+		})
 	})
 }
 
@@ -265,7 +302,6 @@ func TestWithAuthNoToken(t *testing.T) {
 		Reconfigure: testplanet.Reconfigure{
 			Satellite: func(log *zap.Logger, index int, config *satellite.Config) {
 				config.Admin.Address = "127.0.0.1:0"
-				config.Admin.StaticDir = "ui/build"
 				// Disable authorization.
 				config.Console.AuthToken = ""
 			},
@@ -279,7 +315,7 @@ func TestWithAuthNoToken(t *testing.T) {
 		req, err := http.NewRequestWithContext(
 			ctx,
 			http.MethodGet,
-			fmt.Sprintf("%s/api/projects/%s/apikeys", baseURL, projectID.String()),
+			fmt.Sprintf("%s/legacy/api/projects/%s/apikeys", baseURL, projectID.String()),
 			nil,
 		)
 		require.NoError(t, err)
@@ -294,6 +330,6 @@ func TestWithAuthNoToken(t *testing.T) {
 		body, err := io.ReadAll(response.Body)
 		require.NoError(t, response.Body.Close())
 		require.NoError(t, err)
-		require.Contains(t, string(body), admin.AuthorizationNotEnabled)
+		require.Contains(t, string(body), legacyAdmin.AuthorizationNotEnabled)
 	})
 }

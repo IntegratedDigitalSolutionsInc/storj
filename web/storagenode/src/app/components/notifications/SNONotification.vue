@@ -28,69 +28,49 @@
     </div>
 </template>
 
-<script lang="ts">
-import { Component, Prop, Vue } from 'vue-property-decorator';
+<script setup lang="ts">
+import { onBeforeUnmount, onMounted, ref } from 'vue';
 
-import { NOTIFICATIONS_ACTIONS } from '@/app/store/modules/notifications';
 import { UINotification } from '@/app/types/notifications';
+import { useNotificationsStore } from '@/app/store/modules/notificationsStore';
 
-// @vue/component
-@Component
-export default class SNONotification extends Vue {
-    @Prop({ default: () => new UINotification() })
-    public readonly notification: UINotification;
+const props = withDefaults(defineProps<{
+    notification?: UINotification;
+}>(), {
+    notification: () => new UINotification(),
+});
 
-    /**
-     * isSmall props indicates if component used in popup.
-     */
-    @Prop({ default: false })
-    public isSmall: boolean;
+const notificationsStore = useNotificationsStore();
 
-    /**
-     * Minimal window width in pixels for normal notification.
-     */
-    private readonly MIN_WINDOW_WIDTH = 640;
+const MIN_WINDOW_WIDTH = 640;
 
-    /**
-     * Tracks window width for changing notification isSmall type.
-     */
-    public changeNotificationSize(): void {
-        this.isSmall = window.innerWidth < this.MIN_WINDOW_WIDTH;
+const isSmall = ref<boolean>(false);
+
+function changeNotificationSize(): void {
+    isSmall.value = window.innerWidth < MIN_WINDOW_WIDTH;
+}
+
+async function read(): Promise<void> {
+    if (props.notification.isRead) {
+        return;
     }
 
-    /**
-     * Lifecycle hook after initial render.
-     * Adds event on window resizing to change notification isSmall prop.
-     */
-    public mounted(): void {
-        window.addEventListener('resize', this.changeNotificationSize);
-        this.changeNotificationSize();
-    }
-
-    /**
-     * Lifecycle hook before component destruction.
-     * Removes event on window resizing.
-     */
-    public beforeDestroy(): void {
-        window.removeEventListener('resize', this.changeNotificationSize);
-    }
-
-    /**
-     * Fires on hover on notification. If notification is new, marks it as read.
-     */
-    public read(): void {
-        if (this.notification.isRead) {
-            return;
-        }
-
-        try {
-            this.$store.dispatch(NOTIFICATIONS_ACTIONS.MARK_AS_READ, this.notification.id);
-        } catch (error) {
-            // TODO: implement UI notification system.
-            console.error(error);
-        }
+    try {
+        await notificationsStore.markAsRead(props.notification.id);
+    } catch (error) {
+        // TODO: implement UI notification system.
+        console.error(error);
     }
 }
+
+onMounted(() => {
+    window.addEventListener('resize', changeNotificationSize);
+    changeNotificationSize();
+});
+
+onBeforeUnmount(() => {
+    window.removeEventListener('resize', changeNotificationSize);
+});
 </script>
 
 <style scoped lang="scss">
@@ -105,8 +85,7 @@ export default class SNONotification extends Vue {
 
         &__new-indicator-container {
             display: flex;
-            align-items: center;
-            justify-items: center;
+            place-items: center center;
             width: 6px;
             height: 6px;
             min-width: 6px;
@@ -141,7 +120,7 @@ export default class SNONotification extends Vue {
                 font-size: 15px;
                 color: var(--regular-text-color);
                 text-align: left;
-                word-break: break-word;
+                overflow-wrap: anywhere;
 
                 &__bold {
                     font-family: 'font_bold', sans-serif;

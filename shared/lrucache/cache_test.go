@@ -5,9 +5,9 @@ package lrucache
 
 import (
 	"context"
-	"fmt"
 	"math/rand"
 	"runtime"
+	"strconv"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -57,14 +57,14 @@ func TestCache_Get_Fuzz(t *testing.T) {
 	cache := New(Options{Capacity: 2, Expiration: 100 * time.Millisecond})
 	keys := "abcdefghij"
 
-	var ops uint64
+	var ops atomic.Uint64
 	procs := runtime.GOMAXPROCS(-1)
 
 	for i := 0; i < procs; i++ {
 		ctx.Go(func() error {
 			rng := rand.New(rand.NewSource(time.Now().UnixNano()))
 			for {
-				if atomic.AddUint64(&ops, 1) > 1000000 {
+				if ops.Add(1) > 1000000 {
 					return nil
 				}
 
@@ -181,7 +181,7 @@ func TestCache_Add_and_GetCached_Fuzz(t *testing.T) {
 	var addCounter1 int64 = -1
 	ctx.Go(func() error {
 		for e := int64(0); e < numEntries/2; e++ {
-			replaced := cache.Add(ctx, fmt.Sprintf("%d", e), e)
+			replaced := cache.Add(ctx, strconv.FormatInt(e, 10), e)
 			atomic.AddInt64(&addCounter1, 1)
 
 			require.False(t, replaced, "replaced")
@@ -193,7 +193,7 @@ func TestCache_Add_and_GetCached_Fuzz(t *testing.T) {
 	var addCounter2 int64 = (numEntries / 2) - 1
 	ctx.Go(func() error {
 		for e := int64(numEntries / 2); e < numEntries; e++ {
-			replaced := cache.Add(ctx, fmt.Sprintf("%d", e), e)
+			replaced := cache.Add(ctx, strconv.FormatInt(e, 10), e)
 			atomic.AddInt64(&addCounter2, 1)
 
 			require.False(t, replaced, "replaced")
@@ -218,7 +218,7 @@ func TestCache_Add_and_GetCached_Fuzz(t *testing.T) {
 			}
 
 			e++
-			value, cached := cache.GetCached(ctx, fmt.Sprintf("%d", expVal))
+			value, cached := cache.GetCached(ctx, strconv.FormatInt(expVal, 10))
 			require.True(t, cached, "cached")
 			require.Equal(t, expVal, value, "value")
 		}
@@ -232,7 +232,7 @@ func TestCache_Add_and_GetCached_Fuzz(t *testing.T) {
 		for e := uint64(0); e < numEntries; e++ {
 			key := rng.Int63n(numEntries) + numEntries
 
-			_, cached := cache.GetCached(ctx, fmt.Sprintf("%d", key))
+			_, cached := cache.GetCached(ctx, strconv.FormatInt(key, 10))
 			require.False(t, cached, "cached")
 		}
 

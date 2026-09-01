@@ -1,83 +1,66 @@
 // Copyright (C) 2021 Storj Labs, Inc.
 // See LICENSE for copying information.
 
-import Vue from 'vue';
-import Vuetify from 'vuetify/lib/framework';
-import '@mdi/font/css/materialdesignicons.css';
+import { createVuetify } from 'vuetify';
+import { md3 } from 'vuetify/blueprints';
+import { aliases, mdi } from 'vuetify/iconsets/mdi-svg';
+import 'vuetify/styles';
+import '@/styles/styles.scss';
 
-Vue.use(Vuetify);
-
-export default new Vuetify({
-    theme: {
-        options: {
-            customProperties: true,
+export default createVuetify({
+    blueprint: md3,
+    icons: {
+        defaultSet: 'mdi',
+        aliases,
+        sets: {
+            mdi,
         },
+    },
+    theme: {
         themes: {
             light: {
-                primary: '#0059d0',
-                secondary: '#091C45',
-                background: '#fcfcfd',
-                text: '#586474',
-                blue2: '#004199',
-                header: '#131d3a',
-                disabled: '#dadde5',
-                active2: '#f6f7f8',
-                background2: '#f0f6ff',
-                free:'#d6d6d6',
-                trash: '#8fa7c6',
-                overused: '#eb5757',
-                // surface: '#FFF',
-                // info: '#0059D0',
-                // help: '#FFA800',
-                success: '#00AC26',
-                // warning: '#FF7F00',
-                error: '#FF0149',
-                // purple: '#7B61FF',
-                // purple2: '#502EFF',
-                // blue7: '#090920',
-                // blue6:  '#091c45',
-                // blue5: '#0218A7',
-                // blue4: '#0059D0',
-                // blue2: '#003ACD',
-                // yellow: '#FFC600',
-                // yellow2: '#FFB018',
-                warning: '#FFA800',
-                // green: '#00E366',
-                // paragraph: '#283968',
-                border: '#e1e3e6',
-                active: '#e7e9eb',
+                dark: false,
+                colors: {
+                    primary: '#0059d0',
+                    secondary: '#091C45',
+                    background: '#fcfcfd',
+                    text: '#586474',
+                    blue2: '#004199',
+                    header: '#131d3a',
+                    disabled: '#dadde5',
+                    active2: '#f6f7f8',
+                    background2: '#f0f6ff',
+                    free:'#d6d6d6',
+                    trash: '#8fa7c6',
+                    overused: '#eb5757',
+                    success: '#00AC26',
+                    error: '#FF0149',
+                    warning: '#FFA800',
+                    border: '#e1e3e6',
+                    active: '#e7e9eb',
+                },
             },
             dark: {
-                primary: '#0052FF',
-                secondary: '#537CFF',
-                background: '#000a20',
-                text: '#ffffff',
-                blue2: '#024deb',
-                header: '#ffffff',
-                disabled: '#252b38',
-                active2: '#0a152a',
-                background2: '#0a152a',
-                free: '#d4effa',
-                trash: '#9dc6fc',
-                overused: '#ff4747',
-                // surface: '#000b21',
-                success: '#00AC26',
-                // help: '#FFC600',
-                error: '#FF0149',
-                // purple: '#A18EFF',
-                // purple2: '#A18EFF',
-                // blue7: '#090920',
-                // blue6:  '#091c45',
-                // blue5: '#2196f3',
-                // blue4: '#0059D0',
-                // blue2: '#003ACD',
-                // yellow: '#FFC600',
-                // yellow2: '#FFB018',
-                warning: '#FFA800',
-                // warning: '#FF8A00',
-                // green: '#00E366',
-                border: '#242d40',
-                active: '#172135',
+                dark: true,
+                colors: {
+                    primary: '#0052FF',
+                    secondary: '#537CFF',
+                    background: '#000a20',
+                    text: '#ffffff',
+                    blue2: '#024deb',
+                    header: '#ffffff',
+                    disabled: '#252b38',
+                    active2: '#0a152a',
+                    background2: '#0a152a',
+                    free: '#d4effa',
+                    trash: '#9dc6fc',
+                    overused: '#ff4747',
+                    success: '#00AC26',
+                    error: '#FF0149',
+                    warning: '#FFA800',
+                    border: '#242d40',
+                    active: '#172135',
+                },
             },
         },
     },

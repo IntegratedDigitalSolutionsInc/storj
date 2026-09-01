@@ -25,7 +25,7 @@
                 <v-card-title class="font-weight-bold">Edit Name</v-card-title>
                 <template #append>
                     <v-btn
-                        icon="$close"
+                        :icon="X"
                         variant="text"
                         size="small"
                         color="default"
@@ -101,14 +101,14 @@ import {
     VTextField,
     VSheet,
 } from 'vuetify/components';
-import { UserPen } from 'lucide-vue-next';
+import { UserPen, X } from '@lucide/vue';
 
 import { useLoading } from '@/composables/useLoading';
 import { useUsersStore } from '@/store/modules/usersStore';
 import { UpdatedUser } from '@/types/users';
 import { AnalyticsErrorEventSource, AnalyticsEvent } from '@/utils/constants/analyticsEventNames';
 import { useAnalyticsStore } from '@/store/modules/analyticsStore';
-import { useNotify } from '@/utils/hooks';
+import { useNotify } from '@/composables/useNotify';
 
 const rules = [
     (value: string) => (!!value || 'Can\'t be empty'),

@@ -1,0 +1,557 @@
+// Copyright (C) 2025 Storj Labs, Inc.
+// See LICENSE for copying information.
+
+package nodeselection
+
+import (
+	"context"
+	"slices"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"storj.io/common/storj"
+	"storj.io/common/testcontext"
+)
+
+func TestGroupConstraint(t *testing.T) {
+	attribute := func(node SelectedNode) string {
+		return node.LastNet
+	}
+
+	constraint := GroupConstraint(attribute, 2)
+
+	nodes := []*SelectedNode{
+		{ID: storj.NodeID{1}, LastNet: "net1"},
+		{ID: storj.NodeID{2}, LastNet: "net2"},
+		{ID: storj.NodeID{3}, LastNet: "net2"},
+	}
+
+	assert.True(t, constraint(nodes, &SelectedNode{ID: storj.NodeID{3}, LastNet: "net1"}))
+	assert.False(t, constraint(nodes, &SelectedNode{ID: storj.NodeID{3}, LastNet: "net2"}))
+
+}
+
+func TestStreamFilter(t *testing.T) {
+	ctx := testcontext.New(t)
+	defer ctx.Cleanup()
+
+	// Create test nodes
+	nodes := []*SelectedNode{
+		{ID: storj.NodeID{1}, LastNet: "net1"},
+		{ID: storj.NodeID{2}, LastNet: "net1"},
+		{ID: storj.NodeID{3}, LastNet: "net2"},
+		{ID: storj.NodeID{4}, LastNet: "net2"},
+		{ID: storj.NodeID{5}, LastNet: "net3"},
+	}
+
+	// Create a simple stream that returns nodes in order
+	baseStream := func(ctx context.Context, requester storj.NodeID, excluded []storj.NodeID, alreadySelected []storj.NodeID) NodeSequence {
+		i := 0
+		return func(ctx context.Context) *SelectedNode {
+			if i >= len(nodes) {
+				return nil
+			}
+			node := nodes[i]
+			i++
+			return node
+		}
+	}
+
+	// Create a filter that rejects nodes with LastNet="net1"
+	filter := func(selected []*SelectedNode, node *SelectedNode) bool {
+		return node.LastNet != "net1" // Return true to include, false to exclude
+	}
+
+	// Apply the filter (StreamFilter now returns StreamFilterInit, which needs allNodes to build cache)
+	filteredStream := StreamFilter(filter)(nodes)(baseStream)
+
+	// Test the filtered stream
+	sequence := filteredStream(ctx, storj.NodeID{}, nil, nil)
+
+	// We should get nodes 3, 4, and 5 (with LastNet != "net1")
+	node := sequence(ctx)
+	require.NotNil(t, node)
+	assert.Equal(t, storj.NodeID{3}, node.ID)
+
+	node = sequence(ctx)
+	require.NotNil(t, node)
+	assert.Equal(t, storj.NodeID{4}, node.ID)
+
+	node = sequence(ctx)
+	require.NotNil(t, node)
+	assert.Equal(t, storj.NodeID{5}, node.ID)
+
+	// No more nodes
+	node = sequence(ctx)
+	assert.Nil(t, node)
+}
+
+func TestStream(t *testing.T) {
+	ctx := testcontext.New(t)
+	defer ctx.Cleanup()
+
+	// Create test nodes
+	allNodes := []*SelectedNode{
+		{ID: storj.NodeID{1}},
+		{ID: storj.NodeID{2}},
+		{ID: storj.NodeID{3}},
+		{ID: storj.NodeID{4}},
+		{ID: storj.NodeID{5}},
+	}
+
+	// Create a simple seed function
+	seed := func(nodes []*SelectedNode) NodeStream {
+		return func(ctx context.Context, requester storj.NodeID, excluded []storj.NodeID, alreadySelected []storj.NodeID) NodeSequence {
+			i := 0
+			return func(ctx context.Context) *SelectedNode {
+				if i >= len(nodes) {
+					return nil
+				}
+				node := nodes[i]
+				i++
+				return node
+			}
+		}
+	}
+
+	// Create a selector
+	selector := Stream(seed)
+
+	// Initialize the selector with all nodes and no filter
+	nodeSelector := selector(ctx, allNodes, nil)
+
+	// Test selecting 3 nodes
+	selected, err := nodeSelector(ctx, storj.NodeID{}, 3, nil, nil)
+	require.NoError(t, err)
+	require.Len(t, selected, 3)
+	assert.Equal(t, storj.NodeID{1}, selected[0].ID)
+	assert.Equal(t, storj.NodeID{2}, selected[1].ID)
+	assert.Equal(t, storj.NodeID{3}, selected[2].ID)
+
+	// Test with exclusions
+	excluded := []storj.NodeID{{1}, {2}}
+	selected, err = nodeSelector(ctx, storj.NodeID{}, 3, excluded, nil)
+	require.NoError(t, err)
+	require.Len(t, selected, 3)
+	assert.Equal(t, storj.NodeID{3}, selected[0].ID)
+	assert.Equal(t, storj.NodeID{4}, selected[1].ID)
+	assert.Equal(t, storj.NodeID{5}, selected[2].ID)
+
+	// Test requesting more nodes than available
+	_, err = nodeSelector(ctx, storj.NodeID{}, 6, nil, nil)
+	require.Error(t, err)
+}
+
+func TestRandomStream(t *testing.T) {
+	ctx := testcontext.New(t)
+	defer ctx.Cleanup()
+
+	// Create test nodes
+	allNodes := []*SelectedNode{
+		{ID: storj.NodeID{1}},
+		{ID: storj.NodeID{2}},
+		{ID: storj.NodeID{3}},
+		{ID: storj.NodeID{4}},
+		{ID: storj.NodeID{5}},
+	}
+
+	// Create a random stream
+	stream := RandomStream(allNodes)
+	sequence := stream(ctx, storj.NodeID{}, nil, nil)
+
+	// Collect all nodes from the stream
+	var selectedNodes []*SelectedNode
+	for {
+		node := sequence(ctx)
+		if node == nil {
+			break
+		}
+		selectedNodes = append(selectedNodes, node)
+	}
+
+	// We should get all nodes
+	require.Len(t, selectedNodes, len(allNodes))
+
+	// Test with exclusions
+	excluded := []storj.NodeID{{1}, {3}}
+	sequence = stream(ctx, storj.NodeID{}, excluded, nil)
+
+	selectedNodes = nil
+	for {
+		node := sequence(ctx)
+		if node == nil {
+			break
+		}
+		selectedNodes = append(selectedNodes, node)
+		// Verify excluded nodes are not selected
+		assert.NotEqual(t, storj.NodeID{1}, node.ID)
+		assert.NotEqual(t, storj.NodeID{3}, node.ID)
+	}
+
+	// We should get 3 nodes (5 total - 2 excluded)
+	require.Len(t, selectedNodes, 3)
+}
+
+func TestChoiceOfNStream(t *testing.T) {
+	ctx := testcontext.New(t)
+	defer ctx.Cleanup()
+
+	// Create test nodes
+	allNodes := []*SelectedNode{
+		{ID: storj.NodeID{1}, LastNet: "net1"},
+		{ID: storj.NodeID{2}, LastNet: "net2"},
+		{ID: storj.NodeID{3}, LastNet: "net3"},
+		{ID: storj.NodeID{4}, LastNet: "net4"},
+		{ID: storj.NodeID{5}, LastNet: "net5"},
+	}
+
+	// Create a simple base stream
+	baseStream := func(ctx context.Context, requester storj.NodeID, excluded []storj.NodeID, alreadySelected []storj.NodeID) NodeSequence {
+		i := 0
+		return func(ctx context.Context) *SelectedNode {
+			if i >= len(allNodes) {
+				return nil
+			}
+			node := allNodes[i]
+			i++
+			return node
+		}
+	}
+
+	// Create a score function that scores nodes by their ID value
+	scoreNode := &testScoreNode{
+		scoreFunc: func(node *SelectedNode) float64 {
+			return float64(node.ID[0]) // Use first byte of ID as score
+		},
+	}
+
+	choiceStream := ChoiceOfNStream(3, scoreNode)(baseStream)
+
+	for i := 0; i < 100; i++ {
+		sequence := choiceStream(ctx, storj.NodeID{}, nil, nil)
+		node := sequence(ctx)
+		require.NotNil(t, node)
+		// even the worst case scenario (1,2,3 selected), the 3 is the best score
+		assert.Greater(t, int(node.ID[0]), 2)
+	}
+
+}
+
+func TestDropWorst(t *testing.T) {
+	ctx := testcontext.New(t)
+	defer ctx.Cleanup()
+
+	// sequentialSeed returns nodes in order (not random), so we can verify which nodes remain.
+	sequentialSeed := func(nodes []*SelectedNode) NodeStream {
+		return func(ctx context.Context, requester storj.NodeID, excluded []storj.NodeID, alreadySelected []storj.NodeID) NodeSequence {
+			i := 0
+			return func(ctx context.Context) *SelectedNode {
+				if i >= len(nodes) {
+					return nil
+				}
+				node := nodes[i]
+				i++
+				return node
+			}
+		}
+	}
+
+	// score by FreeDisk: higher is better
+	score := &testScoreNode{
+		scoreFunc: func(node *SelectedNode) float64 {
+			return float64(node.FreeDisk)
+		},
+	}
+
+	t.Run("drops worst nodes", func(t *testing.T) {
+		nodes := []*SelectedNode{
+			{ID: storj.NodeID{1}, FreeDisk: 100},
+			{ID: storj.NodeID{2}, FreeDisk: 500},
+			{ID: storj.NodeID{3}, FreeDisk: 200},
+			{ID: storj.NodeID{4}, FreeDisk: 800},
+			{ID: storj.NodeID{5}, FreeDisk: 300},
+		}
+
+		seed := DropWorst(sequentialSeed, 2, score)
+		stream := seed(nodes)
+		seq := stream(ctx, storj.NodeID{}, nil, nil)
+
+		// Worst 2 are FreeDisk=100 and FreeDisk=200 (nodes 1 and 3).
+		// Remaining 3 should have FreeDisk >= 300.
+		var selected []*SelectedNode
+		for {
+			node := seq(ctx)
+			if node == nil {
+				break
+			}
+			selected = append(selected, node)
+		}
+		require.Len(t, selected, 3)
+		for _, node := range selected {
+			assert.GreaterOrEqual(t, node.FreeDisk, int64(300))
+		}
+	})
+
+	t.Run("drop more than available", func(t *testing.T) {
+		nodes := []*SelectedNode{
+			{ID: storj.NodeID{1}, FreeDisk: 100},
+			{ID: storj.NodeID{2}, FreeDisk: 200},
+		}
+
+		seed := DropWorst(sequentialSeed, 5, score)
+		stream := seed(nodes)
+		seq := stream(ctx, storj.NodeID{}, nil, nil)
+
+		// n >= len(nodes), so seed is called with nil
+		node := seq(ctx)
+		assert.Nil(t, node)
+	})
+
+	t.Run("drop zero", func(t *testing.T) {
+		nodes := []*SelectedNode{
+			{ID: storj.NodeID{1}, FreeDisk: 100},
+			{ID: storj.NodeID{2}, FreeDisk: 200},
+			{ID: storj.NodeID{3}, FreeDisk: 300},
+		}
+
+		seed := DropWorst(sequentialSeed, 0, score)
+		stream := seed(nodes)
+		seq := stream(ctx, storj.NodeID{}, nil, nil)
+
+		var selected []*SelectedNode
+		for {
+			node := seq(ctx)
+			if node == nil {
+				break
+			}
+			selected = append(selected, node)
+		}
+		require.Len(t, selected, 3)
+	})
+
+	t.Run("used with Stream selector", func(t *testing.T) {
+		nodes := []*SelectedNode{
+			{ID: storj.NodeID{1}, FreeDisk: 100},
+			{ID: storj.NodeID{2}, FreeDisk: 500},
+			{ID: storj.NodeID{3}, FreeDisk: 200},
+			{ID: storj.NodeID{4}, FreeDisk: 800},
+			{ID: storj.NodeID{5}, FreeDisk: 300},
+		}
+
+		selector := Stream(DropWorst(RandomStream, 2, score))
+		nodeSelector := selector(ctx, nodes, nil)
+
+		selected, err := nodeSelector(ctx, storj.NodeID{}, 3, nil, nil)
+		require.NoError(t, err)
+		require.Len(t, selected, 3)
+		for _, node := range selected {
+			assert.GreaterOrEqual(t, node.FreeDisk, int64(300))
+		}
+	})
+
+	t.Run("does not mutate input slice", func(t *testing.T) {
+		// Regression test: the input slice may be shared across placement
+		// inits or composed DropWorst wrappers; sorting in place would
+		// corrupt the caller's view.
+		nodes := []*SelectedNode{
+			{ID: storj.NodeID{1}, FreeDisk: 100},
+			{ID: storj.NodeID{2}, FreeDisk: 500},
+			{ID: storj.NodeID{3}, FreeDisk: 200},
+			{ID: storj.NodeID{4}, FreeDisk: 800},
+			{ID: storj.NodeID{5}, FreeDisk: 300},
+		}
+		original := slices.Clone(nodes)
+
+		seed := DropWorst(sequentialSeed, 2, score)
+		stream := seed(nodes)
+		seq := stream(ctx, storj.NodeID{}, nil, nil)
+		for seq(ctx) != nil {
+		}
+
+		require.Equal(t, original, nodes, "DropWorst must not reorder its input slice")
+	})
+}
+
+func TestDropWithChoiceOf2(t *testing.T) {
+	ctx := testcontext.New(t)
+	defer ctx.Cleanup()
+
+	// score by FreeDisk: higher is better
+	score := &testScoreNode{
+		scoreFunc: func(node *SelectedNode) float64 {
+			return float64(node.FreeDisk)
+		},
+	}
+
+	t.Run("drops nodes probabilistically", func(t *testing.T) {
+		// With choice-of-2 dropping, worse nodes are more likely to be dropped.
+		// Run multiple iterations to verify statistically.
+		dropCount := map[storj.NodeID]int{}
+
+		for i := 0; i < 200; i++ {
+			nodes := []*SelectedNode{
+				{ID: storj.NodeID{1}, FreeDisk: 100},
+				{ID: storj.NodeID{2}, FreeDisk: 500},
+				{ID: storj.NodeID{3}, FreeDisk: 200},
+				{ID: storj.NodeID{4}, FreeDisk: 800},
+				{ID: storj.NodeID{5}, FreeDisk: 300},
+			}
+
+			seed := DropWithChoiceOf2(RandomStream, 2, score)
+			stream := seed(nodes)
+			seq := stream(ctx, storj.NodeID{}, nil, nil)
+
+			remaining := map[storj.NodeID]bool{}
+			for {
+				node := seq(ctx)
+				if node == nil {
+					break
+				}
+				remaining[node.ID] = true
+			}
+
+			for _, n := range []*SelectedNode{{ID: storj.NodeID{1}}, {ID: storj.NodeID{2}}, {ID: storj.NodeID{3}}, {ID: storj.NodeID{4}}, {ID: storj.NodeID{5}}} {
+				if !remaining[n.ID] {
+					dropCount[n.ID]++
+				}
+			}
+		}
+
+		// The node with FreeDisk=100 (worst) should be dropped more often
+		// than the node with FreeDisk=800 (best).
+		assert.Greater(t, dropCount[storj.NodeID{1}], dropCount[storj.NodeID{4}],
+			"worst node (FreeDisk=100) should be dropped more than best node (FreeDisk=800)")
+	})
+
+	t.Run("drop more than available", func(t *testing.T) {
+		sequentialSeed := func(nodes []*SelectedNode) NodeStream {
+			return func(ctx context.Context, requester storj.NodeID, excluded []storj.NodeID, alreadySelected []storj.NodeID) NodeSequence {
+				i := 0
+				return func(ctx context.Context) *SelectedNode {
+					if i >= len(nodes) {
+						return nil
+					}
+					node := nodes[i]
+					i++
+					return node
+				}
+			}
+		}
+
+		nodes := []*SelectedNode{
+			{ID: storj.NodeID{1}, FreeDisk: 100},
+			{ID: storj.NodeID{2}, FreeDisk: 200},
+		}
+
+		seed := DropWithChoiceOf2(sequentialSeed, 5, score)
+		stream := seed(nodes)
+		seq := stream(ctx, storj.NodeID{}, nil, nil)
+
+		node := seq(ctx)
+		assert.Nil(t, node)
+	})
+
+	t.Run("used with Stream selector", func(t *testing.T) {
+		nodes := []*SelectedNode{
+			{ID: storj.NodeID{1}, FreeDisk: 100},
+			{ID: storj.NodeID{2}, FreeDisk: 500},
+			{ID: storj.NodeID{3}, FreeDisk: 200},
+			{ID: storj.NodeID{4}, FreeDisk: 800},
+			{ID: storj.NodeID{5}, FreeDisk: 300},
+		}
+
+		selector := Stream(DropWithChoiceOf2(RandomStream, 2, score))
+		nodeSelector := selector(ctx, nodes, nil)
+
+		selected, err := nodeSelector(ctx, storj.NodeID{}, 3, nil, nil)
+		require.NoError(t, err)
+		require.Len(t, selected, 3)
+	})
+}
+
+func TestStreamFilterGroupConstraintWithFilteredAlreadySelected(t *testing.T) {
+	// Regression test: when a segment has pieces on nodes that don't pass
+	// the placement filter, StreamFilter's nodesByID map must still contain
+	// them so that GroupConstraint can account for their attributes (e.g.
+	// last_net). Previously, StreamFilterInit received only the filtered
+	// node set, causing alreadySelected lookups to silently miss nodes
+	// outside the filter, which allowed selecting a new node on the same
+	// last_net as an existing piece.
+
+	// Node 10 passes the filter (CountryCode=1), LastNet "net1".
+	// Node 20 does NOT pass the filter (CountryCode=0), LastNet "net2".
+	// Node 30 passes the filter (CountryCode=1), LastNet "net2" -- same as node 20.
+	// Node 40 passes the filter (CountryCode=1), LastNet "net3".
+	allNodes := []*SelectedNode{
+		{ID: storj.NodeID{10}, LastNet: "net1", CountryCode: 1},
+		{ID: storj.NodeID{20}, LastNet: "net2", CountryCode: 0},
+		{ID: storj.NodeID{30}, LastNet: "net2", CountryCode: 1},
+		{ID: storj.NodeID{40}, LastNet: "net3", CountryCode: 1},
+	}
+
+	// Filter: only nodes with CountryCode == 1 pass.
+	filter := NodeFilterFunc(func(node *SelectedNode) bool {
+		return node.CountryCode == 1
+	})
+
+	netAttribute := func(node SelectedNode) string {
+		return node.LastNet
+	}
+
+	// Selector: random stream with group constraint of max 1 per LastNet.
+	selector := Stream(
+		RandomStream,
+		StreamFilter(GroupConstraint(netAttribute, 1)),
+	)
+
+	ctx := testcontext.New(t)
+	defer ctx.Cleanup()
+	nodeSelector := selector(ctx, allNodes, filter)
+
+	t.Run("constraint respects filtered-out alreadySelected nodes", func(t *testing.T) {
+		ctx := testcontext.New(t)
+		defer ctx.Cleanup()
+
+		// alreadySelected includes node 20 which doesn't pass the filter.
+		alreadySelected := []storj.NodeID{{20}}
+
+		// Select 1 node. Node 30 shares LastNet "net2" with node 20, so it
+		// must NOT be selected. Only node 10 or 40 should be returned.
+		for i := 0; i < 100; i++ {
+			selected, err := nodeSelector(ctx, storj.NodeID{}, 1, nil, alreadySelected)
+			require.NoError(t, err)
+			require.Len(t, selected, 1)
+			require.NotEqual(t, storj.NodeID{30}, selected[0].ID,
+				"selected node 30 which shares LastNet with alreadySelected node 20")
+		}
+	})
+
+	t.Run("filtered-out nodes are never selected as candidates", func(t *testing.T) {
+		ctx := testcontext.New(t)
+		defer ctx.Cleanup()
+
+		// Select all available nodes (no alreadySelected). Node 20 must
+		// never appear because it doesn't pass the placement filter,
+		// even though it's now in StreamFilter's nodesByID map.
+		for i := 0; i < 100; i++ {
+			selected, err := nodeSelector(ctx, storj.NodeID{}, 2, nil, nil)
+			require.NoError(t, err)
+			for _, node := range selected {
+				require.NotEqual(t, storj.NodeID{20}, node.ID,
+					"selected node 20 which doesn't pass the placement filter")
+			}
+		}
+	})
+}
+
+// Helper types for testing
+
+type testScoreNode struct {
+	scoreFunc func(*SelectedNode) float64
+}
+
+func (t *testScoreNode) Get(id storj.NodeID) func(*SelectedNode) float64 {
+	return t.scoreFunc
+}

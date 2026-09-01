@@ -11,16 +11,23 @@ import (
 
 	"storj.io/common/leak"
 	"storj.io/common/traces"
+	"storj.io/storj/shared/flightrecorder"
 )
+
+// ExecQueryer contains methods for executing queries.
+type ExecQueryer interface {
+	ExecContext(ctx context.Context, query string, args ...interface{}) (sql.Result, error)
+	QueryContext(ctx context.Context, query string, args ...interface{}) (Rows, error)
+	QueryRowContext(ctx context.Context, query string, args ...interface{}) *sql.Row
+}
 
 // Tx is an interface for *sql.Tx-like transactions.
 type Tx interface {
-	// Exec and other methods take a context for tracing
-	// purposes, but do not pass the context to the underlying database query
-	Exec(ctx context.Context, query string, args ...interface{}) (sql.Result, error)
-	Prepare(ctx context.Context, query string) (Stmt, error)
-	Query(ctx context.Context, query string, args ...interface{}) (Rows, error)
-	QueryRow(ctx context.Context, query string, args ...interface{}) *sql.Row
+	// Name returns the driver name of the database that started this Tx,
+	// using the same values as DB.Name (e.g. tagsql.PostgresName,
+	// tagsql.TiDBName, …). Callers that dispatch driver-specific logic on a
+	// Tx (for example dx.Do) use this to pick the right strategy.
+	Name() string
 
 	// ExecContext and other Context methods take a context for tracing and also
 	// pass the context to the underlying database, if this tagsql instance is
@@ -38,41 +45,23 @@ type Tx interface {
 // sqlTx implements Tx, which optionally disables contexts.
 type sqlTx struct {
 	tx         *sql.Tx
+	name       string
 	useContext bool
 	tracker    leak.Ref
+	box        *flightrecorder.Box
 }
 
-func (s *sqlTx) Exec(ctx context.Context, query string, args ...interface{}) (_ sql.Result, err error) {
-	traces.Tag(ctx, traces.TagDB)
-	defer mon.Task()(&ctx, query, args)(&err)
-
-	return s.tx.Exec(query, args...)
-}
+func (s *sqlTx) Name() string { return s.name }
 
 func (s *sqlTx) ExecContext(ctx context.Context, query string, args ...interface{}) (_ sql.Result, err error) {
+	s.record()
 	traces.Tag(ctx, traces.TagDB)
 	defer mon.Task()(&ctx, query, args)(&err)
 
 	if !s.useContext {
-		return s.tx.Exec(query, args...)
+		return s.tx.Exec(query, args...) //nolint:noctx // fallback for non-context behaviour
 	}
 	return s.tx.ExecContext(ctx, query, args...)
-}
-
-func (s *sqlTx) Prepare(ctx context.Context, query string) (_ Stmt, err error) {
-	traces.Tag(ctx, traces.TagDB)
-	defer mon.Task()(&ctx, query)(&err)
-
-	stmt, err := s.tx.Prepare(query)
-	if err != nil {
-		return nil, err
-	}
-	return &sqlStmt{
-		query:      query,
-		stmt:       stmt,
-		useContext: s.useContext,
-		tracker:    s.tracker.Child("sqlStmt", 1),
-	}, nil
 }
 
 func (s *sqlTx) PrepareContext(ctx context.Context, query string) (_ Stmt, err error) {
@@ -81,7 +70,7 @@ func (s *sqlTx) PrepareContext(ctx context.Context, query string) (_ Stmt, err e
 
 	var stmt *sql.Stmt
 	if !s.useContext {
-		stmt, err = s.tx.Prepare(query)
+		stmt, err = s.tx.Prepare(query) //nolint:noctx // fallback for non-context behaviour
 		if err != nil {
 			return nil, err
 		}
@@ -96,39 +85,28 @@ func (s *sqlTx) PrepareContext(ctx context.Context, query string) (_ Stmt, err e
 		stmt:       stmt,
 		useContext: s.useContext,
 		tracker:    s.tracker.Child("sqlStmt", 1),
+		box:        s.box,
 	}, err
 }
 
-func (s *sqlTx) Query(ctx context.Context, query string, args ...interface{}) (_ Rows, err error) {
-	traces.Tag(ctx, traces.TagDB)
-	defer mon.Task()(&ctx, query, args)(&err)
-
-	return s.wrapRows(s.tx.Query(query, args...))
-}
-
 func (s *sqlTx) QueryContext(ctx context.Context, query string, args ...interface{}) (_ Rows, err error) {
+	s.record()
 	traces.Tag(ctx, traces.TagDB)
 	defer mon.Task()(&ctx, query, args)(&err)
 
 	if !s.useContext {
-		return s.wrapRows(s.tx.Query(query, args...))
+		return s.wrapRows(s.tx.Query(query, args...)) //nolint:noctx // fallback for non-context behaviour
 	}
 	return s.wrapRows(s.tx.QueryContext(ctx, query, args...))
 }
 
-func (s *sqlTx) QueryRow(ctx context.Context, query string, args ...interface{}) *sql.Row {
-	traces.Tag(ctx, traces.TagDB)
-	defer mon.Task()(&ctx, query, args)(nil)
-
-	return s.tx.QueryRow(query, args...)
-}
-
 func (s *sqlTx) QueryRowContext(ctx context.Context, query string, args ...interface{}) *sql.Row {
+	s.record()
 	traces.Tag(ctx, traces.TagDB)
 	defer mon.Task()(&ctx, query, args)(nil)
 
 	if !s.useContext {
-		return s.tx.QueryRow(query, args...)
+		return s.tx.QueryRow(query, args...) //nolint:noctx // fallback for non-context behaviour
 	}
 	return s.tx.QueryRowContext(ctx, query, args...)
 }
@@ -138,5 +116,14 @@ func (s *sqlTx) Commit() error {
 }
 
 func (s *sqlTx) Rollback() error {
+	s.record()
 	return errs.Combine(s.tracker.Close(), s.tx.Rollback())
+}
+
+func (s *sqlTx) record() {
+	if s.box == nil {
+		return
+	}
+
+	s.box.Enqueue(flightrecorder.EventTypeDB, 1) // 1 to skip record call.
 }

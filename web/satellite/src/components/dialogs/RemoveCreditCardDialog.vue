@@ -23,7 +23,7 @@
                 <v-card-title class="font-weight-bold">Remove Card</v-card-title>
                 <template #append>
                     <v-btn
-                        icon="$close"
+                        :icon="X"
                         variant="text"
                         size="small"
                         color="default"
@@ -36,7 +36,10 @@
             <v-divider />
 
             <v-card-item class="px-6 py-0">
-                <v-card-text v-if="card.isDefault" class="py-5 px-0">This is your default payment card. It can't be removed.</v-card-text>
+                <v-card-text v-if="card.isDefault" class="py-5 px-0">
+                    To remove this payment method, you will need to add a replacement first.
+                    Would you like to add a new payment method now?
+                </v-card-text>
                 <v-card-text v-else class="py-5 px-0">This is not your default payment card.</v-card-text>
 
                 <credit-card-item :card="card" />
@@ -46,6 +49,11 @@
 
             <v-card-actions class="pa-6">
                 <v-row>
+                    <v-col v-if="!moreThanOneCard && card.isDefault">
+                        <v-btn :prepend-icon="Plus" color="primary" variant="flat" block :loading="isLoading" @click="emit('addNew')">
+                            New Payment Method
+                        </v-btn>
+                    </v-col>
                     <v-col>
                         <v-btn variant="outlined" color="default" block :disabled="isLoading" @click="model = false">
                             Cancel
@@ -53,7 +61,7 @@
                     </v-col>
                     <v-col v-if="(card.isDefault && moreThanOneCard) || !card.isDefault">
                         <v-btn v-if="card.isDefault && moreThanOneCard" color="primary" variant="flat" block :loading="isLoading" @click="onEditDefault">
-                            Edit Default Card
+                            Set Default Card
                         </v-btn>
                         <v-btn v-if="!card.isDefault" color="error" variant="flat" block :loading="isLoading" @click="onDelete">
                             Remove
@@ -68,25 +76,27 @@
 <script setup lang="ts">
 import { computed } from 'vue';
 import {
-    VDialog,
-    VCard,
-    VCardItem,
-    VCardTitle,
-    VCardText,
-    VDivider,
-    VCardActions,
-    VRow,
-    VCol,
     VBtn,
+    VCard,
+    VCardActions,
+    VCardItem,
+    VCardText,
+    VCardTitle,
+    VCol,
+    VDialog,
+    VDivider,
+    VRow,
     VSheet,
 } from 'vuetify/components';
+import { Plus, X } from '@lucide/vue';
 
 import { useBillingStore } from '@/store/modules/billingStore';
 import { useLoading } from '@/composables/useLoading';
-import { useNotify } from '@/utils/hooks';
-import { AnalyticsErrorEventSource } from '@/utils/constants/analyticsEventNames';
-import { CreditCard } from '@/types/payments';
+import { useNotify } from '@/composables/useNotify';
+import { AnalyticsErrorEventSource, AnalyticsEvent } from '@/utils/constants/analyticsEventNames';
+import type { CreditCard } from '@/types/payments';
 import { useUsersStore } from '@/store/modules/usersStore';
+import { useAnalyticsStore } from '@/store/modules/analyticsStore';
 
 import CreditCardItem from '@/components/dialogs/ccActionComponents/CreditCardItem.vue';
 import IconCard from '@/components/icons/IconCard.vue';
@@ -99,10 +109,12 @@ const model = defineModel<boolean>({ required: true });
 
 const emit = defineEmits<{
     'editDefault': [];
+    'addNew': [];
 }>();
 
 const billingStore = useBillingStore();
 const usersStore = useUsersStore();
+const analyticsStore = useAnalyticsStore();
 
 const { isLoading, withLoading } = useLoading();
 const notify = useNotify();
@@ -113,6 +125,8 @@ async function onDelete(): Promise<void> {
     await withLoading(async () => {
         try {
             await billingStore.removeCreditCard(props.card.id);
+
+            analyticsStore.eventTriggered(AnalyticsEvent.CREDIT_CARD_REMOVED);
             notify.success('Credit card was successfully removed');
             model.value = false;
             attemptPayments();
@@ -139,7 +153,6 @@ async function attemptPayments() {
 }
 
 function onEditDefault(): void {
-    model.value = false;
     emit('editDefault');
 }
 </script>

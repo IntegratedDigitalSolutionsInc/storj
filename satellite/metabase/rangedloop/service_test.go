@@ -8,16 +8,15 @@ import (
 	"errors"
 	"fmt"
 	"sort"
-	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
 	"go.uber.org/zap/zaptest"
 
-	"storj.io/common/memory"
 	"storj.io/common/storj"
 	"storj.io/common/testcontext"
 	"storj.io/common/testrand"
@@ -33,7 +32,6 @@ import (
 	"storj.io/storj/satellite/metrics"
 	"storj.io/storj/satellite/nodeselection"
 	"storj.io/storj/satellite/repair/checker"
-	"storj.io/storj/shared/dbutil"
 )
 
 func TestLoopCount(t *testing.T) {
@@ -373,23 +371,48 @@ func TestLoopContinuesAfterObserverError(t *testing.T) {
 	require.Equal(t, observerDurations[3].Duration, -1*time.Second)
 	require.Equal(t, observerDurations[4].Duration, -1*time.Second)
 	require.Equal(t, observerDurations[5].Duration, -1*time.Second)
+
+	// and the cause, which is all a caller that exits on it can report
+	require.NoError(t, observerDurations[0].Err)
+	require.NoError(t, observerDurations[6].Err)
+	for i, message := range map[int]string{
+		1: "Test OnStart error",
+		2: "Test OnFork error",
+		3: "Test OnProcess error",
+		4: "Test OnJoin error",
+		5: "Test OnFinish error",
+	} {
+		require.ErrorContains(t, observerDurations[i].Err, message, "observer %d", i)
+	}
+
+	err = rangedloop.ObserverError(observerDurations)
+	require.ErrorContains(t, err, "Test OnProcess error")
+
+	// the live count is a suspicion about estimated table statistics, not a
+	// failed run, so a job does not exit on it
+	require.NoError(t, rangedloop.ObserverError([]rangedloop.ObserverDuration{{
+		Observer: rangedloop.NewLiveCountObserver(nil, 0, 0),
+		Duration: -1 * time.Second,
+		Err:      errors.New("processed count looks suspicious"),
+	}}))
 }
 
 func TestAllInOne(t *testing.T) {
 	testplanet.Run(t, testplanet.Config{
-		SatelliteCount: 1, StorageNodeCount: 4, UplinkCount: 1,
+		SatelliteCount: 1, UplinkCount: 1,
 	}, func(t *testing.T, ctx *testcontext.Context, planet *testplanet.Planet) {
 		log := zaptest.NewLogger(t)
 		satellite := planet.Satellites[0]
 
+		segments := []metabase.RawSegment{}
 		for i := 0; i < 100; i++ {
-			err := planet.Uplinks[0].Upload(ctx, satellite, "testbucket", "object"+strconv.Itoa(i), testrand.Bytes(5*memory.KiB))
-			require.NoError(t, err)
+			stream := metabasetest.RandObjectStream()
+			segments = append(segments, metabasetest.DefaultRawSegment(stream, metabase.SegmentPosition{}))
 		}
 
-		require.NoError(t, planet.Uplinks[0].CreateBucket(ctx, satellite, "bf-bucket"))
+		require.NoError(t, planet.Satellites[0].Metabase.DB.TestingBatchInsertSegments(ctx, segments))
 
-		metabaseProvider := rangedloop.NewMetabaseRangeSplitter(satellite.Metabase.DB, 0, 0, 10)
+		require.NoError(t, planet.Uplinks[0].TestingCreateBucket(ctx, satellite, "bf-bucket"))
 
 		config := rangedloop.Config{
 			Parallelism: 8,
@@ -402,14 +425,19 @@ func TestAllInOne(t *testing.T) {
 		require.NoError(t, err)
 		bfConfig.AccessGrant = accessGrant
 
+		metabaseProvider := rangedloop.NewMetabaseRangeSplitter(log, satellite.Metabase.DB, rangedloop.Config{
+			BatchSize: 10,
+		})
 		service := rangedloop.NewService(log, config, metabaseProvider, []rangedloop.Observer{
 			rangedloop.NewLiveCountObserver(satellite.Metabase.DB, config.SuspiciousProcessedRatio, config.AsOfSystemInterval),
 			metrics.NewObserver(),
 			nodetally.NewObserver(log.Named("accounting:nodetally"),
 				satellite.DB.StoragenodeAccounting(),
 				satellite.Metabase.DB,
+				satellite.Config.NodeTally,
 			),
 			audit.NewObserver(log.Named("audit"),
+				nil,
 				satellite.DB.VerifyQueue(),
 				satellite.Config.Audit,
 			),
@@ -417,13 +445,21 @@ func TestAllInOne(t *testing.T) {
 				bfConfig,
 				satellite.DB.OverlayCache(),
 			),
-			checker.NewObserver(
-				log.Named("repair:checker"),
-				satellite.DB.RepairQueue(),
-				satellite.Overlay.Service,
-				nodeselection.TestPlacementDefinitions(),
-				satellite.Config.Checker,
-			),
+			func() *checker.Observer {
+				reliabilityCache := checker.NewReliabilityCache(
+					satellite.Overlay.Service, satellite.Config.Checker.ReliabilityCacheStaleness,
+					satellite.Config.Checker.OnlineWindow,
+				)
+				health := checker.NewProbabilityHealth(satellite.Config.Checker.NodeFailureRate, reliabilityCache)
+				return checker.NewObserver(
+					log.Named("repair:checker"),
+					satellite.Repair.Queue,
+					satellite.Overlay.Service,
+					nodeselection.TestPlacementDefinitions(),
+					satellite.Config.Checker,
+					health,
+				)
+			}(),
 		})
 
 		for i := 0; i < 5; i++ {
@@ -473,7 +509,9 @@ func TestLoopBoundaries(t *testing.T) {
 			var visitedSegments []Segment
 			var mu sync.Mutex
 
-			provider := rangedloop.NewMetabaseRangeSplitter(db, 0, 0, batchSize)
+			provider := rangedloop.NewMetabaseRangeSplitter(zap.NewNop(), db, rangedloop.Config{
+				BatchSize: batchSize,
+			})
 			config := rangedloop.Config{
 				Parallelism: parallelism,
 				BatchSize:   batchSize,
@@ -558,37 +596,4 @@ func TestInlineSegmentDetection(t *testing.T) {
 
 	require.Equal(t, 2, inlineSegments)
 	require.Equal(t, 1, remoteSegments)
-}
-
-func TestRangedLoop_SpannerStaleReads(t *testing.T) {
-	metabasetest.Run(t, func(ctx *testcontext.Context, t *testing.T, db *metabase.DB) {
-		if db.Implementation() != dbutil.Spanner {
-			t.Skip("test requires Spanner")
-		}
-
-		countObserver := &rangedlooptest.CountObserver{}
-		metabasetest.CreateObject(ctx, t, db, metabasetest.RandObjectStream(), 1)
-
-		config := rangedloop.Config{
-			Parallelism: 1,
-			BatchSize:   10,
-		}
-
-		// using stale read from before creating object
-		provider := rangedloop.NewMetabaseRangeSplitter(db, 0, time.Hour, 10)
-		service := rangedloop.NewService(zaptest.NewLogger(t), config, provider, []rangedloop.Observer{countObserver})
-		_, err := service.RunOnce(ctx)
-		require.NoError(t, err)
-		require.Equal(t, 0, countObserver.NumSegments)
-
-		// Wait for the object to be definitely visible for the stale read.
-		time.Sleep(2 * time.Second)
-
-		// using stale read but object should be already visible
-		provider = rangedloop.NewMetabaseRangeSplitter(db, 0, time.Microsecond, 10)
-		service = rangedloop.NewService(zaptest.NewLogger(t), config, provider, []rangedloop.Observer{countObserver})
-		_, err = service.RunOnce(ctx)
-		require.NoError(t, err)
-		require.Equal(t, 1, countObserver.NumSegments)
-	})
 }

@@ -9,6 +9,7 @@ import (
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/zap/zaptest"
 
 	"storj.io/common/testcontext"
 	"storj.io/storj/shared/dbutil"
@@ -20,7 +21,7 @@ import (
 
 func TestQuery(t *testing.T) {
 	dbtest.Run(t, func(ctx *testcontext.Context, t *testing.T, connstr string) {
-		db, err := tempdb.OpenUnique(ctx, connstr, "pgutil-query")
+		db, err := tempdb.OpenUnique(ctx, zaptest.NewLogger(t), connstr, "pgutil-query")
 		require.NoError(t, err)
 		defer ctx.Check(db.Close)
 
@@ -96,9 +97,9 @@ func TestQuery(t *testing.T) {
 				{
 					Name: "users",
 					Columns: []*dbschema.Column{
-						{Name: "a", Type: "bigint", IsNullable: false, Reference: nil},
-						{Name: "b", Type: "bigint", IsNullable: false, Reference: nil},
-						{Name: "c", Type: "text", IsNullable: true, Reference: nil},
+						{Name: "a", Type: "bigint", IsNullable: false},
+						{Name: "b", Type: "bigint", IsNullable: false},
+						{Name: "c", Type: "text", IsNullable: true},
 					},
 					PrimaryKey: []string{"a"},
 					Unique: [][]string{
@@ -110,21 +111,26 @@ func TestQuery(t *testing.T) {
 					Columns: []*dbschema.Column{
 						{
 							Name: "users_a", Type: "bigint", IsNullable: true,
-							Reference: &dbschema.Reference{
-								Table:    "users",
-								Column:   "a",
-								OnDelete: "CASCADE",
-							},
 						},
-						{Name: "a", Type: "text", IsNullable: false, Reference: nil},
-						{Name: "x", Type: "text", IsNullable: false, Reference: nil}, // not null, because primary key
-						{Name: "b", Type: "text", IsNullable: true, Reference: nil},
-						{Name: "c", Type: "bigint", IsNullable: true, Reference: nil},
+						{Name: "a", Type: "text", IsNullable: false},
+						{Name: "x", Type: "text", IsNullable: false}, // not null, because primary key
+						{Name: "b", Type: "text", IsNullable: true},
+						{Name: "c", Type: "bigint", IsNullable: true},
 					},
 					PrimaryKey: []string{"a", "x"},
 					Unique: [][]string{
 						{"a", "b"},
 						{"x"},
+					},
+					ForeignKeys: []*dbschema.ForeignKey{
+						{
+							Name:           "names_users_a_fkey",
+							LocalColumns:   []string{"users_a"},
+							ForeignTable:   "users",
+							ForeignColumns: []string{"a"},
+							OnDelete:       "CASCADE",
+							OnUpdate:       "",
+						},
 					},
 					Checks: []string{
 						"CHECK ((x <> b))",

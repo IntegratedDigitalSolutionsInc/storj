@@ -1,8 +1,8 @@
 // Copyright (C) 2019 Storj Labs, Inc.
 // See LICENSE for copying information.
 
-import { formatPrice, decimalShift } from '@/utils/strings';
-import { JSONRepresentable } from '@/types/json';
+import { formatPrice } from '@/utils/strings';
+import type { JSONRepresentable } from '@/types/json';
 import { Time } from '@/utils/time';
 
 /**
@@ -23,7 +23,7 @@ export interface PaymentsApi {
      *
      * @throws Error
      */
-    setupAccount(): Promise<string>;
+    setupAccount(csrfProtectionToken: string): Promise<string>;
 
     /**
      * Get account balance
@@ -34,40 +34,75 @@ export interface PaymentsApi {
     getBalance(): Promise<AccountBalance>;
 
     /**
-     * projectsUsagesAndCharges returns usage and how much money current user will be charged for each project which he owns.
-     */
-    projectsUsageAndCharges(since: Date, before: Date): Promise<ProjectCharges>;
-
-    /**
      * projectUsagePriceModel returns the project usage price model for the user.
      */
-    projectUsagePriceModel(): Promise<ProjectUsagePriceModel>;
+    projectUsagePriceModel(): Promise<UsagePriceModel>;
 
     /**
-     * Add credit card
-     * @param token - stripe token used to add a credit card as a payment method
+     * productsUsageAndCharges returns usage and how much money current user will be charged for each project which he owns split by product.
+     */
+    productsUsageAndCharges(since: Date, before: Date): Promise<ProductCharges>;
+
+    /**
+     * getPlacementPriceModel returns the usage price model for the user and placement.
+     */
+    getPlacementPriceModel(params: PriceModelForPlacementRequest): Promise<UsagePriceModel>;
+
+    /**
+     * Add funds from a credit card.
+     * @param cardID - the ID of the credit card to charge
+     * @param amount - the amount of funds to add, in cents
+     * @param intent - the intent of the charge, either to add funds or upgrade account
+     * @param csrfProtectionToken - CSRF token
      * @throws Error
      */
-    addCreditCard(token: string): Promise<void>;
+    addFunds(cardID: string, amount: number, intent: ChargeCardIntent, csrfProtectionToken: string): Promise<AddFundsResponse>;
+
+    /**
+     * Creates a payment intent to add funds to the account.
+     * @param amount - the amount of funds to add, in cents
+     * @param withCustomCard - indicates if new intent should support a custom card
+     * @param csrfProtectionToken - CSRF token
+     * @throws Error
+     */
+    createIntent(amount: number, withCustomCard: boolean, csrfProtectionToken: string): Promise<string>;
+
+    /**
+     * Gets a setup intent secret to set up a card with stripe.
+     *
+     * @return string - the client secret for the stripe setup intent.
+     * @throws Error
+     */
+    getCardSetupSecret(): Promise<string>;
+
+    /**
+     * Update credit card
+     * @param params - the parameters to update the card with.
+     * @param csrfProtectionToken - CSRF token
+     * @throws Error
+     */
+    updateCreditCard(params: UpdateCardParams, csrfProtectionToken: string): Promise<void>;
 
     /**
      * Add payment method.
-     * @param pmID - stripe payment method id of the credit card
+     * @param request - add card request
+     * @param csrfProtectionToken - CSRF token
      * @throws Error
      */
-    addCardByPaymentMethodID(pmID: string): Promise<void>;
+    addCardByPaymentMethodID(request: AddCardRequest, csrfProtectionToken: string): Promise<void>;
 
     /**
      * Attempt to pay overdue invoices.
      */
-    attemptPayments(): Promise<void>;
+    attemptPayments(csrfProtectionToken: string): Promise<void>;
 
     /**
      * Detach credit card from payment account.
      * @param cardId
+     * @param csrfProtectionToken
      * @throws Error
      */
-    removeCreditCard(cardId: string): Promise<void>;
+    removeCreditCard(cardId: string, csrfProtectionToken: string): Promise<void>;
 
     /**
      * Get list of user`s credit cards
@@ -80,9 +115,10 @@ export interface PaymentsApi {
     /**
      * Make credit card default
      * @param cardId
+     * @param csrfProtectionToken
      * @throws Error
      */
-    makeCreditCardDefault(cardId: string): Promise<void>;
+    makeCreditCardDefault(cardId: string, csrfProtectionToken: string): Promise<void>;
 
     /**
      * Returns a list of invoices, transactions and all others payments history items for payment account.
@@ -91,6 +127,14 @@ export interface PaymentsApi {
      * @throws Error
      */
     paymentsHistory(param: PaymentHistoryParam): Promise<PaymentHistoryPage>;
+
+    /**
+     * Returns a single failed invoice.
+     *
+     * @returns the failed invoice
+     * @throws Error
+     */
+    getFailedInvoice(): Promise<PaymentsHistoryItem | null>;
 
     /**
      * Returns a list of invoices, transactions and all others payments history items for payment account.
@@ -112,9 +156,10 @@ export interface PaymentsApi {
      * applyCouponCode applies a coupon code.
      *
      * @param couponCode
+     * @param csrfProtectionToken
      * @throws Error
      */
-    applyCouponCode(couponCode: string): Promise<Coupon>;
+    applyCouponCode(couponCode: string, csrfProtectionToken: string): Promise<Coupon>;
 
     /**
      * getCoupon returns the coupon applied to the user.
@@ -137,7 +182,7 @@ export interface PaymentsApi {
      * @returns wallet
      * @throws Error
      */
-    claimWallet(): Promise<Wallet>;
+    claimWallet(csrfProtectionToken: string): Promise<Wallet>;
 
     /**
      * get user's billing information.
@@ -150,17 +195,19 @@ export interface PaymentsApi {
      * add user's default invoice reference.
      *
      * @param reference - invoice reference to be shown on invoices
+     * @param csrfProtectionToken - CSRF token
      * @throws Error
      */
-    addInvoiceReference(reference: string): Promise<BillingInformation>;
+    addInvoiceReference(reference: string, csrfProtectionToken: string): Promise<BillingInformation>;
 
     /**
      * save user's billing information.
      *
      * @param address - billing information to save
+     * @param csrfProtectionToken - CSRF token
      * @throws Error
      */
-    saveBillingAddress(address: BillingAddress): Promise<BillingInformation>;
+    saveBillingAddress(address: BillingAddress, csrfProtectionToken: string): Promise<BillingInformation>;
 
     /**
      * get a list of countries whose taxes are supported.
@@ -179,27 +226,31 @@ export interface PaymentsApi {
     /**
      * add a tax ID to a user's account.
      *
-     * @param taxID - the tax ID to save
+     * @param type - tax type
+     * @param value - tax value
+     * @param csrfProtectionToken - CSRF token
      * @throws Error
      */
-    addTaxID(taxID: TaxID): Promise<BillingInformation>;
+    addTaxID(type: string, value: string, csrfProtectionToken: string): Promise<BillingInformation>;
 
     /**
      * remove a tax ID from a user's account.
      *
      * @param taxID - the tax ID to remove
+     * @param csrfProtectionToken - CSRF token
      * @throws Error
      */
-    removeTaxID(taxID: string): Promise<BillingInformation>;
+    removeTaxID(taxID: string, csrfProtectionToken: string): Promise<BillingInformation>;
 
     /**
-     * Purchases the pricing package associated with the user's partner.
+     * Purchases makes a purchase using a credit card action.
+     * Used for pricing packages and upgrade account.
      *
-     * @param dataStr - the Stripe payment method id or token of the credit card
-     * @param isPMID - whether the dataStr is a payment method id or token
+     * @param request - purchase request
+     * @param csrfProtectionToken - CSRF token
      * @throws Error
      */
-    purchasePricingPackage(dataStr: string, isPMID: boolean): Promise<void>;
+    purchase(request: PurchaseRequest, csrfProtectionToken: string): Promise<void>;
 
     /**
      * Returns whether there is a pricing package configured for the user's partner.
@@ -207,6 +258,12 @@ export interface PaymentsApi {
      * @throws Error
      */
     pricingPackageAvailable(): Promise<boolean>;
+
+    /**
+     * startFreeTrial starts a free trial for the user.
+     * @param csrfProtectionToken
+     */
+    startFreeTrial(csrfProtectionToken: string): Promise<void>;
 }
 
 export class AccountBalance {
@@ -230,24 +287,13 @@ export class AccountBalance {
         return parseFloat(this._credits);
     }
 
-    public get formattedCredits(): string {
-        return formatPrice(decimalShift(this._credits, 2));
-    }
-
-    public get formattedCoins(): string {
-        return formatPrice(this._coins);
-    }
-
     // Returns sum of storjscan and legacy (stripe) balances in cents.
     public get sum(): number {
         return this.credits + (this.coins * 100);
     }
 
     public get formattedSum(): string {
-        return formatPrice((this.sum / 100).toString());
-    }
-    public hasCredits(): boolean {
-        return parseFloat(this._credits) !== 0;
+        return formatPrice((this.sum / 100).toLocaleString(undefined, { maximumFractionDigits: 2 }));
     }
 }
 
@@ -304,44 +350,18 @@ export class PaymentsHistoryItem {
         public readonly end: Date = new Date(),
         public readonly type: PaymentsHistoryItemType = PaymentsHistoryItemType.Invoice,
         public readonly remaining: number = 0,
+        public readonly payLink: string = '',
+        public readonly failed: boolean = false,
     ) { }
-
-    public get quantity(): Amount {
-        if (this.type === PaymentsHistoryItemType.Transaction) {
-            return new Amount('USD $', this.amountDollars(this.amount), this.amountDollars(this.received));
-        }
-
-        return new Amount('USD $', this.amountDollars(this.amount));
-    }
 
     public get formattedStatus(): string {
         return this.status.charAt(0).toUpperCase() + this.status.substring(1);
     }
 
-    public get formattedStart(): string {
-        return Time.formattedDate(this.start);
-    }
+    public get period(): string {
+        const options: Intl.DateTimeFormatOptions = { day: 'numeric', month: 'short', year: 'numeric', timeZone: 'UTC' };
 
-    public get hasExpiration(): boolean {
-        // Go's zero date is passed in if the coupon does not expire
-        // Go's zero date is 0001-01-01 00:00:00 +0000 UTC
-        // Javascript's zero date is 1970-01-01 00:00:00 +0000 UTC
-        return this.end.valueOf() > 0;
-    }
-
-    /**
-     * RemainingAmountPercentage will return remaining amount of item in percentage.
-     */
-    public remainingAmountPercentage(): number {
-        if (this.amount === 0) {
-            return 0;
-        }
-
-        return this.remaining / this.amount * 100;
-    }
-
-    public amountDollars(amount): number {
-        return amount / 100;
+        return Time.formattedDate(this.start, options) + ' - ' + Time.formattedDate(this.end, options);
     }
 
     public get label(): string {
@@ -351,13 +371,6 @@ export class PaymentsHistoryItem {
         default:
             return 'Invoice PDF';
         }
-    }
-
-    /**
-     * isTransactionOrDeposit indicates if payments history item type is transaction or deposit bonus.
-     */
-    public isTransactionOrDeposit(): boolean {
-        return this.type === PaymentsHistoryItemType.Transaction || this.type === PaymentsHistoryItemType.DepositBonus;
     }
 }
 
@@ -407,26 +420,27 @@ export enum PaymentsHistoryItemStatus {
     Empty = '',
 }
 
-/**
- * TokenDeposit holds public information about token deposit.
- */
-export class TokenDeposit {
-    constructor(
-        public amount: number,
-        public address: string,
-        public link: string,
-    ) { }
+export enum ChargeCardIntent {
+    AddFunds = 1,
 }
 
-/**
- * Amount holds information for displaying billing item payment.
- */
-class Amount {
-    public constructor(
-        public currency: string = '',
-        public total: number = 0,
-        public received: number = 0,
-    ) { }
+export interface AddCardRequest {
+    token: string;
+    tax?: PurchaseTax;
+}
+
+export enum PurchaseIntent {
+    PackagePlan = 1,
+    UpgradeAccount = 2,
+}
+
+export interface PurchaseRequest extends AddCardRequest {
+    intent: PurchaseIntent;
+}
+
+export interface PurchaseTax {
+    type: string;
+    value: string;
 }
 
 /**
@@ -444,83 +458,102 @@ export class ProjectCharge {
         // egress shows how many cents we should pay for Egress.
         public egressPrice: number = 0,
         // segmentCount shows how many cents we should pay for segments count.
-        public segmentPrice: number = 0) { }
+        public segmentPrice: number = 0,
+        public includedEgress: number = 0,
+        public remainderStorage: number = 0,
+        public smallObjectFeePrice: number = 0,
+        public retentionRemainder: number = 0,
+        public minimumRetentionFeePrice: number = 0,
+    ) { }
 
     /**
      * summary returns total price for a project in cents.
      */
-    public summary(): number {
-        return this.storagePrice + this.egressPrice + this.segmentPrice;
+    public get summary(): number {
+        return this.storagePrice + this.egressPrice + this.segmentPrice + this.smallObjectFeePrice;
     }
 }
 
 /**
- * The JSON representation of ProjectCharges returned from the API.
+ * ProductCharge shows usage and how much money current project will charge in the end of the month split by product.
  */
-type ProjectChargesJSON = {
-    priceModels: {
-        [partner: string]: JSONRepresentable<ProjectUsagePriceModel>
+export class ProductCharge extends ProjectCharge {
+    constructor(
+        public productID: string = '',
+        public productName: string = '',
+        public priceModel: UsagePriceModel = new UsagePriceModel(),
+        since: Date = new Date(),
+        before: Date = new Date(),
+        egress: number = 0,
+        storage: number = 0,
+        segmentCount: number = 0,
+        storagePrice: number = 0,
+        egressPrice: number = 0,
+        segmentPrice: number = 0,
+        includedEgress: number = 0,
+        remainderStorage: number = 0,
+        smallObjectFeePrice: number = 0,
+        retentionRemainder: number,
+        minimumRetentionFeePrice: number,
+    ) {
+        super(since, before, egress, storage, segmentCount, storagePrice, egressPrice, segmentPrice, includedEgress, remainderStorage, smallObjectFeePrice, retentionRemainder, minimumRetentionFeePrice);
     }
+}
+
+/**
+ * The JSON representation of ProductCharges returned from the API.
+ */
+type ProductChargesJSON = {
     charges: {
         [projectID: string]: {
-            [partner: string]: JSONRepresentable<ProjectCharge> & {
+            [productID: number]: JSONRepresentable<ProductCharge> & {
                 since: string;
                 before: string;
+                egressMBCents: string;
+                storageMBMonthCents: string;
+                segmentMonthCents: string;
+                smallObjectFeeCents: string;
+                minimumRetentionFeeCents: string;
+                egressOverageMode: boolean;
+                egressDiscountRatio: number;
+                storageRemainderBytes: number;
+                minimumRetentionDuration: number;
             };
         };
     }
+    applyMinimumCharge: boolean;
 };
 
 /**
- * Represents a collection of project usage charges grouped by project ID and partner name
- * in addition to project usage price models for each partner.
+ * Represents a collection of project usage charges grouped by project ID and product ID.
  */
-export class ProjectCharges {
-    private map = new Map<string, Map<string, ProjectCharge>>();
-    private priceModels = new Map<string, ProjectUsagePriceModel>();
+export class ProductCharges {
+    private map = new Map<string, Map<number, ProductCharge>>();
+    public applyMinimumCharge = false;
 
     /**
-     * Set the usage charge for a project and partner.
+     * Set the usage charge for a project and product.
      *
      * @param projectID - The ID of the project.
-     * @param partner - The name of the partner.
-     * @param charge - The usage and charges for the project and partner.
+     * @param productID - The ID of the product.
+     * @param charge - The usage and charges for the project and product.
      */
-    public set(projectID: string, partner: string, charge: ProjectCharge): void {
-        const map = this.map.get(projectID) || new Map<string, ProjectCharge>();
-        map.set(partner, charge);
+    public set(projectID: string, productID: number, charge: ProductCharge): void {
+        const map = this.map.get(projectID) || new Map<number, ProductCharge>();
+        map.set(productID, charge);
         this.map.set(projectID, map);
-    }
-
-    /**
-     * Set the project usage price model for a partner.
-     *
-     * @param partner - The name of the partner.
-     * @param model - The price model for the partner.
-     */
-    public setUsagePriceModel(partner: string, model: ProjectUsagePriceModel): void {
-        this.priceModels.set(partner, model);
     }
 
     /**
      * Returns the usage charge for a project and partner or undefined if it does not exist.
      *
      * @param projectID - The ID of the project.
-     * @param partner - The name of the partner.
+     * @param productID - The ID of the product.
      */
-    public get(projectID: string, partner: string): ProjectCharge | undefined {
+    public get(projectID: string, productID: number): ProductCharge | undefined {
         const map = this.map.get(projectID);
         if (!map) return undefined;
-        return map.get(partner);
-    }
-
-    /**
-     * Returns the project usage price model for a partner or undefined if it does not exist.
-     *
-     * @param partner - The name of the partner.
-     */
-    public getUsagePriceModel(partner: string): ProjectUsagePriceModel | undefined {
-        return this.priceModels.get(partner);
+        return map.get(productID);
     }
 
     /**
@@ -529,9 +562,33 @@ export class ProjectCharges {
     public getPrice(): number {
         let sum = 0;
         this.forEachCharge(charge => {
-            sum += charge.summary();
+            sum += charge.summary;
         });
         return sum;
+    }
+
+    /**
+     * Returns the project usage price model for a product or undefined if it does not exist.
+     *
+     * @param projectID - The ID of the project.
+     * @param productID - The ID of the product.
+     */
+    public getUsagePriceModel(projectID: string, productID: number): UsagePriceModel | undefined {
+        const map = this.map.get(projectID);
+        if (!map) return undefined;
+        return map.get(productID)?.priceModel;
+    }
+
+    /**
+     * Returns the product name or undefined if it does not exist.
+     *
+     * @param projectID - The ID of the project.
+     * @param productID - The ID of the product.
+     */
+    public getProductName(projectID: string, productID: number): string | undefined {
+        const map = this.map.get(projectID);
+        if (!map) return undefined;
+        return map.get(productID)?.productName;
     }
 
     /**
@@ -542,7 +599,7 @@ export class ProjectCharges {
     public getProjectPrice(projectID: string): number {
         let sum = 0;
         this.forEachProjectCharge(projectID, charge => {
-            sum += charge.summary();
+            sum += charge.summary;
         });
         return sum;
     }
@@ -557,14 +614,14 @@ export class ProjectCharges {
     }
 
     /**
-     * Iterate over each usage charge for all projects and partners.
+     * Iterate over each usage charge for all projects and products.
      *
      * @param callback - A function to be called for each usage charge.
      */
-    public forEachCharge(callback: (charge: ProjectCharge, partner: string, projectID: string) => void): void {
-        this.map.forEach((partnerCharges, projectID) => {
-            partnerCharges.forEach((charge, partner) => {
-                callback(charge, partner, projectID);
+    public forEachCharge(callback: (charge: ProductCharge, productID: number, projectID: string) => void): void {
+        this.map.forEach((productCharges, projectID) => {
+            productCharges.forEach((charge, productID) => {
+                callback(charge, productID, projectID);
             });
         });
     }
@@ -573,70 +630,105 @@ export class ProjectCharges {
      * Calls a provided function once for each usage charge associated with a given project.
      *
      * @param projectID The project ID for which to iterate over usage charges.
-     * @param callback The function to call for each usage charge, taking the charge object, partner name, and project ID as arguments.
+     * @param callback The function to call for each usage charge, taking the charge object, product ID, and project ID as arguments.
      */
-    public forEachProjectCharge(projectID: string, callback: (charge: ProjectCharge, partner: string) => void): void {
-        const partnerCharges = this.map.get(projectID);
-        if (!partnerCharges) return;
-        partnerCharges.forEach((charge, partner) => {
-            callback(charge, partner);
+    public forEachProjectCharge(projectID: string, callback: (charge: ProductCharge, productID: number) => void): void {
+        const productCharges = this.map.get(projectID);
+        if (!productCharges) return;
+        productCharges.forEach((charge, productID) => {
+            callback(charge, productID);
         });
     }
 
     /**
      * Returns the collection as an array of nested arrays, where each inner array represents a project and its
-     * associated partner charges. The inner arrays have the format [projectID, [partnerCharge1, partnerCharge2, ...]],
-     * where each partnerCharge is a [partnerName, charge] tuple.
+     * associated product charges. The inner arrays have the format [projectID, [productCharge1, productCharge2, ...]],
+     * where each productCharge is a [productID, charge] tuple.
      */
-    public toArray(): [projectID: string, partnerCharges: [partner: string, charge: ProjectCharge][]][] {
-        const result: [string, [string, ProjectCharge][]][] = [];
-        this.map.forEach((partnerCharges, projectID) => {
-            const partnerChargeArray: [string, ProjectCharge][] = [];
-            partnerCharges.forEach((charge, partner) => {
-                partnerChargeArray.push([partner, charge]);
+    public toArray(): [projectID: string, productCharges: [productID: number, charge: ProductCharge][]][] {
+        const result: [string, [number, ProductCharge][]][] = [];
+        this.map.forEach((productCharges, projectID) => {
+            const productChargeArray: [number, ProductCharge][] = [];
+            productCharges.forEach((charge, productID) => {
+                productChargeArray.push([productID, charge]);
             });
-            result.push([projectID, partnerChargeArray]);
+            result.push([projectID, productChargeArray]);
         });
         return result;
     }
 
     /**
-     * Returns an array of all of the project IDs in the collection.
-     */
-    public getProjectIDs(): string[] {
-        return Array.from(this.map.keys()).sort();
-    }
-
-    /**
-     * Returns a new ProjectPartnerCharges instance from a JSON representation.
+     * Returns a new ProjectProductCharges instance from a JSON representation.
      *
-     * @param json - The JSON representation of the ProjectPartnerCharges.
+     * @param json - The JSON representation of the ProjectProductCharges.
      */
-    public static fromJSON(json: ProjectChargesJSON): ProjectCharges {
-        const charges = new ProjectCharges();
+    public static fromJSON(json: ProductChargesJSON): ProductCharges {
+        const charges = new ProductCharges();
+        charges.applyMinimumCharge = json.applyMinimumCharge;
 
-        Object.entries(json.priceModels).forEach(([partner, model]) => {
-            charges.setUsagePriceModel(partner, new ProjectUsagePriceModel(
-                model.storageMBMonthCents,
-                model.egressMBCents,
-                model.segmentMonthCents,
-            ));
-        });
+        for (const [projectID, productMap] of Object.entries(json.charges)) {
+            for (const [productIDKey, chargeJSON] of Object.entries(productMap)) {
+                const productIDNum = Number(productIDKey);
 
-        Object.entries(json.charges).forEach(([projectID, partnerCharges]) => {
-            Object.entries(partnerCharges).forEach(([partner, charge]) => {
-                charges.set(projectID, partner, new ProjectCharge(
-                    new Date(charge.since),
-                    new Date(charge.before),
-                    charge.egress,
-                    charge.storage,
-                    charge.segmentCount,
-                    charge.storagePrice,
-                    charge.egressPrice,
-                    charge.segmentPrice,
-                ));
-            });
-        });
+                const {
+                    productID: pidStr,
+                    productName,
+                    storageMBMonthCents,
+                    egressMBCents,
+                    segmentMonthCents,
+                    since: sinceStr,
+                    before: beforeStr,
+                    egress,
+                    storage,
+                    segmentCount,
+                    storagePrice,
+                    egressPrice,
+                    segmentPrice,
+                    egressOverageMode,
+                    includedEgress,
+                    smallObjectFeeCents,
+                    minimumRetentionFeeCents,
+                    egressDiscountRatio,
+                    remainderStorage,
+                    smallObjectFeePrice,
+                    storageRemainderBytes,
+                    retentionRemainder,
+                    minimumRetentionFeePrice,
+                    minimumRetentionDuration,
+                } = chargeJSON;
+
+                const pc = new ProductCharge(
+                    pidStr,
+                    productName,
+                    new UsagePriceModel(
+                        storageMBMonthCents,
+                        egressMBCents,
+                        segmentMonthCents,
+                        smallObjectFeeCents,
+                        minimumRetentionFeeCents,
+                        egressOverageMode,
+                        egressDiscountRatio,
+                        storageRemainderBytes,
+                        minimumRetentionDuration,
+                    ),
+                    new Date(sinceStr),
+                    new Date(beforeStr),
+                    egress,
+                    storage,
+                    segmentCount,
+                    storagePrice,
+                    egressPrice,
+                    segmentPrice,
+                    includedEgress,
+                    remainderStorage,
+                    smallObjectFeePrice,
+                    retentionRemainder,
+                    minimumRetentionFeePrice,
+                );
+
+                charges.set(projectID, productIDNum, pc);
+            }
+        }
 
         return charges;
     }
@@ -689,7 +781,7 @@ export enum CouponDuration {
     /**
      * Indicates that a coupon is applied every billing period forever.
      */
-    Forever = 'forever'
+    Forever = 'forever',
 }
 
 /**
@@ -719,13 +811,6 @@ export class NativePaymentHistoryItem {
 
     public get formattedStatus(): string {
         return this.status.charAt(0).toUpperCase() + this.status.substring(1);
-    }
-
-    public get formattedType(): string {
-        if (this.type.includes('bonus')) {
-            return 'Bonus';
-        }
-        return 'Deposit';
     }
 
     public get formattedAmount(): string {
@@ -768,19 +853,31 @@ export class TokenAmount {
     }
 
     public get formattedValue(): string {
-        return formatPrice(this._value);
+        return formatPrice(this.value.toLocaleString(undefined, { maximumFractionDigits: 2 }));
     }
 }
 
 /**
  * ProjectUsagePriceModel represents price model for project usage.
  */
-export class ProjectUsagePriceModel {
+export class UsagePriceModel {
     public constructor(
         public readonly storageMBMonthCents: string = '',
         public readonly egressMBCents: string = '',
         public readonly segmentMonthCents: string = '',
+        public readonly smallObjectFeeCents: string = '',
+        public readonly minimumRetentionFeeCents: string = '',
+        public readonly egressOverageMode: boolean = false,
+        public readonly egressDiscountRatio: number = 0,
+        public readonly storageRemainderBytes: number = 0,
+        public readonly minimumRetentionDuration: number = 0,
     ) { }
+}
+
+export interface AddFundsResponse {
+    success: boolean,
+    clientSecret: string,
+    paymentIntentID: string,
 }
 
 export interface TaxCountry {
@@ -815,4 +912,16 @@ export interface BillingInformation {
     address?: BillingAddress,
     taxIDs?: TaxID[],
     invoiceReference: string,
+}
+
+export interface UpdateCardParams {
+    cardID:  string
+    expMonth: number
+    expYear: number
+}
+
+export interface PriceModelForPlacementRequest {
+    placementName?: string;
+    placement?: number;
+    projectID: string;
 }

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/http"
 	"os"
 	"runtime/pprof"
 	"strings"
@@ -36,27 +37,39 @@ import (
 	"storj.io/storj/satellite/buckets"
 	"storj.io/storj/satellite/console"
 	"storj.io/storj/satellite/console/consoleauth"
+	"storj.io/storj/satellite/console/consoleauth/csrf"
 	"storj.io/storj/satellite/console/consoleauth/sso"
+	"storj.io/storj/satellite/console/consoleservice"
 	"storj.io/storj/satellite/console/consoleweb"
+	"storj.io/storj/satellite/console/restapikeys"
 	"storj.io/storj/satellite/console/restkeys"
 	"storj.io/storj/satellite/console/userinfo"
+	"storj.io/storj/satellite/console/valdi"
+	"storj.io/storj/satellite/console/valdi/valdiclient"
 	"storj.io/storj/satellite/contact"
 	"storj.io/storj/satellite/emission"
+	"storj.io/storj/satellite/entitlements"
+	"storj.io/storj/satellite/eventing"
 	"storj.io/storj/satellite/gracefulexit"
 	"storj.io/storj/satellite/kms"
 	"storj.io/storj/satellite/mailservice"
+	"storj.io/storj/satellite/mailservice/hubspotmails"
 	"storj.io/storj/satellite/metabase"
 	"storj.io/storj/satellite/metainfo"
 	"storj.io/storj/satellite/nodeselection"
+	"storj.io/storj/satellite/nodeselection/tracker"
 	"storj.io/storj/satellite/nodestats"
 	"storj.io/storj/satellite/oidc"
 	"storj.io/storj/satellite/orders"
 	"storj.io/storj/satellite/overlay"
 	"storj.io/storj/satellite/payments"
+	"storj.io/storj/satellite/payments/paymentsconfig"
 	"storj.io/storj/satellite/payments/storjscan"
 	"storj.io/storj/satellite/payments/stripe"
 	"storj.io/storj/satellite/reputation"
 	"storj.io/storj/satellite/snopayouts"
+	"storj.io/storj/satellite/trust"
+	"storj.io/storj/satellite/webhook"
 	"storj.io/storj/shared/nodetag"
 )
 
@@ -91,8 +104,10 @@ type API struct {
 	}
 
 	Overlay struct {
-		DB      overlay.DB
-		Service *overlay.Service
+		DB                     overlay.DB
+		Service                *overlay.Service
+		UploadSelectionCache   *overlay.UploadSelectionCache
+		DownloadSelectionCache *overlay.DownloadSelectionCache
 	}
 
 	Reputation struct {
@@ -124,7 +139,8 @@ type API struct {
 	}
 
 	Mail struct {
-		Service *mailservice.Service
+		Service        *mailservice.Service
+		HubspotService *hubspotmails.Service
 	}
 
 	Payments struct {
@@ -138,15 +154,23 @@ type API struct {
 		StripeClient  stripe.Client
 	}
 
-	REST struct {
-		Keys *restkeys.Service
+	Console struct {
+		Listener       net.Listener
+		Service        *console.Service
+		ConsoleService *consoleservice.Service // this is a duplicate of Service, but should replace it in the future.
+		RestKeys       restapikeys.Service
+		Endpoint       *consoleweb.Server
+		AuthTokens     *consoleauth.Service
+		Webhook        *webhook.Service
 	}
 
-	Console struct {
-		Listener   net.Listener
-		Service    *console.Service
-		Endpoint   *consoleweb.Server
-		AuthTokens *consoleauth.Service
+	Entitlements struct {
+		Service *entitlements.Service
+	}
+
+	Valdi struct {
+		Service *valdi.Service
+		Client  *valdiclient.Client
 	}
 
 	NodeStats struct {
@@ -187,11 +211,17 @@ type API struct {
 		Service *sso.Service
 	}
 
+	CSRF struct {
+		Service *csrf.Service
+	}
+
 	HealthCheck struct {
 		Server *healthcheck.Server
 	}
 
-	SuccessTrackers *metainfo.SuccessTrackers
+	Trackers       *metainfo.Trackers
+	TrustedUplinks *trust.TrustedPeersList
+	TrackerMonitor *metainfo.SuccessTrackerMonitor
 }
 
 // NewAPI creates a new satellite API process.
@@ -210,8 +240,122 @@ func NewAPI(log *zap.Logger, full *identity.FullIdentity, db DB,
 	}
 
 	{ // setup buckets service
-		peer.Buckets.Service = buckets.NewService(db.Buckets(), metabaseDB)
+		peer.Buckets.Service = buckets.NewService(db.Buckets(), metabaseDB, db.Attribution())
 	}
+
+	var trackerInfo *metainfo.TrackerInfo
+	var successTrackerUplinks []storj.NodeID
+	{
+		successTrackerTrustedUplinks, err := parseNodeIDs(config.Metainfo.SuccessTrackerTrustedUplinks)
+		if err != nil {
+			log.Warn("Wrong uplink ID for the trusted list of the success trackers", zap.Error(err))
+			return nil, err
+		}
+
+		successTrackerUplinks, err = parseNodeIDs(config.Metainfo.SuccessTrackerUplinks)
+		if err != nil {
+			log.Warn("Wrong uplink ID for the list of the success trackers", zap.Error(err))
+			return nil, err
+		}
+
+		trustedUplinkSlice, err := parseNodeIDs(config.Metainfo.TrustedUplinks)
+		if err != nil {
+			log.Warn("Wrong uplink ID for the list of the trusted uplinks", zap.Error(err))
+			return nil, err
+		}
+
+		trustedUplinkSlice = append(trustedUplinkSlice, successTrackerTrustedUplinks...)
+		successTrackerUplinks = append(successTrackerUplinks, successTrackerTrustedUplinks...)
+
+		peer.TrackerMonitor, err = metainfo.NewSuccessTrackerMonitor(log, db.OverlayCache(), config.Metainfo)
+		if err != nil {
+			return nil, err
+		}
+		newTracker, ok := metainfo.GetNewSuccessTracker(config.Metainfo.SuccessTrackerKind)
+		if !ok {
+			return nil, errs.New("Unknown success tracker kind %q", config.Metainfo.SuccessTrackerKind)
+		}
+		monkit.ScopeNamed(mon.Name() + ".success_trackers").Chain(newTracker())
+
+		failureTracker := metainfo.NewStochasticPercentSuccessTracker(float32(config.Metainfo.FailureTrackerChanceToSkip))
+		monkit.ScopeNamed(mon.Name() + ".failure_tracker").Chain(failureTracker)
+
+		retryTracker := metainfo.NewPercentSuccessTracker()
+		monkit.ScopeNamed(mon.Name() + ".retry_tracker").Chain(retryTracker)
+
+		peer.TrustedUplinks = trust.NewTrustedPeerList(trustedUplinkSlice)
+
+		peer.Trackers = metainfo.NewTrackers(config.Metainfo, successTrackerUplinks, func(uplink storj.NodeID) metainfo.SuccessTracker {
+			return newTracker()
+		}, failureTracker, retryTracker, peer.TrustedUplinks)
+		peer.TrackerMonitor.Register(peer.Trackers)
+
+		peer.Services.Add(lifecycle.Item{
+			Name: "tracker_monitor",
+			Run:  peer.TrackerMonitor.Run,
+		})
+
+	}
+
+	var prometheusTracker *tracker.PrometheusTracker
+	environment := nodeselection.NewPlacementConfigEnvironment(peer.Trackers, peer.Trackers.GetFailureTracker())
+	environment.AddPrometheusTracker(func() nodeselection.ScoreNode {
+		return prometheusTracker
+	})
+
+	placements, err := config.Placement.Parse(config.Overlay.Node.CreateDefaultPlacement, environment)
+	if err != nil {
+		return nil, err
+	}
+
+	{ // setup overlay
+		peer.Overlay.DB = peer.DB.OverlayCache()
+
+		peer.Overlay.UploadSelectionCache, err = overlay.NewUploadSelectionCacheFromConfig(peer.Log.Named("overlay"), peer.Overlay.DB, config.Overlay, placements)
+		if err != nil {
+			return nil, errs.Combine(err, peer.Close())
+		}
+		peer.Overlay.DownloadSelectionCache, err = overlay.NewDownloadSelectionCacheFromConfig(peer.Log.Named("overlay"), peer.Overlay.DB, config.Overlay, placements)
+		if err != nil {
+			return nil, errs.Combine(err, peer.Close())
+		}
+		peer.Overlay.Service, err = overlay.NewService(peer.Log.Named("overlay"), peer.Overlay.DB, peer.DB.NodeEvents(), peer.Overlay.UploadSelectionCache, peer.Overlay.DownloadSelectionCache, placements, config.Console.ExternalAddress, config.Console.SatelliteName, config.Overlay, config.NodeEvents)
+		if err != nil {
+			return nil, errs.Combine(err, peer.Close())
+		}
+		peer.Services.Add(lifecycle.Item{
+			Name:  "overlay",
+			Close: peer.Overlay.Service.Close,
+		})
+		peer.Services.Add(lifecycle.Item{
+			Name: "upload-selection-cache",
+			Run:  peer.Overlay.UploadSelectionCache.Run,
+		})
+		peer.Services.Add(lifecycle.Item{
+			Name: "download-selection-cache",
+			Run:  peer.Overlay.DownloadSelectionCache.Run,
+		})
+	}
+
+	trackerInfo = metainfo.NewTrackerInfo(peer.Trackers, successTrackerUplinks, peer.Overlay.DB)
+
+	nodeSelectionStats := metainfo.NewNodeSelectionStats()
+
+	if config.PrometheusTracker.URL != "" {
+		var err error
+		prometheusTracker, err = tracker.NewPrometheusTracker(log.Named("prometheus-tracker"), peer.Overlay.DB, config.PrometheusTracker)
+		if err != nil {
+			return nil, errs.Combine(err, peer.Close())
+		}
+		peer.Services.Add(lifecycle.Item{
+			Name: "prometheus-tracker",
+			Run:  prometheusTracker.Run,
+		})
+		environment.AddPrometheusTracker(prometheusTracker)
+		trackerInfo = trackerInfo.WithPrometheusTracker(prometheusTracker)
+	}
+
+	migrationModeFlag := metainfo.NewMigrationModeFlagExtension(config.Metainfo)
 
 	{ // setup debug
 		var err error
@@ -224,7 +368,9 @@ func NewAPI(log *zap.Logger, full *identity.FullIdentity, db DB,
 		}
 		debugConfig := config.Debug
 		debugConfig.ControlTitle = "API"
-		peer.Debug.Server = debug.NewServerWithAtomicLevel(log.Named("debug"), peer.Debug.Listener, monkit.Default, debugConfig, atomicLogLevel)
+
+		peer.Debug.Server = debug.NewServerWithAtomicLevel(log.Named("debug"), peer.Debug.Listener, monkit.Default,
+			debugConfig, atomicLogLevel, migrationModeFlag, trackerInfo, nodeSelectionStats)
 		peer.Servers.Add(lifecycle.Item{
 			Name:  "debug",
 			Run:   peer.Debug.Server.Run,
@@ -232,14 +378,12 @@ func NewAPI(log *zap.Logger, full *identity.FullIdentity, db DB,
 		})
 	}
 
-	var err error
-
 	{
 		peer.Log.Info("Version info",
-			zap.Stringer("Version", versionInfo.Version.Version),
-			zap.String("Commit Hash", versionInfo.CommitHash),
-			zap.Stringer("Build Timestamp", versionInfo.Timestamp),
-			zap.Bool("Release Build", versionInfo.Release),
+			zap.String("version", versionInfo.Version.VString()),
+			zap.String("commit_hash", versionInfo.CommitHash),
+			zap.Stringer("build_timestamp", versionInfo.Timestamp),
+			zap.Bool("release_build", versionInfo.Release),
 		)
 
 		peer.Version.Service = checker.NewService(log.Named("version"), config.Version, versionInfo, "Satellite")
@@ -276,47 +420,11 @@ func NewAPI(log *zap.Logger, full *identity.FullIdentity, db DB,
 			Run: func(ctx context.Context) error {
 				// Don't change the format of this comment, it is used to figure out the node id.
 				peer.Log.Info(fmt.Sprintf("Node %s started", peer.Identity.ID))
-				peer.Log.Info(fmt.Sprintf("Public server started on %s", peer.Addr()))
-				peer.Log.Info(fmt.Sprintf("Private server started on %s", peer.PrivateAddr()))
+				peer.Log.Info("Public server started on " + peer.Addr())
+				peer.Log.Info("Private server started on " + peer.PrivateAddr())
 				return peer.Server.Run(ctx)
 			},
 			Close: peer.Server.Close,
-		})
-	}
-
-	{
-		var trustedUplinks []storj.NodeID
-		for _, uplinkIDString := range config.Metainfo.SuccessTrackerTrustedUplinks {
-			uplinkID, err := storj.NodeIDFromString(uplinkIDString)
-			if err != nil {
-				log.Warn("Wrong uplink ID for the trusted list of the success trackers", zap.String("uplink", uplinkIDString), zap.Error(err))
-			}
-			trustedUplinks = append(trustedUplinks, uplinkID)
-		}
-		newTracker, ok := metainfo.GetNewSuccessTracker(config.Metainfo.SuccessTrackerKind)
-		if !ok {
-			return nil, errs.New("Unknown success tracker kind %q", config.Metainfo.SuccessTrackerKind)
-		}
-		peer.SuccessTrackers = metainfo.NewSuccessTrackers(trustedUplinks, newTracker)
-		mon.Chain(peer.SuccessTrackers)
-	}
-
-	placements, err := config.Placement.Parse(config.Overlay.Node.CreateDefaultPlacement, nodeselection.NewPlacementConfigEnvironment(peer.SuccessTrackers))
-	if err != nil {
-		return nil, err
-	}
-
-	{ // setup overlay
-		peer.Overlay.DB = peer.DB.OverlayCache()
-
-		peer.Overlay.Service, err = overlay.NewService(peer.Log.Named("overlay"), peer.Overlay.DB, peer.DB.NodeEvents(), placements, config.Console.ExternalAddress, config.Console.SatelliteName, config.Overlay)
-		if err != nil {
-			return nil, errs.Combine(err, peer.Close())
-		}
-		peer.Services.Add(lifecycle.Item{
-			Name:  "overlay",
-			Run:   peer.Overlay.Service.Run,
-			Close: peer.Overlay.Service.Close,
 		})
 	}
 
@@ -373,11 +481,6 @@ func NewAPI(log *zap.Logger, full *identity.FullIdentity, db DB,
 		)
 	}
 
-	placement, err := config.Placement.Parse(config.Overlay.Node.CreateDefaultPlacement, nodeselection.NewPlacementConfigEnvironment(peer.SuccessTrackers))
-	if err != nil {
-		return nil, err
-	}
-
 	{ // setup orders
 		peer.Orders.DB = rollupsWriteCache
 		peer.Orders.Chore = orders.NewChore(log.Named("orders:chore"), rollupsWriteCache, config.Orders)
@@ -394,7 +497,7 @@ func NewAPI(log *zap.Logger, full *identity.FullIdentity, db DB,
 			signing.SignerFromFullIdentity(peer.Identity),
 			peer.Overlay.Service,
 			peer.Orders.DB,
-			placement.CreateFilters,
+			placements.CreateFilters,
 			config.Orders,
 		)
 		if err != nil {
@@ -407,8 +510,10 @@ func NewAPI(log *zap.Logger, full *identity.FullIdentity, db DB,
 			satelliteSignee,
 			peer.Orders.DB,
 			peer.DB.NodeAPIVersion(),
-			config.Orders.OrdersSemaphoreSize,
 			peer.Orders.Service,
+			config.Orders,
+			peer.Overlay.Service,
+			peer.DB.Console().Projects(),
 		)
 
 		if err := pb.DRPCRegisterOrders(peer.Server.DRPC(), peer.Orders.Endpoint); err != nil {
@@ -416,27 +521,84 @@ func NewAPI(log *zap.Logger, full *identity.FullIdentity, db DB,
 		}
 	}
 
+	{ // setup entitlements
+		peer.Entitlements.Service = entitlements.NewService(
+			peer.Log.Named("entitlements:service"),
+			db.Console().Entitlements(),
+		)
+	}
+
 	{ // setup metainfo
 		peer.Metainfo.Metabase = metabaseDB
+
+		// Initialize bucket notification cache
+		bucketEventingCache, err := eventing.NewConfigCache(
+			peer.DB.Buckets(),
+			config.BucketEventing,
+		)
+		if err != nil {
+			return nil, errs.New("failed to initialize bucket notification cache: %w", err)
+		}
+
+		// Build remainder charge recorder if feature is enabled.
+		var remainderChargeRecorder *accounting.RemainderChargeRecorder
+		if config.Metainfo.CreateRemainderChargeOnObjectDelete {
+			placementOverrideMap := config.Payments.PlacementPriceOverrides.ToMap()
+
+			productPrices, err := config.Payments.Products.ToModels()
+			if err != nil {
+				return nil, errs.Combine(err, peer.Close())
+			}
+
+			remainderProductPrices := make(map[int32]accounting.RemainderProductInfo, len(productPrices))
+			for id, price := range productPrices {
+				remainderProductPrices[id] = accounting.RemainderProductInfo{
+					ProductID:                price.ProductID,
+					MinimumRetentionDuration: price.MinimumRetentionDuration,
+				}
+			}
+
+			remainderChargeRecorder = accounting.NewRemainderChargeRecorder(
+				peer.Log.Named("remainder-charge-recorder"),
+				peer.DB.RetentionRemainderCharges(),
+				accounting.PricingConfig{
+					ProductPrices:       remainderProductPrices,
+					PlacementProductMap: placementOverrideMap,
+				},
+				peer.Entitlements.Service,
+				config.Accounting.RetentionRemainderRecorder,
+			)
+		}
 
 		peer.Metainfo.Endpoint, err = metainfo.NewEndpoint(
 			peer.Log.Named("metainfo:endpoint"),
 			peer.Buckets.Service,
 			peer.Metainfo.Metabase,
+			remainderChargeRecorder,
 			peer.Orders.Service,
 			peer.Overlay.Service,
 			peer.DB.Attribution(),
 			peer.DB.PeerIdentities(),
 			peer.DB.Console().APIKeys(),
+			peer.DB.Console().APIKeyTails(),
 			peer.Accounting.ProjectUsage,
 			peer.DB.Console().Projects(),
 			peer.DB.Console().ProjectMembers(),
 			peer.DB.Console().Users(),
 			signing.SignerFromFullIdentity(peer.Identity),
 			peer.DB.Revocation(),
-			peer.SuccessTrackers,
+			peer.Trackers,
+			peer.TrustedUplinks,
 			config.Metainfo,
-			placement,
+			migrationModeFlag,
+			placements,
+			config.Console,
+			config.Orders,
+			nodeSelectionStats,
+			bucketEventingCache,
+			peer.Entitlements.Service,
+			config.Entitlements,
+			peer.DB.ProjectLimitEvents(),
 		)
 		if err != nil {
 			return nil, errs.Combine(err, peer.Close())
@@ -461,6 +623,7 @@ func NewAPI(log *zap.Logger, full *identity.FullIdentity, db DB,
 				peer.DB.Console().APIKeys(),
 				peer.DB.Console().Projects(),
 				config.Userinfo,
+				userinfo.ConsoleConfig{BillingFeaturesEnabled: config.Console.BillingFeaturesEnabled},
 			)
 			if err != nil {
 				return nil, errs.Combine(err, peer.Close())
@@ -530,8 +693,22 @@ func NewAPI(log *zap.Logger, full *identity.FullIdentity, db DB,
 	}
 
 	if !config.DisableConsoleFromSatelliteAPI {
-		{ // setup mailservice
-			peer.Mail.Service, err = setupMailService(peer.Log, *config)
+		{ // setup oidc
+			peer.OIDC.Service = oidc.NewService(db.OIDC())
+		}
+
+		{ // setup analytics service
+			peer.Analytics.Service = analytics.NewService(peer.Log.Named("analytics:service"), config.Analytics, config.Console.SatelliteName, config.Console.ExternalAddress)
+
+			peer.Services.Add(lifecycle.Item{
+				Name:  "analytics:service",
+				Run:   peer.Analytics.Service.Run,
+				Close: peer.Analytics.Service.Close,
+			})
+		}
+
+		{ // setup legacy and hubspot mail services
+			peer.Mail.Service, err = setupMailService(peer.Log, config.Mail, config.Console)
 			if err != nil {
 				return nil, errs.Combine(err, peer.Close())
 			}
@@ -540,19 +717,12 @@ func NewAPI(log *zap.Logger, full *identity.FullIdentity, db DB,
 				Name:  "mail:service",
 				Close: peer.Mail.Service.Close,
 			})
-		}
 
-		{ // setup oidc
-			peer.OIDC.Service = oidc.NewService(db.OIDC())
-		}
-
-		{ // setup analytics service
-			peer.Analytics.Service = analytics.NewService(peer.Log.Named("analytics:service"), config.Analytics, config.Console.SatelliteName)
+			peer.Mail.HubspotService = hubspotmails.NewService(peer.Log.Named("mail:hubspotservice"), peer.Analytics.Service, config.HubspotMails)
 
 			peer.Services.Add(lifecycle.Item{
-				Name:  "analytics:service",
-				Run:   peer.Analytics.Service.Run,
-				Close: peer.Analytics.Service.Close,
+				Name:  "hubspotmails:service",
+				Close: peer.Mail.HubspotService.Close,
 			})
 		}
 
@@ -571,17 +741,6 @@ func NewAPI(log *zap.Logger, full *identity.FullIdentity, db DB,
 				peer.Services.Add(lifecycle.Item{
 					Name: "kms:service",
 					Run:  peer.KeyManagement.Service.Initialize,
-				})
-			}
-		}
-
-		{ // setup sso
-			if config.SSO.Enabled {
-				peer.SSO.Service = sso.NewService(config.Console.ExternalAddress, config.SSO)
-
-				peer.Services.Add(lifecycle.Item{
-					Name: "sso:service",
-					Run:  peer.SSO.Service.Initialize,
 				})
 			}
 		}
@@ -616,23 +775,56 @@ func NewAPI(log *zap.Logger, full *identity.FullIdentity, db DB,
 				return nil, errs.Combine(err, peer.Close())
 			}
 
+			productPrices, err := pc.Products.ToModels()
+			if err != nil {
+				return nil, errs.Combine(err, peer.Close())
+			}
+
+			placementOverrideMap := pc.PlacementPriceOverrides.ToMap()
+			err = paymentsconfig.ValidatePlacementOverrideMap(placementOverrideMap, productPrices, placements)
+			if err != nil {
+				return nil, errs.Combine(err, peer.Close())
+			}
+
+			minimumChargeDate, err := pc.MinimumCharge.GetEffectiveDate()
+			if err != nil {
+				return nil, errs.Combine(err, peer.Close())
+			}
+
 			peer.Payments.StripeService, err = stripe.NewService(
 				peer.Log.Named("payments.stripe:service"),
 				stripeClient,
+				stripe.ServiceDependencies{
+					DB:                   peer.DB.StripeCoinPayments(),
+					WalletsDB:            peer.DB.Wallets(),
+					BillingDB:            peer.DB.Billing(),
+					ProjectsDB:           peer.DB.Console().Projects(),
+					UsersDB:              peer.DB.Console().Users(),
+					FreezeEventsDB:       peer.DB.Console().AccountFreezeEvents(),
+					UsageDB:              peer.DB.ProjectAccounting(),
+					RetentionRemainderDB: peer.DB.RetentionRemainderCharges(),
+					Analytics:            peer.Analytics.Service,
+					Emission:             emissionService,
+					Entitlements:         peer.Entitlements.Service,
+				},
+				stripe.ServiceConfig{
+					DeleteAccountEnabled:       config.Console.SelfServeAccountDeleteEnabled,
+					DeleteProjectCostThreshold: pc.DeleteProjectCostThreshold,
+					EntitlementsEnabled:        config.Entitlements.Enabled,
+				},
 				pc.StripeCoinPayments,
-				peer.DB.StripeCoinPayments(),
-				peer.DB.Wallets(),
-				peer.DB.Billing(),
-				peer.DB.Console().Projects(),
-				peer.DB.Console().Users(),
-				peer.DB.ProjectAccounting(),
-				prices,
-				priceOverrides,
-				pc.PackagePlans.Packages,
-				pc.BonusRate,
-				peer.Analytics.Service,
-				emissionService,
-				config.Console.SelfServeAccountDeleteEnabled,
+				stripe.PricingConfig{
+					UsagePrices:               prices,
+					UsagePriceOverrides:       priceOverrides,
+					ProductPriceMap:           productPrices,
+					PlacementProductMap:       placementOverrideMap,
+					PackagePlans:              pc.PackagePlans.Packages,
+					BonusRate:                 pc.BonusRate,
+					MinimumChargeAmount:       pc.MinimumCharge.Amount,
+					MinimumChargeDate:         minimumChargeDate,
+					LegacyMinimumChargeAmount: pc.MinimumCharge.LegacyAmount,
+					LegacyPricingUserAgents:   pc.LegacyPricingUserAgents,
+				},
 			)
 
 			if err != nil {
@@ -657,13 +849,12 @@ func NewAPI(log *zap.Logger, full *identity.FullIdentity, db DB,
 			peer.Payments.DepositWallets = peer.Payments.StorjscanService
 		}
 
-		{ // setup account management api keys
-			peer.REST.Keys = restkeys.NewService(peer.DB.OIDC().OAuthTokens(), config.RESTKeys)
-		}
-
 		{ // setup console
+			config.Console.ProjectLimitNotificationsEnabled = config.Metainfo.LimitEmailNotificationsEnabled && config.ProjectLimitEvents.Enabled
 			consoleConfig := config.Console
-			consoleConfig.SsoEnabled = config.SSO.Enabled
+			consoleConfig.Config.SatName = config.Console.SatelliteName
+			consoleConfig.Config.IsBetaSat = config.Console.IsBetaSatellite
+
 			peer.Console.Listener, err = net.Listen("tcp", consoleConfig.Address)
 			if err != nil {
 				return nil, errs.Combine(err, peer.Close())
@@ -672,11 +863,26 @@ func NewAPI(log *zap.Logger, full *identity.FullIdentity, db DB,
 				return nil, errs.New("Auth token secret required")
 			}
 
-			peer.Console.AuthTokens = consoleauth.NewService(config.ConsoleAuth, &consoleauth.Hmac{Secret: []byte(consoleConfig.AuthTokenSecret)})
+			signer := &consoleauth.Hmac{Secret: []byte(consoleConfig.AuthTokenSecret)}
+			peer.Console.AuthTokens = consoleauth.NewService(config.ConsoleAuth, signer)
 
 			externalAddress := consoleConfig.ExternalAddress
 			if externalAddress == "" {
 				externalAddress = "http://" + peer.Console.Listener.Addr().String()
+			}
+
+			if config.SSO.Enabled {
+				// setup sso
+				peer.SSO.Service = sso.NewService(
+					externalAddress,
+					peer.Console.AuthTokens,
+					config.SSO,
+				)
+
+				peer.Services.Add(lifecycle.Item{
+					Name: "sso:service",
+					Run:  peer.SSO.Service.Initialize,
+				})
 			}
 
 			accountFreezeService := console.NewAccountFreezeService(
@@ -685,34 +891,109 @@ func NewAPI(log *zap.Logger, full *identity.FullIdentity, db DB,
 				consoleConfig.AccountFreeze,
 			)
 
+			if config.Console.CloudGpusEnabled {
+				peer.Valdi.Client, err = valdiclient.New(peer.Log.Named("valdi:client"), http.DefaultClient, config.Valdi.Config)
+				if err != nil {
+					return nil, errs.Combine(err, peer.Close())
+				}
+
+				peer.Valdi.Service, err = valdi.NewService(peer.Log.Named("valdi:service"), config.Valdi, peer.Valdi.Client)
+				if err != nil {
+					return nil, errs.Combine(err, peer.Close())
+				}
+			}
+
+			minimumChargeDate, err := config.Payments.MinimumCharge.GetEffectiveDate()
+			if err != nil {
+				return nil, errs.Combine(err, peer.Close())
+			}
+
+			productModels, err := config.Payments.Products.ToModels()
+			if err != nil {
+				return nil, errs.Combine(err, peer.Close())
+			}
+
+			loginURL, err := config.Console.LoginURL()
+			if err != nil {
+				return nil, errs.Combine(err, peer.Close())
+			}
+
+			supportURL := config.Console.SupportURL()
+
+			peer.Console.Webhook = webhook.New(peer.Log.Named("webhook"), config.Webhook)
+			peer.Services.Add(lifecycle.Item{
+				Name:  "webhook:service",
+				Close: peer.Console.Webhook.Close,
+			})
+
 			peer.Console.Service, err = console.NewService(
 				peer.Log.Named("console:service"),
 				peer.DB.Console(),
-				peer.REST.Keys,
+				peer.DB.Console().RestApiKeys(),
+				restkeys.NewService(peer.DB.OIDC().OAuthTokens(), config.Console.RestAPIKeys.DefaultExpiration),
 				peer.DB.ProjectAccounting(),
 				peer.Accounting.ProjectUsage,
 				peer.Buckets.Service,
+				peer.DB.Attribution(),
 				peer.Payments.Accounts,
 				peer.Payments.DepositWallets,
 				peer.DB.Billing(),
 				peer.Analytics.Service,
 				peer.Console.AuthTokens,
 				peer.Mail.Service,
+				peer.Mail.HubspotService,
 				accountFreezeService,
 				emissionService,
 				peer.KeyManagement.Service,
+				peer.SSO.Service,
 				externalAddress,
+				peer.URL().String(),
 				consoleConfig.SatelliteName,
+				consoleConfig.SingleWhiteLabel,
 				config.Metainfo.ProjectLimits.MaxBuckets,
 				config.SSO.Enabled,
-				placement,
-				console.ObjectLockAndVersioningConfig{
-					ObjectLockEnabled:                      config.Metainfo.ObjectLockEnabled,
-					UseBucketLevelObjectVersioning:         config.Metainfo.UseBucketLevelObjectVersioning,
-					UseBucketLevelObjectVersioningProjects: config.Metainfo.UseBucketLevelObjectVersioningProjects,
+				placements,
+				peer.Valdi.Service,
+				peer.Console.Webhook,
+				config.Payments.MinimumCharge.Amount,
+				minimumChargeDate,
+				config.Payments.PackagePlans.Packages,
+				config.Entitlements,
+				peer.Entitlements.Service,
+				config.Payments.PlacementPriceOverrides.ToMap(),
+				productModels,
+				config.Payments.LegacyPricingUserAgents,
+				config.Payments.LegacyPlacementPriceOverrides.ToMap(),
+				consoleConfig.Config,
+				config.Payments.StripeCoinPayments.SkuEnabled,
+				loginURL, supportURL,
+			)
+			if err != nil {
+				return nil, errs.Combine(err, peer.Close())
+			}
+
+			peer.Console.ConsoleService, err = consoleservice.NewService(
+				peer.Log.Named("console:service"),
+				consoleservice.ServiceDependencies{
+					ConsoleDB:            peer.DB.Console(),
+					AccountFreezeService: accountFreezeService,
 				},
 				consoleConfig.Config,
 			)
+			if err != nil {
+				return nil, errs.Combine(err, peer.Close())
+			}
+
+			peer.CSRF.Service = csrf.NewService(signer)
+			// setup account management api keys
+			peer.Console.RestKeys = peer.Console.Service
+
+			prices, err := config.Payments.UsagePrice.ToModel()
+			if err != nil {
+				return nil, errs.Combine(err, peer.Close())
+			}
+
+			priceSummaries, err := consoleweb.CreateProductPriceSummaries(config.Payments.Products)
 			if err != nil {
 				return nil, errs.Combine(err, peer.Close())
 			}
@@ -721,23 +1002,27 @@ func NewAPI(log *zap.Logger, full *identity.FullIdentity, db DB,
 				peer.Log.Named("console:endpoint"),
 				consoleConfig,
 				peer.Console.Service,
+				peer.Console.ConsoleService,
 				peer.OIDC.Service,
 				peer.Mail.Service,
+				peer.Mail.HubspotService,
 				peer.Analytics.Service,
 				peer.ABTesting.Service,
 				accountFreezeService,
 				peer.SSO.Service,
+				peer.CSRF.Service,
 				peer.Console.Listener,
 				config.Payments.StripeCoinPayments.StripePublicKey,
 				config.Payments.Storjscan.Confirmations,
 				peer.URL(),
-				console.ObjectLockAndVersioningConfig{
-					ObjectLockEnabled:                      config.Metainfo.ObjectLockEnabled,
-					UseBucketLevelObjectVersioning:         config.Metainfo.UseBucketLevelObjectVersioning,
-					UseBucketLevelObjectVersioningProjects: config.Metainfo.UseBucketLevelObjectVersioningProjects,
-				},
 				config.Analytics,
-				config.Payments.PackagePlans,
+				config.Payments.MinimumCharge,
+				prices,
+				priceSummaries,
+				config.Payments.LegacyPricingUserAgents,
+				config.Entitlements.Enabled,
+				config.SSO.Enabled,
+				config.AccountFreeze.OptOutFreezeOptedOutOnly,
 			)
 
 			peer.Servers.Add(lifecycle.Item{
@@ -832,3 +1117,15 @@ func (peer *API) URL() storj.NodeURL {
 
 // PrivateAddr returns the private address.
 func (peer *API) PrivateAddr() string { return peer.Server.PrivateAddr().String() }
+
+func parseNodeIDs(nodeIDs []string) ([]storj.NodeID, error) {
+	rv := make([]storj.NodeID, 0, len(nodeIDs))
+	for _, nodeID := range nodeIDs {
+		parsedID, err := storj.NodeIDFromString(nodeID)
+		if err != nil {
+			return nil, err
+		}
+		rv = append(rv, parsedID)
+	}
+	return rv, nil
+}

@@ -45,31 +45,25 @@
     </div>
 </template>
 
-<script lang="ts">
-import { Component, Prop, Vue } from 'vue-property-decorator';
+<script setup lang="ts">
+import { computed } from 'vue';
 
 import CheckIcon from '@/../static/images/common/greenCheck.svg';
 import WalletIcon from '@/../static/images/wallet.svg';
 
-// @vue/component
-@Component({
-    components: {
-        CheckIcon,
-        WalletIcon,
-    },
-})
-export default class WalletArea extends Vue {
-    @Prop({ default: '' })
-    private readonly label: string;
-    @Prop({ default: '' })
-    private readonly walletAddress: string;
-    @Prop({ default: () => [] })
-    private readonly walletFeatures: string[];
+const props = withDefaults(defineProps<{
+    label?: string;
+    walletAddress?: string;
+    walletFeatures?: string[];
+}>(), {
+    label: '',
+    walletAddress: '',
+    walletFeatures: () => [],
+});
 
-    public get isZkSyncEraEnabled(): boolean {
-        return this.walletFeatures.includes('zksync-era');
-    }
-}
+const isZkSyncEraEnabled = computed<boolean>(() => {
+    return props.walletFeatures.includes('zksync-era');
+});
 </script>
 
 <style scoped lang="scss">
@@ -149,7 +143,7 @@ export default class WalletArea extends Vue {
                     background: white;
                     border-radius: 50%;
 
-                    ::v-deep path {
+                    :deep(path) {
                         fill: var(--wallet-feature-opted-in);
                     }
                 }
@@ -175,7 +169,7 @@ export default class WalletArea extends Vue {
         }
     }
 
-    @media screen and (max-width: 1000px) {
+    @media screen and (width <= 1000px) {
 
         .wallet-area {
             flex-direction: column;
@@ -193,7 +187,7 @@ export default class WalletArea extends Vue {
         }
     }
 
-    @media screen and (max-width: 500px) {
+    @media screen and (width <= 500px) {
 
         p {
             margin: 0;

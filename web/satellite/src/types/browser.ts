@@ -1,9 +1,9 @@
 // Copyright (C) 2021 Storj Labs, Inc.
 // See LICENSE for copying information.
 
-import { Component } from 'vue';
+import type { Component } from 'vue';
 
-import { BrowserObject } from '@/store/modules/objectBrowserStore';
+import type { BrowserObject } from '@/store/modules/objectBrowserStore';
 
 import RedditIcon from '@/components/icons/share/IconReddit.vue';
 import FacebookIcon from '@/components/icons/share/IconFacebook.vue';
@@ -23,6 +23,16 @@ import zipIcon from '@/assets/icon-zip-tonal.svg';
 import spreadsheetIcon from '@/assets/icon-spreadsheet-tonal.svg';
 import folderIcon from '@/assets/icon-folder-tonal.svg';
 import fileIcon from '@/assets/icon-file-tonal.svg';
+
+export enum DownloadPrefixType {
+    Folder = 'Folder',
+    Bucket = 'Bucket',
+}
+
+export enum DownloadPrefixFormat {
+    ZIP = 'zip',
+    TAR_GZ = 'tar.gz',
+}
 
 export enum ShareOptions {
     Reddit = 'Reddit',

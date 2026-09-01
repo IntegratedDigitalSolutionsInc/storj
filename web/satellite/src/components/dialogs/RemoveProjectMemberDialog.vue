@@ -20,10 +20,10 @@
                         <component :is="UserMinus" :size="18" />
                     </v-sheet>
                 </template>
-                <v-card-title class="font-weight-bold">Remove member</v-card-title>
+                <v-card-title class="font-weight-bold">Remove {{ memberInviteText }}</v-card-title>
                 <template #append>
                     <v-btn
-                        icon="$close"
+                        :icon="X"
                         variant="text"
                         size="small"
                         color="default"
@@ -36,21 +36,24 @@
             <v-divider />
 
             <v-card-item class="pa-6">
-                <p class="mb-3">The following team members will be removed.</p>
+                <p class="mb-3">
+                    The following {{ removables.filter(e => !e.isInvite).length ? "team" : "" }}
+                    {{ memberInviteText }} will be removed.
+                </p>
 
                 <v-chip
-                    v-for="email in firstThreeSelected"
-                    :key="email"
+                    v-for="removable in firstThreeSelected"
+                    :key="removable.email"
                     class="mb-4 mr-1"
                 >
                     <template #default>
                         <div class="max-width">
-                            <p :title="email" class="text-truncate">{{ email }}</p>
+                            <p :title="removable.email" class="text-truncate">{{ removable.email }}</p>
                         </div>
                     </template>
                 </v-chip>
-                <v-chip v-if="props.emails.length > 3" rounded class="mb-3 mr-1">
-                    + {{ props.emails.length - 3 }} more
+                <v-chip v-if="removables.length > 3" rounded class="mb-3 mr-1">
+                    + {{ removables.length - 3 }} more
                 </v-chip>
 
                 <v-alert variant="tonal" class="pa-4" color="warning">
@@ -58,6 +61,8 @@
                         <strong>Important:</strong> Any access keys created could still provide data access to removed members. If necessary, please revoke these access keys to ensure the security of your data.
                     </template>
                 </v-alert>
+
+                <v-checkbox-btn v-if="membersLength > 0" v-model="removeAccesses" class="mt-4" label="Delete member's access keys." density="compact" />
             </v-card-item>
 
             <v-divider />
@@ -81,7 +86,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed } from 'vue';
+import { computed, ref } from 'vue';
 import {
     VAlert,
     VDialog,
@@ -95,17 +100,18 @@ import {
     VCol,
     VBtn,
     VChip,
+    VCheckboxBtn,
 } from 'vuetify/components';
-import { UserMinus } from 'lucide-vue-next';
+import { UserMinus, X } from '@lucide/vue';
 
 import { useProjectsStore } from '@/store/modules/projectsStore';
 import { useLoading } from '@/composables/useLoading';
-import { useNotify } from '@/utils/hooks';
+import { useNotify } from '@/composables/useNotify';
 import { useProjectMembersStore } from '@/store/modules/projectMembersStore';
 import { AnalyticsErrorEventSource } from '@/utils/constants/analyticsEventNames';
 
 const props = defineProps<{
-    emails: string[],
+    removables: { email:string, isInvite: boolean }[],
 }>();
 
 const model = defineModel<boolean>({ required: true });
@@ -120,12 +126,30 @@ const pmStore = useProjectMembersStore();
 const { isLoading, withLoading } = useLoading();
 const notify = useNotify();
 
-const firstThreeSelected = computed<string[]>(() => props.emails.slice(0, 3));
+const removeAccesses = ref<boolean>(false);
+
+const firstThreeSelected = computed<{ email:string, isInvite: boolean }[]>(() => props.removables.slice(0, 3));
+
+const membersLength = computed<number>(() => props.removables.filter(e => !e.isInvite).length);
+
+const memberInviteText = computed<string>(() => {
+    const invitesLength = props.removables.length - membersLength.value;
+
+    const memberTxt = `member${membersLength.value > 1 ? 's' : ''}`;
+    const inviteTxt = `invite${invitesLength > 1 ? 's' : ''}`;
+    if (membersLength.value && invitesLength) {
+        return `${memberTxt} and ${inviteTxt}`;
+    }
+    if (invitesLength) {
+        return inviteTxt;
+    }
+    return memberTxt;
+});
 
 async function onDelete(): Promise<void> {
     await withLoading(async () => {
         try {
-            await pmStore.deleteProjectMembers(projectsStore.state.selectedProject.id, props.emails);
+            await pmStore.deleteProjectMembers(projectsStore.state.selectedProject.id, props.removables.map(e => e.email), removeAccesses.value);
             notify.success('Members were successfully removed from the project');
             emit('deleted');
             model.value = false;

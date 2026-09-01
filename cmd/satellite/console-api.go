@@ -20,6 +20,7 @@ import (
 	"storj.io/storj/satellite/metabase"
 	"storj.io/storj/satellite/orders"
 	"storj.io/storj/satellite/satellitedb"
+	"storj.io/storj/shared/flightrecorder"
 )
 
 func cmdConsoleAPIRun(cmd *cobra.Command, args []string) (err error) {
@@ -36,10 +37,16 @@ func cmdConsoleAPIRun(cmd *cobra.Command, args []string) (err error) {
 		return errs.New("Failed to load identity: %+v", err)
 	}
 
+	var recorder *flightrecorder.Box
+	if runCfg.FlightRecorder.Enabled {
+		recorder = flightrecorder.NewBox(log.Named("flightrecorder"), runCfg.FlightRecorder)
+	}
+
 	db, err := satellitedb.Open(ctx, log.Named("db"), runCfg.Database, satellitedb.Options{
 		ApplicationName:      "satellite-console-api",
 		APIKeysLRUOptions:    runCfg.APIKeysLRUOptions(),
 		RevocationLRUOptions: runCfg.RevocationLRUOptions(),
+		FlightRecorder:       recorder,
 	})
 	if err != nil {
 		return errs.New("Error starting master database on satellite api: %+v", err)
@@ -48,8 +55,10 @@ func cmdConsoleAPIRun(cmd *cobra.Command, args []string) (err error) {
 		err = errs.Combine(err, db.Close())
 	}()
 
-	metabaseDB, err := metabase.Open(ctx, log.Named("metabase"), runCfg.Config.Metainfo.DatabaseURL,
-		runCfg.Config.Metainfo.Metabase("satellite-console-api"))
+	metabaseCfg := runCfg.Config.Metainfo.Metabase("satellite-console-api")
+	metabaseCfg.FlightRecorder = recorder
+
+	metabaseDB, err := metabase.Open(ctx, log.Named("metabase"), runCfg.Config.Metainfo.DatabaseURL, metabaseCfg)
 	if err != nil {
 		return errs.New("Error creating metabase connection on satellite console api: %+v", err)
 	}
@@ -100,16 +109,8 @@ func cmdConsoleAPIRun(cmd *cobra.Command, args []string) (err error) {
 
 	monkit.Package().Chain(peer.Server)
 
-	err = metabaseDB.CheckVersion(ctx)
-	if err != nil {
-		log.Error("Failed metabase database version check.", zap.Error(err))
-		return errs.New("failed metabase version check: %+v", err)
-	}
-
-	err = db.CheckVersion(ctx)
-	if err != nil {
-		log.Error("Failed satellite database version check.", zap.Error(err))
-		return errs.New("Error checking version for satellitedb: %+v", err)
+	if err := checkDBVersions(ctx, log, runCfg, db, metabaseDB); err != nil {
+		return err
 	}
 
 	runError := peer.Run(ctx)

@@ -114,6 +114,13 @@ func (cache *RollupsWriteCache) Flush(ctx context.Context) {
 	cache.flush(ctx, pendingRollups)
 }
 
+// Close flushes anything in the cache and marks the cache as stopped.
+// It is an alias for CloseAndFlush that satisfies the mud framework's
+// auto-detected Close lifecycle.
+func (cache *RollupsWriteCache) Close(ctx context.Context) error {
+	return cache.CloseAndFlush(ctx)
+}
+
 // CloseAndFlush flushes anything in the cache and marks the cache as stopped.
 func (cache *RollupsWriteCache) CloseAndFlush(ctx context.Context) error {
 	cache.mu.Lock()
@@ -200,11 +207,11 @@ func (cache *RollupsWriteCache) updateCacheValue(ctx context.Context, projectID 
 	if !ok && len(cache.pendingRollups) >= cache.batchSize {
 		mon.Event("rollups_write_cache_update_lost")
 		cache.log.Error("MONEY LOST! Flushing too slow to keep up with demand",
-			zap.Stringer("ProjectID", projectID),
-			zap.Stringer("Action", action),
-			zap.Int64("Allocated", allocated),
-			zap.Int64("Inline", inline),
-			zap.Int64("Settled", settled),
+			zap.Stringer("project_id", projectID),
+			zap.Stringer("action", action),
+			zap.Int64("allocated", allocated),
+			zap.Int64("inline", inline),
+			zap.Int64("settled", settled),
 		)
 	} else {
 

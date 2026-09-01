@@ -26,7 +26,7 @@
                 </v-card-title>
                 <template #append>
                     <v-btn
-                        icon="$close"
+                        :icon="X"
                         variant="text"
                         size="small"
                         color="default"
@@ -91,13 +91,13 @@ import {
     VBtn,
     VSheet,
 } from 'vuetify/components';
-import { LockKeyhole } from 'lucide-vue-next';
+import { LockKeyhole, X } from '@lucide/vue';
 
 import { useUsersStore } from '@/store/modules/usersStore';
 import { useLoading } from '@/composables/useLoading';
-import { useNotify } from '@/utils/hooks';
+import { useNotify } from '@/composables/useNotify';
 import { AnalyticsErrorEventSource } from '@/utils/constants/analyticsEventNames';
-import { UserSettings } from '@/types/users';
+import type { UserSettings } from '@/types/users';
 import { useProjectsStore } from '@/store/modules/projectsStore';
 
 const usersStore = useUsersStore();

@@ -24,10 +24,8 @@ const (
 	invalidParamErrMsg = "invalid value '%s' for query parameter '%s': %w"
 )
 
-var (
-	// ErrBucketsAPI - console buckets api error type.
-	ErrBucketsAPI = errs.Class("console api buckets")
-)
+// ErrBuckets - console buckets api error type.
+var ErrBuckets = errs.Class("console api buckets")
 
 // Buckets is an api controller that exposes all buckets related functionality.
 type Buckets struct {
@@ -85,7 +83,7 @@ func (b *Buckets) AllBucketNames(w http.ResponseWriter, r *http.Request) {
 
 	err = json.NewEncoder(w).Encode(bucketNames)
 	if err != nil {
-		b.log.Error("failed to write json all bucket names response", zap.Error(ErrBucketsAPI.Wrap(err)))
+		b.log.Error("failed to write json all bucket names response", zap.Error(ErrBuckets.Wrap(err)))
 	}
 }
 
@@ -131,7 +129,50 @@ func (b *Buckets) GetBucketMetadata(w http.ResponseWriter, r *http.Request) {
 
 	err = json.NewEncoder(w).Encode(bucketMetadata)
 	if err != nil {
-		b.log.Error("failed to write json all bucket names response", zap.Error(ErrBucketsAPI.Wrap(err)))
+		b.log.Error("failed to write json all bucket names response", zap.Error(ErrBuckets.Wrap(err)))
+	}
+}
+
+// GetPlacementDetails returns a list of available placements and their details.
+func (b *Buckets) GetPlacementDetails(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	var err error
+	defer mon.Task()(&ctx)(&err)
+
+	w.Header().Set("Content-Type", "application/json")
+
+	projectIDString := r.URL.Query().Get("projectID")
+	if projectIDString == "" {
+		b.serveJSONError(ctx, w, http.StatusBadRequest, errs.New("Project ID was not provided."))
+		return
+	}
+
+	projectID, err := uuid.FromString(projectIDString)
+	if err != nil {
+		b.serveJSONError(ctx, w, http.StatusBadRequest, err)
+		return
+	}
+
+	placementDetails, err := b.service.GetPlacementDetails(ctx, projectID)
+	if err != nil {
+		if console.ErrUnauthorized.Has(err) {
+			b.serveJSONError(ctx, w, http.StatusUnauthorized, err)
+			return
+		}
+
+		b.serveJSONError(ctx, w, http.StatusInternalServerError, err)
+		return
+	}
+
+	details := make([]console.PlacementDetail, 0, len(placementDetails))
+	for _, detail := range placementDetails {
+		detail.Pending = detail.WaitlistURL != ""
+		detail.WaitlistURL = ""
+		details = append(details, detail)
+	}
+	err = json.NewEncoder(w).Encode(details)
+	if err != nil {
+		b.log.Error("failed to write placement details json", zap.Error(ErrBuckets.Wrap(err)))
 	}
 }
 
@@ -151,6 +192,17 @@ func (b *Buckets) GetBucketTotals(w http.ResponseWriter, r *http.Request) {
 	projectID, err := uuid.FromString(projectIDString)
 	if err != nil {
 		b.serveJSONError(ctx, w, http.StatusBadRequest, errs.New(invalidParamErrMsg, projectIDString, "projectID", err))
+		return
+	}
+
+	sinceString := r.URL.Query().Get("since")
+	if sinceString == "" {
+		b.serveJSONError(ctx, w, http.StatusBadRequest, errs.New(missingParamErrMsg, "since"))
+		return
+	}
+	since, err := time.Parse(dateLayout, sinceString)
+	if err != nil {
+		b.serveJSONError(ctx, w, http.StatusBadRequest, errs.New(invalidParamErrMsg, sinceString, "since", err))
 		return
 	}
 
@@ -193,7 +245,7 @@ func (b *Buckets) GetBucketTotals(w http.ResponseWriter, r *http.Request) {
 		Limit:  limit,
 		Search: r.URL.Query().Get("search"),
 		Page:   page,
-	}, before)
+	}, since, before)
 	if err != nil {
 		if console.ErrUnauthorized.Has(err) {
 			b.serveJSONError(ctx, w, http.StatusUnauthorized, err)
@@ -206,7 +258,7 @@ func (b *Buckets) GetBucketTotals(w http.ResponseWriter, r *http.Request) {
 
 	err = json.NewEncoder(w).Encode(totals)
 	if err != nil {
-		b.log.Error("failed to write json bucket totals response", zap.Error(ErrBucketsAPI.Wrap(err)))
+		b.log.Error("failed to write json bucket totals response", zap.Error(ErrBuckets.Wrap(err)))
 	}
 }
 
@@ -259,7 +311,7 @@ func (b *Buckets) GetSingleBucketTotals(w http.ResponseWriter, r *http.Request) 
 
 	err = json.NewEncoder(w).Encode(totals)
 	if err != nil {
-		b.log.Error("failed to write json single bucket totals response", zap.Error(ErrBucketsAPI.Wrap(err)))
+		b.log.Error("failed to write json single bucket totals response", zap.Error(ErrBuckets.Wrap(err)))
 	}
 }
 

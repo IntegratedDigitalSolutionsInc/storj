@@ -1,0 +1,1892 @@
+# API Docs
+
+**Version:** `v1`
+
+<h2 id='list-of-endpoints'>List of Endpoints</h2>
+
+* Settings
+  * [Get settings](#settings-get-settings)
+* PlacementManagement
+  * [Get placements](#placementmanagement-get-placements)
+* ProductManagement
+  * [Get products](#productmanagement-get-products)
+* UserManagement
+  * [Get freeze event types](#usermanagement-get-freeze-event-types)
+  * [Get user kinds](#usermanagement-get-user-kinds)
+  * [Get user statuses](#usermanagement-get-user-statuses)
+  * [Get opt-in statuses](#usermanagement-get-opt-in-statuses)
+  * [Search users](#usermanagement-search-users)
+  * [Get user](#usermanagement-get-user)
+  * [Get user](#usermanagement-get-user)
+  * [Update user](#usermanagement-update-user)
+  * [Update user's upgrade time](#usermanagement-update-users-upgrade-time)
+  * [Update user's opt-in status](#usermanagement-update-users-opt-in-status)
+  * [Update user's tenant ID](#usermanagement-update-users-tenant-id)
+  * [Disable user](#usermanagement-disable-user)
+  * [Freeze/Unfreeze User](#usermanagement-freezeunfreeze-user)
+  * [Toggle inactivity exemption](#usermanagement-toggle-inactivity-exemption)
+  * [Toggle MFA](#usermanagement-toggle-mfa)
+  * [Create Rest Key](#usermanagement-create-rest-key)
+  * [Create registration token](#usermanagement-create-registration-token)
+  * [Get user licenses](#usermanagement-get-user-licenses)
+  * [Grant user license](#usermanagement-grant-user-license)
+  * [Revoke user license](#usermanagement-revoke-user-license)
+  * [Delete user license](#usermanagement-delete-user-license)
+  * [Update user license](#usermanagement-update-user-license)
+  * [Get user usage report](#usermanagement-get-user-usage-report)
+* ProjectManagement
+  * [Get project statuses](#projectmanagement-get-project-statuses)
+  * [Get project](#projectmanagement-get-project)
+  * [Get project buckets](#projectmanagement-get-project-buckets)
+  * [Update bucket](#projectmanagement-update-bucket)
+  * [Get bucket state](#projectmanagement-get-bucket-state)
+  * [Update project](#projectmanagement-update-project)
+  * [Disable project](#projectmanagement-disable-project)
+  * [Update project limits](#projectmanagement-update-project-limits)
+  * [Update project entitlements](#projectmanagement-update-project-entitlements)
+  * [Get project members](#projectmanagement-get-project-members)
+* Search
+  * [Search users or projects](#search-search-users-or-projects)
+* ChangeHistory
+  * [Get change history](#changehistory-get-change-history)
+* NodeManagement
+  * [Get node info](#nodemanagement-get-node-info)
+  * [Disqualify node](#nodemanagement-disqualify-node)
+  * [Undisqualify node](#nodemanagement-undisqualify-node)
+* AccessManagement
+  * [Inspect Access](#accessmanagement-inspect-access)
+  * [Revoke Access](#accessmanagement-revoke-access)
+* WhiteLabelManagement
+  * [List tenant whitelabel configs](#whitelabelmanagement-list-tenant-whitelabel-configs)
+  * [Get tenant whitelabel config](#whitelabelmanagement-get-tenant-whitelabel-config)
+  * [Update tenant whitelabel config](#whitelabelmanagement-update-tenant-whitelabel-config)
+
+<h3 id='settings-get-settings'>Get settings (<a href='#list-of-endpoints'>go to full list</a>)</h3>
+
+Gets the settings of the service and relevant Storj services settings
+
+`GET /api/v1/settings/`
+
+**Response body:**
+
+```typescript
+{
+	admin: 	{
+		features: 		{
+			account: 			{
+				create: boolean
+				createRestKey: boolean
+				createRegToken: boolean
+				delete: boolean
+				markPendingDeletion: boolean
+				history: boolean
+				list: boolean
+				projects: boolean
+				search: boolean
+				suspend: boolean
+				unsuspend: boolean
+				disableMFA: boolean
+				updateLimits: boolean
+				updatePlacement: boolean
+				updateStatus: boolean
+				updateEmail: boolean
+				updateKind: boolean
+				updateName: boolean
+				updateUserAgent: boolean
+				updateUpgradeTime: boolean
+				updateTenantID: boolean
+				updateOptInStatus: boolean
+				toggleInactivityExemption: boolean
+				viewLicenses: boolean
+				changeLicenses: boolean
+				view: boolean
+				viewUsage: boolean
+			}
+
+			project: 			{
+				create: boolean
+				delete: boolean
+				markPendingDeletion: boolean
+				history: boolean
+				list: boolean
+				updateInfo: boolean
+				updateLimits: boolean
+				updatePlacement: boolean
+				updateValueAttribution: boolean
+				setEntitlements: boolean
+				view: boolean
+				memberList: boolean
+				memberAdd: boolean
+				memberRemove: boolean
+			}
+
+			bucket: 			{
+				create: boolean
+				delete: boolean
+				history: boolean
+				list: boolean
+				updateInfo: boolean
+				updatePlacement: boolean
+				updateValueAttribution: boolean
+				view: boolean
+			}
+
+			access: 			{
+				inspect: boolean
+				revoke: boolean
+			}
+
+			node: 			{
+				disqualify: boolean
+				undisqualify: boolean
+			}
+
+			whiteLabel: 			{
+				view: boolean
+				update: boolean
+			}
+
+			dashboard: boolean
+			operator: boolean
+			signOut: boolean
+			switchSatellite: boolean
+		}
+
+		branding: unknown
+	}
+
+	console: 	{
+		satelliteName: string
+		isBetaSatellite: boolean
+		externalAddress: string
+		tenantIDList: 		[
+string
+		]
+
+		partnerList: 		[
+string
+		]
+
+		tenantScope: string
+	}
+
+}
+
+```
+
+<h3 id='placementmanagement-get-placements'>Get placements (<a href='#list-of-endpoints'>go to full list</a>)</h3>
+
+Gets placement rule IDs and their locations
+
+`GET /api/v1/placements/`
+
+**Response body:**
+
+```typescript
+[
+	{
+		id: number
+		location: string
+	}
+
+]
+
+```
+
+<h3 id='productmanagement-get-products'>Get products (<a href='#list-of-endpoints'>go to full list</a>)</h3>
+
+Gets all defined product definitions
+
+`GET /api/v1/products/`
+
+**Response body:**
+
+```typescript
+[
+	{
+		productID: number
+		productName: string
+		storageMBMonthCents: string
+		egressMBCents: string
+		segmentMonthCents: string
+		egressDiscountRatio: string
+	}
+
+]
+
+```
+
+<h3 id='usermanagement-get-freeze-event-types'>Get freeze event types (<a href='#list-of-endpoints'>go to full list</a>)</h3>
+
+Gets account freeze event types
+
+`GET /api/v1/users/freeze-event-types`
+
+**Response body:**
+
+```typescript
+[
+	{
+		name: string
+		value: number
+	}
+
+]
+
+```
+
+<h3 id='usermanagement-get-user-kinds'>Get user kinds (<a href='#list-of-endpoints'>go to full list</a>)</h3>
+
+Gets available user kinds
+
+`GET /api/v1/users/kinds`
+
+**Response body:**
+
+```typescript
+[
+	{
+		value: number
+		name: string
+		hasPaidPrivileges: boolean
+	}
+
+]
+
+```
+
+<h3 id='usermanagement-get-user-statuses'>Get user statuses (<a href='#list-of-endpoints'>go to full list</a>)</h3>
+
+Gets available user statuses
+
+`GET /api/v1/users/statuses`
+
+**Response body:**
+
+```typescript
+[
+	{
+		name: string
+		value: number
+	}
+
+]
+
+```
+
+<h3 id='usermanagement-get-opt-in-statuses'>Get opt-in statuses (<a href='#list-of-endpoints'>go to full list</a>)</h3>
+
+Gets opt-in statuses that an admin may assign to a user
+
+`GET /api/v1/users/opt-in-statuses`
+
+**Response body:**
+
+```typescript
+[
+	{
+		name: string
+		value: number
+	}
+
+]
+
+```
+
+<h3 id='usermanagement-search-users'>Search users (<a href='#list-of-endpoints'>go to full list</a>)</h3>
+
+Search users by email or name. Results are limited to 100 users.
+
+`GET /api/v1/users/`
+
+**Query Params:**
+
+| name | type | required | elaboration |
+|---|---|---|---|
+| `term` | `string` | yes |  |
+
+**Response body:**
+
+```typescript
+[
+	{
+		id: string // UUID formatted as `00000000-0000-0000-0000-000000000000`
+		fullName: string
+		email: string
+		kind: 		{
+			value: number
+			name: string
+			hasPaidPrivileges: boolean
+		}
+
+		status: 		{
+			name: string
+			value: number
+		}
+
+		createdAt: string // Date timestamp formatted as `2006-01-02T15:00:00Z`
+		tenantID: string
+	}
+
+]
+
+```
+
+<h3 id='usermanagement-get-user'>Get user (<a href='#list-of-endpoints'>go to full list</a>)</h3>
+
+Gets user by email address
+
+`GET /api/v1/users/email/{email}`
+
+**Path Params:**
+
+| name | type | elaboration |
+|---|---|---|
+| `email` | `string` |  |
+
+**Response body:**
+
+```typescript
+{
+	id: string // UUID formatted as `00000000-0000-0000-0000-000000000000`
+	fullName: string
+	email: string
+	kind: 	{
+		value: number
+		name: string
+		hasPaidPrivileges: boolean
+	}
+
+	createdAt: string // Date timestamp formatted as `2006-01-02T15:00:00Z`
+	upgradeTime: string // Date timestamp formatted as `2006-01-02T15:00:00Z`
+	status: 	{
+		name: string
+		value: number
+	}
+
+	userAgent: string
+	defaultPlacement: number
+	projects: 	[
+		{
+			id: string // UUID formatted as `00000000-0000-0000-0000-000000000000`
+			name: string
+			active: boolean
+			hasManagedPassphrase: boolean
+			ownerID: string // UUID formatted as `00000000-0000-0000-0000-000000000000`
+			bandwidthLimit: number
+			userSetBandwidthLimit: number
+			bandwidthUsed: number
+			storageLimit: number
+			userSetStorageLimit: number
+			storageUsed: number
+			segmentLimit: number
+			segmentUsed: number
+		}
+
+	]
+
+	projectLimit: number
+	storageLimit: number
+	bandwidthLimit: number
+	segmentLimit: number
+	freezeStatus: unknown
+	trialExpiration: string // Date timestamp formatted as `2006-01-02T15:00:00Z`
+	mfaEnabled: boolean
+	tenantID: string
+	optInStatus: 	{
+		name: string
+		value: number
+	}
+
+	inactivityExempt: boolean
+}
+
+```
+
+<h3 id='usermanagement-get-user'>Get user (<a href='#list-of-endpoints'>go to full list</a>)</h3>
+
+Gets user by ID
+
+`GET /api/v1/users/{userID}`
+
+**Path Params:**
+
+| name | type | elaboration |
+|---|---|---|
+| `userID` | `string` | UUID formatted as `00000000-0000-0000-0000-000000000000` |
+
+**Response body:**
+
+```typescript
+{
+	id: string // UUID formatted as `00000000-0000-0000-0000-000000000000`
+	fullName: string
+	email: string
+	kind: 	{
+		value: number
+		name: string
+		hasPaidPrivileges: boolean
+	}
+
+	createdAt: string // Date timestamp formatted as `2006-01-02T15:00:00Z`
+	upgradeTime: string // Date timestamp formatted as `2006-01-02T15:00:00Z`
+	status: 	{
+		name: string
+		value: number
+	}
+
+	userAgent: string
+	defaultPlacement: number
+	projects: 	[
+		{
+			id: string // UUID formatted as `00000000-0000-0000-0000-000000000000`
+			name: string
+			active: boolean
+			hasManagedPassphrase: boolean
+			ownerID: string // UUID formatted as `00000000-0000-0000-0000-000000000000`
+			bandwidthLimit: number
+			userSetBandwidthLimit: number
+			bandwidthUsed: number
+			storageLimit: number
+			userSetStorageLimit: number
+			storageUsed: number
+			segmentLimit: number
+			segmentUsed: number
+		}
+
+	]
+
+	projectLimit: number
+	storageLimit: number
+	bandwidthLimit: number
+	segmentLimit: number
+	freezeStatus: unknown
+	trialExpiration: string // Date timestamp formatted as `2006-01-02T15:00:00Z`
+	mfaEnabled: boolean
+	tenantID: string
+	optInStatus: 	{
+		name: string
+		value: number
+	}
+
+	inactivityExempt: boolean
+}
+
+```
+
+<h3 id='usermanagement-update-user'>Update user (<a href='#list-of-endpoints'>go to full list</a>)</h3>
+
+Updates user info by ID. Limit updates will cascade to all projects of the user.Updating user kind to NFR or Paid without providing limits will set the limits to kind defaults.
+
+`PATCH /api/v1/users/{userID}`
+
+**Path Params:**
+
+| name | type | elaboration |
+|---|---|---|
+| `userID` | `string` | UUID formatted as `00000000-0000-0000-0000-000000000000` |
+
+**Request body:**
+
+```typescript
+{
+	email: string
+	name: string
+	kind: number
+	status: number
+	trialExpiration: string
+	userAgent: string
+	projectLimit: number
+	storageLimit: number
+	bandwidthLimit: number
+	segmentLimit: number
+	defaultPlacement: string
+	reason: string
+}
+
+```
+
+**Response body:**
+
+```typescript
+{
+	id: string // UUID formatted as `00000000-0000-0000-0000-000000000000`
+	fullName: string
+	email: string
+	kind: 	{
+		value: number
+		name: string
+		hasPaidPrivileges: boolean
+	}
+
+	createdAt: string // Date timestamp formatted as `2006-01-02T15:00:00Z`
+	upgradeTime: string // Date timestamp formatted as `2006-01-02T15:00:00Z`
+	status: 	{
+		name: string
+		value: number
+	}
+
+	userAgent: string
+	defaultPlacement: number
+	projects: 	[
+		{
+			id: string // UUID formatted as `00000000-0000-0000-0000-000000000000`
+			name: string
+			active: boolean
+			hasManagedPassphrase: boolean
+			ownerID: string // UUID formatted as `00000000-0000-0000-0000-000000000000`
+			bandwidthLimit: number
+			userSetBandwidthLimit: number
+			bandwidthUsed: number
+			storageLimit: number
+			userSetStorageLimit: number
+			storageUsed: number
+			segmentLimit: number
+			segmentUsed: number
+		}
+
+	]
+
+	projectLimit: number
+	storageLimit: number
+	bandwidthLimit: number
+	segmentLimit: number
+	freezeStatus: unknown
+	trialExpiration: string // Date timestamp formatted as `2006-01-02T15:00:00Z`
+	mfaEnabled: boolean
+	tenantID: string
+	optInStatus: 	{
+		name: string
+		value: number
+	}
+
+	inactivityExempt: boolean
+}
+
+```
+
+<h3 id='usermanagement-update-users-upgrade-time'>Update user's upgrade time (<a href='#list-of-endpoints'>go to full list</a>)</h3>
+
+Updates user's upgrade time by ID
+
+`PATCH /api/v1/users/{userID}/upgrade-time`
+
+**Path Params:**
+
+| name | type | elaboration |
+|---|---|---|
+| `userID` | `string` | UUID formatted as `00000000-0000-0000-0000-000000000000` |
+
+**Request body:**
+
+```typescript
+{
+	upgradeTime: string // Date timestamp formatted as `2006-01-02T15:00:00Z`
+	reason: string
+}
+
+```
+
+**Response body:**
+
+```typescript
+{
+	id: string // UUID formatted as `00000000-0000-0000-0000-000000000000`
+	fullName: string
+	email: string
+	kind: 	{
+		value: number
+		name: string
+		hasPaidPrivileges: boolean
+	}
+
+	createdAt: string // Date timestamp formatted as `2006-01-02T15:00:00Z`
+	upgradeTime: string // Date timestamp formatted as `2006-01-02T15:00:00Z`
+	status: 	{
+		name: string
+		value: number
+	}
+
+	userAgent: string
+	defaultPlacement: number
+	projects: 	[
+		{
+			id: string // UUID formatted as `00000000-0000-0000-0000-000000000000`
+			name: string
+			active: boolean
+			hasManagedPassphrase: boolean
+			ownerID: string // UUID formatted as `00000000-0000-0000-0000-000000000000`
+			bandwidthLimit: number
+			userSetBandwidthLimit: number
+			bandwidthUsed: number
+			storageLimit: number
+			userSetStorageLimit: number
+			storageUsed: number
+			segmentLimit: number
+			segmentUsed: number
+		}
+
+	]
+
+	projectLimit: number
+	storageLimit: number
+	bandwidthLimit: number
+	segmentLimit: number
+	freezeStatus: unknown
+	trialExpiration: string // Date timestamp formatted as `2006-01-02T15:00:00Z`
+	mfaEnabled: boolean
+	tenantID: string
+	optInStatus: 	{
+		name: string
+		value: number
+	}
+
+	inactivityExempt: boolean
+}
+
+```
+
+<h3 id='usermanagement-update-users-opt-in-status'>Update user's opt-in status (<a href='#list-of-endpoints'>go to full list</a>)</h3>
+
+Sets a user's OptInStatus. Only NoAction (0) and Excluded (3) are accepted. Opting in or out is an explicit user action and must not be performed via the admin API.
+
+`PATCH /api/v1/users/{userID}/opt-in-status`
+
+**Path Params:**
+
+| name | type | elaboration |
+|---|---|---|
+| `userID` | `string` | UUID formatted as `00000000-0000-0000-0000-000000000000` |
+
+**Request body:**
+
+```typescript
+{
+	status: number
+	reason: string
+}
+
+```
+
+<h3 id='usermanagement-update-users-tenant-id'>Update user's tenant ID (<a href='#list-of-endpoints'>go to full list</a>)</h3>
+
+Updates user's tenant ID by user ID
+
+`PATCH /api/v1/users/{userID}/tenant-id`
+
+**Path Params:**
+
+| name | type | elaboration |
+|---|---|---|
+| `userID` | `string` | UUID formatted as `00000000-0000-0000-0000-000000000000` |
+
+**Request body:**
+
+```typescript
+{
+	tenantID: string
+	reason: string
+}
+
+```
+
+**Response body:**
+
+```typescript
+{
+	id: string // UUID formatted as `00000000-0000-0000-0000-000000000000`
+	fullName: string
+	email: string
+	kind: 	{
+		value: number
+		name: string
+		hasPaidPrivileges: boolean
+	}
+
+	createdAt: string // Date timestamp formatted as `2006-01-02T15:00:00Z`
+	upgradeTime: string // Date timestamp formatted as `2006-01-02T15:00:00Z`
+	status: 	{
+		name: string
+		value: number
+	}
+
+	userAgent: string
+	defaultPlacement: number
+	projects: 	[
+		{
+			id: string // UUID formatted as `00000000-0000-0000-0000-000000000000`
+			name: string
+			active: boolean
+			hasManagedPassphrase: boolean
+			ownerID: string // UUID formatted as `00000000-0000-0000-0000-000000000000`
+			bandwidthLimit: number
+			userSetBandwidthLimit: number
+			bandwidthUsed: number
+			storageLimit: number
+			userSetStorageLimit: number
+			storageUsed: number
+			segmentLimit: number
+			segmentUsed: number
+		}
+
+	]
+
+	projectLimit: number
+	storageLimit: number
+	bandwidthLimit: number
+	segmentLimit: number
+	freezeStatus: unknown
+	trialExpiration: string // Date timestamp formatted as `2006-01-02T15:00:00Z`
+	mfaEnabled: boolean
+	tenantID: string
+	optInStatus: 	{
+		name: string
+		value: number
+	}
+
+	inactivityExempt: boolean
+}
+
+```
+
+<h3 id='usermanagement-disable-user'>Disable user (<a href='#list-of-endpoints'>go to full list</a>)</h3>
+
+Disables user by ID. User can only be disabled if they have no active projects and pending invoices. It can also set status to pending deletion.
+
+`PUT /api/v1/users/{userID}`
+
+**Path Params:**
+
+| name | type | elaboration |
+|---|---|---|
+| `userID` | `string` | UUID formatted as `00000000-0000-0000-0000-000000000000` |
+
+**Request body:**
+
+```typescript
+{
+	setPendingDeletion: boolean
+	reason: string
+}
+
+```
+
+**Response body:**
+
+```typescript
+{
+	id: string // UUID formatted as `00000000-0000-0000-0000-000000000000`
+	fullName: string
+	email: string
+	kind: 	{
+		value: number
+		name: string
+		hasPaidPrivileges: boolean
+	}
+
+	createdAt: string // Date timestamp formatted as `2006-01-02T15:00:00Z`
+	upgradeTime: string // Date timestamp formatted as `2006-01-02T15:00:00Z`
+	status: 	{
+		name: string
+		value: number
+	}
+
+	userAgent: string
+	defaultPlacement: number
+	projects: 	[
+		{
+			id: string // UUID formatted as `00000000-0000-0000-0000-000000000000`
+			name: string
+			active: boolean
+			hasManagedPassphrase: boolean
+			ownerID: string // UUID formatted as `00000000-0000-0000-0000-000000000000`
+			bandwidthLimit: number
+			userSetBandwidthLimit: number
+			bandwidthUsed: number
+			storageLimit: number
+			userSetStorageLimit: number
+			storageUsed: number
+			segmentLimit: number
+			segmentUsed: number
+		}
+
+	]
+
+	projectLimit: number
+	storageLimit: number
+	bandwidthLimit: number
+	segmentLimit: number
+	freezeStatus: unknown
+	trialExpiration: string // Date timestamp formatted as `2006-01-02T15:00:00Z`
+	mfaEnabled: boolean
+	tenantID: string
+	optInStatus: 	{
+		name: string
+		value: number
+	}
+
+	inactivityExempt: boolean
+}
+
+```
+
+<h3 id='usermanagement-freezeunfreeze-user'>Freeze/Unfreeze User (<a href='#list-of-endpoints'>go to full list</a>)</h3>
+
+Freeze or unfreeze a user account
+
+`PUT /api/v1/users/{userID}/freeze-events`
+
+**Path Params:**
+
+| name | type | elaboration |
+|---|---|---|
+| `userID` | `string` | UUID formatted as `00000000-0000-0000-0000-000000000000` |
+
+**Request body:**
+
+```typescript
+{
+	action: string
+	type: number
+	reason: string
+}
+
+```
+
+<h3 id='usermanagement-toggle-inactivity-exemption'>Toggle inactivity exemption (<a href='#list-of-endpoints'>go to full list</a>)</h3>
+
+Sets or clears the inactivity exemption flag for a user. When granting, clears any pending inactivity warning or freeze.
+
+`PUT /api/v1/users/{userID}/inactivity-exemption`
+
+**Path Params:**
+
+| name | type | elaboration |
+|---|---|---|
+| `userID` | `string` | UUID formatted as `00000000-0000-0000-0000-000000000000` |
+
+**Request body:**
+
+```typescript
+{
+	exempt: boolean
+	reason: string
+}
+
+```
+
+<h3 id='usermanagement-toggle-mfa'>Toggle MFA (<a href='#list-of-endpoints'>go to full list</a>)</h3>
+
+Toggles MFA for a user. Only disabling is supported.
+
+`PUT /api/v1/users/{userID}/mfa`
+
+**Path Params:**
+
+| name | type | elaboration |
+|---|---|---|
+| `userID` | `string` | UUID formatted as `00000000-0000-0000-0000-000000000000` |
+
+**Request body:**
+
+```typescript
+{
+	reason: string
+}
+
+```
+
+<h3 id='usermanagement-create-rest-key'>Create Rest Key (<a href='#list-of-endpoints'>go to full list</a>)</h3>
+
+Creates a rest API key a user
+
+`POST /api/v1/users/rest-keys/{userID}`
+
+**Path Params:**
+
+| name | type | elaboration |
+|---|---|---|
+| `userID` | `string` | UUID formatted as `00000000-0000-0000-0000-000000000000` |
+
+**Request body:**
+
+```typescript
+{
+	expiration: string // Date timestamp formatted as `2006-01-02T15:00:00Z`
+	reason: string
+}
+
+```
+
+**Response body:**
+
+```typescript
+string
+```
+
+<h3 id='usermanagement-create-registration-token'>Create registration token (<a href='#list-of-endpoints'>go to full list</a>)</h3>
+
+Creates a registration token that can be used to register a new user with preset limits
+
+`POST /api/v1/users/registration-tokens`
+
+**Request body:**
+
+```typescript
+{
+	projectLimit: number
+	storageLimit: number
+	bandwidthLimit: number
+	segmentLimit: number
+	expiresIn: string
+	userKind: number
+	email: string
+	partner: string
+	reason: string
+}
+
+```
+
+**Response body:**
+
+```typescript
+{
+	token: string
+	expiresAt: string // Date timestamp formatted as `2006-01-02T15:00:00Z`
+}
+
+```
+
+<h3 id='usermanagement-get-user-licenses'>Get user licenses (<a href='#list-of-endpoints'>go to full list</a>)</h3>
+
+Gets all licenses for a user
+
+`GET /api/v1/users/{userID}/licenses`
+
+**Path Params:**
+
+| name | type | elaboration |
+|---|---|---|
+| `userID` | `string` | UUID formatted as `00000000-0000-0000-0000-000000000000` |
+
+**Response body:**
+
+```typescript
+{
+	licenses: 	[
+		{
+			type: string
+			productId: number
+			productName: string
+			count: number
+			publicId: string
+			bucketName: string
+			expiresAt: string // Date timestamp formatted as `2006-01-02T15:00:00Z`
+			revokedAt: string // Date timestamp formatted as `2006-01-02T15:00:00Z`
+			key: string
+		}
+
+	]
+
+}
+
+```
+
+<h3 id='usermanagement-grant-user-license'>Grant user license (<a href='#list-of-endpoints'>go to full list</a>)</h3>
+
+Grants a new license to a user
+
+`POST /api/v1/users/{userID}/licenses`
+
+**Path Params:**
+
+| name | type | elaboration |
+|---|---|---|
+| `userID` | `string` | UUID formatted as `00000000-0000-0000-0000-000000000000` |
+
+**Request body:**
+
+```typescript
+{
+	type: string
+	productId: number
+	count: number
+	publicId: string
+	bucketName: string
+	expiresAt: string // Date timestamp formatted as `2006-01-02T15:00:00Z`
+	key: string
+	reason: string
+}
+
+```
+
+<h3 id='usermanagement-revoke-user-license'>Revoke user license (<a href='#list-of-endpoints'>go to full list</a>)</h3>
+
+Revokes a license for a user
+
+`DELETE /api/v1/users/{userID}/licenses`
+
+**Path Params:**
+
+| name | type | elaboration |
+|---|---|---|
+| `userID` | `string` | UUID formatted as `00000000-0000-0000-0000-000000000000` |
+
+**Request body:**
+
+```typescript
+{
+	type: string
+	publicId: string
+	bucketName: string
+	expiresAt: string // Date timestamp formatted as `2006-01-02T15:00:00Z`
+	reason: string
+}
+
+```
+
+<h3 id='usermanagement-delete-user-license'>Delete user license (<a href='#list-of-endpoints'>go to full list</a>)</h3>
+
+Permanently deletes a license for a user
+
+`POST /api/v1/users/{userID}/licenses/delete`
+
+**Path Params:**
+
+| name | type | elaboration |
+|---|---|---|
+| `userID` | `string` | UUID formatted as `00000000-0000-0000-0000-000000000000` |
+
+**Request body:**
+
+```typescript
+{
+	type: string
+	publicId: string
+	bucketName: string
+	expiresAt: string // Date timestamp formatted as `2006-01-02T15:00:00Z`
+	reason: string
+}
+
+```
+
+<h3 id='usermanagement-update-user-license'>Update user license (<a href='#list-of-endpoints'>go to full list</a>)</h3>
+
+Updates a license's expiration time for a user
+
+`PATCH /api/v1/users/{userID}/licenses`
+
+**Path Params:**
+
+| name | type | elaboration |
+|---|---|---|
+| `userID` | `string` | UUID formatted as `00000000-0000-0000-0000-000000000000` |
+
+**Request body:**
+
+```typescript
+{
+	type: string
+	publicId: string
+	bucketName: string
+	expiresAt: string // Date timestamp formatted as `2006-01-02T15:00:00Z`
+	newExpiresAt: string // Date timestamp formatted as `2006-01-02T15:00:00Z`
+	reason: string
+}
+
+```
+
+<h3 id='usermanagement-get-user-usage-report'>Get user usage report (<a href='#list-of-endpoints'>go to full list</a>)</h3>
+
+Gets storage and bandwidth usage for all active projects owned by a user for a given period as a downloadable CSV file. Filter to a single project with projectID. Aggregate by project instead of bucket with projectSummary=true.
+
+`GET /api/v1/users/{userID}/usage-report`
+
+**Query Params:**
+
+| name | type | required | elaboration |
+|---|---|---|---|
+| `since` | `string` | yes | Date timestamp formatted as `2006-01-02T15:00:00Z` |
+| `before` | `string` | yes | Date timestamp formatted as `2006-01-02T15:00:00Z` |
+| `projectID` | `string` | no | UUID formatted as `00000000-0000-0000-0000-000000000000` |
+| `projectSummary` | `boolean` | no |  |
+
+**Path Params:**
+
+| name | type | elaboration |
+|---|---|---|
+| `userID` | `string` | UUID formatted as `00000000-0000-0000-0000-000000000000` |
+
+**Response type:** `text/csv`
+
+CSV file. Default columns: projectName, projectPublicID, bucketName, storage (GB-hours), egress (GB), objectCount, segmentCount, since, before. With projectSummary=true: bucketName is omitted and rows are aggregated per project.
+
+<h3 id='projectmanagement-get-project-statuses'>Get project statuses (<a href='#list-of-endpoints'>go to full list</a>)</h3>
+
+Gets available project statuses
+
+`GET /api/v1/projects/statuses`
+
+**Response body:**
+
+```typescript
+[
+	{
+		name: string
+		value: number
+	}
+
+]
+
+```
+
+<h3 id='projectmanagement-get-project'>Get project (<a href='#list-of-endpoints'>go to full list</a>)</h3>
+
+Gets project by ID
+
+`GET /api/v1/projects/{publicID}`
+
+**Path Params:**
+
+| name | type | elaboration |
+|---|---|---|
+| `publicID` | `string` | UUID formatted as `00000000-0000-0000-0000-000000000000` |
+
+**Response body:**
+
+```typescript
+{
+	privateID: string // UUID formatted as `00000000-0000-0000-0000-000000000000`
+	id: string // UUID formatted as `00000000-0000-0000-0000-000000000000`
+	name: string
+	description: string
+	userAgent: string
+	owner: 	{
+		id: string // UUID formatted as `00000000-0000-0000-0000-000000000000`
+		fullName: string
+		email: string
+	}
+
+	createdAt: string // Date timestamp formatted as `2006-01-02T15:00:00Z`
+	defaultPlacement: number
+	hasManagedPassphrase: boolean
+	rateLimit: number
+	burstLimit: number
+	rateLimitHead: number
+	burstLimitHead: number
+	rateLimitGet: number
+	burstLimitGet: number
+	rateLimitPut: number
+	burstLimitPut: number
+	rateLimitDelete: number
+	burstLimitDelete: number
+	rateLimitList: number
+	burstLimitList: number
+	maxBuckets: number
+	bandwidthLimit: number
+	userSetBandwidthLimit: number
+	bandwidthUsed: number
+	storageLimit: number
+	userSetStorageLimit: number
+	storageUsed: number
+	segmentLimit: number
+	segmentUsed: number
+	status: unknown
+	entitlements: unknown
+}
+
+```
+
+<h3 id='projectmanagement-get-project-buckets'>Get project buckets (<a href='#list-of-endpoints'>go to full list</a>)</h3>
+
+Gets a project's buckets
+
+`GET /api/v1/projects/{publicID}/buckets`
+
+**Query Params:**
+
+| name | type | required | elaboration |
+|---|---|---|---|
+| `search` | `string` | yes |  |
+| `page` | `string` | yes |  |
+| `limit` | `string` | yes |  |
+| `since` | `string` | yes | Date timestamp formatted as `2006-01-02T15:00:00Z` |
+| `before` | `string` | yes | Date timestamp formatted as `2006-01-02T15:00:00Z` |
+
+**Path Params:**
+
+| name | type | elaboration |
+|---|---|---|
+| `publicID` | `string` | UUID formatted as `00000000-0000-0000-0000-000000000000` |
+
+**Response body:**
+
+```typescript
+{
+	items: 	[
+		{
+			name: string
+			userAgent: string
+			placement: string
+			storage: number
+			egress: number
+			segmentCount: number
+			createdAt: string // Date timestamp formatted as `2006-01-02T15:00:00Z`
+			objectLockEnabled: boolean
+			versioning: number
+		}
+
+	]
+
+	limit: number
+	offset: number
+	pageCount: number
+	currentPage: number
+	totalCount: number
+}
+
+```
+
+<h3 id='projectmanagement-update-bucket'>Update bucket (<a href='#list-of-endpoints'>go to full list</a>)</h3>
+
+Updates a bucket's user agent, and placement if the bucket is empty
+
+`PATCH /api/v1/projects/{publicID}/buckets/{bucketName}`
+
+**Path Params:**
+
+| name | type | elaboration |
+|---|---|---|
+| `publicID` | `string` | UUID formatted as `00000000-0000-0000-0000-000000000000` |
+| `bucketName` | `string` |  |
+
+**Request body:**
+
+```typescript
+{
+	userAgent: string
+	placement: number
+	reason: string
+}
+
+```
+
+<h3 id='projectmanagement-get-bucket-state'>Get bucket state (<a href='#list-of-endpoints'>go to full list</a>)</h3>
+
+Gets a bucket's state that is not stored in the buckets table and requires additional queries.
+
+`GET /api/v1/projects/{publicID}/buckets/{bucketName}/state`
+
+**Path Params:**
+
+| name | type | elaboration |
+|---|---|---|
+| `publicID` | `string` | UUID formatted as `00000000-0000-0000-0000-000000000000` |
+| `bucketName` | `string` |  |
+
+**Response body:**
+
+```typescript
+{
+	empty: boolean
+}
+
+```
+
+<h3 id='projectmanagement-update-project'>Update project (<a href='#list-of-endpoints'>go to full list</a>)</h3>
+
+Updates project name, user agent and default placement by ID
+
+`PATCH /api/v1/projects/{publicID}`
+
+**Path Params:**
+
+| name | type | elaboration |
+|---|---|---|
+| `publicID` | `string` | UUID formatted as `00000000-0000-0000-0000-000000000000` |
+
+**Request body:**
+
+```typescript
+{
+	name: string
+	description: string
+	userAgent: string
+	status: number
+	defaultPlacement: number
+	reason: string
+}
+
+```
+
+**Response body:**
+
+```typescript
+{
+	privateID: string // UUID formatted as `00000000-0000-0000-0000-000000000000`
+	id: string // UUID formatted as `00000000-0000-0000-0000-000000000000`
+	name: string
+	description: string
+	userAgent: string
+	owner: 	{
+		id: string // UUID formatted as `00000000-0000-0000-0000-000000000000`
+		fullName: string
+		email: string
+	}
+
+	createdAt: string // Date timestamp formatted as `2006-01-02T15:00:00Z`
+	defaultPlacement: number
+	hasManagedPassphrase: boolean
+	rateLimit: number
+	burstLimit: number
+	rateLimitHead: number
+	burstLimitHead: number
+	rateLimitGet: number
+	burstLimitGet: number
+	rateLimitPut: number
+	burstLimitPut: number
+	rateLimitDelete: number
+	burstLimitDelete: number
+	rateLimitList: number
+	burstLimitList: number
+	maxBuckets: number
+	bandwidthLimit: number
+	userSetBandwidthLimit: number
+	bandwidthUsed: number
+	storageLimit: number
+	userSetStorageLimit: number
+	storageUsed: number
+	segmentLimit: number
+	segmentUsed: number
+	status: unknown
+	entitlements: unknown
+}
+
+```
+
+<h3 id='projectmanagement-disable-project'>Disable project (<a href='#list-of-endpoints'>go to full list</a>)</h3>
+
+Disables a project by ID. It can also set status to pending deletion.
+
+`PUT /api/v1/projects/{publicID}`
+
+**Path Params:**
+
+| name | type | elaboration |
+|---|---|---|
+| `publicID` | `string` | UUID formatted as `00000000-0000-0000-0000-000000000000` |
+
+**Request body:**
+
+```typescript
+{
+	setPendingDeletion: boolean
+	reason: string
+}
+
+```
+
+<h3 id='projectmanagement-update-project-limits'>Update project limits (<a href='#list-of-endpoints'>go to full list</a>)</h3>
+
+Updates project limits by ID
+
+`PATCH /api/v1/projects/{publicID}/limits`
+
+**Path Params:**
+
+| name | type | elaboration |
+|---|---|---|
+| `publicID` | `string` | UUID formatted as `00000000-0000-0000-0000-000000000000` |
+
+**Request body:**
+
+```typescript
+{
+	maxBuckets: number
+	storageLimit: number
+	bandwidthLimit: number
+	segmentLimit: number
+	rateLimit: number
+	burstLimit: number
+	userSetStorageLimit: number
+	userSetBandwidthLimit: number
+	rateLimitHead: number
+	burstLimitHead: number
+	rateLimitGet: number
+	burstLimitGet: number
+	rateLimitPut: number
+	burstLimitPut: number
+	rateLimitDelete: number
+	burstLimitDelete: number
+	rateLimitList: number
+	burstLimitList: number
+	reason: string
+}
+
+```
+
+**Response body:**
+
+```typescript
+{
+	privateID: string // UUID formatted as `00000000-0000-0000-0000-000000000000`
+	id: string // UUID formatted as `00000000-0000-0000-0000-000000000000`
+	name: string
+	description: string
+	userAgent: string
+	owner: 	{
+		id: string // UUID formatted as `00000000-0000-0000-0000-000000000000`
+		fullName: string
+		email: string
+	}
+
+	createdAt: string // Date timestamp formatted as `2006-01-02T15:00:00Z`
+	defaultPlacement: number
+	hasManagedPassphrase: boolean
+	rateLimit: number
+	burstLimit: number
+	rateLimitHead: number
+	burstLimitHead: number
+	rateLimitGet: number
+	burstLimitGet: number
+	rateLimitPut: number
+	burstLimitPut: number
+	rateLimitDelete: number
+	burstLimitDelete: number
+	rateLimitList: number
+	burstLimitList: number
+	maxBuckets: number
+	bandwidthLimit: number
+	userSetBandwidthLimit: number
+	bandwidthUsed: number
+	storageLimit: number
+	userSetStorageLimit: number
+	storageUsed: number
+	segmentLimit: number
+	segmentUsed: number
+	status: unknown
+	entitlements: unknown
+}
+
+```
+
+<h3 id='projectmanagement-update-project-entitlements'>Update project entitlements (<a href='#list-of-endpoints'>go to full list</a>)</h3>
+
+Updates project entitlements by ID. Only one entitlement can be updated at a time.
+
+`PATCH /api/v1/projects/{publicID}/entitlements`
+
+**Path Params:**
+
+| name | type | elaboration |
+|---|---|---|
+| `publicID` | `string` | UUID formatted as `00000000-0000-0000-0000-000000000000` |
+
+**Request body:**
+
+```typescript
+{
+	newBucketPlacements: 	[
+number
+	]
+
+	computeAccessToken: string
+	placementProductMappings: unknown
+	reason: string
+}
+
+```
+
+**Response body:**
+
+```typescript
+{
+	newBucketPlacements: 	[
+string
+	]
+
+	computeAccessToken: string
+	placementProductMappings: unknown
+}
+
+```
+
+<h3 id='projectmanagement-get-project-members'>Get project members (<a href='#list-of-endpoints'>go to full list</a>)</h3>
+
+Gets paged project members by project ID
+
+`GET /api/v1/projects/{publicID}/members`
+
+**Query Params:**
+
+| name | type | required | elaboration |
+|---|---|---|---|
+| `search` | `string` | yes |  |
+| `page` | `string` | yes |  |
+| `limit` | `string` | yes |  |
+| `order` | `string` | yes |  |
+| `direction` | `string` | yes |  |
+
+**Path Params:**
+
+| name | type | elaboration |
+|---|---|---|
+| `publicID` | `string` | UUID formatted as `00000000-0000-0000-0000-000000000000` |
+
+**Response body:**
+
+```typescript
+{
+	projectMembers: 	[
+		{
+			userID: string // UUID formatted as `00000000-0000-0000-0000-000000000000`
+			email: string
+			role: number
+			createdAt: string // Date timestamp formatted as `2006-01-02T15:00:00Z`
+		}
+
+	]
+
+	search: string
+	limit: number
+	order: number
+	orderDirection: number
+	offset: number
+	pageCount: number
+	currentPage: number
+	totalCount: number
+}
+
+```
+
+<h3 id='search-search-users-or-projects'>Search users or projects (<a href='#list-of-endpoints'>go to full list</a>)</h3>
+
+Search by ID, email, name, Stripe customer ID, or node operator email. Results include at most one project and up to 100 users and 100 nodes.
+
+`GET /api/v1/search/`
+
+**Query Params:**
+
+| name | type | required | elaboration |
+|---|---|---|---|
+| `term` | `string` | yes |  |
+
+**Response body:**
+
+```typescript
+{
+	project: unknown
+	accounts: 	[
+		{
+			id: string // UUID formatted as `00000000-0000-0000-0000-000000000000`
+			fullName: string
+			email: string
+			kind: 			{
+				value: number
+				name: string
+				hasPaidPrivileges: boolean
+			}
+
+			status: 			{
+				name: string
+				value: number
+			}
+
+			createdAt: string // Date timestamp formatted as `2006-01-02T15:00:00Z`
+			tenantID: string
+		}
+
+	]
+
+	nodes: 	[
+		{
+			id: string
+			online: boolean
+			disqualified: boolean
+			createdAt: string // Date timestamp formatted as `2006-01-02T15:00:00Z`
+		}
+
+	]
+
+}
+
+```
+
+<h3 id='changehistory-get-change-history'>Get change history (<a href='#list-of-endpoints'>go to full list</a>)</h3>
+
+Retrieves change history for users, projects and buckets. If the exact parameter is `true`, this wouldfetch changes strictly on the user, project or bucket. It'll do otherwise if it's `false`.
+
+`GET /api/v1/changehistory/`
+
+**Query Params:**
+
+| name | type | required | elaboration |
+|---|---|---|---|
+| `exact` | `string` | yes |  |
+| `itemType` | `string` | yes |  |
+| `id` | `string` | yes |  |
+
+**Response body:**
+
+```typescript
+[
+	{
+		id: string // UUID formatted as `00000000-0000-0000-0000-000000000000`
+		userID: string // UUID formatted as `00000000-0000-0000-0000-000000000000`
+		projectID: string // UUID formatted as `00000000-0000-0000-0000-000000000000`
+		bucketName: string
+		adminEmail: string
+		itemType: string
+		reason: string
+		operation: string
+		changes: unknown
+		timestamp: string // Date timestamp formatted as `2006-01-02T15:00:00Z`
+	}
+
+]
+
+```
+
+<h3 id='nodemanagement-get-node-info'>Get node info (<a href='#list-of-endpoints'>go to full list</a>)</h3>
+
+Gets detailed information about a storage node by its ID.
+
+`GET /api/v1/nodes/{nodeID}`
+
+**Path Params:**
+
+| name | type | elaboration |
+|---|---|---|
+| `nodeID` | `string` |  |
+
+**Response body:**
+
+```typescript
+{
+	id: string
+	address: string
+	email: string
+	wallet: string
+	walletFeatures: 	[
+string
+	]
+
+	lastContactSuccess: string // Date timestamp formatted as `2006-01-02T15:00:00Z`
+	lastContactFailure: string // Date timestamp formatted as `2006-01-02T15:00:00Z`
+	vettedAt: string // Date timestamp formatted as `2006-01-02T15:00:00Z`
+	disqualified: string // Date timestamp formatted as `2006-01-02T15:00:00Z`
+	disqualificationReason: string
+	freeDisk: number
+	pieceCount: number
+	createdAt: string // Date timestamp formatted as `2006-01-02T15:00:00Z`
+	version: string
+	countryCode: string
+	exitInitiatedAt: string // Date timestamp formatted as `2006-01-02T15:00:00Z`
+	exitFinishedAt: string // Date timestamp formatted as `2006-01-02T15:00:00Z`
+	exitSuccess: boolean
+}
+
+```
+
+<h3 id='nodemanagement-disqualify-node'>Disqualify node (<a href='#list-of-endpoints'>go to full list</a>)</h3>
+
+Sets the disqualification status of a storage node by its ID.
+
+`POST /api/v1/nodes/{nodeID}/disqualification`
+
+**Path Params:**
+
+| name | type | elaboration |
+|---|---|---|
+| `nodeID` | `string` |  |
+
+**Request body:**
+
+```typescript
+{
+	disqualificationReason: string
+	reason: string
+}
+
+```
+
+<h3 id='nodemanagement-undisqualify-node'>Undisqualify node (<a href='#list-of-endpoints'>go to full list</a>)</h3>
+
+Clears the disqualification status of a storage node by its ID.
+
+`DELETE /api/v1/nodes/{nodeID}/disqualification`
+
+**Path Params:**
+
+| name | type | elaboration |
+|---|---|---|
+| `nodeID` | `string` |  |
+
+**Request body:**
+
+```typescript
+{
+	reason: string
+}
+
+```
+
+<h3 id='accessmanagement-inspect-access'>Inspect Access (<a href='#list-of-endpoints'>go to full list</a>)</h3>
+
+Inspects a provided access string and returns its metadata
+
+`POST /api/v1/access/`
+
+**Request body:**
+
+```typescript
+{
+	access: string
+}
+
+```
+
+**Response body:**
+
+```typescript
+{
+	satelliteAddr: string
+	defaultPathCipher: string
+	apiKey: string
+	apiKeyID: string
+	macaroon: 	{
+		caveats: 		[
+			{
+				disallow_reads: boolean
+				disallow_writes: boolean
+				disallow_lists: boolean
+				disallow_deletes: boolean
+				disallow_locks: boolean
+				disallow_put_retention: boolean
+				disallow_get_retention: boolean
+				disallow_put_legal_hold: boolean
+				disallow_get_legal_hold: boolean
+				disallow_bypass_governance_retention: boolean
+				disallow_put_bucket_object_lock_configuration: boolean
+				disallow_get_bucket_object_lock_configuration: boolean
+				disallow_put_bucket_notification_configuration: boolean
+				disallow_get_bucket_notification_configuration: boolean
+				allowed_paths: 				[
+unknown
+				]
+
+				not_after: string // Date timestamp formatted as `2006-01-02T15:00:00Z`
+				not_before: string // Date timestamp formatted as `2006-01-02T15:00:00Z`
+				max_object_ttl: number
+				nonce: 				string
+			}
+
+		]
+
+		tail: 		string
+	}
+
+	revoked: boolean
+	publicProjectID: string
+	projectOwnerID: string
+	projectOwnerEmail: string
+	creatorID: string
+}
+
+```
+
+<h3 id='accessmanagement-revoke-access'>Revoke Access (<a href='#list-of-endpoints'>go to full list</a>)</h3>
+
+Revokes access based on provided access tail and API key ID
+
+`POST /api/v1/access/revoke`
+
+**Request body:**
+
+```typescript
+{
+	tail: 	string
+	apiKeyID: string
+	reason: string
+}
+
+```
+
+<h3 id='whitelabelmanagement-list-tenant-whitelabel-configs'>List tenant whitelabel configs (<a href='#list-of-endpoints'>go to full list</a>)</h3>
+
+Lists all per-tenant whitelabel configs. Not available in tenant-scoped admin.
+
+`GET /api/v1/whitelabel/`
+
+**Response body:**
+
+```typescript
+[
+	{
+		tenantID: string
+		configYAML: string
+		createdAt: string // Date timestamp formatted as `2006-01-02T15:00:00Z`
+		updatedAt: string // Date timestamp formatted as `2006-01-02T15:00:00Z`
+	}
+
+]
+
+```
+
+<h3 id='whitelabelmanagement-get-tenant-whitelabel-config'>Get tenant whitelabel config (<a href='#list-of-endpoints'>go to full list</a>)</h3>
+
+Gets the persisted whitelabel config for a tenant.
+
+`GET /api/v1/whitelabel/{tenantID}`
+
+**Path Params:**
+
+| name | type | elaboration |
+|---|---|---|
+| `tenantID` | `string` |  |
+
+**Response body:**
+
+```typescript
+{
+	tenantID: string
+	configYAML: string
+	createdAt: string // Date timestamp formatted as `2006-01-02T15:00:00Z`
+	updatedAt: string // Date timestamp formatted as `2006-01-02T15:00:00Z`
+}
+
+```
+
+<h3 id='whitelabelmanagement-update-tenant-whitelabel-config'>Update tenant whitelabel config (<a href='#list-of-endpoints'>go to full list</a>)</h3>
+
+Creates or replaces the whitelabel config for a tenant.
+
+`PUT /api/v1/whitelabel/{tenantID}`
+
+**Path Params:**
+
+| name | type | elaboration |
+|---|---|---|
+| `tenantID` | `string` |  |
+
+**Request body:**
+
+```typescript
+{
+	configYAML: string
+}
+
+```
+
+**Response body:**
+
+```typescript
+{
+	tenantID: string
+	configYAML: string
+	createdAt: string // Date timestamp formatted as `2006-01-02T15:00:00Z`
+	updatedAt: string // Date timestamp formatted as `2006-01-02T15:00:00Z`
+}
+
+```
+

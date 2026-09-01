@@ -4,7 +4,6 @@
 package main
 
 import (
-	"fmt"
 	"reflect"
 	"strconv"
 	"time"
@@ -74,9 +73,9 @@ func mapDeprecatedConfigs(log *zap.Logger, cfg *StorageNodeFlags) {
 
 			reflect.ValueOf(migration.newValue).Elem().Set(reflect.ValueOf(override))
 			log.Debug("Found deprecated flag. Migrating value.",
-				zap.Stringer("Value", reflect.ValueOf(migration.newValue).Elem()),
-				zap.String("From", migration.oldConfigString),
-				zap.String("To", migration.newConfigString),
+				zap.Stringer("value", reflect.ValueOf(migration.newValue).Elem()),
+				zap.String("from", migration.oldConfigString),
+				zap.String("to", migration.newConfigString),
 			)
 		}
 	}
@@ -84,51 +83,51 @@ func mapDeprecatedConfigs(log *zap.Logger, cfg *StorageNodeFlags) {
 
 func parseOverride(typ reflect.Type, value string) interface{} {
 	switch typ {
-	case reflect.TypeOf(int(0)):
+	case reflect.TypeFor[int]():
 		val, err := strconv.ParseInt(value, 0, strconv.IntSize)
 		if err != nil {
 			panic(err)
 		}
 		return int(val)
-	case reflect.TypeOf(int64(0)):
+	case reflect.TypeFor[int64]():
 		val, err := strconv.ParseInt(value, 0, 64)
 		if err != nil {
 			panic(err)
 		}
 		return val
-	case reflect.TypeOf(uint(0)):
+	case reflect.TypeFor[uint]():
 		val, err := strconv.ParseUint(value, 0, strconv.IntSize)
 		if err != nil {
 			panic(err)
 		}
 		return uint(val)
-	case reflect.TypeOf(uint64(0)):
+	case reflect.TypeFor[uint64]():
 		val, err := strconv.ParseUint(value, 0, 64)
 		if err != nil {
 			panic(err)
 		}
 		return val
-	case reflect.TypeOf(time.Duration(0)):
+	case reflect.TypeFor[time.Duration]():
 		val, err := time.ParseDuration(value)
 		if err != nil {
 			panic(err)
 		}
 		return val
-	case reflect.TypeOf(float64(0)):
+	case reflect.TypeFor[float64]():
 		val, err := strconv.ParseFloat(value, 64)
 		if err != nil {
 			panic(err)
 		}
 		return val
-	case reflect.TypeOf(string("")):
+	case reflect.TypeFor[string]():
 		return value
-	case reflect.TypeOf(bool(false)):
+	case reflect.TypeFor[bool]():
 		val, err := strconv.ParseBool(value)
 		if err != nil {
 			panic(err)
 		}
 		return val
 	default:
-		panic(fmt.Sprintf("invalid field type: %s", typ.String()))
+		panic("invalid field type: " + typ.String())
 	}
 }

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"net"
 	"runtime/pprof"
+	"time"
 
 	"github.com/spacemonkeygo/monkit/v3"
 	"github.com/zeebo/errs"
@@ -22,12 +23,15 @@ import (
 	"storj.io/storj/private/version/checker"
 	"storj.io/storj/satellite/accounting"
 	"storj.io/storj/satellite/admin"
-	backoffice "storj.io/storj/satellite/admin/back-office"
+	"storj.io/storj/satellite/admin/auditlogger"
 	"storj.io/storj/satellite/analytics"
 	"storj.io/storj/satellite/buckets"
 	"storj.io/storj/satellite/console"
+	"storj.io/storj/satellite/console/restapikeys"
 	"storj.io/storj/satellite/console/restkeys"
 	"storj.io/storj/satellite/emission"
+	"storj.io/storj/satellite/entitlements"
+	"storj.io/storj/satellite/mailservice"
 	"storj.io/storj/satellite/metabase"
 	"storj.io/storj/satellite/payments"
 	"storj.io/storj/satellite/payments/stripe"
@@ -60,6 +64,10 @@ type Admin struct {
 		Service *analytics.Service
 	}
 
+	Entitlements struct {
+		Service *entitlements.Service
+	}
+
 	Payments struct {
 		Accounts payments.Accounts
 		Service  *stripe.Service
@@ -69,7 +77,7 @@ type Admin struct {
 	Admin struct {
 		Listener net.Listener
 		Server   *admin.Server
-		Service  *backoffice.Service
+		Service  *admin.Service
 	}
 
 	Buckets struct {
@@ -77,7 +85,7 @@ type Admin struct {
 	}
 
 	REST struct {
-		Keys *restkeys.Service
+		Keys restapikeys.Service
 	}
 
 	FreezeAccounts struct {
@@ -91,11 +99,19 @@ type Admin struct {
 	Accounting struct {
 		Service *accounting.Service
 	}
+
+	Mail struct {
+		Service *mailservice.Service
+	}
 }
 
 // NewAdmin creates a new satellite admin peer.
 func NewAdmin(log *zap.Logger, full *identity.FullIdentity, db DB, metabaseDB *metabase.DB,
 	liveAccounting accounting.Cache, versionInfo version.Info, config *Config, atomicLogLevel *zap.AtomicLevel) (*Admin, error) {
+	consoleConfig := config.Console.Config
+	consoleConfig.SatName = config.Console.SatelliteName
+	consoleConfig.IsBetaSat = config.Console.IsBetaSatellite
+
 	peer := &Admin{
 		Log:        log,
 		Identity:   full,
@@ -107,11 +123,17 @@ func NewAdmin(log *zap.Logger, full *identity.FullIdentity, db DB, metabaseDB *m
 	}
 
 	{
-		peer.Buckets.Service = buckets.NewService(db.Buckets(), metabaseDB)
+		peer.Buckets.Service = buckets.NewService(db.Buckets(), metabaseDB, db.Attribution())
 	}
 
 	{ // setup rest keys
-		peer.REST.Keys = restkeys.NewService(db.OIDC().OAuthTokens(), config.RESTKeys)
+		peer.REST.Keys = console.NewRestKeysService(
+			log.Named("restKeyService"),
+			db.Console().RestApiKeys(),
+			restkeys.NewService(peer.DB.OIDC().OAuthTokens(), config.Console.RestAPIKeys.DefaultExpiration),
+			time.Now,
+			consoleConfig,
+		)
 	}
 
 	{ // setup debug
@@ -136,10 +158,10 @@ func NewAdmin(log *zap.Logger, full *identity.FullIdentity, db DB, metabaseDB *m
 	{
 		if !versionInfo.IsZero() {
 			peer.Log.Debug("Version info",
-				zap.Stringer("Version", versionInfo.Version.Version),
-				zap.String("Commit Hash", versionInfo.CommitHash),
-				zap.Stringer("Build Timestamp", versionInfo.Timestamp),
-				zap.Bool("Release Build", versionInfo.Release),
+				zap.String("version", versionInfo.Version.VString()),
+				zap.String("commit_hash", versionInfo.CommitHash),
+				zap.Stringer("build_timestamp", versionInfo.Timestamp),
+				zap.Bool("release_build", versionInfo.Release),
 			)
 		}
 		peer.Version.Service = checker.NewService(log.Named("version"), config.Version, versionInfo, "Satellite")
@@ -152,13 +174,20 @@ func NewAdmin(log *zap.Logger, full *identity.FullIdentity, db DB, metabaseDB *m
 	}
 
 	{ // setup analytics
-		peer.Analytics.Service = analytics.NewService(peer.Log.Named("analytics:service"), config.Analytics, config.Console.SatelliteName)
+		peer.Analytics.Service = analytics.NewService(peer.Log.Named("analytics:service"), config.Analytics, config.Console.SatelliteName, config.Console.ExternalAddress)
 
 		peer.Services.Add(lifecycle.Item{
 			Name:  "analytics:service",
 			Run:   peer.Analytics.Service.Run,
 			Close: peer.Analytics.Service.Close,
 		})
+	}
+
+	{ // setup entitlements
+		peer.Entitlements.Service = entitlements.NewService(
+			peer.Log.Named("entitlements:service"),
+			db.Console().Entitlements(),
+		)
 	}
 
 	{ // setup payments
@@ -189,29 +218,56 @@ func NewAdmin(log *zap.Logger, full *identity.FullIdentity, db DB, metabaseDB *m
 			return nil, errs.Combine(err, peer.Close())
 		}
 
+		productPrices, err := pc.Products.ToModels()
+		if err != nil {
+			return nil, errs.Combine(err, peer.Close())
+		}
+
 		peer.FreezeAccounts.Service = console.NewAccountFreezeService(
 			db.Console(),
 			peer.Analytics.Service,
 			config.Console.AccountFreeze,
 		)
 
+		minimumChargeDate, err := pc.MinimumCharge.GetEffectiveDate()
+		if err != nil {
+			return nil, errs.Combine(err, peer.Close())
+		}
+
 		peer.Payments.Service, err = stripe.NewService(
 			peer.Log.Named("payments.stripe:service"),
 			stripeClient,
+			stripe.ServiceDependencies{
+				DB:                   peer.DB.StripeCoinPayments(),
+				WalletsDB:            peer.DB.Wallets(),
+				BillingDB:            peer.DB.Billing(),
+				ProjectsDB:           peer.DB.Console().Projects(),
+				UsersDB:              peer.DB.Console().Users(),
+				FreezeEventsDB:       peer.DB.Console().AccountFreezeEvents(),
+				UsageDB:              peer.DB.ProjectAccounting(),
+				RetentionRemainderDB: peer.DB.RetentionRemainderCharges(),
+				Analytics:            peer.Analytics.Service,
+				Emission:             emission.NewService(config.Emission),
+				Entitlements:         peer.Entitlements.Service,
+			},
+			stripe.ServiceConfig{
+				DeleteAccountEnabled:       config.Console.SelfServeAccountDeleteEnabled,
+				DeleteProjectCostThreshold: pc.DeleteProjectCostThreshold,
+				EntitlementsEnabled:        config.Entitlements.Enabled,
+			},
 			pc.StripeCoinPayments,
-			peer.DB.StripeCoinPayments(),
-			peer.DB.Wallets(),
-			peer.DB.Billing(),
-			peer.DB.Console().Projects(),
-			peer.DB.Console().Users(),
-			peer.DB.ProjectAccounting(),
-			prices,
-			priceOverrides,
-			pc.PackagePlans.Packages,
-			pc.BonusRate,
-			peer.Analytics.Service,
-			emission.NewService(config.Emission),
-			config.Console.SelfServeAccountDeleteEnabled,
+			stripe.PricingConfig{
+				UsagePrices:               prices,
+				UsagePriceOverrides:       priceOverrides,
+				ProductPriceMap:           productPrices,
+				PlacementProductMap:       pc.PlacementPriceOverrides.ToMap(),
+				PackagePlans:              pc.PackagePlans.Packages,
+				BonusRate:                 pc.BonusRate,
+				MinimumChargeAmount:       pc.MinimumCharge.Amount,
+				MinimumChargeDate:         minimumChargeDate,
+				LegacyMinimumChargeAmount: pc.MinimumCharge.LegacyAmount,
+				LegacyPricingUserAgents:   pc.LegacyPricingUserAgents,
+			},
 		)
 
 		if err != nil {
@@ -233,11 +289,24 @@ func NewAdmin(log *zap.Logger, full *identity.FullIdentity, db DB, metabaseDB *m
 			peer.LiveAccounting.Cache,
 			*metabaseDB,
 			config.LiveAccounting.BandwidthCacheTTL,
-			config.Console.Config.UsageLimits.Storage.Free,
-			config.Console.Config.UsageLimits.Bandwidth.Free,
-			config.Console.Config.UsageLimits.Segment.Free,
+			consoleConfig.UsageLimits.Storage.Free,
+			consoleConfig.UsageLimits.Bandwidth.Free,
+			consoleConfig.UsageLimits.Segment.Free,
 			config.LiveAccounting.AsOfSystemInterval,
 		)
+	}
+
+	{ // setup mail service
+		var err error
+		peer.Mail.Service, err = setupMailService(peer.Log, config.Mail, config.Console)
+		if err != nil {
+			return nil, errs.Combine(err, peer.Close())
+		}
+
+		peer.Services.Add(lifecycle.Item{
+			Name:  "mail:service",
+			Close: peer.Mail.Service.Close,
+		})
 	}
 
 	{ // setup admin
@@ -252,18 +321,61 @@ func NewAdmin(log *zap.Logger, full *identity.FullIdentity, db DB, metabaseDB *m
 			return nil, err
 		}
 
-		peer.Admin.Service = backoffice.NewService(
-			log.Named("back-office:service"),
+		adminConfig := config.Admin
+		adminConfig.Legacy.AuthorizationToken = config.Console.AuthToken
+		adminConfig.Legacy.AllowedOauthHost = adminConfig.AllowedOauthHost
+		if config.PendingDeleteCleanup.Enabled {
+			adminConfig.PendingDeleteUserCleanupEnabled = config.PendingDeleteCleanup.User.Enabled
+			adminConfig.PendingDeleteProjectCleanupEnabled = config.PendingDeleteCleanup.Project.Enabled
+		}
+
+		productPrices, err := config.Payments.Products.ToModels()
+		if err != nil {
+			return nil, errs.Combine(err, peer.Close())
+		}
+
+		externalAddress := config.Admin.ExternalAddress
+		if externalAddress == "" {
+			externalAddress = "http://" + peer.Admin.Listener.Addr().String()
+		}
+
+		logger := auditlogger.New(log.Named("audit-logger"), peer.Analytics.Service, peer.DB.AdminChangeHistory(), externalAddress, config.Admin.AuditLogger)
+		if config.Admin.AuditLogger.Enabled {
+			peer.Services.Add(lifecycle.Item{
+				Name:  "admin-audit-logger",
+				Run:   logger.Run,
+				Close: logger.Close,
+			})
+		}
+
+		peer.Admin.Service = admin.NewService(
+			log.Named("admin:service"),
 			peer.DB.Console(),
+			peer.DB.AdminChangeHistory(),
+			db.Attribution(),
 			peer.DB.ProjectAccounting(),
 			peer.Accounting.Service,
+			admin.NewAuthorizer(log.Named("admin:auth"), adminConfig),
+			peer.FreezeAccounts.Service,
+			peer.Analytics.Service,
+			peer.Buckets.Service,
+			peer.Entitlements.Service,
+			metabaseDB,
+			peer.DB.OverlayCache(),
+			peer.DB.Revocation(),
+			logger,
+			peer.Payments.Accounts,
+			peer.REST.Keys,
+			peer.Mail.Service,
 			placement,
-			config.Metainfo.ProjectLimits.MaxBuckets,
-			config.Metainfo.RateLimiter.Rate,
+			productPrices,
+			admin.Defaults{
+				MaxBuckets: config.Metainfo.ProjectLimits.MaxBuckets,
+				RateLimit:  int(config.Metainfo.RateLimiter.Rate),
+			},
+			adminConfig,
+			consoleConfig,
 		)
-
-		adminConfig := config.Admin
-		adminConfig.AuthorizationToken = config.Console.AuthToken
 
 		peer.Admin.Server = admin.NewServer(
 			log.Named("admin"),
@@ -276,7 +388,10 @@ func NewAdmin(log *zap.Logger, full *identity.FullIdentity, db DB, metabaseDB *m
 			peer.Analytics.Service,
 			peer.Payments.Accounts,
 			peer.Admin.Service,
+			peer.Entitlements.Service,
+			placement,
 			config.Console,
+			config.Entitlements,
 			adminConfig,
 		)
 

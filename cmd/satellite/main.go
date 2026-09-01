@@ -6,7 +6,6 @@ package main
 import (
 	"context"
 	"fmt"
-	"io"
 	mathrand "math/rand"
 	"os"
 	"path/filepath"
@@ -23,6 +22,7 @@ import (
 
 	"storj.io/common/cfgstruct"
 	"storj.io/common/fpath"
+	"storj.io/common/identity"
 	"storj.io/common/pb"
 	"storj.io/common/peertls/tlsopts"
 	"storj.io/common/process"
@@ -37,7 +37,7 @@ import (
 	"storj.io/storj/satellite"
 	"storj.io/storj/satellite/accounting"
 	"storj.io/storj/satellite/accounting/live"
-	"storj.io/storj/satellite/compensation"
+	"storj.io/storj/satellite/jobq"
 	"storj.io/storj/satellite/metabase"
 	"storj.io/storj/satellite/nodeselection"
 	"storj.io/storj/satellite/payments/stripe"
@@ -62,6 +62,8 @@ type Satellite struct {
 	}
 
 	satellite.Config
+
+	UnsafeSkipDBVersionCheck bool `help:"skip database (satellite/metabase) version check, use with caution" default:"false" advanced:"true"`
 }
 
 // APIKeysLRUOptions returns a cache.Options based on the APIKeys LRU config.
@@ -102,7 +104,7 @@ var (
 	}
 	runConsoleAPICmd = &cobra.Command{
 		Use:   "console-api",
-		Short: "Run the satellite API",
+		Short: "Run the satellite console API",
 		RunE:  cmdConsoleAPIRun,
 	}
 	runUICmd = &cobra.Command{
@@ -127,12 +129,12 @@ var (
 	}
 	runGCCmd = &cobra.Command{
 		Use:   "garbage-collection",
-		Short: "Run the satellite garbage collection process",
+		Short: "Run the satellite garbage collection process to send generated bloom filters to storage nodes",
 		RunE:  cmdGCRun,
 	}
 	runGCBloomFilterCmd = &cobra.Command{
 		Use:   "garbage-collection-bloom-filters",
-		Short: "Run the satellite process which collects nodes bloom filters for garbage collection",
+		Short: "Run the satellite garbage collection process which creates a bloom filter for each node",
 		RunE:  cmdGCBloomFilterRun,
 	}
 	runRangedLoopCmd = &cobra.Command{
@@ -183,31 +185,6 @@ var (
 		Args:  cobra.MinimumNArgs(2),
 		RunE:  reportsVerifyGEReceipt,
 	}
-	compensationCmd = &cobra.Command{
-		Use:   "compensation",
-		Short: "Storage Node Compensation commands",
-	}
-	generateInvoicesCmd = &cobra.Command{
-		Use:   "generate-invoices [period]",
-		Short: "Generate storage node invoices",
-		Long:  "Generate storage node invoices for a pay period. Period is a UTC date formatted like YYYY-MM.",
-		Args:  cobra.ExactArgs(1),
-		RunE:  cmdGenerateInvoices,
-	}
-	recordPeriodCmd = &cobra.Command{
-		Use:   "record-period [paystubs-csv] [payments-csv]",
-		Short: "Record storage node pay period",
-		Long:  "Record storage node paystubs and payments for a pay period",
-		Args:  cobra.ExactArgs(2),
-		RunE:  cmdRecordPeriod,
-	}
-	recordOneOffPaymentsCmd = &cobra.Command{
-		Use:   "record-one-off-payments [payments-csv]",
-		Short: "Record one-off storage node payments",
-		Long:  "Record one-off storage node payments outside of a pay period",
-		Args:  cobra.ExactArgs(1),
-		RunE:  cmdRecordOneOffPayments,
-	}
 	billingCmd = &cobra.Command{
 		Use:   "billing",
 		Short: "Customer billing commands",
@@ -232,10 +209,6 @@ var (
 		RunE:  cmdCreateCustomerBalanceInvoiceItems,
 	}
 
-	aggregate           = false
-	groupInvoiceItems   = false
-	includeEmissionInfo = false
-
 	prepareCustomerInvoiceRecordsCmd = &cobra.Command{
 		Use:   "prepare-invoice-records [period]",
 		Short: "Prepares invoice project records",
@@ -243,26 +216,12 @@ var (
 		Args:  cobra.ExactArgs(1),
 		RunE:  cmdPrepareCustomerInvoiceRecords,
 	}
-	createCustomerProjectInvoiceItemsCmd = &cobra.Command{
-		Use:   "create-project-invoice-items [period]",
-		Short: "Creates stripe invoice line items for project charges",
-		Long:  "Creates stripe invoice line items for not consumed project records.",
-		Args:  cobra.ExactArgs(1),
-		RunE:  cmdCreateCustomerProjectInvoiceItems,
-	}
 	createCustomerProjectInvoiceItemsGroupedCmd = &cobra.Command{
 		Use:   "create-project-invoice-items-grouped [period]",
 		Short: "Creates stripe invoice line items for project charges grouped by project",
 		Long:  "Creates stripe invoice line items for not consumed project records grouped by project",
 		Args:  cobra.ExactArgs(1),
 		RunE:  cmdCreateCustomerProjectInvoiceItemsGrouped,
-	}
-	createCustomerAggregatedProjectInvoiceItemsCmd = &cobra.Command{
-		Use:   "create-aggregated-project-invoice-items [period]",
-		Short: "Creates aggregated stripe invoice line items for project charges",
-		Long:  "Creates aggregated stripe invoice line items for not consumed project records.",
-		Args:  cobra.ExactArgs(1),
-		RunE:  cmdCreateAggregatedCustomerProjectInvoiceItems,
 	}
 	createCustomerInvoicesCmd = &cobra.Command{
 		Use:   "create-invoices [period]",
@@ -318,6 +277,13 @@ var (
 		Long:  "Ensures that we have a stripe customer for every satellite user.",
 		RunE:  cmdStripeCustomer,
 	}
+	generateListOfReusedCardFingerprints = &cobra.Command{
+		Use:   "list-reused-card-fingerprints [min-customers] [csv-path]",
+		Short: "List reused card fingerprints",
+		Long:  "List reused card fingerprints for all the customers.",
+		Args:  cobra.ExactArgs(2),
+		RunE:  cmdGenerateListOfReusedCardFingerprints,
+	}
 	consistencyCmd = &cobra.Command{
 		Use:   "consistency",
 		Short: "Readdress DB consistency issues",
@@ -361,30 +327,140 @@ var (
 		RunE:  cmdFixLastNets,
 	}
 
+	entitlementsCmd = &cobra.Command{
+		Use:   "entitlements",
+		Short: "Entitlements administration",
+		Long:  "Operations to administrate satellite entitlements",
+	}
+	projectEntitlementsCmd = &cobra.Command{
+		Use:   "projects",
+		Short: "Project entitlements administration",
+		Long:  "Operations to administrate satellite project entitlements",
+	}
+	setNewBucketPlacementsCmd = &cobra.Command{
+		Use:   "set-new-bucket-placements",
+		Short: "Set NewBucketPlacements entitlement for projects",
+		Long:  "Set NewBucketPlacements entitlement for projects to be reused during new bucket creation",
+		RunE:  cmdSetNewBucketPlacements,
+	}
+	setPlacementProductMapCmd = &cobra.Command{
+		Use:   "set-placement-product-mappings",
+		Short: "Set PlacementProductMappings entitlement for projects",
+		Long:  "Set PlacementProductMappings entitlement for projects to override global configs",
+		RunE:  cmdSetPlacementProductMap,
+	}
+	migratePricingCmd = &cobra.Command{
+		Use:   "migrate-pricing",
+		Short: "Migrate per-project entitlement rows to new pricing tiers",
+		Long:  "Migrates new_bucket_placements, default_placement, and placement_product_mappings across all projects in batches",
+		RunE:  cmdMigratePricing,
+	}
+
+	usersCmd = &cobra.Command{
+		Use:   "user-accounts",
+		Short: "User accounts administration",
+		Long:  "Operations to administrate satellite users accounts",
+	}
+
+	batchSizeDeleteObjects           = 100
+	useDeleteAllObjectsUncoordinated = false
+	deleteObjectsCmd                 = &cobra.Command{
+		Use:   "delete-objects",
+		Short: "Delete objects and their segments",
+		Long: "Delete from a list of users accounts their objects and segments.\nAccounts must be on " +
+			"'pending deletion' status, when not they are logged with an info message and skipped. " +
+			"Unexisting accounts are logged with an debug message and skipped.\nSystem errors exit the " +
+			"process with an error message.\nThe command can operate on one account or on multiple " +
+			"accounts; when the passed possitional argmuent is a string that contains '@', the command " +
+			"considers that's the email address of the user to delete its data, otherwise it considers " +
+			"a path to a CSV file where the first column contains the email of the user's account and " +
+			"if the first row doesn't contain '@' is considered the header and skipped.",
+		Args: cobra.ExactArgs(1),
+		RunE: cmdDeleteObjects,
+	}
+
+	executeDeleteAllObjectsUncoordinated = false
+	deleteAllObjectsUncoordinatedCmd     = &cobra.Command{
+		Use:   "delete-all-objects-uncoordinated <public-project-id> <bucket-name> <owner-email>",
+		Short: "Delete all the objects in a bucket",
+		Long: "Deletes the objects in a given bucket, but does not guarantee consistency, while the " +
+			"delete is in progress. There must be no uploads, downloads or deletes happening while this is being run." +
+			"On failure, the system should check whether there are any undeleted streams or objects in the system. " +
+			"The owner-email argument is used to verify that the provided project and bucket are owned by the user with this email address.",
+		Args: cobra.ExactArgs(3),
+		RunE: cmdDeleteAllObjectsUncoordinated,
+	}
+
+	deleteNonExistingBucketObjectsCmd = &cobra.Command{
+		Use:   "delete-non-existing-bucket-objects <project-id> <bucket-name>",
+		Short: "Delete all the objects of an unexisting bucket",
+		Long: "Deletes the objects in a given bucket, but does not guarantee consistency, while the " +
+			"delete is in progress. Bucket must not exists at the moment when command is executed otherwise " +
+			"command will return error",
+		Args: cobra.ExactArgs(2),
+		RunE: cmdDeleteNonExistingBucketObjects,
+	}
+
+	deleteAccountsCmd = &cobra.Command{
+		Use:   "delete-accounts",
+		Short: "Delete accounts and their associated entities",
+		Long: "From the list of users accounts it redacts the users' personal information and marks " +
+			"their accounts as deleted, deactivate their projects, and delete their API keys.\n The " +
+			"accounts must be on 'pending deletion' status, otherwise they are logged with an info " +
+			"message and skipped. The accounts must not have data, otherwise they are logged as an " +
+			"error message and skipped. Unexisting accounts are logged with a debug  message and " +
+			"skipped.\nSystem errors exit the process with an error message.\nThe command can operate " +
+			"on one account or on multiple accounts; when the passed positional argument is a string " +
+			"that contains '@', the command considers that's the email address of the user to delete " +
+			"its data, otherwise it considers a path to a CSV file where the first column contains the " +
+			"email of the user's account and if the first row doesn't contain '@' is considered the " +
+			"header and skipped.",
+		Args: cobra.ExactArgs(1),
+		RunE: cmdDeleteAccounts,
+	}
+
+	setAccountsStatusPendingDeletionCmd = &cobra.Command{
+		Use:   "set-status-pending-deletion",
+		Short: "Safely change accounts to pending deletion status for accounts with trial expiration freeze",
+		Long: "Changes the status of user accounts to 'pending deletion', but only if certain safety criteria are met:\n" +
+			"1. The account is currently in 'active' status\n" +
+			"2. The account is NOT in the paid tier\n" +
+			"3. The account has an active 'trial expiration freeze'\n" +
+			"4. The active 'trial expiration freeze' days till escalation is over'\n" +
+			"5. The account is NOT a member of any third party project\n\n" +
+			"Accounts that don't meet these criteria are logged and skipped.\n" +
+			"The command can operate on one account or on multiple accounts; when the passed positional argument " +
+			"is a string that contains '@', the command considers that's the email address of the user to change its " +
+			"status, otherwise it considers a path to a CSV file where the first column contains the " +
+			"email of the user's account and if the first row doesn't contain '@' is considered the " +
+			"header and skipped.",
+		Args: cobra.ExactArgs(1),
+		RunE: cmdSetAccountsStatusPendingDeletion,
+	}
+
+	excludeFromOptInCmd = &cobra.Command{
+		Use:   "exclude-from-opt-in",
+		Short: "Excludes users from opt-in",
+		Long: "This command changes users' opt-in status to Excluded(3). This will make it so that they are not required\n" +
+			"to opt in to account changes and are not asked to do so on the UI.\n" +
+			"You can provide either a path to a CSV file with a list of user emails/IDs to exclude or a string of comma separated emails/IDs.",
+		Args: cobra.ExactArgs(1),
+		RunE: cmdExcludeFromOptIn,
+	}
+
 	runCfg   Satellite
 	setupCfg Satellite
 
 	qdiagCfg struct {
-		Database   string `help:"satellite database connection string" releaseDefault:"postgres://" devDefault:"postgres://"`
-		QListLimit int    `help:"maximum segments that can be requested" default:"1000"`
+		JobQueue   jobq.Config
+		Identity   identity.Config
+		QListLimit int `help:"maximum segments that can be requested" default:"1000"`
 	}
 	nodeUsageCfg struct {
 		Database string `help:"satellite database connection string" releaseDefault:"postgres://" devDefault:"postgres://"`
 		Output   string `help:"destination of report output" default:""`
 	}
-	generateInvoicesCfg struct {
-		Database     string `help:"satellite database connection string" releaseDefault:"postgres://" devDefault:"postgres://"`
-		Output       string `help:"destination of report output" default:""`
-		Compensation compensation.Config
-		SurgePercent int64 `help:"surge percent for payments" default:"0"`
-	}
-	recordPeriodCfg struct {
-		Database string `help:"satellite database connection string" releaseDefault:"postgres://" devDefault:"postgres://"`
-	}
-	recordOneOffPaymentsCfg struct {
-		Database string `help:"satellite database connection string" releaseDefault:"postgres://" devDefault:"postgres://"`
-	}
-	partnerAttribtionCfg struct {
+	partnerAttributionCfg struct {
 		Database string `help:"satellite database connection string" releaseDefault:"postgres://" devDefault:"postgres://"`
 		Output   string `help:"destination of report output" default:""`
 	}
@@ -428,7 +504,6 @@ func init() {
 	rootCmd.AddCommand(setupCmd)
 	rootCmd.AddCommand(qdiagCmd)
 	rootCmd.AddCommand(reportsCmd)
-	rootCmd.AddCommand(compensationCmd)
 	rootCmd.AddCommand(billingCmd)
 	rootCmd.AddCommand(consistencyCmd)
 	rootCmd.AddCommand(restoreTrashCmd)
@@ -436,34 +511,59 @@ func init() {
 	rootCmd.AddCommand(fetchPiecesCmd)
 	rootCmd.AddCommand(repairSegmentCmd)
 	rootCmd.AddCommand(fixLastNetsCmd)
+	rootCmd.AddCommand(usersCmd)
+	rootCmd.AddCommand(entitlementsCmd)
 	reportsCmd.AddCommand(nodeUsageCmd)
 	reportsCmd.AddCommand(partnerAttributionCmd)
 	reportsCmd.AddCommand(reportsGracefulExitCmd)
 	reportsCmd.AddCommand(reportsVerifyGEReceiptCmd)
-	compensationCmd.AddCommand(generateInvoicesCmd)
-	compensationCmd.AddCommand(recordPeriodCmd)
-	compensationCmd.AddCommand(recordOneOffPaymentsCmd)
 	billingCmd.AddCommand(applyFreeTierCouponsCmd)
 	billingCmd.AddCommand(setInvoiceStatusCmd)
 	billingCmd.AddCommand(createCustomerBalanceInvoiceItemsCmd)
 	billingCmd.AddCommand(prepareCustomerInvoiceRecordsCmd)
-	prepareCustomerInvoiceRecordsCmd.Flags().BoolVar(&aggregate, "aggregate", false, "Used to enable creation of to be aggregated project records in case users have many projects (more than 83).")
-	billingCmd.AddCommand(createCustomerProjectInvoiceItemsCmd)
 	billingCmd.AddCommand(createCustomerProjectInvoiceItemsGroupedCmd)
-	billingCmd.AddCommand(createCustomerAggregatedProjectInvoiceItemsCmd)
 	billingCmd.AddCommand(createCustomerInvoicesCmd)
-	createCustomerInvoicesCmd.Flags().BoolVar(&includeEmissionInfo, "emission", false, "Used to enable CO2 emission impact calculation to be added to invoice footer.")
 	billingCmd.AddCommand(generateCustomerInvoicesCmd)
-	generateCustomerInvoicesCmd.Flags().BoolVar(&aggregate, "aggregate", false, "Used to enable invoice items aggregation in case users have many projects (more than 83).")
-	generateCustomerInvoicesCmd.Flags().BoolVar(&groupInvoiceItems, "group-invoice-items", false, "Used to ensure invoice items are grouped by project.")
-	generateCustomerInvoicesCmd.Flags().BoolVar(&includeEmissionInfo, "emission", false, "Used to enable CO2 emission impact calculation to be added to invoice footer.")
 	billingCmd.AddCommand(finalizeCustomerInvoicesCmd)
 	billingCmd.AddCommand(payInvoicesWithTokenCmd)
 	billingCmd.AddCommand(payAllInvoicesCmd)
 	billingCmd.AddCommand(failPendingInvoiceTokenPaymentCmd)
 	billingCmd.AddCommand(completePendingInvoiceTokenPaymentCmd)
 	billingCmd.AddCommand(stripeCustomerCmd)
+	billingCmd.AddCommand(generateListOfReusedCardFingerprints)
+	entitlementsCmd.AddCommand(projectEntitlementsCmd)
+	projectEntitlementsCmd.AddCommand(setNewBucketPlacementsCmd)
+	setNewBucketPlacementsCmd.Flags().StringVar(&entitlementUserEmail, "email", "", "Set bucket placements for all active projects of a specific user by email")
+	setNewBucketPlacementsCmd.Flags().StringVar(&entitlementUserEmailCSV, "csv", "", "Set bucket placements for all active projects of users listed in CSV file")
+	setNewBucketPlacementsCmd.Flags().StringVar(&entitlementJSON, "placements", "", "JSON array of placement IDs to set (e.g., \"[0, 12]\"). If not provided, uses satellite config defaults")
+	setNewBucketPlacementsCmd.Flags().BoolVar(&entitlementSkipConfirm, "skip-confirmation", false, "Skip confirmation prompt for bulk operations")
+	setNewBucketPlacementsCmd.Flags().BoolVar(&entitlementVerbose, "verbose", false, "Whether to log info about each processed project")
+	projectEntitlementsCmd.AddCommand(setPlacementProductMapCmd)
+	setPlacementProductMapCmd.Flags().StringVar(&entitlementUserEmail, "email", "", "Set placement-product mapping for all active projects of a specific user by email")
+	setPlacementProductMapCmd.Flags().StringVar(&entitlementUserEmailCSV, "csv", "", "Set placement-product mapping for all active projects of users listed in CSV file")
+	setPlacementProductMapCmd.Flags().StringVar(&entitlementJSON, "placements", "", "1:1 JSON mapping of placement to product ID to set (e.g., \"{0:3,12:2}\"). If not provided, uses satellite config defaults")
+	setPlacementProductMapCmd.Flags().BoolVar(&entitlementSkipConfirm, "skip-confirmation", false, "Skip confirmation prompt for bulk operations")
+	setPlacementProductMapCmd.Flags().BoolVar(&entitlementVerbose, "verbose", false, "Whether to log info about each processed project")
+	projectEntitlementsCmd.AddCommand(migratePricingCmd)
+	migratePricingCmd.Flags().StringVar(&mpFlagTargetNBP, "target-new-bucket-placements", "", "Target new_bucket_placements for standard projects (e.g. 0,12)")
+	migratePricingCmd.Flags().StringVar(&mpFlagSunsetPlacements, "sunset-default-placements", "", "old:new pairs for default_placement migration (e.g. 30:0,31:12,32:0)")
+	migratePricingCmd.Flags().StringVar(&mpFlagNewPPM, "new-placement-product-map", "", "New placement_product_mappings for standard projects (e.g. 0:20,12:21)")
+	migratePricingCmd.Flags().StringVar(&mpFlagKnownPlacements, "known-placement-ids", "", "Allowlist of standard placement IDs; projects with any ID outside this set are treated as custom (e.g. 0,12,30,31,32)")
+	migratePricingCmd.Flags().Int32Var(&mpFlagFallbackProductID, "fallback-product-id", 0, "Phase 2: for custom projects, map each unknown placement that's not already mapped to this product ID")
+	migratePricingCmd.Flags().Int32Var(&mpFlagLegacyFallbackProductID, "legacy-fallback-product-id", 0, "Phase 2: for legacy-pricing carve-out projects, map each unknown placement that's not already mapped to this (legacy) product ID; 0 disables")
+	migratePricingCmd.Flags().StringVar(&mpFlagPhase, "phase", "", "Migration phase: ui (Phase 1 only) or billing (Phase 2 only)")
+	migratePricingCmd.Flags().BoolVar(&mpFlagDryRun, "dry-run", false, "Log what would change without writing")
 	consistencyCmd.AddCommand(consistencyGECleanupCmd)
+	usersCmd.AddCommand(deleteObjectsCmd)
+	deleteObjectsCmd.Flags().IntVar(&batchSizeDeleteObjects, "batch-size", 100, "Number of objects/segments to delete in a single batch")
+	deleteObjectsCmd.Flags().BoolVar(&useDeleteAllObjectsUncoordinated, "use-delete-all-objects-uncoordinated", false, "Delete all objects with a more performant way at the expense of no consistency guarantee")
+	usersCmd.AddCommand(deleteAccountsCmd)
+	usersCmd.AddCommand(deleteAllObjectsUncoordinatedCmd)
+	deleteAllObjectsUncoordinatedCmd.Flags().IntVar(&batchSizeDeleteObjects, "batch-size", 100, "Number of objects/segments to delete in a single batch")
+	deleteAllObjectsUncoordinatedCmd.Flags().BoolVar(&executeDeleteAllObjectsUncoordinated, "really-run-this-dangerous-command-without-any-confirmation", false, "This disables bucket reconfirmation.")
+	usersCmd.AddCommand(deleteNonExistingBucketObjectsCmd)
+	usersCmd.AddCommand(setAccountsStatusPendingDeletionCmd)
+	usersCmd.AddCommand(excludeFromOptInCmd)
 	process.Bind(runCmd, &runCfg, defaults, cfgstruct.ConfDir(confDir), cfgstruct.IdentityDir(identityDir))
 	process.Bind(runMigrationCmd, &runCfg, defaults, cfgstruct.ConfDir(confDir), cfgstruct.IdentityDir(identityDir))
 	process.Bind(runAPICmd, &runCfg, defaults, cfgstruct.ConfDir(confDir), cfgstruct.IdentityDir(identityDir))
@@ -482,20 +582,15 @@ func init() {
 	process.Bind(setupCmd, &setupCfg, defaults, cfgstruct.ConfDir(confDir), cfgstruct.IdentityDir(identityDir), cfgstruct.SetupMode())
 	process.Bind(qdiagCmd, &qdiagCfg, defaults, cfgstruct.ConfDir(confDir), cfgstruct.IdentityDir(identityDir))
 	process.Bind(nodeUsageCmd, &nodeUsageCfg, defaults, cfgstruct.ConfDir(confDir), cfgstruct.IdentityDir(identityDir))
-	process.Bind(generateInvoicesCmd, &generateInvoicesCfg, defaults, cfgstruct.ConfDir(confDir), cfgstruct.IdentityDir(identityDir))
-	process.Bind(recordPeriodCmd, &recordPeriodCfg, defaults, cfgstruct.ConfDir(confDir), cfgstruct.IdentityDir(identityDir))
-	process.Bind(recordOneOffPaymentsCmd, &recordOneOffPaymentsCfg, defaults, cfgstruct.ConfDir(confDir), cfgstruct.IdentityDir(identityDir))
 	process.Bind(reportsGracefulExitCmd, &reportsGracefulExitCfg, defaults, cfgstruct.ConfDir(confDir), cfgstruct.IdentityDir(identityDir))
 	process.Bind(reportsVerifyGEReceiptCmd, &reportsVerifyGracefulExitReceiptCfg, defaults, cfgstruct.ConfDir(confDir), cfgstruct.IdentityDir(identityDir))
-	process.Bind(partnerAttributionCmd, &partnerAttribtionCfg, defaults, cfgstruct.ConfDir(confDir), cfgstruct.IdentityDir(identityDir))
+	process.Bind(partnerAttributionCmd, &partnerAttributionCfg, defaults, cfgstruct.ConfDir(confDir), cfgstruct.IdentityDir(identityDir))
 	process.Bind(applyFreeTierCouponsCmd, &runCfg, defaults, cfgstruct.ConfDir(confDir), cfgstruct.IdentityDir(identityDir))
 	process.Bind(setInvoiceStatusCmd, &runCfg, defaults, cfgstruct.ConfDir(confDir), cfgstruct.IdentityDir(identityDir))
 	process.Bind(setInvoiceStatusCmd, &setInvoiceStatusCfg, defaults, cfgstruct.ConfDir(confDir), cfgstruct.IdentityDir(identityDir))
 	process.Bind(createCustomerBalanceInvoiceItemsCmd, &runCfg, defaults, cfgstruct.ConfDir(confDir), cfgstruct.IdentityDir(identityDir))
 	process.Bind(prepareCustomerInvoiceRecordsCmd, &runCfg, defaults, cfgstruct.ConfDir(confDir), cfgstruct.IdentityDir(identityDir))
-	process.Bind(createCustomerProjectInvoiceItemsCmd, &runCfg, defaults, cfgstruct.ConfDir(confDir), cfgstruct.IdentityDir(identityDir))
 	process.Bind(createCustomerProjectInvoiceItemsGroupedCmd, &runCfg, defaults, cfgstruct.ConfDir(confDir), cfgstruct.IdentityDir(identityDir))
-	process.Bind(createCustomerAggregatedProjectInvoiceItemsCmd, &runCfg, defaults, cfgstruct.ConfDir(confDir), cfgstruct.IdentityDir(identityDir))
 	process.Bind(createCustomerInvoicesCmd, &runCfg, defaults, cfgstruct.ConfDir(confDir), cfgstruct.IdentityDir(identityDir))
 	process.Bind(generateCustomerInvoicesCmd, &runCfg, defaults, cfgstruct.ConfDir(confDir), cfgstruct.IdentityDir(identityDir))
 	process.Bind(finalizeCustomerInvoicesCmd, &runCfg, defaults, cfgstruct.ConfDir(confDir), cfgstruct.IdentityDir(identityDir))
@@ -504,8 +599,18 @@ func init() {
 	process.Bind(failPendingInvoiceTokenPaymentCmd, &runCfg, defaults, cfgstruct.ConfDir(confDir), cfgstruct.IdentityDir(identityDir))
 	process.Bind(completePendingInvoiceTokenPaymentCmd, &runCfg, defaults, cfgstruct.ConfDir(confDir), cfgstruct.IdentityDir(identityDir))
 	process.Bind(stripeCustomerCmd, &runCfg, defaults, cfgstruct.ConfDir(confDir), cfgstruct.IdentityDir(identityDir))
+	process.Bind(generateListOfReusedCardFingerprints, &runCfg, defaults, cfgstruct.ConfDir(confDir), cfgstruct.IdentityDir(identityDir))
 	process.Bind(consistencyGECleanupCmd, &consistencyGECleanupCfg, defaults, cfgstruct.ConfDir(confDir), cfgstruct.IdentityDir(identityDir))
 	process.Bind(fixLastNetsCmd, &runCfg, defaults, cfgstruct.ConfDir(confDir), cfgstruct.IdentityDir(identityDir))
+	process.Bind(deleteObjectsCmd, &runCfg, defaults, cfgstruct.ConfDir(confDir), cfgstruct.IdentityDir(identityDir))
+	process.Bind(deleteAllObjectsUncoordinatedCmd, &runCfg, defaults, cfgstruct.ConfDir(confDir), cfgstruct.IdentityDir(identityDir))
+	process.Bind(deleteNonExistingBucketObjectsCmd, &runCfg, defaults, cfgstruct.ConfDir(confDir), cfgstruct.IdentityDir(identityDir))
+	process.Bind(deleteAccountsCmd, &runCfg, defaults, cfgstruct.ConfDir(confDir), cfgstruct.IdentityDir(identityDir))
+	process.Bind(setAccountsStatusPendingDeletionCmd, &runCfg, defaults, cfgstruct.ConfDir(confDir), cfgstruct.IdentityDir(identityDir))
+	process.Bind(excludeFromOptInCmd, &runCfg, defaults, cfgstruct.ConfDir(confDir), cfgstruct.IdentityDir(identityDir))
+	process.Bind(setNewBucketPlacementsCmd, &runCfg, defaults, cfgstruct.ConfDir(confDir), cfgstruct.IdentityDir(identityDir))
+	process.Bind(setPlacementProductMapCmd, &runCfg, defaults, cfgstruct.ConfDir(confDir), cfgstruct.IdentityDir(identityDir))
+	process.Bind(migratePricingCmd, &runCfg, defaults, cfgstruct.ConfDir(confDir), cfgstruct.IdentityDir(identityDir))
 
 	if err := consistencyGECleanupCmd.MarkFlagRequired("before"); err != nil {
 		panic(err)
@@ -553,6 +658,14 @@ func cmdRun(cmd *cobra.Command, args []string) (err error) {
 		err = errs.Combine(err, revocationDB.Close())
 	}()
 
+	if runCfg.JobQueue.ServerNodeURL.IsZero() {
+		return errs.New("job queue server node URL is required")
+	}
+	repairQueue, err := jobq.OpenJobQueue(ctx, identity, runCfg.JobQueue)
+	if err != nil {
+		return errs.New("opening jobq connection: %+v", err)
+	}
+
 	liveAccounting, err := live.OpenCache(ctx, log.Named("live-accounting"), runCfg.LiveAccounting)
 	if err != nil {
 		if !accounting.ErrSystemOrNetError.Has(err) || liveAccounting == nil {
@@ -567,7 +680,7 @@ func cmdRun(cmd *cobra.Command, args []string) (err error) {
 		err = errs.Combine(err, liveAccounting.Close())
 	}()
 
-	peer, err := satellite.New(log, identity, db, metabaseDB, revocationDB, liveAccounting, version.Build, &runCfg.Config, process.AtomicLevel(cmd))
+	peer, err := satellite.New(log, identity, db, metabaseDB, revocationDB, repairQueue, liveAccounting, version.Build, &runCfg.Config, process.AtomicLevel(cmd))
 	if err != nil {
 		return err
 	}
@@ -654,19 +767,19 @@ func cmdSetup(cmd *cobra.Command, args []string) (err error) {
 func cmdQDiag(cmd *cobra.Command, args []string) (err error) {
 	ctx, _ := process.Ctx(cmd)
 
-	// open the master db
-	database, err := satellitedb.Open(ctx, zap.L().Named("db"), qdiagCfg.Database, satellitedb.Options{ApplicationName: "satellite-qdiag"})
-	if err != nil {
-		return errs.New("error connecting to master database on satellite: %+v", err)
+	if qdiagCfg.JobQueue.ServerNodeURL.IsZero() {
+		return errs.New("job queue server node URL is required")
 	}
-	defer func() {
-		err := database.Close()
-		if err != nil {
-			fmt.Printf("error closing connection to master database on satellite: %+v\n", err)
-		}
-	}()
+	identity, err := qdiagCfg.Identity.Load()
+	if err != nil {
+		return errs.New("could not load identity: %+v", err)
+	}
+	repairQueue, err := jobq.OpenJobQueue(ctx, identity, qdiagCfg.JobQueue)
+	if err != nil {
+		return errs.Wrap(err)
+	}
 
-	list, err := database.RepairQueue().SelectN(context.Background(), qdiagCfg.QListLimit)
+	list, err := repairQueue.SelectN(context.Background(), qdiagCfg.QListLimit)
 	if err != nil {
 		return err
 	}
@@ -678,7 +791,7 @@ func cmdQDiag(cmd *cobra.Command, args []string) (err error) {
 
 	// populate the row fields
 	for _, v := range list {
-		_, _ = fmt.Fprint(w, v.StreamID.String(), "\t", v.Position.Encode(), "\t", v.SegmentHealth, "\t")
+		_, _ = fmt.Fprintln(w, v.StreamID.String(), "\t", v.Position.Encode(), "\t", v.SegmentHealth, "\t")
 	}
 
 	// display the data
@@ -754,49 +867,6 @@ func cmdNodeUsage(cmd *cobra.Command, args []string) (err error) {
 	return generateNodeUsageCSV(ctx, start, end, file)
 }
 
-func cmdGenerateInvoices(cmd *cobra.Command, args []string) (err error) {
-	ctx, _ := process.Ctx(cmd)
-
-	period, err := compensation.PeriodFromString(args[0])
-	if err != nil {
-		return err
-	}
-
-	if err := runWithOutput(generateInvoicesCfg.Output, func(out io.Writer) error {
-		return generateInvoicesCSV(ctx, period, out)
-	}); err != nil {
-		return err
-	}
-
-	if generateInvoicesCfg.Output != "" {
-		fmt.Println("Generated invoices")
-	}
-	return nil
-}
-
-func cmdRecordPeriod(cmd *cobra.Command, args []string) (err error) {
-	ctx, _ := process.Ctx(cmd)
-
-	paystubsCount, paymentsCount, err := recordPeriod(ctx, args[0], args[1])
-	if err != nil {
-		return err
-	}
-	fmt.Println(paystubsCount, "paystubs recorded")
-	fmt.Println(paymentsCount, "payments recorded")
-	return nil
-}
-
-func cmdRecordOneOffPayments(cmd *cobra.Command, args []string) (err error) {
-	ctx, _ := process.Ctx(cmd)
-
-	count, err := recordOneOffPayments(ctx, args[0])
-	if err != nil {
-		return err
-	}
-	fmt.Println(count, "payments recorded")
-	return nil
-}
-
 func cmdValueAttribution(cmd *cobra.Command, args []string) (err error) {
 	ctx, _ := process.Ctx(cmd)
 	log := zap.L().Named("satellite-cli")
@@ -812,12 +882,12 @@ func cmdValueAttribution(cmd *cobra.Command, args []string) (err error) {
 	}
 
 	// send output to stdout
-	if partnerAttribtionCfg.Output == "" {
-		return reports.GenerateAttributionCSV(ctx, partnerAttribtionCfg.Database, start, end, userAgents, os.Stdout)
+	if partnerAttributionCfg.Output == "" {
+		return reports.GenerateAttributionCSV(ctx, partnerAttributionCfg.Database, start, end, userAgents, os.Stdout)
 	}
 
 	// send output to file
-	file, err := os.Create(partnerAttribtionCfg.Output)
+	file, err := os.Create(partnerAttributionCfg.Output)
 	if err != nil {
 		return err
 	}
@@ -826,13 +896,13 @@ func cmdValueAttribution(cmd *cobra.Command, args []string) (err error) {
 		err = errs.Combine(err, file.Close())
 		if err != nil {
 			log.Error("Error closing the output file after retrieving partner value attribution data.",
-				zap.String("Output File", partnerAttribtionCfg.Output),
+				zap.String("output_file", partnerAttributionCfg.Output),
 				zap.Error(err),
 			)
 		}
 	}()
 
-	return reports.GenerateAttributionCSV(ctx, partnerAttribtionCfg.Database, start, end, userAgents, file)
+	return reports.GenerateAttributionCSV(ctx, partnerAttributionCfg.Database, start, end, userAgents, file)
 }
 
 // cmdSetInvoiceStatus sets the status of all open invoices within the provided period to the provided status.
@@ -876,20 +946,7 @@ func cmdPrepareCustomerInvoiceRecords(cmd *cobra.Command, args []string) (err er
 	}
 
 	return runBillingCmd(ctx, func(ctx context.Context, payments *stripe.Service, _ satellite.DB) error {
-		return payments.PrepareInvoiceProjectRecords(ctx, periodStart, aggregate)
-	})
-}
-
-func cmdCreateCustomerProjectInvoiceItems(cmd *cobra.Command, args []string) (err error) {
-	ctx, _ := process.Ctx(cmd)
-
-	periodStart, err := parseYearMonth(args[0])
-	if err != nil {
-		return err
-	}
-
-	return runBillingCmd(ctx, func(ctx context.Context, payments *stripe.Service, _ satellite.DB) error {
-		return payments.InvoiceApplyProjectRecords(ctx, periodStart)
+		return payments.PrepareInvoiceProjectRecords(ctx, periodStart)
 	})
 }
 
@@ -906,19 +963,6 @@ func cmdCreateCustomerProjectInvoiceItemsGrouped(cmd *cobra.Command, args []stri
 	})
 }
 
-func cmdCreateAggregatedCustomerProjectInvoiceItems(cmd *cobra.Command, args []string) (err error) {
-	ctx, _ := process.Ctx(cmd)
-
-	periodStart, err := parseYearMonth(args[0])
-	if err != nil {
-		return err
-	}
-
-	return runBillingCmd(ctx, func(ctx context.Context, payments *stripe.Service, _ satellite.DB) error {
-		return payments.InvoiceApplyToBeAggregatedProjectRecords(ctx, periodStart)
-	})
-}
-
 func cmdCreateCustomerInvoices(cmd *cobra.Command, args []string) (err error) {
 	ctx, _ := process.Ctx(cmd)
 
@@ -928,7 +972,7 @@ func cmdCreateCustomerInvoices(cmd *cobra.Command, args []string) (err error) {
 	}
 
 	return runBillingCmd(ctx, func(ctx context.Context, payments *stripe.Service, _ satellite.DB) error {
-		return payments.CreateInvoices(ctx, periodStart, includeEmissionInfo)
+		return payments.CreateInvoices(ctx, periodStart)
 	})
 }
 
@@ -941,7 +985,7 @@ func cmdGenerateCustomerInvoices(cmd *cobra.Command, args []string) (err error) 
 	}
 
 	return runBillingCmd(ctx, func(ctx context.Context, payments *stripe.Service, _ satellite.DB) error {
-		return payments.GenerateInvoices(ctx, periodStart, aggregate, groupInvoiceItems, includeEmissionInfo)
+		return payments.GenerateInvoices(ctx, periodStart)
 	})
 }
 
@@ -1002,6 +1046,17 @@ func cmdStripeCustomer(cmd *cobra.Command, args []string) (err error) {
 	return generateStripeCustomers(ctx)
 }
 
+func cmdGenerateListOfReusedCardFingerprints(cmd *cobra.Command, args []string) error {
+	ctx, _ := process.Ctx(cmd)
+
+	minCustomers, err := strconv.Atoi(args[0])
+	if err != nil {
+		return errs.New("invalid numeric argument for minimum customers: %v", err)
+	}
+
+	return getListOfReusedCardFingerprints(ctx, minCustomers, args[1])
+}
+
 func cmdConsistencyGECleanup(cmd *cobra.Command, args []string) error {
 	return errs.New("this command is not supported with time-based graceful exit")
 }
@@ -1041,9 +1096,10 @@ func cmdRestoreTrash(cmd *cobra.Command, args []string) error {
 
 	successes := new(int64)
 	failures := new(int64)
+	nonexistent := new(int64)
 
 	undelete := func(node *nodeselection.SelectedNode) {
-		log.Info("starting restore trash", zap.String("Node ID", node.ID.String()))
+		log.Info("starting restore trash", zap.String("node_id", node.ID.String()))
 
 		ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 		defer cancel()
@@ -1054,13 +1110,13 @@ func cmdRestoreTrash(cmd *cobra.Command, args []string) error {
 		})
 		if err != nil {
 			atomic.AddInt64(failures, 1)
-			log.Error("unable to connect", zap.String("Node ID", node.ID.String()), zap.Error(err))
+			log.Error("unable to connect", zap.String("node_id", node.ID.String()), zap.Error(err))
 			return
 		}
 		defer func() {
 			err := conn.Close()
 			if err != nil {
-				log.Error("close failure", zap.String("Node ID", node.ID.String()), zap.Error(err))
+				log.Error("close failure", zap.String("node_id", node.ID.String()), zap.Error(err))
 			}
 		}()
 
@@ -1068,12 +1124,12 @@ func cmdRestoreTrash(cmd *cobra.Command, args []string) error {
 		_, err = client.RestoreTrash(ctx, &pb.RestoreTrashRequest{})
 		if err != nil {
 			atomic.AddInt64(failures, 1)
-			log.Error("unable to restore trash", zap.String("Node ID", node.ID.String()), zap.Error(err))
+			log.Error("unable to restore trash", zap.String("node_id", node.ID.String()), zap.Error(err))
 			return
 		}
 
 		atomic.AddInt64(successes, 1)
-		log.Info("successful restore trash", zap.String("Node ID", node.ID.String()))
+		log.Info("successful restore trash", zap.String("node_id", node.ID.String()))
 	}
 
 	var nodes []*nodeselection.SelectedNode
@@ -1089,11 +1145,15 @@ func cmdRestoreTrash(cmd *cobra.Command, args []string) error {
 		for _, nodeid := range args {
 			parsedNodeID, err := storj.NodeIDFromString(nodeid)
 			if err != nil {
-				return err
+				log.Error("unable to parse node id", zap.String("node_id", nodeid), zap.Error(err))
+				atomic.AddInt64(nonexistent, 1)
+				continue
 			}
 			dossier, err := db.OverlayCache().Get(ctx, parsedNodeID)
 			if err != nil {
-				return err
+				log.Error("unable to find node id", zap.String("node_id", nodeid), zap.Error(err))
+				atomic.AddInt64(nonexistent, 1)
+				continue
 			}
 			nodes = append(nodes, &nodeselection.SelectedNode{
 				ID:         dossier.Id,
@@ -1115,7 +1175,7 @@ func cmdRestoreTrash(cmd *cobra.Command, args []string) error {
 	}
 	limiter.Wait()
 
-	log.Sugar().Infof("restore trash complete. %d successes, %d failures", *successes, *failures)
+	log.Sugar().Infof("restore trash complete. %d successes, %d failures, %d nonexistent", *successes, *failures, *nonexistent)
 	return nil
 }
 
@@ -1140,7 +1200,7 @@ func cmdRegisterLostSegments(cmd *cobra.Command, args []string) error {
 	// we can't actually tell whether metrics is really enabled at this point;
 	// process.InitMetrics...() can return a nil error while disabling metrics
 	// entirely. make sure that's clear to the user.
-	log.Info("lost segment event(s) sent (if metrics are actually enabled)", zap.Int("lost-segments", numLostSegments))
+	log.Info("lost segment event(s) sent (if metrics are actually enabled)", zap.Int("lost_segments", numLostSegments))
 
 	return nil
 }

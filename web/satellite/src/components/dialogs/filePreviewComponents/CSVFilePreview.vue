@@ -21,9 +21,9 @@
 import { ref, onMounted } from 'vue';
 import { useTheme } from 'vuetify';
 import { VProgressCircular, VContainer } from 'vuetify/components';
-import Papa, { ParseResult } from 'papaparse';
+import { type ParseResult, parse  } from 'papaparse';
 
-import { useNotify } from '@/utils/hooks';
+import { useNotify } from '@/composables/useNotify';
 import { AnalyticsErrorEventSource } from '@/utils/constants/analyticsEventNames';
 
 const theme = useTheme();
@@ -39,7 +39,7 @@ const isError = ref<boolean>(false);
 
 onMounted(() => {
     try {
-        Papa.parse(props.src, {
+        parse(props.src, {
             download: true,
             worker: true,
             header: false,
@@ -74,7 +74,7 @@ table {
         white-space: nowrap;
 
         /* stylelint-disable-next-line color-function-notation */
-        border: 1px solid rgba(var(--v-border-color),var(--v-border-opacity));
+        border: 1px solid rgb(var(--v-border-color),var(--v-border-opacity));
     }
 }
 </style>

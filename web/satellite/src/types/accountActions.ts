@@ -19,6 +19,7 @@ export enum DeleteAccountStep {
     ConfirmDeleteStep,
     FinalConfirmDeleteStep,
     DeleteBucketsStep,
+    LockEnabledBucketsStep,
     DeleteAccessKeysStep,
     PayInvoicesStep,
     WaitForInvoicingStep,
@@ -31,6 +32,9 @@ export enum DeleteProjectStep {
     VerifyEmailStep,
     ConfirmDeleteStep,
     DeleteBucketsStep,
+    LockEnabledBucketsStep,
     DeleteAccessKeysStep,
     WaitForInvoicingStep,
 }
+
+export const SKIP_OBJECT_LOCK_ENABLED_BUCKETS = 'skip-object-lock-enabled-buckets';

@@ -71,7 +71,7 @@ func TestStorageNodeApi(t *testing.T) {
 			baseURL := fmt.Sprintf("http://%s/api/sno", console.Listener.Addr())
 
 			// pause node stats reputation cache because later tests assert a specific join date.
-			sno.NodeStats.Cache.Reputation.Pause()
+			sno.Reputation.Chore.Loop.Pause()
 			startingPoint := time.Now().UTC().Add(-2 * time.Hour)
 
 			for _, action := range actions {
@@ -105,7 +105,7 @@ func TestStorageNodeApi(t *testing.T) {
 
 			t.Run("EstimatedPayout", func(t *testing.T) {
 				// should return estimated payout for both satellites in current month and empty for previous
-				req, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("%s/estimated-payout", baseURL), nil)
+				req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/estimated-payout", nil)
 				require.NoError(t, err)
 
 				// setting now here to cache closest to api all timestamp, so service call
@@ -135,6 +135,11 @@ func TestStorageNodeApi(t *testing.T) {
 					PreviousMonth:            estimation.PreviousMonth,
 					CurrentMonthExpectations: estimation.CurrentMonthExpectations,
 				}
+				// Current-month disk space includes the partial current day, so
+				// the HTTP request and direct service call use slightly different
+				// cut-off times.
+				require.InEpsilon(t, expectedPayout.CurrentMonth.DiskSpace, bodyPayout.CurrentMonth.DiskSpace, 1e-6)
+				expectedPayout.CurrentMonth.DiskSpace = bodyPayout.CurrentMonth.DiskSpace
 				require.EqualValues(t, expectedPayout, bodyPayout)
 			})
 		},

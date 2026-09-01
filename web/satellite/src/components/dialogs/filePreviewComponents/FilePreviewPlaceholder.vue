@@ -3,8 +3,8 @@
 
 <template>
     <div class="h-100 w-100 d-flex flex-column align-center justify-center">
-        <p class="mb-5">{{ file?.Key ?? '' }}</p>
-        <p class="text-h5 mb-5 font-weight-bold">No preview available</p>
+        <p class="mb-5 text-center">{{ file?.Key ?? '' }}</p>
+        <p class="text-headline-small mb-5 font-weight-bold">No preview available</p>
         <v-btn
             @click="onDownloadClick"
         >
@@ -20,11 +20,11 @@
 import { computed } from 'vue';
 import { VBtn } from 'vuetify/components';
 
-import { BrowserObject } from '@/store/modules/objectBrowserStore';
+import type { BrowserObject } from '@/store/modules/objectBrowserStore';
 import { Size } from '@/utils/bytesSize';
-import { ProjectLimits } from '@/types/projects';
+import type { ProjectLimits } from '@/types/projects';
 import { useProjectsStore } from '@/store/modules/projectsStore';
-import { useNotify } from '@/utils/hooks';
+import { useNotify } from '@/composables/useNotify';
 
 const projectsStore = useProjectsStore();
 

@@ -3,297 +3,93 @@
 
 <template>
     <v-container>
-        <low-token-balance-banner
-            v-if="isLowBalance"
-            :cta-label="tab !== TABS['payment-methods'] ? 'Deposit' : ''"
-            @click="onAddTokensClicked"
-        />
-
         <v-row>
             <v-col>
                 <PageTitleComponent title="Account Billing" />
             </v-col>
         </v-row>
 
-        <v-card color="default" class="mt-2 mb-6" variant="flat">
+        <v-card color="default" class="mt-2 mb-6" rounded="md">
             <v-tabs
                 v-model="tab"
-                color="default"
+                color="primary"
                 center-active
                 show-arrows
                 grow
             >
-                <v-tab>
-                    Overview
-                </v-tab>
-                <v-tab>
-                    Payment Methods
-                </v-tab>
-                <v-tab>
-                    STORJ Transactions
-                </v-tab>
-                <v-tab>
-                    Billing History
-                </v-tab>
-                <v-tab v-if="billingInformationUIEnabled">
-                    Billing Information
-                </v-tab>
+                <v-tab>Overview</v-tab>
+                <v-tab>Payment Methods</v-tab>
+                <v-tab>Billing History</v-tab>
+                <v-tab v-if="nativeTokenPaymentsEnabled">STORJ Transactions</v-tab>
+                <v-tab v-if="billingInformationUIEnabled">Billing Information</v-tab>
             </v-tabs>
         </v-card>
 
         <v-window v-model="tab">
-            <v-window-item>
-                <v-row>
-                    <v-col cols="12" sm="4">
-                        <v-card
-                            :subtitle="`For ${new Date().toLocaleString('en-US', { month: 'long', year: 'numeric' })}`"
-                            variant="flat"
-                        >
-                            <template #title>
-                                <v-row class="align-center">
-                                    <v-col>
-                                        <span>Estimated Total Cost</span>
-                                        <span class="ml-2">
-                                            <v-icon class="text-cursor-pointer" size="15" :icon="Info" />
-                                            <v-tooltip
-                                                class="text-center"
-                                                activator="parent"
-                                                location="top"
-                                            >
-                                                Expected charges for current billing period.
-                                            </v-tooltip>
-                                        </span>
-                                    </v-col>
-                                </v-row>
-                            </template>
-                            <template #loader>
-                                <v-progress-linear v-if="isLoading" indeterminate />
-                            </template>
-                            <v-card-text>
-                                <v-chip color="warning" variant="tonal" class="font-weight-bold mb-2">
-                                    {{ centsToDollars(priceSummary) }}
-                                </v-chip>
-                                <v-divider class="my-4" />
-                                <v-btn variant="outlined" color="default" size="small" rounded="md" class="mr-2" :append-icon="ArrowRight" @click="tab = TABS['billing-history']">View Billing History</v-btn>
-                            </v-card-text>
-                        </v-card>
-                    </v-col>
-
-                    <v-col cols="12" sm="4">
-                        <v-card subtitle="Your Storj account balance" variant="flat">
-                            <template #title>
-                                <v-row class="align-center">
-                                    <v-col>
-                                        <span>Available Funds</span>
-                                        <span class="ml-2">
-                                            <v-icon class="text-cursor-pointer" size="15" :icon="Info" />
-                                            <v-tooltip
-                                                class="text-center"
-                                                activator="parent"
-                                                location="top"
-                                            >
-                                                Prepaid balance for upcoming account usage.
-                                            </v-tooltip>
-                                        </span>
-                                    </v-col>
-                                </v-row>
-                            </template>
-                            <template #loader>
-                                <v-progress-linear v-if="isLoading" indeterminate />
-                            </template>
-                            <v-card-text>
-                                <v-chip color="success" variant="tonal" class="font-weight-bold mb-2">
-                                    {{ formattedAccountBalance }}
-                                </v-chip>
-                                <v-divider class="my-4" />
-                                <v-btn variant="outlined" color="default" size="small" rounded="md" class="mr-2" :prepend-icon="Plus" @click="onAddTokensClicked">
-                                    Add STORJ Tokens
-                                </v-btn>
-                            </v-card-text>
-                        </v-card>
-                    </v-col>
-
-                    <v-col cols="12" sm="4">
-                        <v-card
-                            v-if="isLoading"
-                            class="d-flex align-center justify-center"
-                            height="200"
-                            variant="flat"
-                        >
-                            <template #loader>
-                                <v-progress-linear v-if="isLoading" indeterminate />
-                            </template>
-                        </v-card>
-                        <v-card
-                            v-else-if="coupon"
-                            :title="`Coupon / ${coupon.name}`"
-                            height="100%"
-                            :subtitle="`${isCouponActive ? 'Active' : 'Expired'} / ${couponExpiration}`"
-                            variant="flat"
-                        >
-                            <v-card-text>
-                                <v-chip
-                                    :color="isCouponActive ? 'success' : 'error'"
-                                    variant="tonal"
-                                    class="font-weight-bold mb-2"
-                                >
-                                    {{ couponDiscount }}
-                                </v-chip>
-
-                                <v-divider class="my-4" />
-
-                                <v-btn
-                                    v-if="couponCodeBillingUIEnabled"
-                                    variant="outlined"
-                                    color="default"
-                                    size="small"
-                                    class="mr-2"
-                                    rounded="md"
-                                    :prepend-icon="Plus"
-                                    @click="isAddCouponDialogShown = true"
-                                >
-                                    Add Coupon
-                                </v-btn>
-                            </v-card-text>
-                        </v-card>
-
-                        <v-card
-                            v-else-if="couponCodeBillingUIEnabled"
-                            title="Coupon"
-                            subtitle="Apply a new coupon to your account"
-                            variant="flat"
-                        >
-                            <v-card-text>
-                                <v-chip color="default" variant="tonal" class="font-weight-bold mb-2">
-                                    No Coupon
-                                </v-chip>
-
-                                <v-divider class="my-4" />
-
-                                <v-btn
-                                    variant="outlined"
-                                    color="default"
-                                    size="small"
-                                    class="mr-2"
-                                    rounded="md"
-                                    :prepend-icon="Plus"
-                                    @click="isAddCouponDialogShown = true"
-                                >
-                                    Apply New Coupon
-                                </v-btn>
-                            </v-card-text>
-                        </v-card>
-                    </v-col>
-                </v-row>
-
-                <v-row>
-                    <v-col>
-                        <v-card title="Detailed Usage Report" subtitle="Get a complete usage report for all your projects." variant="flat">
-                            <v-card-text>
-                                <v-btn variant="outlined" color="default" size="small" rounded="md" :prepend-icon="Calendar">
-                                    <detailed-usage-report-dialog />
-                                    Detailed Account Report
-                                </v-btn>
-                            </v-card-text>
-                        </v-card>
-                    </v-col>
-                </v-row>
-
-                <v-row v-if="isRollupLoading" justify="center" align="center">
-                    <v-col cols="auto">
-                        <v-progress-circular indeterminate />
-                    </v-col>
-                </v-row>
-                <usage-and-charges-component v-else :project-ids="projectIDs" />
+            <v-window-item class="pb-2">
+                <overview-tab
+                    @to-billing-history-tab="tab = TABS['billing-history']"
+                    @add-tokens-clicked="onAddTokensClicked"
+                />
             </v-window-item>
 
-            <v-window-item>
+            <v-window-item class="pb-2">
                 <v-row>
-                    <v-col cols="12" md="4" sm="6">
-                        <StorjTokenCardComponent ref="tokenCardComponent" @historyClicked="tab = TABS.transactions" />
+                    <v-col v-if="nativeTokenPaymentsEnabled" cols="12" sm="12" md="6" lg="6" xl="6" xxl="4">
+                        <StorjTokenCardComponent ref="tokenCardComponent" @history-clicked="tab = TABS.transactions" />
                     </v-col>
 
-                    <v-col v-for="(card, i) in creditCards" :key="i" cols="12" md="4" sm="6">
-                        <CreditCardComponent :card="card" />
-                    </v-col>
-
-                    <v-col cols="12" md="4" sm="6">
-                        <AddCreditCardComponent />
-                    </v-col>
+                    <CreditCards />
                 </v-row>
             </v-window-item>
 
-            <v-window-item>
-                <token-transactions-table-component />
-            </v-window-item>
-
-            <v-window-item>
+            <v-window-item class="pb-2">
                 <billing-history-tab />
             </v-window-item>
 
-            <v-window-item v-if="billingInformationUIEnabled">
+            <v-window-item v-if="nativeTokenPaymentsEnabled" class="pb-2">
+                <token-transactions-table-component />
+            </v-window-item>
+
+            <v-window-item v-if="billingInformationUIEnabled" class="pb-2">
                 <billing-information-tab />
             </v-window-item>
         </v-window>
     </v-container>
-
-    <apply-coupon-code-dialog v-model="isAddCouponDialogShown" />
 </template>
 
 <script setup lang="ts">
-import { computed, onBeforeMount, onMounted, ref } from 'vue';
+import { computed, onBeforeMount, ref } from 'vue';
 import {
-    VContainer,
     VCard,
-    VTabs,
+    VCol,
+    VContainer,
+    VRow,
     VTab,
+    VTabs,
     VWindow,
     VWindowItem,
-    VRow,
-    VCol,
-    VCardText,
-    VChip,
-    VDivider,
-    VBtn,
-    VProgressCircular,
-    VProgressLinear,
-    VTooltip,
-    VIcon,
 } from 'vuetify/components';
 import { useRoute, useRouter } from 'vue-router';
-import { Calendar, Info, Plus, ArrowRight } from 'lucide-vue-next';
 
-import { useLoading } from '@/composables/useLoading';
-import { useNotify } from '@/utils/hooks';
-import { useBillingStore } from '@/store/modules/billingStore';
-import { AccountBalance, Coupon, CouponDuration, CreditCard } from '@/types/payments';
-import { centsToDollars } from '@/utils/strings';
-import { AnalyticsErrorEventSource } from '@/utils/constants/analyticsEventNames';
-import { SHORT_MONTHS_NAMES } from '@/utils/constants/date';
-import { useProjectsStore } from '@/store/modules/projectsStore';
-import { useConfigStore } from '@/store/modules/configStore';
-import { useLowTokenBalance } from '@/composables/useLowTokenBalance';
 import { ROUTES } from '@/router';
+import { useConfigStore } from '@/store/modules/configStore';
 import { useUsersStore } from '@/store/modules/usersStore';
 import { useAppStore } from '@/store/modules/appStore';
 
 import PageTitleComponent from '@/components/PageTitleComponent.vue';
-import CreditCardComponent from '@/components/CreditCardComponent.vue';
-import AddCreditCardComponent from '@/components/AddCreditCardComponent.vue';
 import BillingHistoryTab from '@/components/billing/BillingHistoryTab.vue';
-import UsageAndChargesComponent from '@/components/billing/UsageAndChargesComponent.vue';
-import StorjTokenCardComponent from '@/components/StorjTokenCardComponent.vue';
-import TokenTransactionsTableComponent from '@/components/TokenTransactionsTableComponent.vue';
-import ApplyCouponCodeDialog from '@/components/dialogs/ApplyCouponCodeDialog.vue';
-import LowTokenBalanceBanner from '@/components/LowTokenBalanceBanner.vue';
-import DetailedUsageReportDialog from '@/components/dialogs/DetailedUsageReportDialog.vue';
+import StorjTokenCardComponent from '@/components/billing/StorjTokenCardComponent.vue';
+import TokenTransactionsTableComponent from '@/components/billing/TokenTransactionsTableComponent.vue';
 import BillingInformationTab from '@/components/billing/BillingInformationTab.vue';
+import OverviewTab from '@/components/billing/OverviewTab.vue';
+import CreditCards from '@/components/billing/CreditCards.vue';
 
 enum TABS {
     overview,
     'payment-methods',
-    transactions,
     'billing-history',
+    transactions,
     'billing-information',
 }
 
@@ -301,60 +97,19 @@ interface IStorjTokenCardComponent {
     onAddTokens(): Promise<void>;
 }
 
-const billingStore = useBillingStore();
-const projectsStore = useProjectsStore();
 const configStore = useConfigStore();
 const usersStore = useUsersStore();
 const appStore = useAppStore();
 
-const { isLoading, withLoading } = useLoading();
-const notify = useNotify();
 const router = useRouter();
 const route = useRoute();
-const isLowBalance = useLowTokenBalance();
-
-const isRollupLoading = ref(true);
-const isAddCouponDialogShown = ref<boolean>(false);
 
 const tokenCardComponent = ref<IStorjTokenCardComponent>();
 
-const creditCards = computed((): CreditCard[] => {
-    return billingStore.state.creditCards;
-});
-
-const couponCodeBillingUIEnabled = computed<boolean>(() => configStore.state.config.couponCodeBillingUIEnabled);
 const billingInformationUIEnabled = computed<boolean>(() => configStore.state.config.billingInformationTabEnabled);
-
-/**
- * projectIDs is an array of all of the project IDs for which there exist project usage charges.
- */
-const projectIDs = computed((): string[] => {
-    return projectsStore.state.projects
-        .filter(proj => billingStore.state.projectCharges.hasProject(proj.id))
-        .sort((proj1, proj2) => proj1.name.localeCompare(proj2.name))
-        .map(proj => proj.id);
-});
-
-/**
- * Returns price summary of all project usages.
- */
-const priceSummary = computed((): number => {
-    return billingStore.state.projectCharges.getPrice();
-});
-
-/**
- * Returns account balance (sum storjscan and stripe credit) from store.
- */
-const formattedAccountBalance = computed((): string => {
-    return billingStore.state.balance.formattedSum;
-});
-
-/**
- * Returns the coupon applied to the user's account.
- */
-const coupon = computed((): Coupon | null => {
-    return billingStore.state.coupon;
-});
+const nativeTokenPaymentsEnabled = computed<boolean>(() => configStore.state.config.nativeTokenPaymentsEnabled);
+const userPaidTier = computed<boolean>(() => usersStore.state.user.isPaid);
+const isMemberAccount = computed<boolean>(() => usersStore.state.user.isMember);
 
 /**
  * Returns the last billing tab the user was on,
@@ -370,44 +125,10 @@ const tab = computed({
     },
 });
 
-/**
- * Returns the expiration date of the coupon.
- */
-const couponExpiration = computed((): string => {
-    const c = coupon.value;
-    if (!c) return '';
-
-    const exp = c.expiresAt;
-    if (!exp || c.duration === CouponDuration.Forever) {
-        return 'No Expiration';
-    }
-    return `Expires on ${exp.getDate()} ${SHORT_MONTHS_NAMES[exp.getMonth()]} ${exp.getFullYear()}`;
-});
-
-/**
- * Returns the coupon's discount amount.
- */
-const couponDiscount = computed((): string => {
-    const c = coupon.value;
-    if (!c) return '';
-
-    if (c.percentOff !== 0) {
-        return `${parseFloat(c.percentOff.toFixed(2)).toString()}% off`;
-    }
-    return `$${(c.amountOff / 100).toFixed(2).replace('.00', '')} off`;
-});
-
-/**
- * Returns the whether the coupon is active.
- */
-const isCouponActive = computed((): boolean => {
-    const now = Date.now();
-    const c = coupon.value;
-    return !!c && (c.duration === 'forever' || (!!c.expiresAt && now < c.expiresAt.getTime()));
-});
-
 function onAddTokensClicked(): void {
-    if (!usersStore.state.user.paidTier) {
+    if (!nativeTokenPaymentsEnabled.value) return;
+
+    if (!userPaidTier.value) {
         appStore.toggleUpgradeFlow(true);
         return;
     }
@@ -417,37 +138,8 @@ function onAddTokensClicked(): void {
 }
 
 onBeforeMount(() => {
-    if (!configStore.getBillingEnabled(usersStore.state.user.hasVarPartner)) {
+    if (!configStore.getBillingEnabled(usersStore.state.user) || isMemberAccount.value) {
         router.replace({ name: ROUTES.AccountSettings.name });
-    }
-});
-
-onMounted(async () => {
-    withLoading(async () => {
-        const promises: Promise<void | AccountBalance | CreditCard[]>[] = [
-            billingStore.getBalance(),
-            billingStore.getCoupon(),
-            billingStore.getCreditCards(),
-            billingStore.getProjectUsagePriceModel(),
-        ];
-
-        if (configStore.state.config.nativeTokenPaymentsEnabled) {
-            promises.push(billingStore.getNativePaymentsHistory());
-        }
-
-        try {
-            await Promise.all(promises);
-        } catch (error) {
-            notify.notifyError(error, AnalyticsErrorEventSource.BILLING_AREA);
-        }
-    });
-
-    try {
-        await billingStore.getProjectUsageAndChargesCurrentRollup();
-    } catch (error) {
-        notify.notifyError(error, AnalyticsErrorEventSource.BILLING_AREA);
-    } finally {
-        isRollupLoading.value = false;
     }
 });
 </script>

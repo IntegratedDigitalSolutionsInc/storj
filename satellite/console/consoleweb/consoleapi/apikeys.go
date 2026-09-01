@@ -31,7 +31,7 @@ type APIKeys struct {
 	service *console.Service
 }
 
-// NewAPIKeys is a constructor for api api keys controller.
+// NewAPIKeys is a constructor for api keys controller.
 func NewAPIKeys(log *zap.Logger, service *console.Service) *APIKeys {
 	return &APIKeys{
 		log:     log,
@@ -66,21 +66,20 @@ func (keys *APIKeys) CreateAPIKey(w http.ResponseWriter, r *http.Request) {
 	}
 	name := string(bodyBytes)
 
-	project, err := keys.service.GetProject(ctx, projectID)
+	err = keys.service.ValidateFreeFormFieldLengths(&name)
 	if err != nil {
-		if console.ErrUnauthorized.Has(err) || console.ErrNoMembership.Has(err) {
-			keys.serveJSONError(ctx, w, http.StatusUnauthorized, err)
-			return
-		}
-
-		keys.serveJSONError(ctx, w, http.StatusInternalServerError, err)
+		keys.serveJSONError(ctx, w, http.StatusBadRequest, err)
 		return
 	}
 
 	apiKeyVersion := macaroon.APIKeyVersionMin
-	if keys.service.GetObjectLockUIEnabledByProject(project) {
+	if keys.service.GetObjectLockUIEnabled() {
 		apiKeyVersion = macaroon.APIKeyVersionObjectLock
 	}
+	if keys.service.ProjectSupportsAuditableAPIKeys(projectID) {
+		apiKeyVersion |= macaroon.APIKeyVersionAuditable
+	}
+	apiKeyVersion |= macaroon.APIKeyVersionEventing
 
 	info, key, err := keys.service.CreateAPIKey(ctx, projectID, name, apiKeyVersion)
 	if err != nil {
@@ -278,7 +277,7 @@ func (keys *APIKeys) DeleteByIDs(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// DeleteByNameAndProjectID deletes specific API key by it's name and project ID.
+// DeleteByNameAndProjectID deletes specific API key by its name and project ID.
 // ID here may be project.publicID or project.ID.
 func (keys *APIKeys) DeleteByNameAndProjectID(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()

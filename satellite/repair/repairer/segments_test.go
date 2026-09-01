@@ -43,22 +43,25 @@ func TestSegmentRepairPlacement(t *testing.T) {
 				testplanet.ReconfigureRS(1, 1, piecesCount, piecesCount),
 				func(log *zap.Logger, index int, config *satellite.Config) {
 					config.Repairer.DoDeclumping = false
+					// Disable stray node disqualification because the storage nodes' contact chores are paused.
+					config.StrayNodes.EnableDQ = false
 				},
 			),
 		},
+		Timeout: -1,
 	}, func(t *testing.T, ctx *testcontext.Context, planet *testplanet.Planet) {
 		// disable pinging the Satellite so we can control storagenode status.
 		for _, node := range planet.StorageNodes {
 			node.Contact.Chore.Pause(ctx)
 		}
 
-		require.NoError(t, planet.Uplinks[0].CreateBucket(ctx, planet.Satellites[0], "testbucket"))
+		require.NoError(t, planet.Uplinks[0].TestingCreateBucket(ctx, planet.Satellites[0], "testbucket"))
 		defaultLocation := location.Poland
 
 		_, err := planet.Satellites[0].API.Buckets.Service.UpdateBucket(ctx, buckets.Bucket{
 			ProjectID: planet.Uplinks[0].Projects[0].ID,
 			Name:      "testbucket",
-			Placement: storj.EU,
+			Placement: storj.PlacementConstraint(1),
 		})
 		require.NoError(t, err)
 
@@ -90,10 +93,11 @@ func TestSegmentRepairPlacement(t *testing.T) {
 
 			t.Run(fmt.Sprintf("oop_%d_ar_%d_off_%d", tc.piecesOutOfPlacement, tc.piecesAfterRepair, tc.piecesOutOfPlacementOffline), func(t *testing.T) {
 				for _, node := range planet.StorageNodes {
-					require.NoError(t, planet.Satellites[0].Overlay.Service.TestNodeCountryCode(ctx, node.ID(), defaultLocation.String()))
+					require.NoError(t, planet.Satellites[0].Overlay.Service.TestSetNodeCountryCode(ctx, node.ID(), defaultLocation.String()))
 				}
 
 				require.NoError(t, planet.Satellites[0].Repairer.Overlay.DownloadSelectionCache.Refresh(ctx))
+				require.NoError(t, planet.Satellites[0].Repairer.SegmentRepairer.RefreshParticipatingNodesCache(ctx))
 
 				expectedData := testrand.Bytes(5 * memory.KiB)
 				err = planet.Uplinks[0].Upload(ctx, planet.Satellites[0], "testbucket", "object", expectedData)
@@ -117,7 +121,7 @@ func TestSegmentRepairPlacement(t *testing.T) {
 
 					if index < tc.piecesOutOfPlacement {
 						t.Logf("marking node %s as out of placement", node.ID())
-						require.NoError(t, planet.Satellites[0].Overlay.Service.TestNodeCountryCode(ctx, piece.StorageNode, "US"))
+						require.NoError(t, planet.Satellites[0].Overlay.Service.TestSetNodeCountryCode(ctx, piece.StorageNode, "US"))
 					}
 				}
 
@@ -131,6 +135,7 @@ func TestSegmentRepairPlacement(t *testing.T) {
 				require.False(t, ok)
 
 				require.NoError(t, planet.Satellites[0].Repairer.Overlay.DownloadSelectionCache.Refresh(ctx))
+				require.NoError(t, planet.Satellites[0].Repairer.SegmentRepairer.RefreshParticipatingNodesCache(ctx))
 
 				t.Log("starting repair")
 				_, err = planet.Satellites[0].Repairer.SegmentRepairer.Repair(ctx, queue.InjuredSegment{
@@ -151,7 +156,8 @@ func TestSegmentRepairPlacement(t *testing.T) {
 				require.NoError(t, err)
 				require.True(t, ok)
 
-				require.NoError(t, planet.Satellites[0].API.Overlay.Service.DownloadSelectionCache.Refresh(ctx))
+				require.NoError(t, planet.Satellites[0].API.Overlay.DownloadSelectionCache.Refresh(ctx))
+				require.NoError(t, planet.Satellites[0].Repairer.SegmentRepairer.RefreshParticipatingNodesCache(ctx))
 
 				data, err := planet.Uplinks[0].Download(ctx, planet.Satellites[0], "testbucket", "object")
 				require.NoError(t, err)
@@ -173,7 +179,7 @@ func TestSegmentRepairInMemoryUpload(t *testing.T) {
 			),
 		},
 	}, func(t *testing.T, ctx *testcontext.Context, planet *testplanet.Planet) {
-		require.NoError(t, planet.Uplinks[0].CreateBucket(ctx, planet.Satellites[0], "testbucket"))
+		require.NoError(t, planet.Uplinks[0].TestingCreateBucket(ctx, planet.Satellites[0], "testbucket"))
 
 		expectedData := testrand.Bytes(5 * memory.KiB)
 		err := planet.Uplinks[0].Upload(ctx, planet.Satellites[0], "testbucket", "object", expectedData)
@@ -185,6 +191,7 @@ func TestSegmentRepairInMemoryUpload(t *testing.T) {
 		require.Len(t, segments[0].Pieces, 2)
 
 		require.NoError(t, planet.StopNodeAndUpdate(ctx, planet.FindNode(segments[0].Pieces[0].StorageNode)))
+		require.NoError(t, planet.Satellites[0].Repairer.SegmentRepairer.RefreshParticipatingNodesCache(ctx))
 
 		_, err = planet.Satellites[0].Repairer.SegmentRepairer.Repair(ctx, queue.InjuredSegment{
 			StreamID: segments[0].StreamID,
@@ -206,14 +213,13 @@ func TestSegmentRepairInMemoryUpload(t *testing.T) {
 
 func TestSegmentRepairWithNodeTags(t *testing.T) {
 	satelliteIdentity := signing.SignerFromFullIdentity(testidentity.MustPregeneratedSignedIdentity(0, storj.LatestIDVersion()))
-	ctx := testcontext.New(t)
-
 	testplanet.Run(t, testplanet.Config{
 		// we use 23 nodes:
 		//      first 0-9: untagged
 		//      next 10-19: tagged, used to upload (remaining should be offline during first upload)
 		//      next 20-22: tagged, used to upload during repair (4 should be offline from the previous set: we will have 6 pieces + 3 new to these)
 		SatelliteCount: 1, StorageNodeCount: 23, UplinkCount: 1,
+		Timeout: -1,
 		Reconfigure: testplanet.Reconfigure{
 			Satellite: testplanet.Combine(
 				func(log *zap.Logger, index int, config *satellite.Config) {
@@ -223,7 +229,6 @@ func TestSegmentRepairWithNodeTags(t *testing.T) {
 					}
 				},
 				func(log *zap.Logger, index int, config *satellite.Config) {
-
 					config.Overlay.Node.AsOfSystemTime.Enabled = false
 				},
 				testplanet.ReconfigureRS(4, 6, 8, 10),
@@ -241,7 +246,7 @@ func TestSegmentRepairWithNodeTags(t *testing.T) {
 						},
 					}
 
-					signed, err := nodetag.Sign(ctx, tags, satelliteIdentity)
+					signed, err := nodetag.Sign(t.Context(), tags, satelliteIdentity)
 					require.NoError(t, err)
 
 					config.Contact.Tags = contact.SignedTags(pb.SignedNodeTagSets{
@@ -267,8 +272,8 @@ func TestSegmentRepairWithNodeTags(t *testing.T) {
 		{
 			// create two buckets: one normal, one with placement=10
 
-			require.NoError(t, planet.Uplinks[0].CreateBucket(ctx, planet.Satellites[0], "generic"))
-			require.NoError(t, planet.Uplinks[0].CreateBucket(ctx, planet.Satellites[0], "selected"))
+			require.NoError(t, planet.Uplinks[0].TestingCreateBucket(ctx, planet.Satellites[0], "generic"))
+			require.NoError(t, planet.Uplinks[0].TestingCreateBucket(ctx, planet.Satellites[0], "selected"))
 
 			_, err := planet.Satellites[0].API.Buckets.Service.UpdateBucket(ctx, buckets.Bucket{
 				ProjectID: planet.Uplinks[0].Projects[0].ID,
@@ -284,7 +289,8 @@ func TestSegmentRepairWithNodeTags(t *testing.T) {
 			require.NoError(t, updateNodeStatus(ctx, planet.Satellites[0], planet.StorageNodes[21], true, location.Germany))
 			require.NoError(t, updateNodeStatus(ctx, planet.Satellites[0], planet.StorageNodes[22], true, location.Germany))
 
-			require.NoError(t, planet.Satellites[0].Overlay.Service.UploadSelectionCache.Refresh(ctx))
+			require.NoError(t, planet.Satellites[0].Core.Overlay.UploadSelectionCache.Refresh(ctx))
+			require.NoError(t, planet.Satellites[0].Repairer.SegmentRepairer.RefreshParticipatingNodesCache(ctx))
 		}
 
 		expectedData := testrand.Bytes(5 * memory.KiB)
@@ -325,6 +331,7 @@ func TestSegmentRepairWithNodeTags(t *testing.T) {
 			require.NoError(t, updateNodeStatus(ctx, planet.Satellites[0], planet.StorageNodes[22], false, location.Germany))
 
 			require.NoError(t, planet.Satellites[0].Repairer.Overlay.UploadSelectionCache.Refresh(ctx))
+			require.NoError(t, planet.Satellites[0].Repairer.SegmentRepairer.RefreshParticipatingNodesCache(ctx))
 		}
 
 		{
@@ -366,27 +373,28 @@ func TestSegmentRepairPlacementAndClumped(t *testing.T) {
 			node.Contact.Chore.Pause(ctx)
 		}
 
-		require.NoError(t, planet.Uplinks[0].CreateBucket(ctx, planet.Satellites[0], "testbucket"))
+		require.NoError(t, planet.Uplinks[0].TestingCreateBucket(ctx, planet.Satellites[0], "testbucket"))
 
 		_, err := planet.Satellites[0].API.Buckets.Service.UpdateBucket(ctx, buckets.Bucket{
 			ProjectID: planet.Uplinks[0].Projects[0].ID,
 			Name:      "testbucket",
-			Placement: storj.EU,
+			Placement: storj.PlacementConstraint(1),
 		})
 		require.NoError(t, err)
 
 		for _, node := range planet.StorageNodes {
-			require.NoError(t, planet.Satellites[0].Overlay.Service.TestNodeCountryCode(ctx, node.ID(), "PL"))
+			require.NoError(t, planet.Satellites[0].Overlay.Service.TestSetNodeCountryCode(ctx, node.ID(), "PL"))
 		}
 
 		err = planet.Uplinks[0].Upload(ctx, planet.Satellites[0], "testbucket", "object", testrand.Bytes(5*memory.KiB))
 		require.NoError(t, err)
 
 		for _, node := range planet.StorageNodes {
-			require.NoError(t, planet.Satellites[0].Overlay.Service.TestNodeCountryCode(ctx, node.ID(), "PL"))
+			require.NoError(t, planet.Satellites[0].Overlay.Service.TestSetNodeCountryCode(ctx, node.ID(), "PL"))
 		}
 
 		require.NoError(t, planet.Satellites[0].Repairer.Overlay.DownloadSelectionCache.Refresh(ctx))
+		require.NoError(t, planet.Satellites[0].Repairer.SegmentRepairer.RefreshParticipatingNodesCache(ctx))
 
 		segments, err := planet.Satellites[0].Metabase.DB.TestingAllSegments(ctx)
 		require.NoError(t, err)
@@ -396,7 +404,7 @@ func TestSegmentRepairPlacementAndClumped(t *testing.T) {
 		// set nodes to the same placement/country and put all nodes into the same net to mark them as clumped
 		node0 := planet.FindNode(segments[0].Pieces[0].StorageNode)
 		for _, piece := range segments[0].Pieces {
-			require.NoError(t, planet.Satellites[0].Overlay.Service.TestNodeCountryCode(ctx, piece.StorageNode, "US"))
+			require.NoError(t, planet.Satellites[0].Overlay.Service.TestSetNodeCountryCode(ctx, piece.StorageNode, "US"))
 
 			local := node0.Contact.Service.Local()
 			checkInInfo := overlay.NodeCheckInInfo{
@@ -422,6 +430,7 @@ func TestSegmentRepairPlacementAndClumped(t *testing.T) {
 		require.False(t, ok)
 
 		require.NoError(t, planet.Satellites[0].Repairer.Overlay.DownloadSelectionCache.Refresh(ctx))
+		require.NoError(t, planet.Satellites[0].Repairer.SegmentRepairer.RefreshParticipatingNodesCache(ctx))
 
 		_, err = planet.Satellites[0].Repairer.SegmentRepairer.Repair(ctx, queue.InjuredSegment{
 			StreamID: segments[0].StreamID,
@@ -454,17 +463,17 @@ func TestSegmentRepairPlacementNotEnoughNodes(t *testing.T) {
 			node.Contact.Chore.Pause(ctx)
 		}
 
-		require.NoError(t, planet.Uplinks[0].CreateBucket(ctx, planet.Satellites[0], "testbucket"))
+		require.NoError(t, planet.Uplinks[0].TestingCreateBucket(ctx, planet.Satellites[0], "testbucket"))
 
 		_, err := planet.Satellites[0].API.Buckets.Service.UpdateBucket(ctx, buckets.Bucket{
 			ProjectID: planet.Uplinks[0].Projects[0].ID,
 			Name:      "testbucket",
-			Placement: storj.EU,
+			Placement: storj.PlacementConstraint(1),
 		})
 		require.NoError(t, err)
 
 		for _, node := range planet.StorageNodes {
-			require.NoError(t, planet.Satellites[0].Overlay.Service.TestNodeCountryCode(ctx, node.ID(), "PL"))
+			require.NoError(t, planet.Satellites[0].Overlay.Service.TestSetNodeCountryCode(ctx, node.ID(), "PL"))
 		}
 
 		err = planet.Uplinks[0].Upload(ctx, planet.Satellites[0], "testbucket", "object", testrand.Bytes(5*memory.KiB))
@@ -472,10 +481,11 @@ func TestSegmentRepairPlacementNotEnoughNodes(t *testing.T) {
 
 		// change all nodes location to US
 		for _, node := range planet.StorageNodes {
-			require.NoError(t, planet.Satellites[0].Overlay.Service.TestNodeCountryCode(ctx, node.ID(), "US"))
+			require.NoError(t, planet.Satellites[0].Overlay.Service.TestSetNodeCountryCode(ctx, node.ID(), "US"))
 		}
 
 		require.NoError(t, planet.Satellites[0].Repairer.Overlay.DownloadSelectionCache.Refresh(ctx))
+		require.NoError(t, planet.Satellites[0].Repairer.SegmentRepairer.RefreshParticipatingNodesCache(ctx))
 
 		segments, err := planet.Satellites[0].Metabase.DB.TestingAllSegments(ctx)
 		require.NoError(t, err)
@@ -576,7 +586,6 @@ func updateNodeStatus(ctx context.Context, satellite *testplanet.Satellite, node
 // when both are placed to wrong nodes (nodes are moved to wrong country), only one of them will be repaired, as repairer
 // is configured to include only that placement constraint.
 func TestSegmentRepairPlacementRestrictions(t *testing.T) {
-
 	placement := nodeselection.ConfigurablePlacementRule{}
 	err := placement.Set(`1:country("PL");2:country("PL")`)
 	require.NoError(t, err)
@@ -608,7 +617,7 @@ func TestSegmentRepairPlacementRestrictions(t *testing.T) {
 		require.NoError(t, err)
 
 		{
-			require.NoError(t, planet.Uplinks[0].CreateBucket(ctx, planet.Satellites[0], "testbucket1"))
+			require.NoError(t, planet.Uplinks[0].TestingCreateBucket(ctx, planet.Satellites[0], "testbucket1"))
 			_, err := planet.Satellites[0].API.Buckets.Service.UpdateBucket(ctx, buckets.Bucket{
 				ProjectID: planet.Uplinks[0].Projects[0].ID,
 				Name:      "testbucket1",
@@ -616,7 +625,7 @@ func TestSegmentRepairPlacementRestrictions(t *testing.T) {
 			})
 			require.NoError(t, err)
 
-			require.NoError(t, planet.Uplinks[0].CreateBucket(ctx, planet.Satellites[0], "testbucket2"))
+			require.NoError(t, planet.Uplinks[0].TestingCreateBucket(ctx, planet.Satellites[0], "testbucket2"))
 			_, err = planet.Satellites[0].API.Buckets.Service.UpdateBucket(ctx, buckets.Bucket{
 				ProjectID: planet.Uplinks[0].Projects[0].ID,
 				Name:      "testbucket2",
@@ -635,11 +644,12 @@ func TestSegmentRepairPlacementRestrictions(t *testing.T) {
 				if ix > 3 {
 					l = badLocation
 				}
-				require.NoError(t, planet.Satellites[0].Overlay.Service.TestNodeCountryCode(ctx, node.ID(), l.String()))
+				require.NoError(t, planet.Satellites[0].Overlay.Service.TestSetNodeCountryCode(ctx, node.ID(), l.String()))
 
 			}
 			require.NoError(t, planet.Satellites[0].Repairer.Overlay.UploadSelectionCache.Refresh(ctx))
 			require.NoError(t, planet.Satellites[0].Repairer.Overlay.DownloadSelectionCache.Refresh(ctx))
+			require.NoError(t, planet.Satellites[0].Repairer.SegmentRepairer.RefreshParticipatingNodesCache(ctx))
 		}
 
 		expectedData := testrand.Bytes(5 * memory.KiB)
@@ -673,10 +683,11 @@ func TestSegmentRepairPlacementRestrictions(t *testing.T) {
 				if ix < 4 {
 					l = badLocation
 				}
-				require.NoError(t, planet.Satellites[0].Overlay.Service.TestNodeCountryCode(ctx, node.ID(), l.String()))
+				require.NoError(t, planet.Satellites[0].Overlay.Service.TestSetNodeCountryCode(ctx, node.ID(), l.String()))
 
 			}
 			require.NoError(t, planet.Satellites[0].Repairer.Overlay.UploadSelectionCache.Refresh(ctx))
+			require.NoError(t, planet.Satellites[0].Repairer.SegmentRepairer.RefreshParticipatingNodesCache(ctx))
 		}
 
 		{
@@ -696,7 +707,7 @@ func TestSegmentRepairPlacementRestrictions(t *testing.T) {
 			planet.Satellites[0].RangedLoop.RangedLoop.Service.Loop.TriggerWait()
 
 			// we should see both segments in repair queue
-			n, err := planet.Satellites[0].DB.RepairQueue().SelectN(ctx, 10)
+			n, err := planet.Satellites[0].Repair.Queue.SelectN(ctx, 10)
 			require.NoError(t, err)
 			require.Len(t, n, 2)
 		}
@@ -704,10 +715,10 @@ func TestSegmentRepairPlacementRestrictions(t *testing.T) {
 		{
 			// this should repair only one segment (where placement=1)
 			planet.Satellites[0].Repairer.Repairer.Loop.TriggerWait()
-			planet.Satellites[0].Repairer.Repairer.WaitForPendingRepairs()
+			require.NoError(t, planet.Satellites[0].Repairer.Repairer.WaitForPendingRepairs(ctx))
 
 			// one of the segments are repaired
-			n, err := planet.Satellites[0].DB.RepairQueue().SelectN(ctx, 10)
+			n, err := planet.Satellites[0].Repair.Queue.SelectN(ctx, 10)
 			require.NoError(t, err)
 			require.Len(t, n, 1)
 

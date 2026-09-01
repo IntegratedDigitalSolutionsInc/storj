@@ -1,0 +1,14 @@
+# syntax=docker/dockerfile:1.4-labs
+ARG GO_VERSION="1.26.6"
+
+FROM golang:${GO_VERSION}
+
+ARG GOPROXY
+ENV GOPROXY=${GOPROXY}
+
+RUN apt-get update && apt-get install -y ca-certificates
+
+WORKDIR /workspace
+COPY . .
+
+ENTRYPOINT ["/workspace/testsuite/rolling-upgrade/start-sim.sh"]

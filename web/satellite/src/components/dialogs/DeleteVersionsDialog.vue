@@ -20,11 +20,11 @@
                     </v-sheet>
                 </template>
                 <v-card-title class="font-weight-bold">
-                    Delete Object{{ props.files.length > 1 ? 's' : '' }} and {{ foldersCount > 0 ? foldersCount > 1 ? 'Folders' : 'Folder' : '' }}
+                    Delete Object{{ props.files.length > 1 ? 's' : '' }} {{ !!foldersCount ? 'and' : '' }} {{ foldersCount > 0 ? foldersCount > 1 ? 'Folders' : 'Folder' : '' }}
                 </v-card-title>
                 <template #append>
                     <v-btn
-                        icon="$close"
+                        :icon="X"
                         variant="text"
                         size="small"
                         color="default"
@@ -56,10 +56,10 @@
                     <template #prepend="{ item }">
                         <img :src="icons.get(item.title)" alt="icon" class="mr-3">
                     </template>
-                    <template #item="{ props }">
-                        <v-list-item :title="props.title" :class="{ 'text-medium-emphasis': subtitles.has(props.title) }">
-                            <v-list-item-subtitle v-if="subtitles.has(props.title)" class="text-caption">
-                                {{ subtitles.get(props.title) }}
+                    <template #item="{ props: itemProps }">
+                        <v-list-item :title="itemProps.title" :class="{ 'text-medium-emphasis': subtitles.has(itemProps.title) }">
+                            <v-list-item-subtitle v-if="subtitles.has(itemProps.title)" class="text-body-small">
+                                {{ subtitles.get(itemProps.title) }}
                             </v-list-item-subtitle>
                         </v-list-item>
                     </template>
@@ -97,7 +97,7 @@
 </template>
 
 <script setup lang="ts">
-import { Component, computed, ref, watch } from 'vue';
+import { type Component, computed, ref, watch  } from 'vue';
 import {
     VBtn,
     VCard,
@@ -112,15 +112,15 @@ import {
     VListItemSubtitle,
     VRow,
     VSheet,
+    VTreeview,
 } from 'vuetify/components';
-import { VTreeview } from 'vuetify/labs/VTreeview';
-import { Trash2 } from 'lucide-vue-next';
+import { Trash2, X } from '@lucide/vue';
 
 import { useBucketsStore } from '@/store/modules/bucketsStore';
-import { BrowserObject, useObjectBrowserStore } from '@/store/modules/objectBrowserStore';
+import { type BrowserObject, useObjectBrowserStore  } from '@/store/modules/objectBrowserStore';
 import { Time } from '@/utils/time';
 import { EXTENSION_INFOS, FILE_INFO, FOLDER_INFO } from '@/types/browser';
-import { ObjectLockStatus } from '@/types/objectLock';
+import type { ObjectLockStatus } from '@/types/objectLock';
 
 interface TreeItem {
     title: string;

@@ -19,6 +19,9 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
 
+	"storj.io/common/macaroon"
+	"storj.io/common/memory"
+	"storj.io/common/storj"
 	"storj.io/common/testcontext"
 	"storj.io/common/uuid"
 	"storj.io/storj/private/apigen"
@@ -26,13 +29,25 @@ import (
 	"storj.io/storj/satellite"
 	"storj.io/storj/satellite/accounting"
 	"storj.io/storj/satellite/console"
+	"storj.io/storj/satellite/console/restapikeys"
+	"storj.io/storj/satellite/nodeselection"
 	"storj.io/storj/satellite/payments"
+	"storj.io/storj/satellite/payments/paymentsconfig"
 	"storj.io/storj/satellite/payments/storjscan/blockchaintest"
 )
 
 func TestAuth(t *testing.T) {
 	testplanet.Run(t, testplanet.Config{
-		SatelliteCount: 1, StorageNodeCount: 0, UplinkCount: 1,
+		SatelliteCount: 1, UplinkCount: 1,
+		Reconfigure: testplanet.Reconfigure{
+			Satellite: func(log *zap.Logger, index int, config *satellite.Config) {
+				// This date must be set to some time in the future so we can simulate a user
+				// taking action on the pricing pop-up (see Test_UserSettings). Otherwise, the user
+				// will be found to have been created after the pricing cutoff and will
+				// subsequently be excluded from the opt in/out flow.
+				config.Console.NewPricingEffectiveDate = time.Now().Add(time.Hour).Format(time.RFC3339)
+			},
+		},
 	}, func(t *testing.T, ctx *testcontext.Context, planet *testplanet.Planet) {
 		test := newTest(t, ctx, planet)
 		user := test.defaultUser()
@@ -115,22 +130,6 @@ func TestAuth(t *testing.T) {
 			require.Equal(test.t, http.StatusBadRequest, resp.StatusCode)
 		}
 
-		{ // Get_FreezeStatus
-			resp, body := test.request(http.MethodGet, "/auth/account/freezestatus", nil)
-			require.Equal(test.t, http.StatusOK, resp.StatusCode)
-			require.Contains(test.t, body, "frozen")
-			require.Contains(test.t, body, "warned")
-
-			var freezestatus struct {
-				Frozen bool
-				Warned bool
-			}
-			require.NoError(test.t, json.Unmarshal([]byte(body), &freezestatus))
-			require.Equal(test.t, http.StatusOK, resp.StatusCode)
-			require.False(test.t, freezestatus.Frozen)
-			require.False(test.t, freezestatus.Warned)
-		}
-
 		{ // Test_UserSettings
 			type expectedSettings struct {
 				SessionDuration  *time.Duration
@@ -139,6 +138,7 @@ func TestAuth(t *testing.T) {
 				PassphrasePrompt bool
 				OnboardingStep   *string
 				NoticeDismissal  console.NoticeDismissal
+				OptInStatus      console.OptInStatus
 			}
 			testGetSettings := func(expected expectedSettings) {
 				resp, body := test.request(http.MethodGet, "/auth/account/settings", nil)
@@ -150,6 +150,7 @@ func TestAuth(t *testing.T) {
 					PassphrasePrompt bool
 					OnboardingStep   *string
 					NoticeDismissal  console.NoticeDismissal
+					OptInStatus      console.OptInStatus
 				}
 				require.Equal(t, http.StatusOK, resp.StatusCode)
 				require.NoError(test.t, json.Unmarshal([]byte(body), &settings))
@@ -159,6 +160,7 @@ func TestAuth(t *testing.T) {
 				require.Equal(test.t, expected.OnboardingStep, settings.OnboardingStep)
 				require.Equal(test.t, expected.SessionDuration, settings.SessionDuration)
 				require.Equal(test.t, expected.NoticeDismissal, settings.NoticeDismissal)
+				require.Equal(test.t, expected.OptInStatus, settings.OptInStatus)
 			}
 
 			noticeDismissal := console.NoticeDismissal{
@@ -167,7 +169,6 @@ func TestAuth(t *testing.T) {
 				PartnerUpgradeBanner:     false,
 				ProjectMembersPassphrase: false,
 				UploadOverwriteWarning:   false,
-				VersioningBetaBanner:     false,
 			}
 
 			testGetSettings(expectedSettings{
@@ -186,7 +187,6 @@ func TestAuth(t *testing.T) {
 			noticeDismissal.PartnerUpgradeBanner = true
 			noticeDismissal.ProjectMembersPassphrase = true
 			noticeDismissal.UploadOverwriteWarning = true
-			noticeDismissal.VersioningBetaBanner = true
 			resp, _ := test.request(http.MethodPatch, "/auth/account/settings",
 				test.toJSON(map[string]interface{}{
 					"sessionDuration":  duration,
@@ -200,7 +200,6 @@ func TestAuth(t *testing.T) {
 						"partnerUpgradeBanner":     noticeDismissal.PartnerUpgradeBanner,
 						"projectMembersPassphrase": noticeDismissal.ProjectMembersPassphrase,
 						"uploadOverwriteWarning":   noticeDismissal.UploadOverwriteWarning,
-						"versioningBetaBanner":     noticeDismissal.VersioningBetaBanner,
 					},
 				}))
 
@@ -247,6 +246,52 @@ func TestAuth(t *testing.T) {
 				OnboardingEnd:   false,
 				OnboardingStep:  &step,
 				NoticeDismissal: noticeDismissal,
+			})
+
+			// PATCH optInStatus=OptedIn (1) must persist and be returned by a subsequent GET.
+			resp, _ = test.request(http.MethodPatch, "/auth/account/settings",
+				test.toJSON(map[string]interface{}{
+					"optInStatus": console.OptedIn,
+				}))
+			require.Equal(t, http.StatusOK, resp.StatusCode)
+			testGetSettings(expectedSettings{
+				SessionDuration: nil,
+				OnboardingStart: true,
+				OnboardingEnd:   false,
+				OnboardingStep:  &step,
+				NoticeDismissal: noticeDismissal,
+				OptInStatus:     console.OptedIn,
+			})
+
+			// PATCH optInStatus=OptedOut (2) will be rejected; OptedIn cannot be changed to
+			// OptedOut.
+			resp, _ = test.request(http.MethodPatch, "/auth/account/settings",
+				test.toJSON(map[string]interface{}{
+					"optInStatus": console.OptedOut,
+				}))
+			require.Equal(t, http.StatusConflict, resp.StatusCode)
+			testGetSettings(expectedSettings{
+				SessionDuration: nil,
+				OnboardingStart: true,
+				OnboardingEnd:   false,
+				OnboardingStep:  &step,
+				NoticeDismissal: noticeDismissal,
+				OptInStatus:     console.OptedIn,
+			})
+
+			// PATCH without optInStatus must leave the stored value (OptedIn) unchanged (patch semantics).
+			resp, _ = test.request(http.MethodPatch, "/auth/account/settings",
+				test.toJSON(map[string]interface{}{
+					"onboardingStep": step,
+				}))
+			require.Equal(t, http.StatusOK, resp.StatusCode)
+			testGetSettings(expectedSettings{
+				SessionDuration: nil,
+				OnboardingStart: true,
+				OnboardingEnd:   false,
+				OnboardingStep:  &step,
+				NoticeDismissal: noticeDismissal,
+				OptInStatus:     console.OptedIn,
 			})
 		}
 
@@ -296,7 +341,7 @@ func TestAuth(t *testing.T) {
 
 func TestAnalytics(t *testing.T) {
 	testplanet.Run(t, testplanet.Config{
-		SatelliteCount: 1, StorageNodeCount: 0, UplinkCount: 1,
+		SatelliteCount: 1, UplinkCount: 1,
 		Reconfigure: testplanet.Reconfigure{
 			Satellite: func(log *zap.Logger, index int, config *satellite.Config) {
 				config.Console.RateLimit.Burst = 10
@@ -332,8 +377,47 @@ func TestAnalytics(t *testing.T) {
 }
 
 func TestPayments(t *testing.T) {
+	var (
+		placement       = storj.PlacementConstraint(10)
+		placementDetail = console.PlacementDetail{
+			ID:          10,
+			IdName:      "placement10",
+			WaitlistURL: "waitlist",
+		}
+		productID    = int32(1)
+		productPrice = paymentsconfig.ProductUsagePrice{
+			Name: "product",
+			ProjectUsagePrice: paymentsconfig.ProjectUsagePrice{
+				StorageTB: "4",
+				EgressTB:  "5",
+				Segment:   "6",
+			},
+		}
+	)
+	productModel, err := productPrice.ToModel()
+	require.NoError(t, err)
+
 	testplanet.Run(t, testplanet.Config{
-		SatelliteCount: 1, StorageNodeCount: 0, UplinkCount: 1,
+		SatelliteCount: 1, UplinkCount: 1,
+		Reconfigure: testplanet.Reconfigure{
+			Satellite: func(log *zap.Logger, index int, config *satellite.Config) {
+				config.Placement = nodeselection.ConfigurablePlacementRule{
+					PlacementRules: `10:annotation("location", "placement10")`,
+				}
+				config.Console.Placement.SelfServeEnabled = true
+
+				config.Payments.Products.SetMap(map[int32]paymentsconfig.ProductUsagePrice{
+					productID: productPrice,
+				})
+				config.Payments.PlacementPriceOverrides.SetMap(map[int]int32{int(placement): productID})
+				config.Console.Placement.SelfServeDetails.SetMap(map[storj.PlacementConstraint]console.PlacementDetail{
+					0:         {ID: 0},
+					placement: placementDetail,
+				})
+				config.Console.BillingStripeCheckoutEnabled = true
+				config.Console.RateLimit.Burst = 10
+			},
+		},
 	}, func(t *testing.T, ctx *testcontext.Context, planet *testplanet.Planet) {
 		test := newTest(t, ctx, planet)
 		user := test.defaultUser()
@@ -344,7 +428,7 @@ func TestPayments(t *testing.T) {
 				"/payments/account/balance",
 				"/payments/billing-history",
 				"/payments/invoice-history",
-				"/payments/account/charges?from=1619827200&to=1620844320",
+				"/payments/account/product-charges?from=1619827200&to=1620844320",
 			} {
 				resp, body := test.request(http.MethodGet, path, nil)
 				require.Contains(t, body, "unauthorized", path)
@@ -379,9 +463,42 @@ func TestPayments(t *testing.T) {
 		}
 
 		{ // Get_AccountChargesByDateRange
-			resp, body := test.request(http.MethodGet, "/payments/account/charges?from=1619827200&to=1620844320", nil)
-			require.Contains(t, body, "egress")
+			consoleDB := planet.Satellites[0].DB.Console()
+			consoleUser, err := consoleDB.Users().GetByEmailAndTenant(ctx, user.email, nil)
+			require.NoError(t, err)
+			projects, err := consoleDB.Projects().GetOwnActive(ctx, consoleUser.ID)
+			require.NoError(t, err)
+			require.NotEmpty(t, projects)
+
+			resp, body := test.request(http.MethodGet, "/payments/account/product-charges?from=1619827200&to=1620844320", nil)
+			require.Contains(t, body, projects[0].PublicID.String())
 			require.Equal(t, http.StatusOK, resp.StatusCode)
+		}
+
+		{ // Post_AddFunds
+			consoleCfg := test.planet.Satellites[0].Config.Console
+
+			makeRequest := func(cardID string, amount int) Response {
+				resp, _ := test.request(http.MethodPost, "/payments/add-funds", test.toJSON(map[string]any{
+					"cardID": cardID,
+					"amount": amount,
+					"intent": payments.AddFundsIntent,
+				}))
+
+				return resp
+			}
+
+			response := makeRequest("", 100)
+			require.Equal(test.t, http.StatusBadRequest, response.StatusCode)
+
+			response = makeRequest("testID", consoleCfg.MaxAddFundsAmount+1)
+			require.Equal(test.t, http.StatusBadRequest, response.StatusCode)
+
+			response = makeRequest("testID", consoleCfg.MinAddFundsAmount-1)
+			require.Equal(test.t, http.StatusBadRequest, response.StatusCode)
+
+			response = makeRequest("testID", consoleCfg.MinAddFundsAmount)
+			require.Equal(test.t, http.StatusOK, response.StatusCode)
 		}
 
 		{ // Get_TaxCountries
@@ -403,12 +520,46 @@ func TestPayments(t *testing.T) {
 			require.NoError(t, json.Unmarshal([]byte(body), &txs))
 			require.Equal(t, taxes, txs)
 		}
+
+		{ // Get_PlacementPricing
+			projectID := test.defaultProjectID()
+			resp, body := test.request(http.MethodGet, "/payments/placement-pricing?placementName="+placementDetail.IdName+"&projectID="+projectID, nil)
+			require.Equal(t, http.StatusOK, resp.StatusCode)
+
+			var model payments.ProjectUsagePriceModel
+			require.NoError(t, json.Unmarshal([]byte(body), &model))
+			require.Equal(t, productModel.EgressDiscountRatio, model.EgressDiscountRatio)
+			require.Equal(t, productModel.EgressMBCents.String(), model.EgressMBCents.String())
+			require.Equal(t, productModel.SegmentMonthCents.String(), model.SegmentMonthCents.String())
+			require.Equal(t, productModel.StorageMBMonthCents.String(), model.StorageMBMonthCents.String())
+		}
+
+		{ // Get_PlacementDetails
+			projectIdStr := test.defaultProjectID()
+			projectID, err := uuid.FromString(projectIdStr)
+			require.NoError(t, err)
+
+			project, err := planet.Satellites[0].DB.Console().Projects().Get(ctx, projectID)
+			require.NoError(t, err)
+			require.Empty(t, project.UserAgent)
+
+			resp, body := test.request(http.MethodGet, "/buckets/placement-details?projectID="+projectIdStr, nil)
+			require.Equal(t, http.StatusOK, resp.StatusCode)
+
+			var details []console.PlacementDetail
+			require.NoError(t, json.Unmarshal([]byte(body), &details))
+			require.Len(t, details, 1)
+			require.Equal(t, placementDetail.ID, details[0].ID)
+			require.Equal(t, placementDetail.IdName, details[0].IdName)
+			require.True(t, details[0].Pending)
+			require.Empty(t, details[0].WaitlistURL)
+		}
 	})
 }
 
 func TestWalletPayments(t *testing.T) {
 	testplanet.Run(t, testplanet.Config{
-		SatelliteCount: 1, StorageNodeCount: 0, UplinkCount: 1,
+		SatelliteCount: 1, UplinkCount: 1,
 	}, func(t *testing.T, ctx *testcontext.Context, planet *testplanet.Planet) {
 		test := newTest(t, ctx, planet)
 		sat := planet.Satellites[0]
@@ -416,7 +567,7 @@ func TestWalletPayments(t *testing.T) {
 		userData := test.defaultUser()
 		test.login(userData.email, userData.password)
 
-		user, err := sat.DB.Console().Users().GetByEmail(ctx, userData.email)
+		user, err := sat.DB.Console().Users().GetByEmailAndTenant(ctx, userData.email, nil)
 		require.NoError(t, err)
 
 		wallet := blockchaintest.NewAddress()
@@ -430,7 +581,7 @@ func TestWalletPayments(t *testing.T) {
 
 func TestBuckets(t *testing.T) {
 	testplanet.Run(t, testplanet.Config{
-		SatelliteCount: 1, StorageNodeCount: 0, UplinkCount: 1,
+		SatelliteCount: 1, UplinkCount: 1,
 	}, func(t *testing.T, ctx *testcontext.Context, planet *testplanet.Planet) {
 		test := newTest(t, ctx, planet)
 		user := test.defaultUser()
@@ -455,9 +606,13 @@ func TestBuckets(t *testing.T) {
 		}
 
 		{ // get bucket usages
+			now := time.Now()
+			beginningOfMonth := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, now.Location())
+
 			params := url.Values{
 				"projectID": {test.defaultProjectID()},
-				"before":    {time.Now().Add(time.Second).Format(apigen.DateFormat)},
+				"since":     {beginningOfMonth.Format(apigen.DateFormat)},
+				"before":    {now.Add(time.Second).Format(apigen.DateFormat)},
 				"limit":     {"1"},
 				"search":    {""},
 				"page":      {"1"},
@@ -470,7 +625,7 @@ func TestBuckets(t *testing.T) {
 			require.Empty(t, page.BucketUsages)
 
 			const bucketName = "my-bucket"
-			require.NoError(t, planet.Uplinks[0].CreateBucket(ctx, planet.Satellites[0], bucketName))
+			require.NoError(t, planet.Uplinks[0].TestingCreateBucket(ctx, planet.Satellites[0], bucketName))
 
 			resp, body = test.request(http.MethodGet, "/buckets/usage-totals?"+params.Encode(), nil)
 			require.Equal(t, http.StatusOK, resp.StatusCode)
@@ -482,21 +637,122 @@ func TestBuckets(t *testing.T) {
 	})
 }
 
+func TestDomains(t *testing.T) {
+	testplanet.Run(t, testplanet.Config{
+		SatelliteCount: 1, UplinkCount: 1,
+		Reconfigure: testplanet.Reconfigure{
+			Satellite: func(log *zap.Logger, index int, config *satellite.Config) {
+				config.Console.DomainsPageEnabled = true
+			},
+		},
+	}, func(t *testing.T, ctx *testcontext.Context, planet *testplanet.Planet) {
+		test := newTest(t, ctx, planet)
+		user := test.defaultUser()
+		test.upgradeUser(ctx, user.email)
+		test.login(user.email, user.password)
+
+		{ // Post_Create_Domain
+			path := "/domains/project/" + test.defaultProjectID()
+			resp, _ := test.request(http.MethodPost, path,
+				test.toJSON(map[string]interface{}{
+					"subdomain": "test.example.com",
+					"prefix":    "test",
+					"accessID":  "testAccessID",
+				}))
+			require.Equal(t, http.StatusOK, resp.StatusCode)
+		}
+
+		{ // Get_ProjectDomains
+			path := "/domains/project/''/paged?limit=6&page=1&order=1&orderDirection=1"
+			resp, _ := test.request(http.MethodGet, path, nil)
+			require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+
+			path = "/domains/project/" + test.defaultProjectID() + "/paged?page=1&order=1&orderDirection=1"
+			resp, _ = test.request(http.MethodGet, path, nil)
+			require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+
+			path = "/domains/project/" + test.defaultProjectID() + "/paged?limit=6&order=1&orderDirection=1"
+			resp, _ = test.request(http.MethodGet, path, nil)
+			require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+
+			path = "/domains/project/" + test.defaultProjectID() + "/paged?limit=6&page=1&orderDirection=1"
+			resp, _ = test.request(http.MethodGet, path, nil)
+			require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+
+			path = "/domains/project/" + test.defaultProjectID() + "/paged?limit=6&page=1&order=1"
+			resp, _ = test.request(http.MethodGet, path, nil)
+			require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+
+			var page console.DomainPage
+			path = "/domains/project/" + test.defaultProjectID() + "/paged?limit=6&page=1&order=1&orderDirection=1"
+			resp, body := test.request(http.MethodGet, path, nil)
+			require.Equal(t, http.StatusOK, resp.StatusCode)
+			require.NoError(t, json.Unmarshal([]byte(body), &page))
+			require.Contains(t, body, "domains")
+			require.Len(t, page.Domains, 1)
+
+			path = "/domains/project/" + test.defaultProjectID() + "/paged?search=123&limit=6&page=1&order=1&orderDirection=1"
+			resp, body = test.request(http.MethodGet, path, nil)
+			require.Equal(t, http.StatusOK, resp.StatusCode)
+			require.NoError(t, json.Unmarshal([]byte(body), &page))
+			require.Contains(t, body, "domains")
+			require.Len(t, page.Domains, 0)
+		}
+
+		{ // Get_ProjectAllDomainNames
+			var names []string
+			path := "/domains/project/" + test.defaultProjectID() + "/names"
+			resp, body := test.request(http.MethodGet, path, nil)
+			require.Equal(t, http.StatusOK, resp.StatusCode)
+			require.NoError(t, json.Unmarshal([]byte(body), &names))
+			require.Len(t, names, 1)
+		}
+	})
+}
+
 func TestAPIKeys(t *testing.T) {
 	testplanet.Run(t, testplanet.Config{
-		SatelliteCount: 1, StorageNodeCount: 0, UplinkCount: 1,
+		SatelliteCount: 1, UplinkCount: 1,
+		Reconfigure: testplanet.Reconfigure{
+			Satellite: func(log *zap.Logger, index int, config *satellite.Config) {
+				config.Console.RestAPIKeysUIEnabled = true
+				config.Console.UseNewRestKeysTable = true
+			},
+		},
 	}, func(t *testing.T, ctx *testcontext.Context, planet *testplanet.Planet) {
 		test := newTest(t, ctx, planet)
 		user := test.defaultUser()
 		test.login(user.email, user.password)
 
 		{ // Get_ProjectAPIKeys
-			var projects console.APIKeyPage
-			path := "/api-keys/list-paged?projectID=" + test.defaultProjectID() + "&search=''&limit=6&page=1&order=1&orderDirection=1"
+			pr, err := planet.Satellites[0].AddProject(ctx, planet.Uplinks[0].Projects[0].Owner.ID, "test project")
+			require.NoError(t, err)
+			secret, err := macaroon.NewSecret()
+			require.NoError(t, err)
+			key, err := macaroon.NewAPIKey(secret)
+			require.NoError(t, err)
+			apikey := console.APIKeyInfo{
+				Name:      "testKey",
+				ProjectID: pr.ID,
+				CreatedBy: pr.OwnerID,
+				Secret:    secret,
+				Version:   macaroon.APIKeyVersionMin,
+			}
+			info, err := planet.Satellites[0].DB.Console().APIKeys().Create(ctx, key.Head(), apikey)
+			require.NoError(t, err)
+			require.NotNil(t, info)
+
+			var keysPage console.APIKeyPage
+			path := "/api-keys/list-paged?projectID=" + test.defaultProjectID() + "&search=&limit=6&page=1&order=1&orderDirection=1"
 			resp, body := test.request(http.MethodGet, path, nil)
 			require.Equal(t, http.StatusOK, resp.StatusCode)
-			require.NoError(t, json.Unmarshal([]byte(body), &projects))
+			require.NoError(t, json.Unmarshal([]byte(body), &keysPage))
 			require.Contains(t, body, "apiKeys")
+			require.NotNil(t, keysPage.APIKeys)
+			require.Len(t, keysPage.APIKeys, 1)
+			for _, key := range keysPage.APIKeys {
+				require.Equal(t, user.email, key.CreatorEmail)
+			}
 		}
 
 		{ // Post_Create_APIKey
@@ -532,12 +788,47 @@ func TestAPIKeys(t *testing.T) {
 			require.Equal(t, http.StatusOK, resp.StatusCode)
 			require.Empty(t, body)
 		}
+
+		{ // REST API Keys
+			now := time.Now()
+			userId := planet.Uplinks[0].Projects[0].Owner.ID
+			err := planet.Satellites[0].API.DB.Console().Users().UpdatePaidTier(ctx, userId, true, memory.PB, memory.PB, 1000000, 3, &now)
+			require.NoError(t, err)
+
+			path := "/restkeys"
+			resp, body := test.request(http.MethodPost, path,
+				test.toJSON(map[string]interface{}{
+					"expiration": 1 * time.Hour,
+				}))
+			require.Equal(t, http.StatusCreated, resp.StatusCode)
+			require.NotEmpty(t, body)
+
+			var response []restapikeys.Key
+			resp, body = test.request(http.MethodGet, path+"?limit=10&page=1", nil)
+			require.Equal(t, http.StatusOK, resp.StatusCode)
+			require.NotEmpty(t, body)
+			err = json.Unmarshal([]byte(body), &response)
+			require.NoError(t, err)
+			require.Len(t, response, 1)
+
+			resp, _ = test.request(http.MethodDelete, path, test.toJSON(map[string]interface{}{
+				"ids": []uuid.UUID{response[0].ID},
+			}))
+			require.Equal(t, http.StatusOK, resp.StatusCode)
+
+			resp, body = test.request(http.MethodGet, path+"?limit=10&page=1", nil)
+			require.Equal(t, http.StatusOK, resp.StatusCode)
+			require.NotEmpty(t, body)
+			err = json.Unmarshal([]byte(body), &response)
+			require.NoError(t, err)
+			require.Empty(t, response)
+		}
 	})
 }
 
 func TestProjects(t *testing.T) {
 	testplanet.Run(t, testplanet.Config{
-		SatelliteCount: 1, StorageNodeCount: 0, UplinkCount: 1,
+		SatelliteCount: 1, UplinkCount: 1,
 	}, func(t *testing.T, ctx *testcontext.Context, planet *testplanet.Planet) {
 		test := newTest(t, ctx, planet)
 		user := test.defaultUser()
@@ -589,16 +880,8 @@ func TestProjects(t *testing.T) {
 			require.Contains(t, body, "storageLimit")
 		}
 
-		{ // Get_OwnedProjects - HTTP
-			var projects console.ProjectInfoPage
-			resp, body := test.request(http.MethodGet, "/projects/paged?limit=6&page=1", nil)
-			require.Equal(t, http.StatusOK, resp.StatusCode)
-			require.NoError(t, json.Unmarshal([]byte(body), &projects))
-			require.NotEmpty(t, projects.Projects)
-		}
-
 		{ // Post_ProjectRenameInvalid
-			resp, body := test.request(http.MethodPatch, fmt.Sprintf("/projects/%s", test.defaultProjectID()),
+			resp, body := test.request(http.MethodPatch, "/projects/"+test.defaultProjectID(),
 				test.toJSON(map[string]interface{}{
 					"name": "My Second Project with a long name",
 				}))
@@ -607,43 +890,18 @@ func TestProjects(t *testing.T) {
 		}
 
 		{ // Post_ProjectRename
-			resp, _ := test.request(http.MethodPatch, fmt.Sprintf("/projects/%s", test.defaultProjectID()),
+			resp, _ := test.request(http.MethodPatch, "/projects/"+test.defaultProjectID(),
 				test.toJSON(map[string]interface{}{
 					"name": "new name",
 				}))
 			require.Equal(t, http.StatusOK, resp.StatusCode)
-		}
-
-		{ // Versioning_Opt_In
-			projectID, err := uuid.FromString(test.defaultProjectID())
-			require.NoError(t, err)
-
-			checkVersioning := func(prompted bool, versioning console.DefaultVersioning) {
-				project, err := planet.Satellites[0].DB.Console().Projects().Get(ctx, projectID)
-				require.NoError(t, err)
-
-				require.Equal(t, prompted, project.PromptedForVersioningBeta)
-				require.Equal(t, versioning, project.DefaultVersioning)
-			}
-
-			checkVersioning(false, console.Unversioned)
-
-			resp, _ := test.request(http.MethodPatch, fmt.Sprintf("/projects/%s/versioning-opt-out", projectID), nil)
-			require.Equal(t, http.StatusOK, resp.StatusCode)
-
-			checkVersioning(true, console.VersioningUnsupported)
-
-			resp, _ = test.request(http.MethodPatch, fmt.Sprintf("/projects/%s/versioning-opt-in", projectID), nil)
-			require.Equal(t, http.StatusOK, resp.StatusCode)
-
-			checkVersioning(true, console.Unversioned)
 		}
 	})
 }
 
 func TestWrongUser(t *testing.T) {
 	testplanet.Run(t, testplanet.Config{
-		SatelliteCount: 1, StorageNodeCount: 0, UplinkCount: 1,
+		SatelliteCount: 1, UplinkCount: 1,
 		Reconfigure: testplanet.Reconfigure{
 			Satellite: func(log *zap.Logger, index int, config *satellite.Config) {
 				config.Console.RateLimit.Burst = 4
@@ -683,6 +941,9 @@ func TestWrongUser(t *testing.T) {
 		apiKeyId := response.KeyInfo.ID.String()
 
 		test.login(unauthorizedUser.email, unauthorizedUser.password)
+
+		now := time.Now()
+		beginningOfMonth := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, now.Location())
 
 		testCases := []endpointTest{
 			{
@@ -726,7 +987,7 @@ func TestWrongUser(t *testing.T) {
 				method:   http.MethodGet,
 			},
 			{
-				endpoint: "/buckets/usage-totals?limit=10&page=1&before=" + time.Now().Format(apigen.DateFormat) + "&projectID=" + test.defaultProjectID(),
+				endpoint: "/buckets/usage-totals?limit=10&page=1&since=" + beginningOfMonth.Format(apigen.DateFormat) + "&before=" + now.Format(apigen.DateFormat) + "&projectID=" + test.defaultProjectID(),
 				method:   http.MethodGet,
 			},
 			{
@@ -760,7 +1021,7 @@ func TestWrongUser(t *testing.T) {
 		}
 
 		for _, testCase := range testCases {
-			t.Run(fmt.Sprintf("Unauthorized on %s", testCase.endpoint), func(t *testing.T) {
+			t.Run("Unauthorized on "+testCase.endpoint, func(t *testing.T) {
 				resp, body = test.request(testCase.method, testCase.endpoint, test.toJSON(testCase.body))
 				require.Contains(t, body, "not authorized")
 				require.Equal(t, http.StatusUnauthorized, resp.StatusCode)
@@ -770,7 +1031,7 @@ func TestWrongUser(t *testing.T) {
 		// login with correct user to make sure they have access.
 		test.login(authorizedUser.email, authorizedUser.password)
 		for _, testCase := range testCases {
-			t.Run(fmt.Sprintf("Authorized on %s", testCase.endpoint), func(t *testing.T) {
+			t.Run("Authorized on "+testCase.endpoint, func(t *testing.T) {
 				resp, body = test.request(testCase.method, testCase.endpoint, test.toJSON(testCase.body))
 				require.NotContains(t, body, "not authorized")
 				require.NotEqual(t, http.StatusUnauthorized, resp.StatusCode)
@@ -902,12 +1163,24 @@ func (test *test) registerUser(email, password string) registeredUser {
 func (test *test) activateUser(ctx context.Context, email string) {
 	usersDB := test.planet.Satellites[0].DB.Console().Users()
 
-	_, users, err := usersDB.GetByEmailWithUnverified(ctx, email)
+	_, users, err := usersDB.GetByEmailAndTenantWithUnverified(ctx, email, nil)
 	require.NoError(test.t, err)
 	require.Len(test.t, users, 1)
 
 	activeStatus := console.Active
 	err = usersDB.Update(ctx, users[0].ID, console.UpdateUserRequest{Status: &activeStatus})
+	require.NoError(test.t, err)
+}
+
+func (test *test) upgradeUser(ctx context.Context, email string) {
+	usersDB := test.planet.Satellites[0].DB.Console().Users()
+
+	user, _, err := usersDB.GetByEmailAndTenantWithUnverified(ctx, email, nil)
+	require.NoError(test.t, err)
+	require.NotNil(test.t, user)
+
+	paidKind := console.PaidUser
+	err = usersDB.Update(ctx, user.ID, console.UpdateUserRequest{Kind: &paidKind})
 	require.NoError(test.t, err)
 }
 

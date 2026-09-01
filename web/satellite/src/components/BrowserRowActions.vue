@@ -10,12 +10,12 @@
         </v-tooltip>
         <template v-else>
             <v-btn
-                v-if="file.type !== 'folder' && !file.isDeleteMarker"
+                v-if="(file.type === 'file' && !file.isDeleteMarker) || (file.type === 'folder' && downloadPrefixEnabled)"
                 variant="text"
                 color="default"
                 size="small"
                 rounded="md"
-                class="mr-1 text-caption"
+                class="mr-1 text-body-small"
                 density="comfortable"
                 title="Download"
                 icon
@@ -32,24 +32,24 @@
             </v-btn>
 
             <v-btn
-                v-if="!isVersion && !file.isDeleteMarker"
+                v-if="configStore.isDefaultBrand && ((!props.isVersion && !props.file.isDeleteMarker) || props.file.isLatest)"
                 variant="text"
                 color="default"
                 size="small"
-                class="mr-1 text-caption"
+                class="mr-1 text-body-small"
                 density="comfortable"
                 title="Share"
                 icon
                 @click="emit('shareClick')"
             >
-                <component :is="Share" :size="17" />
+                <component :is="Share2" :size="17" />
             </v-btn>
 
             <v-btn
                 variant="text"
                 color="default"
                 size="small"
-                class="mr-1 text-caption"
+                class="text-body-small"
                 density="comfortable"
                 title="More Actions"
                 icon
@@ -62,7 +62,7 @@
                                 <template #prepend>
                                     <component :is="ZoomIn" :size="18" />
                                 </template>
-                                <v-list-item-title class="ml-3 text-body-2 font-weight-medium">
+                                <v-list-item-title class="ml-3 text-body-medium font-weight-medium">
                                     Preview
                                 </v-list-item-title>
                             </v-list-item>
@@ -77,7 +77,7 @@
                                     <component :is="Download" :size="18" />
                                 </template>
                                 <v-fade-transition>
-                                    <v-list-item-title v-show="!isDownloading" class="ml-3 text-body-2 font-weight-medium">
+                                    <v-list-item-title v-show="!isDownloading" class="ml-3 text-body-medium font-weight-medium">
                                         Download
                                     </v-list-item-title>
                                 </v-fade-transition>
@@ -97,7 +97,7 @@
                                     <v-progress-circular v-if="isGettingLockStatus" color="primary" indeterminate size="18" width="2" />
                                     <component :is="Lock" v-else :size="18" />
                                 </template>
-                                <v-list-item-title class="ml-3 text-body-2 font-weight-medium">
+                                <v-list-item-title class="ml-3 text-body-medium font-weight-medium">
                                     Lock{{ lockStatus?.retention.active ? 'ed' : '' }}
                                 </v-list-item-title>
                             </v-list-item>
@@ -114,7 +114,7 @@
                                     <v-progress-circular v-if="isGettingLockStatus" color="primary" indeterminate size="18" width="2" />
                                     <component :is="FileLock2" v-else :size="18" />
                                 </template>
-                                <v-list-item-title class="ml-3 text-body-2 font-weight-medium">
+                                <v-list-item-title class="ml-3 text-body-medium font-weight-medium">
                                     {{ lockStatus?.legalHold ? 'On' : '' }} Legal Hold
                                 </v-list-item-title>
                             </v-list-item>
@@ -122,17 +122,36 @@
                                 <template #prepend>
                                     <component :is="Redo2" :size="18" />
                                 </template>
-                                <v-list-item-title class="ml-3 text-body-2 font-weight-medium">
+                                <v-list-item-title class="ml-3 text-body-medium font-weight-medium">
                                     Restore
                                 </v-list-item-title>
                             </v-list-item>
                         </template>
 
-                        <v-list-item v-if="!isVersion && !file.isDeleteMarker" density="comfortable" link @click="emit('shareClick')">
+                        <template v-if="file.type === 'folder'">
+                            <v-list-item density="comfortable" link @click="emit('previewClick')">
+                                <template #prepend>
+                                    <component :is="FolderOpen" :size="18" />
+                                </template>
+                                <v-list-item-title class="ml-3 text-body-medium font-weight-medium">
+                                    Open Folder
+                                </v-list-item-title>
+                            </v-list-item>
+                            <v-list-item v-if="downloadPrefixEnabled" density="comfortable" link @click="emit('downloadFolderClick')">
+                                <template #prepend>
+                                    <component :is="Download" :size="18" />
+                                </template>
+                                <v-list-item-title class="ml-3 text-body-medium font-weight-medium">
+                                    Download
+                                </v-list-item-title>
+                            </v-list-item>
+                        </template>
+
+                        <v-list-item v-if="configStore.isDefaultBrand && !isVersion && !file.isDeleteMarker" density="comfortable" link @click="emit('shareClick')">
                             <template #prepend>
-                                <component :is="Share" :size="18" />
+                                <component :is="Share2" :size="18" />
                             </template>
-                            <v-list-item-title class="ml-3 text-body-2 font-weight-medium">
+                            <v-list-item-title class="ml-3 text-body-medium font-weight-medium">
                                 Share
                             </v-list-item-title>
                         </v-list-item>
@@ -145,7 +164,7 @@
                                     <v-progress-circular v-if="isGettingLockStatus" indeterminate size="18" width="2" />
                                     <component :is="Trash2" v-else :size="18" />
                                 </template>
-                                <v-list-item-title class="ml-3 text-body-2 font-weight-medium">
+                                <v-list-item-title class="ml-3 text-body-medium font-weight-medium">
                                     Delete
                                 </v-list-item-title>
                             </v-list-item>
@@ -170,21 +189,21 @@ import {
     VIcon,
     VBtn, VTooltip,
 } from 'vuetify/components';
-import { Ellipsis, Share, Download, ZoomIn, Trash2, Redo2, Lock, FileLock2 } from 'lucide-vue-next';
+import { Ellipsis, Share2, Download, ZoomIn, Trash2, Redo2, Lock, FileLock2, FolderOpen } from '@lucide/vue';
 
 import {
-    BrowserObject,
-    FullBrowserObject,
+    type BrowserObject,
+    type FullBrowserObject,
     useObjectBrowserStore,
 } from '@/store/modules/objectBrowserStore';
-import { useNotify } from '@/utils/hooks';
+import { useNotify } from '@/composables/useNotify';
 import { AnalyticsErrorEventSource } from '@/utils/constants/analyticsEventNames';
-import { ProjectLimits } from '@/types/projects';
+import type { ProjectLimits } from '@/types/projects';
 import { useProjectsStore } from '@/store/modules/projectsStore';
-import { BucketMetadata } from '@/types/buckets';
+import type { BucketMetadata } from '@/types/buckets';
 import { useBucketsStore } from '@/store/modules/bucketsStore';
 import { useConfigStore } from '@/store/modules/configStore';
-import { ObjectLockStatus } from '@/types/objectLock';
+import type { ObjectLockStatus } from '@/types/objectLock';
 import { usePreCheck } from '@/composables/usePreCheck';
 
 const bucketsStore = useBucketsStore();
@@ -207,6 +226,7 @@ const emit = defineEmits<{
     previewClick: [];
     deleteFileClick: [];
     shareClick: [];
+    downloadFolderClick: [];
     restoreObjectClick: [];
     lockObjectClick: [];
     legalHoldClick: [];
@@ -222,6 +242,8 @@ const alignClass = computed<string>(() => {
     return 'text-' + props.align;
 });
 
+const downloadPrefixEnabled = computed<boolean>(() => configStore.state.config.downloadPrefixEnabled && configStore.isDefaultBrand);
+
 /**
  * Returns metadata of the current bucket.
  */
@@ -233,9 +255,7 @@ const bucket = computed<BucketMetadata | undefined>(() => {
  * Whether object lock is enabled for current bucket.
  */
 const objectLockEnabledForBucket = computed<boolean>(() => {
-    return configStore.objectLockUIEnabled
-        && projectsStore.objectLockUIEnabledForProject
-        && !!bucket.value?.objectLockEnabled;
+    return configStore.state.config.objectLockUIEnabled && !!bucket.value?.objectLockEnabled;
 });
 
 /**
@@ -257,6 +277,11 @@ async function onDownloadClick(): Promise<void> {
             return;
         }
 
+        if (props.file.type === 'folder' && downloadPrefixEnabled.value) {
+            emit('downloadFolderClick');
+            return;
+        }
+
         if (isDownloading.value) {
             return;
         }
@@ -265,7 +290,7 @@ async function onDownloadClick(): Promise<void> {
         try {
             await obStore.download(props.file);
             notify.success(
-                () => ['Keep this download link private.', h('br'), 'If you want to share, use the Share option.'],
+                () => ['Keep this download link private.', h('br'), configStore.isDefaultBrand ? 'If you want to share, use the Share option.' : ''],
                 'Download started',
             );
         } catch (error) {
@@ -285,7 +310,7 @@ async function onDeleteClick(): Promise<void> {
 }
 
 async function getLockStatus() {
-    if (!objectLockEnabledForBucket.value || props.file.type === 'folder') {
+    if (!objectLockEnabledForBucket.value || props.file.type === 'folder' || props.file.isDeleteMarker) {
         return;
     }
     if (isGettingLockStatus.value) {

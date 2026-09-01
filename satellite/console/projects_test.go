@@ -4,6 +4,7 @@
 package console_test
 
 import (
+	"context"
 	"math/rand"
 	"sort"
 	"strconv"
@@ -81,6 +82,7 @@ func TestProjectsRepository(t *testing.T) {
 
 				project, err = projects.Insert(ctx, project)
 				assert.NotNil(t, project)
+				assert.Equal(t, console.ProjectActive, *project.Status)
 				assert.NoError(t, err)
 			})
 
@@ -92,6 +94,7 @@ func TestProjectsRepository(t *testing.T) {
 				assert.Equal(t, projectByID.OwnerID, owner.ID)
 				assert.Equal(t, projectByID.Description, description)
 				require.NotNil(t, project)
+				require.Equal(t, console.ProjectActive, *project.Status)
 				require.NoError(t, err)
 			})
 
@@ -114,11 +117,10 @@ func TestProjectsRepository(t *testing.T) {
 
 				// creating new project with updated values.
 				newProject := &console.Project{
-					ID:                        oldProject.ID,
-					Name:                      newName,
-					Description:               newDescription,
-					RateLimit:                 &newRateLimit,
-					PromptedForVersioningBeta: true,
+					ID:          oldProject.ID,
+					Name:        newName,
+					Description: newDescription,
+					RateLimit:   &newRateLimit,
 				}
 
 				err = projects.Update(ctx, newProject)
@@ -131,7 +133,16 @@ func TestProjectsRepository(t *testing.T) {
 				require.Equal(t, newName, newProject.Name)
 				require.Equal(t, newDescription, newProject.Description)
 				require.Equal(t, newRateLimit, *newProject.RateLimit)
-				require.True(t, newProject.PromptedForVersioningBeta)
+				require.Equal(t, console.ProjectActive, *newProject.Status)
+
+				disabledStatus := console.ProjectDisabled
+				newProject.Status = &disabledStatus
+				err = projects.Update(ctx, newProject)
+				require.NoError(t, err)
+
+				newProject, err = projects.Get(ctx, oldProject.ID)
+				require.NoError(t, err)
+				require.Equal(t, console.ProjectDisabled, *newProject.Status)
 			})
 
 			t.Run("Delete project success", func(t *testing.T) {
@@ -243,6 +254,203 @@ func TestProjectsList(t *testing.T) {
 				})
 				return rs
 			})))
+	})
+}
+
+func TestListPendingDeletionBefore(t *testing.T) {
+	satellitedbtest.Run(t, func(ctx *testcontext.Context, t *testing.T, db satellite.DB) {
+		usersRepo := db.Console().Users()
+		projectsRepo := db.Console().Projects()
+
+		owner1, err := usersRepo.Insert(ctx, &console.User{
+			ID:           testrand.UUID(),
+			FullName:     "Test User 1",
+			Email:        "test1@test.test",
+			PasswordHash: testrand.Bytes(8),
+		})
+		require.NoError(t, err)
+
+		owner2, err := usersRepo.Insert(ctx, &console.User{
+			ID:           testrand.UUID(),
+			FullName:     "Test User 2",
+			Email:        "test2@test.test",
+			PasswordHash: testrand.Bytes(8),
+		})
+		require.NoError(t, err)
+
+		now := time.Now().Truncate(time.Minute)
+		beforeTime := now.Add(-time.Hour)
+		afterTime := now.Add(time.Hour)
+
+		pendingProject1, err := projectsRepo.Insert(ctx, &console.Project{
+			ID:      testrand.UUID(),
+			Name:    "PendingDeletion1",
+			OwnerID: owner1.ID,
+		})
+		require.NoError(t, err)
+
+		pendingProject2, err := projectsRepo.Insert(ctx, &console.Project{
+			ID:      testrand.UUID(),
+			Name:    "PendingDeletion2",
+			OwnerID: owner2.ID,
+		})
+		require.NoError(t, err)
+
+		_, err = projectsRepo.Insert(ctx, &console.Project{
+			ID:      testrand.UUID(),
+			Name:    "Active",
+			OwnerID: owner1.ID,
+		})
+		require.NoError(t, err)
+
+		err = projectsRepo.UpdateStatus(ctx, pendingProject1.ID, console.ProjectPendingDeletion)
+		require.NoError(t, err)
+
+		err = projectsRepo.UpdateStatus(ctx, pendingProject2.ID, console.ProjectPendingDeletion)
+		require.NoError(t, err)
+
+		page, err := projectsRepo.ListPendingDeletionBefore(ctx, 0, 10, afterTime)
+		require.NoError(t, err)
+		require.Len(t, page.Ids, 2)
+		require.Contains(t, page.Ids, console.ProjectIdOwnerId{
+			ProjectID:       pendingProject1.ID,
+			ProjectPublicID: pendingProject1.PublicID,
+			OwnerID:         owner1.ID,
+		})
+		require.Contains(t, page.Ids, console.ProjectIdOwnerId{
+			ProjectID:       pendingProject2.ID,
+			ProjectPublicID: pendingProject2.PublicID,
+			OwnerID:         owner2.ID,
+		})
+
+		page, err = projectsRepo.ListPendingDeletionBefore(ctx, 0, 1, afterTime)
+		require.NoError(t, err)
+		require.Len(t, page.Ids, 1)
+		require.Equal(t, pendingProject1.ID, page.Ids[0].ProjectID)
+		require.Equal(t, pendingProject1.PublicID, page.Ids[0].ProjectPublicID)
+
+		page, err = projectsRepo.ListPendingDeletionBefore(ctx, 1, 1, afterTime)
+		require.NoError(t, err)
+		require.Len(t, page.Ids, 1)
+		require.Equal(t, pendingProject2.ID, page.Ids[0].ProjectID)
+		require.Equal(t, pendingProject2.PublicID, page.Ids[0].ProjectPublicID)
+
+		page, err = projectsRepo.ListPendingDeletionBefore(ctx, 0, 10, beforeTime)
+		require.NoError(t, err)
+		require.Len(t, page.Ids, 0)
+	})
+}
+
+func TestUpdateStatus(t *testing.T) {
+	satellitedbtest.Run(t, func(ctx *testcontext.Context, t *testing.T, db satellite.DB) { // repositories
+		owner, err := db.Console().Users().Insert(ctx,
+			&console.User{
+				ID:           testrand.UUID(),
+				FullName:     "test",
+				Email:        "test@example.test",
+				PasswordHash: []byte("example_password"),
+			},
+		)
+		require.NoError(t, err)
+
+		projectsDB := db.Console().Projects()
+
+		timestamp := time.Now().Add(10 * time.Hour)
+		projectsDB.TestSetNowFn(func() time.Time {
+			return timestamp
+		})
+
+		proj, err := projectsDB.Insert(ctx,
+			&console.Project{
+				Name:        "example",
+				Description: "example",
+				OwnerID:     owner.ID,
+			},
+		)
+		require.NoError(t, err)
+		require.Equal(t, console.ProjectActive, *proj.Status)
+
+		err = projectsDB.UpdateStatus(ctx, proj.ID, console.ProjectDisabled)
+		require.NoError(t, err)
+
+		proj, err = projectsDB.Get(ctx, proj.ID)
+		require.NoError(t, err)
+		require.Equal(t, console.ProjectDisabled, *proj.Status)
+		require.NotNil(t, proj.StatusUpdatedAt)
+		assert.WithinDuration(t, timestamp, *proj.StatusUpdatedAt, time.Minute)
+
+		// get db again to be sure got the same instance
+		projectsDB = db.Console().Projects()
+
+		active := console.ProjectActive
+		proj.Status = &active
+		err = projectsDB.Update(ctx, proj)
+		require.NoError(t, err)
+
+		proj, err = projectsDB.Get(ctx, proj.ID)
+		require.NoError(t, err)
+		require.Equal(t, console.ProjectActive, *proj.Status)
+		require.NotNil(t, proj.StatusUpdatedAt)
+		require.WithinDuration(t, timestamp, *proj.StatusUpdatedAt, time.Minute)
+
+		// test that status_updated_at is set correctly when updating status in transaction
+		newTimestamp := timestamp.Add(24 * time.Hour)
+		projectsDB.TestSetNowFn(func() time.Time { return newTimestamp })
+		var result *console.Project
+		err = db.Console().WithTx(ctx, func(ctx context.Context, tx console.DBTx) error {
+			result = nil
+			err := tx.Projects().UpdateStatus(ctx, proj.ID, console.ProjectPendingDeletion)
+			if err != nil {
+				return err
+			}
+
+			result, err = tx.Projects().Get(ctx, proj.ID)
+			if err != nil {
+				return err
+			}
+
+			return nil
+		})
+		require.NoError(t, err)
+		require.Equal(t, console.ProjectPendingDeletion, *result.Status)
+		require.NotNil(t, result.StatusUpdatedAt)
+		require.WithinDuration(t, newTimestamp, *result.StatusUpdatedAt, time.Minute)
+	})
+}
+
+func TestGetOwnActive(t *testing.T) {
+	satellitedbtest.Run(t, func(ctx *testcontext.Context, t *testing.T, db satellite.DB) { // repositories
+		owner, err := db.Console().Users().Insert(ctx,
+			&console.User{
+				ID:           testrand.UUID(),
+				FullName:     "test",
+				Email:        "test@example.test",
+				PasswordHash: []byte("example_password"),
+			},
+		)
+		require.NoError(t, err)
+
+		projectsDB := db.Console().Projects()
+
+		proj1, err := projectsDB.Insert(ctx, &console.Project{Name: "example1", OwnerID: owner.ID})
+		require.NoError(t, err)
+		require.Equal(t, console.ProjectActive, *proj1.Status)
+
+		proj2, err := projectsDB.Insert(ctx, &console.Project{Name: "example2", OwnerID: owner.ID})
+		require.NoError(t, err)
+		require.Equal(t, console.ProjectActive, *proj2.Status)
+
+		projects, err := projectsDB.GetOwnActive(ctx, owner.ID)
+		require.NoError(t, err)
+		require.Len(t, projects, 2)
+
+		err = projectsDB.UpdateStatus(ctx, proj1.ID, console.ProjectDisabled)
+		require.NoError(t, err)
+
+		projects, err = projectsDB.GetOwnActive(ctx, owner.ID)
+		require.NoError(t, err)
+		require.Len(t, projects, 1)
+		require.Equal(t, proj2.ID, projects[0].ID)
 	})
 }
 
@@ -378,6 +586,17 @@ func TestProjectsListByOwner(t *testing.T) {
 				require.Equal(t, originalProjects[i].Name, p.Name)
 				require.Equal(t, originalProjects[i].MemberCount, p.MemberCount)
 			}
+
+			err = projectsDB.UpdateStatus(ctx, ownerProjectsDB[0].ID, console.ProjectDisabled)
+			require.NoError(t, err)
+
+			projsPage, err = projectsDB.ListByOwnerID(ctx, tt.id, *cursor)
+			require.NoError(t, err)
+			require.EqualValues(t, length, projsPage.TotalCount)
+
+			projsPage, err = projectsDB.ListActiveByOwnerID(ctx, tt.id, *cursor)
+			require.NoError(t, err)
+			require.EqualValues(t, length-1, projsPage.TotalCount)
 		}
 	})
 }
@@ -389,9 +608,9 @@ func TestGetMaxBuckets(t *testing.T) {
 		project, err := consoleDB.Projects().Insert(ctx, &console.Project{Name: "testproject1", MaxBuckets: &maxCount})
 		require.NoError(t, err)
 		projectsDB := db.Console().Projects()
-		max, err := projectsDB.GetMaxBuckets(ctx, project.ID)
+		maxBuckets, err := projectsDB.GetMaxBuckets(ctx, project.ID)
 		require.NoError(t, err)
-		require.Equal(t, maxCount, *max)
+		require.Equal(t, maxCount, *maxBuckets)
 	})
 }
 
@@ -425,7 +644,7 @@ func TestValidateNameAndDescription(t *testing.T) {
 func TestRateLimit_ProjectRateLimitZero(t *testing.T) {
 	rateLimit := 2
 	testplanet.Run(t, testplanet.Config{
-		SatelliteCount: 1, StorageNodeCount: 0, UplinkCount: 1,
+		SatelliteCount: 1, UplinkCount: 1,
 		Reconfigure: testplanet.Reconfigure{
 			Satellite: func(_ *zap.Logger, _ int, config *satellite.Config) {
 				config.Metainfo.RateLimiter.Rate = float64(rateLimit)
@@ -437,20 +656,21 @@ func TestRateLimit_ProjectRateLimitZero(t *testing.T) {
 		},
 	}, func(t *testing.T, ctx *testcontext.Context, planet *testplanet.Planet) {
 		ul := planet.Uplinks[0]
-		satellite := planet.Satellites[0]
+		sat := planet.Satellites[0]
 
-		projects, err := satellite.DB.Console().Projects().GetAll(ctx)
+		projects, err := sat.DB.Console().Projects().GetAll(ctx)
 		require.NoError(t, err)
 		require.Len(t, projects, 1)
 
 		zeroRateLimit := 0
-		err = satellite.DB.Console().Projects().UpdateRateLimit(ctx, projects[0].ID, &zeroRateLimit)
+		err = sat.DB.Console().Projects().UpdateRateLimit(ctx, projects[0].ID, &zeroRateLimit)
 		require.NoError(t, err)
 
 		var group errs2.Group
 		for i := 0; i <= rateLimit; i++ {
 			group.Go(func() error {
-				return ul.CreateBucket(ctx, satellite, testrand.BucketName())
+				_, err := ul.ListBuckets(ctx, sat)
+				return err
 			})
 		}
 		groupErrs := group.Wait()
@@ -461,7 +681,7 @@ func TestRateLimit_ProjectRateLimitZero(t *testing.T) {
 func TestBurstLimit_ProjectBurstLimitZero(t *testing.T) {
 	rateLimit := 2
 	testplanet.Run(t, testplanet.Config{
-		SatelliteCount: 1, StorageNodeCount: 0, UplinkCount: 1,
+		SatelliteCount: 1, UplinkCount: 1,
 		Reconfigure: testplanet.Reconfigure{
 			Satellite: func(_ *zap.Logger, _ int, config *satellite.Config) {
 				config.Metainfo.RateLimiter.Rate = float64(rateLimit)
@@ -473,20 +693,21 @@ func TestBurstLimit_ProjectBurstLimitZero(t *testing.T) {
 		},
 	}, func(t *testing.T, ctx *testcontext.Context, planet *testplanet.Planet) {
 		ul := planet.Uplinks[0]
-		satellite := planet.Satellites[0]
+		sat := planet.Satellites[0]
 
-		projects, err := satellite.DB.Console().Projects().GetAll(ctx)
+		projects, err := sat.DB.Console().Projects().GetAll(ctx)
 		require.NoError(t, err)
 		require.Len(t, projects, 1)
 
 		zeroRateLimit := 0
-		err = satellite.DB.Console().Projects().UpdateBurstLimit(ctx, projects[0].ID, &zeroRateLimit)
+		err = sat.DB.Console().Projects().UpdateBurstLimit(ctx, projects[0].ID, &zeroRateLimit)
 		require.NoError(t, err)
 
 		var group errs2.Group
 		for i := 0; i <= rateLimit; i++ {
 			group.Go(func() error {
-				return ul.CreateBucket(ctx, satellite, testrand.BucketName())
+				_, err := ul.ListBuckets(ctx, sat)
+				return err
 			})
 		}
 		groupErrs := group.Wait()

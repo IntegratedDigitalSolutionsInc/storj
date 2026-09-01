@@ -17,8 +17,9 @@ class AppState {
     public isBrowserCardViewEnabled = LocalData.getBrowserCardViewEnabled();
     public isNavigationDrawerShown = true;
     public isUpgradeFlowDialogShown = false;
+    public isPricingOptInDialogShown = false;
     public isExpirationDialogShown = false;
-    public isAccountSetupDialogShown = false;
+    public isCreateProjectDialogShown = false;
     public isProjectPassphraseDialogShown = false;
     public managedPassphraseNotRetrievable = false;
     public managedPassphraseErrorDialogShown = false;
@@ -85,12 +86,16 @@ export const useAppStore = defineStore('app', () => {
         }
     }
 
-    function toggleExpirationDialog(isShown?: boolean): void {
-        state.isExpirationDialogShown = isShown ?? !state.isExpirationDialogShown;
+    function togglePricingOptInDialog(isShown: boolean): void {
+        state.isPricingOptInDialogShown = isShown;
     }
 
-    function toggleAccountSetup(isShown?: boolean): void {
-        state.isAccountSetupDialogShown = isShown ?? !state.isAccountSetupDialogShown;
+    function toggleCreateProjectDialog(isShown?: boolean): void {
+        state.isCreateProjectDialogShown = isShown ?? !state.isCreateProjectDialogShown;
+    }
+
+    function toggleExpirationDialog(isShown?: boolean): void {
+        state.isExpirationDialogShown = isShown ?? !state.isExpirationDialogShown;
     }
 
     function toggleProjectPassphraseDialog(isShown?: boolean): void {
@@ -129,8 +134,9 @@ export const useAppStore = defineStore('app', () => {
         LocalData.removeProjectTableViewConfig();
         state.isNavigationDrawerShown = true;
         state.isUpgradeFlowDialogShown = false;
+        state.isPricingOptInDialogShown = false;
+        state.isCreateProjectDialogShown = false;
         state.pathBeforeAccountPage = null;
-        state.isAccountSetupDialogShown = false;
         state.managedPassphraseNotRetrievable = false;
         state.managedPassphraseErrorDialogShown = false;
     }
@@ -145,12 +151,13 @@ export const useAppStore = defineStore('app', () => {
         setManagedPassphraseNotRetrievable,
         toggleManagedPassphraseErrorDialog,
         toggleExpirationDialog,
+        toggleCreateProjectDialog,
         setUploadingModal,
         setErrorPage,
         removeErrorPage,
         toggleNavigationDrawer,
         toggleUpgradeFlow,
-        toggleAccountSetup,
+        togglePricingOptInDialog,
         setPathBeforeAccountPage,
         setIsNavigating,
         clear,

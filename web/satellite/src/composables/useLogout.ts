@@ -16,6 +16,11 @@ import { useUsersStore } from '@/store/modules/usersStore';
 import { useNotificationsStore } from '@/store/modules/notificationsStore';
 import { useProjectsStore } from '@/store/modules/projectsStore';
 import { useObjectBrowserStore } from '@/store/modules/objectBrowserStore';
+import { useConfigStore } from '@/store/modules/configStore';
+import { useAccessGrantWorker } from '@/composables/useAccessGrantWorker';
+import { useRestApiKeysStore } from '@/store/modules/apiKeysStore';
+import { useDomainsStore } from '@/store/modules/domainsStore';
+import { useComputeStore } from '@/store/modules/computeStore';
 
 export function useLogout() {
     const auth: AuthHttpApi = new AuthHttpApi();
@@ -31,27 +36,43 @@ export function useLogout() {
     const notificationsStore = useNotificationsStore();
     const projectsStore = useProjectsStore();
     const obStore = useObjectBrowserStore();
+    const configStore = useConfigStore();
+    const apiKeysStore = useRestApiKeysStore();
+    const domainsStore = useDomainsStore();
+    const computeStore = useComputeStore();
 
     async function clearStores(): Promise<void> {
+        const { stop } = useAccessGrantWorker();
+
+        stop();
+
         await Promise.all([
             pmStore.clear(),
             projectsStore.clear(),
             usersStore.clear(),
-            agStore.stopWorker(),
             agStore.clear(),
             notificationsStore.clear(),
             bucketsStore.clear(),
             appStore.clear(),
             billingStore.clear(),
             obStore.clear(),
+            apiKeysStore.clear(),
+            domainsStore.clear(),
+            computeStore.clear(),
         ]);
     }
 
     async function logout(): Promise<void> {
         analyticsStore.eventTriggered(AnalyticsEvent.LOGOUT_CLICKED);
-        await auth.logout();
+        await auth.logout(configStore.state.config.csrfToken);
 
         await clearStores();
+
+        const logoutUrl = configStore.state.config.primaryAuthLogoutURL;
+        if (logoutUrl) {
+            window.location.href = logoutUrl;
+            return;
+        }
 
         await router.push(ROUTES.Login.path);
     }

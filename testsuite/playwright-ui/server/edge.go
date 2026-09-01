@@ -39,6 +39,7 @@ import (
 	"storj.io/storj/cmd/uplink/cmd"
 	"storj.io/storj/private/testplanet"
 	"storj.io/storj/satellite"
+	"storj.io/storj/satellite/console"
 )
 
 // EdgePlanet contains defaults for testplanet with Edge.
@@ -62,7 +63,8 @@ type EdgeTest func(t *testing.T, ctx *testcontext.Context, planet *EdgePlanet)
 
 var counter int64
 
-func Edge(t *testing.T, test EdgeTest) {
+// Edge starts a new test which includes edge services.
+func Edge(t *testing.T, test EdgeTest, isWhiteLabel bool) {
 	edgehost := os.Getenv("STORJ_TEST_EDGE_HOST")
 	if edgehost == "" {
 		edgehost = "127.0.0.1"
@@ -75,15 +77,29 @@ func Edge(t *testing.T, test EdgeTest) {
 	certFile, keyFile, _, _ := createSelfSignedCertificateFile(t, edgehost)
 
 	testplanet.Run(t, testplanet.Config{
-		Timeout:        10 * time.Minute,
+		Timeout:        15 * time.Minute,
 		SatelliteCount: 1, StorageNodeCount: 4, UplinkCount: 1,
 		Reconfigure: testplanet.Reconfigure{
 			Satellite: func(log *zap.Logger, index int, config *satellite.Config) {
 				configureSatellite(log, index, config)
+				if isWhiteLabel {
+					config.Console.SingleWhiteLabel = console.SingleWhiteLabelConfig{
+						TenantID:   "tenant1",
+						Name:       "Tenant One",
+						SupportURL: "https://support.tenant1.example",
+					}
+				}
 				config.Console.GatewayCredentialsRequestURL = "http://" + authSvcAddr
 			},
 		},
 	}, func(t *testing.T, ctx *testcontext.Context, planet *testplanet.Planet) {
+		if isWhiteLabel {
+			planet.Satellites[0].API.Console.Endpoint.TestSetTenantHostnameMap(map[string]string{
+				"tenant1.localhost.test": "tenant1",
+				"tenant2.localhost.test": "tenant2",
+			})
+		}
+
 		gwConfig := server.Config{}
 		cfgstruct.Bind(&pflag.FlagSet{}, &gwConfig, cfgstruct.UseTestDefaults())
 
@@ -111,8 +127,7 @@ func Edge(t *testing.T, test EdgeTest) {
 			CertFile:          certFile.Name(),
 			KeyFile:           keyFile.Name(),
 			Node: badgerauth.Config{
-				FirstStart:          true,
-				ReplicationInterval: 5 * time.Second,
+				FirstStart: true,
 			},
 		}
 		authService, err := auth.New(ctx, zaptest.NewLogger(t).Named("auth"), authConfig, fpath.ApplicationDir("storj", "authservice"))

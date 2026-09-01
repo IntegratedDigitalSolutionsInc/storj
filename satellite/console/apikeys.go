@@ -35,15 +35,10 @@ type APIKeys interface {
 	DeleteMultiple(ctx context.Context, ids []uuid.UUID) error
 	// DeleteAllByProjectID deletes all APIKeyInfos from store by given projectID.
 	DeleteAllByProjectID(ctx context.Context, id uuid.UUID) error
+	// DeleteAllByProjectIDAndOwnerID deletes all APIKeyInfos from store by given projectID and ownerID.
+	DeleteAllByProjectIDAndOwnerID(ctx context.Context, projectID, ownerID uuid.UUID) error
 	// DeleteExpiredByNamePrefix deletes expired APIKeyInfo from store by key name prefix.
 	DeleteExpiredByNamePrefix(ctx context.Context, lifetime time.Duration, prefix string, asOfSystemTimeInterval time.Duration, pageSize int) error
-}
-
-// RESTKeys is an interface for rest key operations.
-type RESTKeys interface {
-	Create(ctx context.Context, userID uuid.UUID, expiration time.Duration) (apiKey string, expiresAt time.Time, err error)
-	GetUserAndExpirationFromKey(ctx context.Context, apiKey string) (userID uuid.UUID, exp time.Time, err error)
-	Revoke(ctx context.Context, apiKey string) (err error)
 }
 
 // CreateAPIKeyRequest holds create API key info.
@@ -64,6 +59,7 @@ type APIKeyInfo struct {
 	ProjectID       uuid.UUID              `json:"projectId"`
 	ProjectPublicID uuid.UUID              `json:"projectPublicId"`
 	CreatedBy       uuid.UUID              `json:"createdBy"`
+	CreatorEmail    string                 `json:"creatorEmail"`
 	UserAgent       []byte                 `json:"userAgent"`
 	Name            string                 `json:"name"`
 	Head            []byte                 `json:"-"`
@@ -88,6 +84,8 @@ type APIKeyInfo struct {
 	ProjectStorageLimit   *int64 `json:"-"`
 	ProjectSegmentsLimit  *int64 `json:"-"`
 	ProjectBandwidthLimit *int64 `json:"-"`
+
+	LimitNotificationFlags int `json:"-"`
 }
 
 // APIKeyCursor holds info for api keys cursor pagination.
@@ -122,4 +120,6 @@ const (
 	KeyName APIKeyOrder = 1
 	// CreationDate indicates that we should order by creation date.
 	CreationDate APIKeyOrder = 2
+	// KeyCreatorEmail indicates that we should order by key creator email.
+	KeyCreatorEmail APIKeyOrder = 3
 )

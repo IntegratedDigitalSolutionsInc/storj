@@ -1,18 +1,19 @@
 // Copyright (C) 2023 Storj Labs, Inc.
 // See LICENSE for copying information.
 
-import { watch } from 'vue';
-import { RouteRecordRaw, createRouter, createWebHistory, Router, RouteLocation } from 'vue-router';
+import { watchEffect } from 'vue';
+import { type RouteRecordRaw, type Router, type RouteLocation, createRouter, createWebHistory  } from 'vue-router';
 
-import { useProjectsStore } from '@/store/modules/projectsStore';
 import { useConfigStore } from '@/store/modules/configStore';
 import { useAppStore } from '@/store/modules/appStore';
 import { NavigationLink } from '@/types/navigation';
 import { useAnalyticsStore } from '@/store/modules/analyticsStore';
+import { defaultBrandingName } from '@/types/config';
 
 enum RouteName {
     Account = 'Account',
     Billing = 'Billing',
+    APIKeys = 'API Keys',
     AccountSettings = 'Account Settings',
     Projects = 'Projects',
     Project = 'Project',
@@ -22,6 +23,8 @@ enum RouteName {
     Access = 'Access Keys',
     Team = 'Team',
     Domains = 'Domains',
+    Usage = 'Usage',
+    ObjectMount = 'Object Mount',
     Applications = 'Applications',
     ProjectSettings = 'Project Settings',
     Login = 'Login',
@@ -31,21 +34,31 @@ enum RouteName {
     PasswordResetConfirmation = 'Password Reset Confirmation',
     PasswordRecovery = 'Password Recovery',
     Activate = 'Activate Account',
+    SsoLink = 'SSO Link',
+    AuthError = 'Auth Error',
+    RateLimited = 'Rate Limited',
+    ComputeOverview = 'Overview',
+    ComputeInstances = 'Instances',
+    ComputeKeys = 'SSH Keys',
+    ComputeDeployInstance = 'Deploy Instance',
 }
 
 export abstract class ROUTES {
     public static Account = new NavigationLink('/account', RouteName.Account);
     public static Billing = new NavigationLink('billing', RouteName.Billing);
+    public static APIKeys = new NavigationLink('api-keys', RouteName.APIKeys);
     public static AccountSettings = new NavigationLink('settings', RouteName.AccountSettings);
 
     public static Projects = new NavigationLink('/projects', RouteName.Projects);
     public static Project = new NavigationLink(':id', RouteName.Project);
     public static Dashboard = new NavigationLink('dashboard', RouteName.Dashboard);
     public static Buckets = new NavigationLink('buckets', RouteName.Buckets);
-    public static Bucket = new NavigationLink(':browserPath+', RouteName.Bucket);
+    public static Bucket = new NavigationLink(':browserPath(.*)+', RouteName.Bucket);
     public static Access = new NavigationLink('access', RouteName.Access);
     public static Team = new NavigationLink('team', RouteName.Team);
     public static Domains = new NavigationLink('domains', RouteName.Domains);
+    public static Usage = new NavigationLink('usage', RouteName.Usage);
+    public static ObjectMount = new NavigationLink('object-mount', RouteName.ObjectMount);
     public static Applications = new NavigationLink('applications', RouteName.Applications);
     public static ProjectSettings = new NavigationLink('settings', RouteName.ProjectSettings);
 
@@ -56,13 +69,27 @@ export abstract class ROUTES {
     public static PasswordResetConfirmation = new NavigationLink('/password-reset-confirmation', RouteName.PasswordResetConfirmation);
     public static PasswordRecovery = new NavigationLink('/password-recovery', RouteName.PasswordRecovery);
     public static Activate = new NavigationLink('/activate', RouteName.Activate);
+    public static SsoLink = new NavigationLink('/sso-link', RouteName.SsoLink);
+    public static AuthError = new NavigationLink('/auth-error', RouteName.AuthError);
+    public static RateLimited = new NavigationLink('/rate-limited', RouteName.RateLimited);
 
-    public static DashboardAnalyticsLink = `${this.Projects.path}/${this.Dashboard.path}`;
-    public static ProjectSettingsAnalyticsLink = `${this.Projects.path}/${this.ProjectSettings.path}`;
-    public static AccessAnalyticsLink = `${this.Projects.path}/${this.Access.path}`;
-    public static ApplicationsAnalyticsLink = `${this.Projects.path}/${this.Applications.path}`;
-    public static TeamAnalyticsLink = `${this.Projects.path}/${this.Team.path}`;
-    public static BucketsAnalyticsLink = `${this.Projects.path}/${this.Buckets.path}`;
+    public static ComputeOverview = new NavigationLink('compute-overview', RouteName.ComputeOverview);
+    public static ComputeInstances = new NavigationLink('compute-instances', RouteName.ComputeInstances);
+    public static ComputeKeys = new NavigationLink('compute-keys', RouteName.ComputeKeys);
+    public static ComputeDeployInstance = new NavigationLink('compute-deploy-instance', RouteName.ComputeDeployInstance);
+
+    public static AuthRoutes = [
+        ROUTES.Login.path,
+        ROUTES.Signup.path,
+        ROUTES.ForgotPassword.path,
+        ROUTES.Activate.path,
+        ROUTES.PasswordRecovery.path,
+        ROUTES.SignupConfirmation.path,
+        ROUTES.PasswordResetConfirmation.path,
+        ROUTES.SsoLink.path,
+        ROUTES.AuthError.path,
+        ROUTES.RateLimited.path,
+    ];
 }
 
 const routes: RouteRecordRaw[] = [
@@ -72,7 +99,7 @@ const routes: RouteRecordRaw[] = [
     },
     {
         path: '/',
-        component: () => import('@/layouts/default/Auth.vue'),
+        component: () => import('@/layouts/auth/AuthLayout.vue'),
         children: [
             {
                 path: ROUTES.Login.path,
@@ -109,11 +136,26 @@ const routes: RouteRecordRaw[] = [
                 name: ROUTES.Activate.name,
                 component: () => import(/* webpackChunkName: "ActivateAccountRequest" */ '@/views/ActivateAccountRequest.vue'),
             },
+            {
+                path: ROUTES.SsoLink.path,
+                name: ROUTES.SsoLink.name,
+                component: () => import(/* webpackChunkName: "SsoLinkConfirmation" */ '@/views/SsoLinkConfirmation.vue'),
+            },
         ],
     },
     {
+        path: ROUTES.AuthError.path,
+        name: ROUTES.AuthError.name,
+        component: () => import(/* webpackChunkName: "AuthError" */ '@/views/AuthError.vue'),
+    },
+    {
+        path: ROUTES.RateLimited.path,
+        name: ROUTES.RateLimited.name,
+        component: () => import(/* webpackChunkName: "AuthError" */ '@/views/AuthError.vue'),
+    },
+    {
         path: ROUTES.Account.path,
-        component: () => import('@/layouts/default/Account.vue'),
+        component: () => import('@/layouts/account/AccountLayout.vue'),
         beforeEnter: (_, from) => useAppStore().setPathBeforeAccountPage(from.path),
         children: [
             {
@@ -126,6 +168,11 @@ const routes: RouteRecordRaw[] = [
                 component: () => import(/* webpackChunkName: "Billing" */ '@/views/Billing.vue'),
             },
             {
+                path: ROUTES.APIKeys.path,
+                name: ROUTES.APIKeys.name,
+                component: () => import(/* webpackChunkName: "Billing" */ '@/views/RestApiKeys.vue'),
+            },
+            {
                 path: ROUTES.AccountSettings.path,
                 name: ROUTES.AccountSettings.name,
                 component: () => import(/* webpackChunkName: "MyAccount" */ '@/views/AccountSettings.vue'),
@@ -134,7 +181,7 @@ const routes: RouteRecordRaw[] = [
     },
     {
         path: ROUTES.Projects.path,
-        component: () => import('@/layouts/default/AllProjects.vue'),
+        component: () => import('@/layouts/account/AccountLayout.vue'),
         children: [
             {
                 path: '',
@@ -145,8 +192,7 @@ const routes: RouteRecordRaw[] = [
     },
     {
         path: ROUTES.Projects.with(ROUTES.Project).path,
-        name: RouteName.Project,
-        component: () => import('@/layouts/default/Default.vue'),
+        component: () => import('@/layouts/project/ProjectLayout.vue'),
         children: [
             {
                 path: '',
@@ -177,9 +223,19 @@ const routes: RouteRecordRaw[] = [
                 component: () => import(/* webpackChunkName: "Access" */ '@/views/Access.vue'),
             },
             {
+                path: ROUTES.Usage.path,
+                name: ROUTES.Usage.name,
+                component: () => import(/* webpackChunkName: "Usage" */ '@/views/Usage.vue'),
+            },
+            {
                 path: ROUTES.Domains.path,
                 name: ROUTES.Domains.name,
                 component: () => import(/* webpackChunkName: "Domains" */ '@/views/Domains.vue'),
+            },
+            {
+                path: ROUTES.ObjectMount.path,
+                name: ROUTES.ObjectMount.name,
+                component: () => import(/* webpackChunkName: "ObjectMount" */ '@/views/ObjectMount.vue'),
             },
             {
                 path: ROUTES.Team.path,
@@ -196,29 +252,51 @@ const routes: RouteRecordRaw[] = [
                 name: ROUTES.ProjectSettings.name,
                 component: () => import(/* webpackChunkName: "ProjectSettings" */ '@/views/ProjectSettings.vue'),
             },
+            // TODO: enable when we have more compute features.
+            // {
+            //     path: ROUTES.ComputeOverview.path,
+            //     name: ROUTES.ComputeOverview.name,
+            //     component: () => import(/* webpackChunkName: "ComputeOverview" */ '@/views/ComputeOverview.vue'),
+            // },
+            {
+                path: ROUTES.ComputeInstances.path,
+                name: ROUTES.ComputeInstances.name,
+                component: () => import(/* webpackChunkName: "ComputeInstances" */ '@/views/ComputeInstances.vue'),
+            },
+            {
+                path: ROUTES.ComputeKeys.path,
+                name: ROUTES.ComputeKeys.name,
+                component: () => import(/* webpackChunkName: "ComputeKeys" */ '@/views/ComputeKeys.vue'),
+            },
+            // {
+            //     path: ROUTES.ComputeDeployInstance.path,
+            //     name: ROUTES.ComputeDeployInstance.name,
+            //     component: () => import(/* webpackChunkName: "ComputeDeployInstance" */ '@/views/ComputeDeployInstance.vue'),
+            // },
         ],
     },
 ];
 
 export function setupRouter(): Router {
-    const history = createWebHistory('');
+    const base = import.meta.env.PROD ? '' : '/';
+    const history = createWebHistory(base);
     const router = createRouter({
         history,
         routes,
     });
 
-    router.beforeEach((to, _, next) => {
+    router.beforeEach((to) => {
         const appStore = useAppStore();
         appStore.setIsNavigating(true);
 
         if (!to.matched.length) {
             appStore.setErrorPage(404);
-            return;
+            return false;
         } else if (appStore.state.error.visible) {
             appStore.removeErrorPage();
         }
 
-        next();
+        return true;
     });
 
     router.afterEach((to, from) => {
@@ -232,25 +310,24 @@ export function setupRouter(): Router {
             // we are navigating within the same bucket, do not track the page visit
             return;
         }
+        if (to.name === ROUTES.AuthError.name || to.name === ROUTES.RateLimited.name) {
+            return;
+        }
         useAnalyticsStore().pageVisit(to.matched[to.matched.length - 1].path, configStore.state.config.satelliteName);
     });
 
-    const projectsStore = useProjectsStore();
     const configStore = useConfigStore();
 
-    watch(
-        () => [router.currentRoute.value, projectsStore.state.selectedProject.name] as const,
-        ([route, projectName]) => {
-            const parts = [configStore.state.config.satelliteName];
+    watchEffect(() => {
+        const route = router.currentRoute.value;
+        const brandName = configStore.state.branding.name;
+        const parts = [configStore.state.config.satelliteName];
 
-            if (route.name) parts.unshift(route.name as string);
-            if (route.matched.some(route => route.name === RouteName.Project) && projectName) {
-                parts.unshift(projectName);
-            }
+        if (brandName === defaultBrandingName) parts.unshift(brandName);
+        if (typeof route.name === 'string' && route.name) parts.unshift(route.name);
 
-            document.title = parts.join(' | ');
-        },
-    );
+        document.title = parts.join(' | ');
+    });
 
     return router;
 }

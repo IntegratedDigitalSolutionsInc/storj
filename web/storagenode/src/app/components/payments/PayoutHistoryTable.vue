@@ -18,61 +18,48 @@
             <PayoutHistoryTableItem v-for="historyItem in payoutHistory" :key="historyItem.satelliteID" :history-item="historyItem" />
             <div class="payout-history-table__table-container__totals-area">
                 <p class="payout-history-table__table-container__totals-area__label">Total</p>
-                <p class="payout-history-table__table-container__totals-area__value">{{ totalPaid | centsToDollars }}</p>
+                <p class="payout-history-table__table-container__totals-area__value">{{ centsToDollars(totalPaid) }}</p>
             </div>
         </div>
     </section>
 </template>
 
-<script lang="ts">
-import { Component, Vue } from 'vue-property-decorator';
+<script setup lang="ts">
+import { computed, onMounted } from 'vue';
 
-import { PAYOUT_ACTIONS } from '@/app/store/modules/payout';
 import { SatellitePayoutForPeriod } from '@/storagenode/payouts/payouts';
+import { centsToDollars } from '@/app/utils/payout';
+import { usePayoutStore } from '@/app/store/modules/payoutStore';
 
 import PayoutHistoryPeriodDropdown from '@/app/components/payments/PayoutHistoryPeriodDropdown.vue';
 import PayoutHistoryTableItem from '@/app/components/payments/PayoutHistoryTableItem.vue';
 
-// @vue/component
-@Component ({
-    components: {
-        PayoutHistoryPeriodDropdown,
-        PayoutHistoryTableItem,
-    },
-})
-export default class PayoutHistoryTable extends Vue {
-    public get payoutHistory(): SatellitePayoutForPeriod[] {
-        return this.$store.state.payoutModule.payoutHistory;
+const payoutStore = usePayoutStore();
+
+const payoutHistory = computed<SatellitePayoutForPeriod[]>(() => {
+    return payoutStore.state.payoutHistory as SatellitePayoutForPeriod[];
+});
+
+const totalPaid = computed<number>(() => {
+    return payoutStore.totalPaidForPayoutHistoryPeriod;
+});
+
+onMounted(async () => {
+    const payoutPeriods = payoutStore.state.payoutPeriods;
+
+    if (!payoutPeriods.length) {
+        return;
     }
 
-    /**
-     * Returns sum of payouts for all satellites of current period.
-     */
-    public get totalPaid(): number {
-        return this.$store.getters.totalPaidForPayoutHistoryPeriod;
+    const lastPeriod = payoutPeriods[payoutPeriods.length - 1];
+    payoutStore.setPayoutHistoryPeriod(lastPeriod.period);
+
+    try {
+        await payoutStore.fetchPayoutHistory();
+    } catch (error) {
+        console.error(error);
     }
-
-    /**
-     * Lifecycle hook after initial render.
-     * Fetches payout history for last period.
-     */
-    public async mounted(): Promise<void> {
-        const payoutPeriods = this.$store.state.payoutModule.payoutPeriods;
-
-        if (!payoutPeriods.length) {
-            return;
-        }
-
-        const lastPeriod = payoutPeriods[payoutPeriods.length - 1];
-        await this.$store.dispatch(PAYOUT_ACTIONS.SET_PAYOUT_HISTORY_PERIOD, lastPeriod.period);
-
-        try {
-            await this.$store.dispatch(PAYOUT_ACTIONS.GET_PAYOUT_HISTORY);
-        } catch (error) {
-            console.error(error);
-        }
-    }
-}
+});
 </script>
 
 <style scoped lang="scss">
@@ -137,7 +124,7 @@ export default class PayoutHistoryTable extends Vue {
         }
     }
 
-    @media screen and (max-width: 640px) {
+    @media screen and (width <= 640px) {
 
         .payout-history-table {
             padding: 28px 20px;

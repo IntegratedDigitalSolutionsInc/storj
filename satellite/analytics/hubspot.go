@@ -22,8 +22,6 @@ import (
 
 const (
 	expiryBufferTime = 5 * time.Minute
-	// string template for hubspot submission form. %s is a placeholder for the form(ID) being submitted.
-	hubspotFormTemplate = "https://api.hsforms.com/submissions/v3/integration/submit/44965639/%s"
 )
 
 // HubSpotConfig is a configuration struct for Concurrent Sending of Events.
@@ -35,9 +33,19 @@ type HubSpotConfig struct {
 	ChannelSize     int           `help:"the number of events that can be in the queue before dropping" default:"1000"`
 	ConcurrentSends int           `help:"the number of concurrent api requests that can be made" default:"4"`
 	DefaultTimeout  time.Duration `help:"the default timeout for the hubspot http client" default:"10s"`
-	EventPrefix     string        `help:"the prefix for the event name" default:""`
-	SignupFormId    string        `help:"the hubspot form ID for signup" default:""`
+	SignupEventName string        `help:"the event name for signup action" default:""`
+	SignupFormURL   string        `help:"the hubspot form URL for signup" default:""`
 	LifeCycleStage  string        `help:"the hubspot lifecycle stage for new accounts" default:""`
+
+	AccountObjectCreatedWebhookEnabled  bool          `help:"whether account object created webhook is enabled" default:"false"`
+	AccountObjectCreatedWebhookEndpoint string        `help:"the endpoint for account object created webhook" default:"/api/v0/analytics/hubspot/account-object-created"`
+	WebhookRequestLifetime              time.Duration `help:"the lifetime of the webhook request" default:"5m"`
+}
+
+// AccountObjectCreatedRequest is a configuration struct for receiving Account Object Created request from HubSpot.
+type AccountObjectCreatedRequest struct {
+	UserID   string      `json:"userid"`
+	ObjectID json.Number `json:"hs_object_id"`
 }
 
 // HubSpotEvent is a configuration struct for sending API request to HubSpot.
@@ -110,6 +118,11 @@ func (q *HubSpotEvents) Run(ctx context.Context) error {
 
 // EnqueueCreateUserMinimal is for creating user in HubSpot using the minimal form.
 func (q *HubSpotEvents) EnqueueCreateUserMinimal(fields TrackCreateUserFields) {
+	if q.config.SignupFormURL == "" || q.config.SignupEventName == "" {
+		q.log.Warn("hubspot signup form URL or event name is not set")
+		return
+	}
+
 	newField := func(name string, value interface{}) map[string]interface{} {
 		return map[string]interface{}{
 			"name":  name,
@@ -128,14 +141,18 @@ func (q *HubSpotEvents) EnqueueCreateUserMinimal(fields TrackCreateUserFields) {
 	if fields.SignupCaptcha != nil {
 		formFields = append(formFields, newField("signup_captcha_score", *fields.SignupCaptcha))
 	}
+	if fields.TenantID != nil && *fields.TenantID != "" {
+		formFields = append(formFields, newField("tenant", *fields.TenantID))
+	}
 
 	properties := map[string]interface{}{
 		"userid":             fields.ID.String(),
 		"email":              fields.Email,
 		"satellite_selected": q.satelliteName,
 	}
-
-	formURL := fmt.Sprintf(hubspotFormTemplate, q.config.SignupFormId)
+	if fields.TenantID != nil && *fields.TenantID != "" {
+		properties["tenant"] = *fields.TenantID
+	}
 
 	data := map[string]interface{}{
 		"fields": formFields,
@@ -148,7 +165,7 @@ func (q *HubSpotEvents) EnqueueCreateUserMinimal(fields TrackCreateUserFields) {
 	}
 
 	createUser := HubSpotEvent{
-		Endpoint: formURL,
+		Endpoint: q.config.SignupFormURL,
 		Data:     data,
 	}
 
@@ -156,7 +173,7 @@ func (q *HubSpotEvents) EnqueueCreateUserMinimal(fields TrackCreateUserFields) {
 		Endpoint: "https://api.hubapi.com/events/v3/send",
 		Data: map[string]interface{}{
 			"email":      fields.Email,
-			"eventName":  q.config.EventPrefix + "_" + strings.ToLower(q.satelliteName) + "_" + "account_created",
+			"eventName":  q.config.SignupEventName,
 			"properties": properties,
 		},
 	}
@@ -165,6 +182,39 @@ func (q *HubSpotEvents) EnqueueCreateUserMinimal(fields TrackCreateUserFields) {
 	case q.events <- []HubSpotEvent{createUser, sendUserEvent}:
 	default:
 		q.log.Error("create user hubspot event failed, event channel is full")
+	}
+}
+
+// EnqueueJoinPlacementWaitlist is for tracking user joining placement waitlist using hubspot form.
+func (q *HubSpotEvents) EnqueueJoinPlacementWaitlist(fields TrackJoinPlacementWaitlistFields) {
+	if fields.WaitlistURL == "" {
+		q.log.Warn("hubspot placement waitlist form URL is not set")
+		return
+	}
+
+	newField := func(name string, value string) map[string]string {
+		return map[string]string{
+			"name":  name,
+			"value": value,
+		}
+	}
+
+	formFields := []map[string]string{
+		newField("email", fields.Email),
+		newField("us_select_storage_interest", fields.StorageNeeds),
+	}
+
+	joinWaitlistEvent := HubSpotEvent{
+		Endpoint: fields.WaitlistURL,
+		Data: map[string]interface{}{
+			"fields": formFields,
+		},
+	}
+
+	select {
+	case q.events <- []HubSpotEvent{joinWaitlistEvent}:
+	default:
+		q.log.Error("join placement waitlist hubspot event failed, event channel is full")
 	}
 }
 
@@ -188,6 +238,9 @@ func (q *HubSpotEvents) EnqueueUserOnboardingInfo(fields TrackOnboardingInfoFiel
 		"firstname": firstName,
 		"lastname":  lastName,
 		"use_case":  fields.StorageUseCase,
+	}
+	if fields.TenantID != nil && *fields.TenantID != "" {
+		properties["tenant"] = *fields.TenantID
 	}
 	if fields.Type == Professional {
 		properties["have_sales_contact"] = fields.HaveSalesContact

@@ -6,9 +6,7 @@ package metabase
 import (
 	"context"
 	"fmt"
-	"strings"
 
-	"cloud.google.com/go/spanner/admin/database/apiv1/databasepb"
 	"github.com/zeebo/errs"
 
 	"storj.io/storj/private/migrate"
@@ -38,7 +36,7 @@ func (p *PostgresAdapter) testMigrateToLatest(ctx context.Context) error {
 			{
 				DB:          &p.db,
 				Description: "Test snapshot",
-				Version:     20,
+				Version:     21,
 				Action: migrate.SQL{
 					`CREATE TABLE objects (
 						project_id   BYTEA NOT NULL,
@@ -46,6 +44,8 @@ func (p *PostgresAdapter) testMigrateToLatest(ctx context.Context) error {
 						object_key   BYTEA NOT NULL, -- using 'object_key' instead of 'key' to avoid reserved word
 						version      INT8  NOT NULL,
 						stream_id    BYTEA NOT NULL,
+
+						product_id INTEGER,
 
 						created_at TIMESTAMPTZ NOT NULL default now(),
 						expires_at TIMESTAMPTZ,
@@ -56,6 +56,7 @@ func (p *PostgresAdapter) testMigrateToLatest(ctx context.Context) error {
 						encrypted_metadata_nonce         BYTEA default NULL,
 						encrypted_metadata               BYTEA default NULL,
 						encrypted_metadata_encrypted_key BYTEA default NULL,
+						encrypted_etag                   BYTEA default NULL,
 
 						total_plain_size     INT8 NOT NULL default 0, -- migrated objects have this = 0
 						total_encrypted_size INT8 NOT NULL default 0,
@@ -68,6 +69,10 @@ func (p *PostgresAdapter) testMigrateToLatest(ctx context.Context) error {
 						retention_mode INT2,
 						retain_until   TIMESTAMPTZ,
 
+						checksum BYTEA,
+
+						clear_metadata JSONB,
+
 						PRIMARY KEY (project_id, bucket_name, object_key, version)
 					);
 
@@ -78,6 +83,8 @@ func (p *PostgresAdapter) testMigrateToLatest(ctx context.Context) error {
 					COMMENT ON COLUMN objects.version     is 'version is a monotonically increasing number per object. currently unused.';
 					COMMENT ON COLUMN objects.stream_id   is 'stream_id is a random identifier for the content uploaded to the object.';
 
+					COMMENT ON COLUMN objects.product_id is 'product_id specifies which product the object is.';
+
 					COMMENT ON COLUMN objects.created_at  is 'created_at is the creation date of this object.';
 					COMMENT ON COLUMN objects.expires_at  is 'expires_at is the date when this object will be marked for deletion.';
 
@@ -87,6 +94,7 @@ func (p *PostgresAdapter) testMigrateToLatest(ctx context.Context) error {
 					COMMENT ON COLUMN objects.encrypted_metadata_nonce is 'encrypted_metadata_nonce is random identifier used as part of encryption for encrypted_metadata.';
 					COMMENT ON COLUMN objects.encrypted_metadata       is 'encrypted_metadata is encrypted key-value pairs of user-specified data.';
 					COMMENT ON COLUMN objects.encrypted_metadata_encrypted_key is 'encrypted_metadata_encrypted_key is the encrypted key for encrypted_metadata.';
+					COMMENT ON COLUMN objects.encrypted_etag           is 'encrypted_etag is the etag, which has been encrypted.';
 
 					COMMENT ON COLUMN objects.total_plain_size     is 'total_plain_size is the user-specified total size of the object. This can be zero for old migrated objects.';
 					COMMENT ON COLUMN objects.total_encrypted_size is 'total_encrypted_size is the sum of the encrypted data sizes of segments.';
@@ -98,6 +106,12 @@ func (p *PostgresAdapter) testMigrateToLatest(ctx context.Context) error {
 
 					COMMENT ON COLUMN objects.retention_mode is 'retention_mode specifies an object version''s retention mode: NULL/0=none, and 1=compliance.';
 					COMMENT ON COLUMN objects.retain_until   is 'retain_until specifies when an object version''s retention period ends.';
+
+					COMMENT ON COLUMN objects.checksum is 'checksum is the serialized set of checksum properties (checksum algorithm, checksum type, and encrypted checksum value) for an object.';
+
+					COMMENT ON COLUMN objects.clear_metadata is 'clear_metadata contains unencrypted metadata that indexed for efficient metadata search.';
+
+					CREATE INDEX IF NOT EXISTS objects_clear_metadata_idx ON objects USING GIN (project_id, bucket_name, clear_metadata);
 
 					CREATE TABLE segments (
 						stream_id  BYTEA NOT NULL,
@@ -122,6 +136,8 @@ func (p *PostgresAdapter) testMigrateToLatest(ctx context.Context) error {
 
 						placement integer,
 						encrypted_etag BYTEA default NULL,
+
+						encrypted_checksum BYTEA,
 
 						PRIMARY KEY (stream_id, position)
 					);
@@ -150,6 +166,8 @@ func (p *PostgresAdapter) testMigrateToLatest(ctx context.Context) error {
 					COMMENT ON COLUMN segments.placement is 'placement is the country or region restriction for the segment data. See storj.PlacementConstraint for the values.';
 					COMMENT ON COLUMN segments.encrypted_etag is 'encrypted_etag is etag that has been encrypted.';
 
+					COMMENT ON COLUMN segments.encrypted_checksum IS 'encrypted_checksum is the encrypted checksum of the object part that the segment belongs to.';
+
 					CREATE SEQUENCE node_alias_seq
 						INCREMENT BY 1
 						MINVALUE 1 MAXVALUE 2147483647 -- MaxInt32
@@ -161,18 +179,20 @@ func (p *PostgresAdapter) testMigrateToLatest(ctx context.Context) error {
 
 					COMMENT ON TABLE  node_aliases            is 'node_aliases table contains unique identifiers (aliases) for storagenodes that take less space than a NodeID.';
 					COMMENT ON COLUMN node_aliases.node_id    is 'node_id refers to the storj.NodeID';
-					COMMENT ON COLUMN node_aliases.node_alias is 'node_alias is a unique integer value assigned for the node_id. It is used for compressing segments.remote_alias_pieces.';`,
+					COMMENT ON COLUMN node_aliases.node_alias is 'node_alias is a unique integer value assigned for the node_id. It is used for compressing segments.remote_alias_pieces.';
+
+					CREATE INDEX IF NOT EXISTS node_aliases_node_alias_order ON node_aliases(node_alias DESC);`,
 				},
 			},
 		},
 	}
 
-	if p.testingUniqueUnversioned {
+	if p.config.TestingUniqueUnversioned {
 		// This is only part of testing, because we do not want to affect the production performance.
 		migration.Steps = append(migration.Steps, &migrate.Step{
 			DB:          &p.db,
 			Description: "Constraint for ensuring our metabase correctness.",
-			Version:     21,
+			Version:     22,
 			Action: migrate.SQL{
 				`CREATE UNIQUE INDEX objects_one_unversioned_per_location ON objects (project_id, bucket_name, object_key) WHERE status IN ` + statusesUnversioned + `;`,
 			},
@@ -196,24 +216,4 @@ func (c *CockroachAdapter) TestMigrateToLatest(ctx context.Context) error {
 	}
 
 	return c.PostgresAdapter.testMigrateToLatest(ctx)
-}
-
-// TestMigrateToLatest creates a database and applies all the migration for test purposes.
-func (s *SpannerAdapter) TestMigrateToLatest(ctx context.Context) error {
-	var statements []string
-	for _, ddl := range strings.Split(spannerDDL, ";") {
-		if strings.TrimSpace(ddl) != "" {
-			statements = append(statements, ddl)
-		}
-	}
-
-	operation, err := s.adminClient.UpdateDatabaseDdl(ctx, &databasepb.UpdateDatabaseDdlRequest{
-		Database:   s.connParams.DatabasePath(),
-		Statements: statements,
-	})
-	if err != nil {
-		return errs.Wrap(err)
-	}
-
-	return operation.Wait(ctx)
 }

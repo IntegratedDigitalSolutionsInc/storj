@@ -7,76 +7,68 @@
         <div class="wallets__content-area">
             <div class="wallets__left-area">
                 <wallets-table
-                    v-if="operatorsState.operators.length"
+                    v-if="operators.length"
                     class="wallets__left-area__table"
-                    :operators="operatorsState.operators"
+                    :operators="operators"
                 />
             </div>
             <div class="wallets__right-area">
                 <info-block class="information">
-                    <div slot="body" class="wallets__information">
-                        <h3 class="wallets__information__title">Payouts with zkSync</h3>
-                        <p class="wallets__information__description">Short description how minimal threshold system works.</p>
-                        <v-link uri="https://forum.storj.io/t/minimum-threshold-for-storage-node-operator-payouts/11064" label="Learn more" />
-                    </div>
+                    <template #body>
+                        <div class="wallets__information">
+                            <h3 class="wallets__information__title">Payouts with zkSync</h3>
+                            <p class="wallets__information__description">Short description how minimal threshold system works.</p>
+                            <v-link uri="https://forum.storj.io/t/minimum-threshold-for-storage-node-operator-payouts/11064" label="Learn more" />
+                        </div>
+                    </template>
                 </info-block>
             </div>
         </div>
-        <div v-if="operatorsState.pageCount > 1" class="wallets__pagination">
+        <div v-if="pageCount > 1" class="wallets__pagination">
             <v-pagination
-                :total-page-count="operatorsState.pageCount"
-                :preselected-current-page-number="operatorsState.currentPage"
+                :total-page-count="pageCount"
+                :preselected-current-page-number="currentPage"
                 :on-page-click-callback="listPaginated"
             />
-            <p class="wallets__pagination__info">Showing <strong>{{ operatorsState.operators.length }} of {{ operatorsState.totalCount }}</strong> wallets</p>
+            <p class="wallets__pagination__info">Showing <strong>{{ operators.length }} of {{ totalCount }}</strong> wallets</p>
         </div>
     </div>
 </template>
 
-<script lang="ts">
-import { Component, Vue } from 'vue-property-decorator';
+<script setup lang="ts">
+import { computed, onMounted } from 'vue';
 
 import { UnauthorizedError } from '@/api';
-import { OperatorsState } from '@/app/store/operators';
+import { useOperatorsStore } from '@/app/store/operatorsStore';
+import { Operator } from '@/operators';
 
 import InfoBlock from '@/app/components/common/InfoBlock.vue';
 import VLink from '@/app/components/common/VLink.vue';
 import VPagination from '@/app/components/common/VPagination.vue';
 import WalletsTable from '@/app/components/wallets/tables/walletsSummary/WalletsTable.vue';
 
-// @vue/component
-@Component({
-    components: {
-        VPagination,
-        VLink,
-        InfoBlock,
-        WalletsTable,
-    },
-})
-export default class WalletsPage extends Vue {
-    public async mounted(): Promise<void> {
-        await this.listPaginated(this.operatorsState.currentPage);
-    }
+const operatorsStore = useOperatorsStore();
 
-    /**
-     * retrieves all operator related data.
-     */
-    public get operatorsState(): OperatorsState {
-        return this.$store.state.operators;
-    }
+const pageCount = computed<number>(() => operatorsStore.state.pageCount);
+const totalCount = computed<number>(() => operatorsStore.state.totalCount);
+const currentPage = computed<number>(() => operatorsStore.state.currentPage);
+const operators = computed<Operator[]>(() => operatorsStore.state.operators as Operator[]);
 
-    public async listPaginated(pageNumber: number): Promise<void> {
-        try {
-            await this.$store.dispatch('operators/listPaginated', pageNumber);
-        } catch (error) {
-            if (error instanceof UnauthorizedError) {
-                // TODO: redirect to login screen.
-            }
-
-            // TODO: notify error
+async function listPaginated(pageNumber: number): Promise<void> {
+    try {
+        await operatorsStore.listPaginated(pageNumber);
+    } catch (error) {
+        if (error instanceof UnauthorizedError) {
+            // TODO: redirect to login screen.
         }
+
+        // TODO: notify error
     }
 }
+
+onMounted(async () => {
+    await listPaginated(currentPage.value);
+});
 </script>
 
 <style lang="scss" scoped>
@@ -85,6 +77,7 @@ export default class WalletsPage extends Vue {
         padding: 60px;
         overflow-y: auto;
         height: calc(100vh - 60px);
+        background-color: var(--v-background-base);
 
         &__title {
             font-family: 'font_bold', sans-serif;

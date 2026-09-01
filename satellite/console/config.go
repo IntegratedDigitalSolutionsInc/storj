@@ -5,16 +5,22 @@ package console
 
 import (
 	"encoding/json"
+	"os"
+	"strings"
 	"time"
 
 	"github.com/spf13/pflag"
+	"github.com/zeebo/errs"
+	"gopkg.in/yaml.v3"
 
 	"storj.io/common/storj"
-	"storj.io/common/uuid"
 )
 
 // Config keeps track of core console service configuration parameters.
 type Config struct {
+	ExternalAddress                   string                    `help:"external endpoint of the satellite if hosted" default:""`
+	SatName                           string                    `help:"used to display at web satellite console. provided by consoleweb.Config.SatelliteName" default:"" hidden:"true"`
+	IsBetaSat                         bool                      `help:"indicates if satellite is in beta. provided by consoleweb.Config.IsBetaSatellite" default:"false" hidden:"true"`
 	PasswordCost                      int                       `help:"password hashing cost (0=automatic)" testDefault:"4" default:"0"`
 	OpenRegistrationEnabled           bool                      `help:"enable open registration" default:"false" testDefault:"true"`
 	DefaultProjectLimit               int                       `help:"default project limits for users" default:"1" testDefault:"5"`
@@ -24,26 +30,99 @@ type Config struct {
 	ProjectInvitationExpiration       time.Duration             `help:"duration that project member invitations are valid for" default:"168h"`
 	UnregisteredInviteEmailsEnabled   bool                      `help:"indicates whether invitation emails can be sent to unregistered email addresses" default:"true"`
 	UserBalanceForUpgrade             int64                     `help:"amount of base units of US micro dollars needed to upgrade user's tier status" default:"10000000"`
-	PlacementEdgeURLOverrides         PlacementEdgeURLOverrides `help:"placement-specific edge service URL overrides in the format {\"placementID\": {\"authService\": \"...\", \"publicLinksharing\": \"...\", \"internalLinksharing\": \"...\"}, \"placementID2\": ...}"`
+	PlacementEdgeURLOverrides         PlacementEdgeURLOverrides `help:"placement-specific edge service URL overrides in the format {\"placementID\": {\"authService\": \"...\", \"publicLinksharing\": \"...\", \"internalLinksharing\": \"...\", \"gatewayEndpoint\": \"...\"}, \"placementID2\": ...}"`
 	BlockExplorerURL                  string                    `help:"url of the transaction block explorer" default:"https://etherscan.io/"`
 	ZkSyncBlockExplorerURL            string                    `help:"url of the zkSync transaction block explorer" default:"https://explorer.zksync.io/"`
+	ZkSyncContractAddress             string                    `help:"the STORJ zkSync Era contract address" default:"0xA0806DA7835a4E63dB2CE44A2b622eF8b73B5DB5"`
 	BillingFeaturesEnabled            bool                      `help:"indicates if billing features should be enabled" default:"true"`
-	StripePaymentElementEnabled       bool                      `help:"indicates whether the stripe payment element should be used to collect card info" default:"true"`
+	MaxAddFundsAmount                 int                       `help:"maximum amount (in cents) allowed to be added to an account balance." default:"250000"`
+	MinAddFundsAmount                 int                       `help:"minimum amount (in cents) allowed to be added to an account balance." default:"1000"`
+	UpgradePayUpfrontAmount           int                       `help:"amount (in cents) required to upgrade to a paid tier, use 0 to disable" default:"500"`
+	LegacyUpgradePayUpfrontAmount     int                       `help:"a version of upgrade-pay-upfront-amount that applies to payments.legacy-pricing-user-agents, use 0 to disable" default:"500"`
 	SignupActivationCodeEnabled       bool                      `help:"indicates whether the whether account activation is done using activation code" default:"true" testDefault:"false" devDefault:"false"`
 	FreeTrialDuration                 time.Duration             `help:"duration for which users can access the system free of charge, 0 = unlimited time trial" default:"0"`
 	VarPartners                       []string                  `help:"list of partners whose users will not see billing UI." default:""`
 	ObjectBrowserKeyNamePrefix        string                    `help:"prefix for object browser API key names" default:".storj-web-file-browser-api-key-"`
 	ObjectBrowserKeyLifetime          time.Duration             `help:"duration for which the object browser API key remains valid" default:"72h"`
 	MaxNameCharacters                 int                       `help:"defines the maximum number of characters allowed for names, e.g. user first/last names and company names" default:"100"`
+	MaxLongFormFieldCharacters        int                       `help:"defines the maximum number of characters allowed for long form fields, e.g. comment type fields" default:"500"`
 	BillingInformationTabEnabled      bool                      `help:"indicates if billing information tab should be enabled" default:"false"`
 	SatelliteManagedEncryptionEnabled bool                      `help:"indicates whether satellite managed encryption projects can be created." default:"false"`
+	AccessCreationHttpApiEnabled      bool                      `help:"whether the access creation HTTP API is enabled." default:"false"`
+	AccessCreationViaAPIEnabled       bool                      `help:"whether the UI should use the access creation HTTP API instead of wasm for satellite managed encryption projects." default:"false"`
+	BucketCreationHttpApiEnabled      bool                      `help:"whether the bucket creation HTTP API is enabled" default:"false"`
+	BucketCreationViaAPIEnabled       bool                      `help:"whether the UI should use the bucket creation HTTP API" default:"false"`
+	HideProjectEncryptionOptions      bool                      `help:"whether to hide encryption options in the UI if satellite managed encryption is also enabled" default:"false"`
 	EmailChangeFlowEnabled            bool                      `help:"whether change user email flow is enabled" default:"false"`
 	DeleteProjectEnabled              bool                      `help:"whether project deletion from satellite UI is enabled" default:"false"`
+	AbbreviatedDeleteProjectEnabled   bool                      `help:"whether the abbreviated delete project flow is enabled" default:"false"`
 	SelfServeAccountDeleteEnabled     bool                      `help:"whether self-serve account delete flow is enabled" default:"false"`
-	UsageLimits                       UsageLimitsConfig
-	Captcha                           CaptchaConfig
-	Session                           SessionConfig
-	AccountFreeze                     AccountFreezeConfig
+	AbbreviatedDeleteAccountEnabled   bool                      `help:"whether the abbreviated self-serve delete account flow is enabled" default:"false"`
+	UseNewRestKeysTable               bool                      `help:"whether to use the new rest keys table" default:"false"`
+	NewDetailedUsageReportEnabled     bool                      `help:"whether to use the new detailed usage report" default:"false"`
+	PricingPackagesEnabled            bool                      `help:"whether to allow purchasing pricing packages" default:"true"`
+	UserFeedbackEnabled               bool                      `help:"whether user feedback is enabled" default:"false"`
+	AuditableAPIKeyProjects           []string                  `help:"list of public project IDs for which auditable API keys are enabled" default:"[]" hidden:"true"`
+	ValidAnnouncementNames            []string                  `help:"list of valid announcement names that can be used in the UI" default:"[]"`
+	TenantIDList                      []string                  `help:"list of all possible tenant IDs for users of this satellite" default:""`
+	ComputeUiEnabled                  bool                      `help:"whether the compute UI is enabled" default:"false"`
+	ExternalComputeURL                string                    `help:"url of the external OpenStack compute application; when set, a sidebar link is shown" default:""`
+	ShowNewPricingTiers               bool                      `help:"whether to show new pricing tiers in the UI" default:"false"`
+	PreviousPricingUpdateDate         string                    `help:"the date (YYYY-MM-DD) when the previous pricing update happened" default:"2025-11-01"`
+	MemberAccountsEnabled             bool                      `help:"whether member accounts are enabled" default:"false"`
+	HideUplinkBehavior                bool                      `help:"whether to hide uplink behavior in the UI" default:"false"`
+	AuthMigrationModeEnabled          bool                      `help:"whether auth migration mode is enabled, disabling password/email/MFA changes and new registrations" default:"false"`
+	ProjectLimitNotificationsEnabled  bool                      `help:"whether project limit email notification UI is enabled. Provided by satellite config." default:"false" hidden:"true"`
+	ProjectInvitationsEnabled         bool                      `help:"whether inviting users to projects is enabled" default:"true"`
+	AccountInfoEnabledFields          []string                  `help:"list of fields enabled in the account info setup step; if empty, the step is skipped entirely" default:"name,companyName,storageNeeds,haveSalesContact"`
+	OptInPopupEnabled                 bool                      `help:"whether to show opt-in popup for pricing updates" default:"false"`
+	NewPricingEffectiveDate           string                    `help:"the date (RFC3339) when new pricing tiers will take effect" default:"2026-07-01T00:00:00Z"`
+
+	LegacyPlacements                           []string                       `help:"list of placement IDs that are considered legacy placements" default:""`
+	LegacyPlacementProductMappingsForMigration TieredPlacementProductMappings `help:"per-tier mapping of legacy placement IDs to product IDs used during project pricing migration" default:""`
+
+	PartnerAdminEmailMapping PartnerAdminEmailMapping `help:"mapping of partner names to partner admin email address in the format {\"partnerName\":\"adminEmail\", ...}"`
+
+	PartnerUI        PartnerUIConfig        `help:"partner-specific UI configuration in YAML format or file path"`
+	SingleWhiteLabel SingleWhiteLabelConfig `noflag:"true"`
+
+	ManagedEncryption SatelliteManagedEncryptionConfig
+	RestAPIKeys       RestAPIKeysConfig
+	Placement         PlacementsConfig
+	UsageLimits       UsageLimitsConfig
+	Captcha           CaptchaConfig
+	Session           SessionConfig
+	AccountFreeze     AccountFreezeConfig
+	Announcement      AnnouncementConfig
+}
+
+// AnnouncementConfig contains configurations for announcements shown in the UI.
+type AnnouncementConfig struct {
+	Enabled bool   `help:"indicates whether announcement should be shown in the UI" default:"false" json:"enabled"`
+	Name    string `help:"name of the announcement" default:"" json:"name"`
+	Title   string `help:"title of the announcement" default:"" json:"title"`
+	Body    string `help:"body of the announcement" default:"" json:"body"`
+}
+
+// SatelliteManagedEncryptionConfig contains configurations for Satellite Managed Encryption.
+type SatelliteManagedEncryptionConfig struct {
+	PathEncryptionEnabled bool `help:"indicates whether projects with managed encryption should have path encryption enabled" default:"false"`
+}
+
+// RestAPIKeysConfig contains configurations for REST API keys.
+type RestAPIKeysConfig struct {
+	DefaultExpiration time.Duration `help:"expiration to use if user does not specify an rest key expiration" default:"720h"`
+}
+
+// PlacementsConfig contains configurations for self-serve placement logic.
+type PlacementsConfig struct {
+	SelfServeEnabled                  bool                              `help:"whether self-serve placement selection feature is enabled" default:"false"`
+	SelfServeDetails                  PlacementDetails                  `help:"human-readable details for placements allowed for self serve placement. See satellite/console/README.md for more details."`
+	AllowedPlacementIdsForNewProjects AllowedPlacementIDsForNewProjects `help:"list of placement IDs that are allowed for new projects, e.g.[0, 10]" default:"[]"`
+	NewProjectTierLockEnabled         bool                              `help:"whether tier selection is locked to project creation time for new projects" default:"false"`
+	LegacySelfServeDetails            PlacementDetails                  `help:"a version of placement.self-serve-details shown to users matched by payments.legacy-pricing-user-agents who signed up before console.new-pricing-effective-date"`
+
+	LegacyAllowedPlacementIdsForNewProjects AllowedPlacementIDsForNewProjects `help:"list of placement IDs allowed for new projects of users matched by payments.legacy-pricing-user-agents who signed up before console.new-pricing-effective-date, e.g.[0, 10]" default:"[]"`
 }
 
 // CaptchaConfig contains configurations for login/registration captcha system.
@@ -56,10 +135,16 @@ type CaptchaConfig struct {
 	Registration         MultiCaptchaConfig `json:"registration"`
 }
 
-// MultiCaptchaConfig contains configurations for Recaptcha and Hcaptcha systems.
+// MultiCaptchaConfig contains configurations for Recaptcha, Hcaptcha and Turnstile systems.
 type MultiCaptchaConfig struct {
 	Recaptcha SingleCaptchaConfig `json:"recaptcha"`
 	Hcaptcha  SingleCaptchaConfig `json:"hcaptcha"`
+	Turnstile SingleCaptchaConfig `json:"turnstile"`
+}
+
+// AnyEnabled returns whether any of the configured captcha providers is enabled.
+func (c MultiCaptchaConfig) AnyEnabled() bool {
+	return c.Recaptcha.Enabled || c.Hcaptcha.Enabled || c.Turnstile.Enabled
 }
 
 // SingleCaptchaConfig contains configurations abstract captcha system.
@@ -77,19 +162,53 @@ type SessionConfig struct {
 	Duration                     time.Duration `help:"duration a session is valid for (superseded by inactivity timer delay if inactivity timer is enabled)" default:"168h"`
 }
 
-// ObjectLockAndVersioningConfig contains configurations for object versioning.
-type ObjectLockAndVersioningConfig struct {
-	ObjectLockEnabled                      bool
-	UseBucketLevelObjectVersioning         bool
-	UseBucketLevelObjectVersioningProjects []string
-	projectMap                             map[uuid.UUID]struct{}
-}
-
 // EdgeURLOverrides contains edge service URL overrides.
 type EdgeURLOverrides struct {
 	AuthService         string `json:"authService,omitempty"`
 	PublicLinksharing   string `json:"publicLinksharing,omitempty"`
 	InternalLinksharing string `json:"internalLinksharing,omitempty"`
+	GatewayEndpoint     string `json:"gatewayEndpoint,omitempty"`
+}
+
+// AllowedPlacementIDsForNewProjects represents a list of placement IDs that are allowed for new projects.
+type AllowedPlacementIDsForNewProjects []storj.PlacementConstraint
+
+// Ensure that AllowedPlacementIDsForNewProjects implements pflag.Value.
+var _ pflag.Value = (*AllowedPlacementIDsForNewProjects)(nil)
+
+// Type implements pflag.Value.
+func (*AllowedPlacementIDsForNewProjects) Type() string {
+	return "console.AllowedPlacementIDsForNewProjects"
+}
+
+// String implements pflag.Value.
+func (ap *AllowedPlacementIDsForNewProjects) String() string {
+	if ap == nil || len(*ap) == 0 {
+		return ""
+	}
+
+	placements, err := json.Marshal(ap)
+	if err != nil {
+		return ""
+	}
+
+	return string(placements)
+}
+
+// Set implements pflag.Value.
+func (ap *AllowedPlacementIDsForNewProjects) Set(s string) error {
+	if s == "" {
+		return nil
+	}
+
+	var placements []storj.PlacementConstraint
+	err := json.Unmarshal([]byte(s), &placements)
+	if err != nil {
+		return err
+	}
+	*ap = placements
+
+	return nil
 }
 
 // PlacementEdgeURLOverrides represents a mapping between placement IDs and edge service URL overrides.
@@ -101,7 +220,7 @@ type PlacementEdgeURLOverrides struct {
 var _ pflag.Value = (*PlacementEdgeURLOverrides)(nil)
 
 // Type implements pflag.Value.
-func (PlacementEdgeURLOverrides) Type() string { return "console.PlacementEdgeURLOverrides" }
+func (*PlacementEdgeURLOverrides) Type() string { return "console.PlacementEdgeURLOverrides" }
 
 // String implements pflag.Value.
 func (ov *PlacementEdgeURLOverrides) String() string {
@@ -140,4 +259,380 @@ func (ov *PlacementEdgeURLOverrides) Get(placement storj.PlacementConstraint) (o
 	}
 	overrides, ok = ov.overrideMap[placement]
 	return overrides, ok
+}
+
+// PlacementDetail represents human-readable details of a placement.
+type PlacementDetail struct {
+	ID          int    `json:"id" yaml:"id"`
+	IdName      string `json:"idName" yaml:"id-name"`
+	Name        string `json:"name" yaml:"name"`
+	ShortName   string `json:"shortName" yaml:"short-name"`
+	Title       string `json:"title" yaml:"title"`
+	Description string `json:"description" yaml:"description"`
+	// WaitlistURL is only parsed from configuration and not sent to the front-end.
+	WaitlistURL string `json:"waitlist_url,omitempty" yaml:"wait-list-url,omitempty"`
+	// Pending indicates whether the placement has a waitlist - to be sent to the front-end.
+	Pending    bool   `json:"pending" yaml:"-"`
+	LucideIcon string `json:"lucideIcon,omitempty" yaml:"lucide-icon,omitempty"`
+}
+
+// PlacementDetails represents a mapping between placement IDs and their human-readable details.
+type PlacementDetails []PlacementDetail
+
+// Ensure that PlacementDetails implements pflag.Value.
+var _ pflag.Value = (*PlacementDetails)(nil)
+
+// Type implements pflag.Value.
+func (*PlacementDetails) Type() string { return "console.PlacementDetails" }
+
+// String implements pflag.Value.
+func (pd *PlacementDetails) String() string {
+	if pd == nil || len(*pd) == 0 {
+		return ""
+	}
+
+	bytes, err := yaml.Marshal(pd)
+	if err != nil {
+		return ""
+	}
+
+	return string(bytes)
+}
+
+// SetMap sets the internal mapping between a placement and detail.
+func (pd *PlacementDetails) SetMap(overrides map[storj.PlacementConstraint]PlacementDetail) {
+	details := make([]PlacementDetail, 0, len(overrides))
+	for _, detail := range overrides {
+		details = append(details, detail)
+	}
+	*pd = details
+}
+
+// GetMap returns the internal mapping between a placement and detail.
+func (pd *PlacementDetails) GetMap() map[storj.PlacementConstraint]PlacementDetail {
+	detailMap := make(map[storj.PlacementConstraint]PlacementDetail, len(*pd))
+	for _, detail := range *pd {
+		detailMap[storj.PlacementConstraint(detail.ID)] = detail
+	}
+	return detailMap
+}
+
+// Set implements pflag.Value.
+func (pd *PlacementDetails) Set(s string) error {
+	if s == "" {
+		return nil
+	}
+
+	s = strings.TrimSpace(s)
+	strBytes := []byte(s)
+
+	var details PlacementDetails
+	switch {
+	case strings.HasSuffix(s, ".yaml"):
+		// YAML file path
+		data, err := os.ReadFile(s)
+		if err != nil {
+			return errs.New("Couldn't read placement config file from %s: %v", s, err)
+		}
+
+		err = yaml.Unmarshal(data, &details)
+		if err != nil {
+			return errs.New("failed to parse placement config YAML file: %v", err)
+		}
+	default:
+		// YAML string
+		err := yaml.Unmarshal(strBytes, &details)
+		if err != nil {
+			return errs.New("failed to parse placement config YAML: %v", err)
+		}
+	}
+
+	*pd = details
+
+	return nil
+}
+
+// Get returns the details for the given placement ID.
+func (pd *PlacementDetails) Get(placement storj.PlacementConstraint) (details PlacementDetail, ok bool) {
+	if pd == nil {
+		return PlacementDetail{}, false
+	}
+	for _, detail := range *pd {
+		if detail.ID == int(placement) {
+			return detail, true
+		}
+	}
+	return PlacementDetail{}, false
+}
+
+// TieredPlacementProductMappings maps migration tier names ("archive", "global") to
+// placement-product override maps used during project pricing migration.
+//
+// When a user migrates a classic project they choose a target tier, and the corresponding
+// sub-map is applied on top of the satellite's default placement-product mappings.
+//
+// Every placement ID listed in LegacyPlacements must appear in every configured tier's
+// sub-map, otherwise service startup will fail. This ensures no legacy placement is left
+// without a product assignment regardless of which tier the user picks.
+//
+// Placements whose product is the same across tiers (e.g. US Select always maps to Regional US)
+// should repeat that product ID in each tier entry — the user's choice has no effect on them.
+//
+// Format:
+//
+//	{"archive": {"0": <archiveProductID>}, "global": {"0": <globalProductID>}}
+//
+// US1 example (placement 0 = Legacy Global, placement 12 = US Select):
+//
+//	{"archive": {"0": 12, "12": 11}, "global": {"0": 10, "12": 11}}
+//
+// EU1 / AP1 example (only Legacy Global exists):
+//
+//	{"archive": {"0": 12}, "global": {"0": 10}}
+type TieredPlacementProductMappings struct {
+	mappings map[MigrationTargetTier]map[storj.PlacementConstraint]int32
+}
+
+// Ensure that TieredPlacementProductMappings implements pflag.Value.
+var _ pflag.Value = (*TieredPlacementProductMappings)(nil)
+
+// Type returns the type of the pflag.Value.
+func (*TieredPlacementProductMappings) Type() string { return "console.TieredPlacementProductMappings" }
+
+// String returns a JSON string representation of the TieredPlacementProductMappings.
+func (t *TieredPlacementProductMappings) String() string {
+	if t == nil || len(t.mappings) == 0 {
+		return ""
+	}
+	data, err := json.Marshal(t.mappings)
+	if err != nil {
+		return ""
+	}
+	return string(data)
+}
+
+// Set parses and sets the TieredPlacementProductMappings from a JSON string.
+func (t *TieredPlacementProductMappings) Set(value string) error {
+	if value == "" {
+		return nil
+	}
+	mappings := make(map[MigrationTargetTier]map[storj.PlacementConstraint]int32)
+	if err := json.Unmarshal([]byte(strings.TrimSpace(value)), &mappings); err != nil {
+		return errs.New("failed to parse TieredPlacementProductMappings: %w", err)
+	}
+	t.mappings = mappings
+	return nil
+}
+
+// GetMapping returns the placement-product mapping for the given tier name.
+// Returns nil if the tier is not configured.
+func (t *TieredPlacementProductMappings) GetMapping(tier MigrationTargetTier) map[storj.PlacementConstraint]int32 {
+	if t == nil {
+		return nil
+	}
+	return t.mappings[tier]
+}
+
+// PartnerAdminEmailMapping represents a mapping between partner and partner's admin email.
+type PartnerAdminEmailMapping struct {
+	mapping map[string]string
+}
+
+// Ensure that PartnerAdminEmailMapping implements pflag.Value.
+var _ pflag.Value = (*PartnerAdminEmailMapping)(nil)
+
+// Type implements pflag.Value.
+func (*PartnerAdminEmailMapping) Type() string { return "console.PartnerAdminEmailMapping" }
+
+// String implements pflag.Value.
+func (ov *PartnerAdminEmailMapping) String() string {
+	if ov == nil || len(ov.mapping) == 0 {
+		return ""
+	}
+
+	mapping, err := json.Marshal(ov.mapping)
+	if err != nil {
+		return ""
+	}
+
+	return string(mapping)
+}
+
+// Set implements pflag.Value.
+func (ov *PartnerAdminEmailMapping) Set(s string) error {
+	if s == "" {
+		return nil
+	}
+
+	mapping := make(map[string]string)
+	err := json.Unmarshal([]byte(s), &mapping)
+	if err != nil {
+		return err
+	}
+	ov.mapping = mapping
+
+	return nil
+}
+
+// Get returns the partner admin email for the given partner.
+func (ov *PartnerAdminEmailMapping) Get(partner string) (email string, ok bool) {
+	if ov == nil {
+		return "", false
+	}
+	email, ok = ov.mapping[partner]
+	return email, ok
+}
+
+// GetAllPartners returns a list of all partners in the mapping.
+func (ov *PartnerAdminEmailMapping) GetAllPartners() []string {
+	if ov == nil {
+		return nil
+	}
+
+	partners := make([]string, 0, len(ov.mapping))
+
+	for p := range ov.mapping {
+		partners = append(partners, p)
+	}
+
+	return partners
+}
+
+// UIConfig contains UI configuration for different parts of the UI.
+type UIConfig struct {
+	Billing     map[string]any `yaml:"billing,omitempty"`
+	Onboarding  map[string]any `yaml:"onboarding,omitempty"`
+	Upgrade     map[string]any `yaml:"upgrade,omitempty"`
+	PricingPlan map[string]any `yaml:"pricing-plan,omitempty"`
+	Signup      map[string]any `yaml:"signup,omitempty"`
+}
+
+// PartnerUIConfig contains partner-specific UI configuration.
+type PartnerUIConfig struct {
+	Value map[string]UIConfig
+}
+
+var _ pflag.Value = (*PartnerUIConfig)(nil)
+
+// Set parses a YAML file or string into PartnerUIConfig.
+func (p *PartnerUIConfig) Set(s string) error {
+	if s == "" {
+		return nil
+	}
+
+	s = strings.TrimSpace(s)
+	strBytes := []byte(s)
+	var cfg map[string]UIConfig
+	switch {
+	case strings.HasSuffix(s, ".yaml"):
+		// YAML file path
+		data, err := os.ReadFile(s)
+		if err != nil {
+			return errs.New("Couldn't read partner UI config file from %s: %v", s, err)
+		}
+
+		err = yaml.Unmarshal(data, &cfg)
+		if err != nil {
+			return errs.New("failed to parse partner UI config YAML file: %v", err)
+		}
+	default:
+		// YAML string
+		err := yaml.Unmarshal(strBytes, &cfg)
+		if err != nil {
+			return errs.New("failed to parse config YAML: %v", err)
+		}
+	}
+
+	*p = PartnerUIConfig{Value: cfg}
+	return nil
+}
+
+// String returns the YAML representation of PartnerUIConfig.
+func (p *PartnerUIConfig) String() string {
+	if p == nil {
+		return ""
+	}
+
+	bytes, err := yaml.Marshal(p.Value)
+	if err != nil {
+		return ""
+	}
+
+	str := string(bytes)
+	if str == "{}\n" {
+		return ""
+	}
+
+	return string(bytes)
+}
+
+// Type returns the type of the pflag.Value.
+func (p *PartnerUIConfig) Type() string {
+	return "console.PartnerUIConfig"
+}
+
+// WhiteLabelConfig contains white-label configuration.
+type WhiteLabelConfig struct {
+	TenantID            string            `yaml:"tenant-id,omitempty"`
+	HostName            string            `yaml:"host-name,omitempty"`
+	ExternalAddress     string            `yaml:"external-address,omitempty"`
+	Name                string            `yaml:"name,omitempty"`
+	LogoURLs            map[string]string `yaml:"logo-urls,omitempty"`
+	FaviconURLs         map[string]string `yaml:"favicon-urls,omitempty"`
+	Colors              map[string]string `yaml:"colors,omitempty"`
+	SupportURL          string            `yaml:"support-url,omitempty"`
+	DocsURL             string            `yaml:"docs-url,omitempty"`
+	HomepageURL         string            `yaml:"homepage-url,omitempty"`
+	GetInTouchURL       string            `yaml:"get-in-touch-url,omitempty"`
+	SourceCodeURL       string            `yaml:"source-code-url,omitempty"`
+	SocialURL           string            `yaml:"social-url,omitempty"`
+	BlogURL             string            `yaml:"blog-url,omitempty"`
+	PrivacyPolicyURL    string            `yaml:"privacy-policy-url,omitempty"`
+	TermsOfServiceURL   string            `yaml:"terms-of-service-url,omitempty"`
+	TermsOfUseURL       string            `yaml:"terms-of-use-url,omitempty"`
+	GatewayURL          string            `yaml:"gateway-url,omitempty"`
+	CompanyName         string            `yaml:"company-name,omitempty"`
+	AddressLine1        string            `yaml:"address-line1,omitempty"`
+	AddressLine2        string            `yaml:"address-line2,omitempty"`
+	AdminLogsEmail      string            `yaml:"admin-logs-email,omitempty"`
+	AdminLogsWebhookURL string            `yaml:"admin-logs-webhook-url,omitempty"`
+	SMTP                SMTPConfig        `yaml:"smtp,omitempty"`
+	FreeTrialsEnabled   bool              `yaml:"free-trials-enabled,omitempty"`
+}
+
+// SMTPConfig contains SMTP configuration for sending emails.
+type SMTPConfig struct {
+	ServerAddress string `yaml:"server-address,omitempty"`
+	From          string `yaml:"from,omitempty"`
+	AuthType      string `yaml:"auth-type,omitempty"`
+	Login         string `yaml:"login,omitempty"`
+	Password      string `yaml:"password,omitempty"`
+}
+
+// SingleWhiteLabelConfig provides white-label configuration for dedicated
+// single-brand deployments. When enabled (Name is set), the satellite uses
+// custom branding instead of the default Storj branding.
+//
+// This is configured directly in YAML without CLI flag support.
+// Example YAML:
+//
+//	console.single-white-label:
+//	  name: "MyBrand"
+//	  tenant-id: "my-tenant"
+//	  logo-urls:
+//	    full-light: "https://..."
+//	    full-dark: "https://..."
+//	  colors:
+//	    primary-light: "#FF0000"
+//	  support-url: "https://support.mybrand.com"
+type SingleWhiteLabelConfig WhiteLabelConfig
+
+// Enabled returns true if single white label mode is enabled.
+func (s *SingleWhiteLabelConfig) Enabled() bool {
+	return s.Name != ""
+}
+
+// ToWhiteLabelConfig returns the config as WhiteLabelConfig.
+func (s *SingleWhiteLabelConfig) ToWhiteLabelConfig() WhiteLabelConfig {
+	return WhiteLabelConfig(*s)
 }

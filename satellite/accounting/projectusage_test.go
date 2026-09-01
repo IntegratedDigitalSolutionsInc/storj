@@ -15,7 +15,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/zeebo/errs"
 	"go.uber.org/zap"
@@ -37,6 +36,7 @@ import (
 	"storj.io/storj/satellite/metabase"
 	"storj.io/storj/satellite/orders"
 	"storj.io/storj/satellite/satellitedb/satellitedbtest"
+	"storj.io/storj/shared/s3event"
 	snorders "storj.io/storj/storagenode/orders"
 	"storj.io/uplink"
 	"storj.io/uplink/private/metaclient"
@@ -52,7 +52,7 @@ func TestProjectUsageStorage(t *testing.T) {
 			},
 		},
 	}, func(t *testing.T, ctx *testcontext.Context, planet *testplanet.Planet) {
-		var uploaded uint32
+		var uploaded atomic.Uint32
 
 		checkctx, checkcancel := context.WithCancel(ctx)
 		defer checkcancel()
@@ -60,7 +60,7 @@ func TestProjectUsageStorage(t *testing.T) {
 		var group errgroup.Group
 		group.Go(func() error {
 			// wait things to be uploaded
-			for atomic.LoadUint32(&uploaded) == 0 {
+			for uploaded.Load() == 0 {
 				if !sync2.Sleep(checkctx, time.Microsecond) {
 					return nil
 				}
@@ -90,7 +90,7 @@ func TestProjectUsageStorage(t *testing.T) {
 
 		// successful upload
 		err = planet.Uplinks[0].Upload(ctx, planet.Satellites[0], "testbucket", "test/path/0", data)
-		atomic.StoreUint32(&uploaded, 1)
+		uploaded.Store(1)
 		require.NoError(t, err)
 		planet.Satellites[0].Accounting.Tally.Loop.TriggerWait()
 
@@ -162,9 +162,9 @@ func TestProjectUsageBandwidth(t *testing.T) {
 				projectUsage.SetNow(func() time.Time {
 					return now
 				})
-				actualExceeded, _, err := projectUsage.ExceedsBandwidthUsage(ctx, accounting.ProjectLimits{ProjectID: bucket.ProjectID})
+				bwLimit, err := projectUsage.ExceedsBandwidthUsage(ctx, accounting.ProjectLimits{ProjectID: bucket.ProjectID}, false)
 				require.NoError(t, err)
-				require.Equal(t, testCase.expectedExceeded, actualExceeded)
+				require.Equal(t, testCase.expectedExceeded, bwLimit.Exceeds)
 
 				// Execute test: check that the uplink gets an error when they have exceeded bandwidth limits and try to download a file
 				_, actualErr := planet.Uplinks[0].Download(ctx, planet.Satellites[0], string(bucket.BucketName), filePath)
@@ -407,55 +407,6 @@ func TestProjectBandwidthRollups(t *testing.T) {
 	})
 }
 
-func createBucketSettleBandwidthRollupsForPast4Days(ctx *testcontext.Context, satelliteDB satellite.DB, projectID uuid.UUID) (int64, error) {
-	var expectedSum int64
-	ordersDB := satelliteDB.Orders()
-	amount := int64(1000)
-	now := time.Now()
-
-	for i := 0; i < 4; i++ {
-		var bucketName string
-		var intervalStart time.Time
-		if i%2 == 0 {
-			// When the bucket name and intervalStart is different, a new record is created
-			bucketName = fmt.Sprintf("%s%d", "testbucket", i)
-			// Use a intervalStart time in the past to test we get all records in past 30 days
-			intervalStart = now.AddDate(0, 0, -i)
-		} else {
-			// When the bucket name and intervalStart is the same, we update the existing record
-			bucketName = "testbucket"
-			intervalStart = now
-		}
-
-		err := ordersDB.UpdateBucketBandwidthSettle(ctx,
-			projectID, []byte(bucketName), pb.PieceAction_GET, amount, 0, intervalStart,
-		)
-		if err != nil {
-			return expectedSum, err
-		}
-		expectedSum += amount
-	}
-	return expectedSum, nil
-}
-
-func TestGetProjectSettledBandwidthTotal(t *testing.T) {
-	satellitedbtest.Run(t, func(ctx *testcontext.Context, t *testing.T, db satellite.DB) {
-		pdb := db.ProjectAccounting()
-		projectID := testrand.UUID()
-
-		// Setup: create bucket bandwidth rollup records
-		expectedTotal, err := createBucketSettleBandwidthRollupsForPast4Days(ctx, db, projectID)
-		require.NoError(t, err)
-
-		// Execute test: get project bandwidth total
-		since := time.Now().AddDate(0, -1, 0)
-
-		actualBandwidthTotal, err := pdb.GetProjectSettledBandwidthTotal(ctx, projectID, since)
-		require.NoError(t, err)
-		require.Equal(t, expectedTotal, actualBandwidthTotal)
-	})
-}
-
 func setUpBucketBandwidthAllocations(ctx *testcontext.Context, projectID uuid.UUID, orderDB orders.DB, now time.Time) error {
 	// Create many records that sum greater than project usage limit of 50GB
 	for i := 0; i < 4; i++ {
@@ -520,12 +471,6 @@ func TestProjectUsageCustomLimit(t *testing.T) {
 func TestUsageRollups(t *testing.T) {
 	testplanet.Run(t, testplanet.Config{
 		SatelliteCount: 1, StorageNodeCount: 0, UplinkCount: 3,
-		Reconfigure: testplanet.Reconfigure{
-			Satellite: func(log *zap.Logger, index int, config *satellite.Config) {
-				config.Metainfo.UseBucketLevelObjectVersioning = true
-				config.Metainfo.ObjectLockEnabled = true
-			},
-		},
 	}, func(t *testing.T, ctx *testcontext.Context, planet *testplanet.Planet) {
 		const (
 			numBuckets     = 5
@@ -534,6 +479,7 @@ func TestUsageRollups(t *testing.T) {
 		)
 
 		now := time.Now()
+		since := now.Add(-time.Hour * 24)
 		start := now.Add(tallyInterval * -tallyIntervals)
 
 		db := planet.Satellites[0].DB
@@ -542,9 +488,13 @@ func TestUsageRollups(t *testing.T) {
 		project2 := planet.Uplinks[1].Projects[0].ID
 		project3 := planet.Uplinks[2].Projects[0].ID
 
-		p1base := binary.BigEndian.Uint64(project1[:8]) >> 48
-		p2base := binary.BigEndian.Uint64(project2[:8]) >> 48
-		p3base := binary.BigEndian.Uint64(project3[:8]) >> 48
+		base := func(projectID uuid.UUID) uint64 {
+			return binary.BigEndian.Uint64(projectID[:8]) >> 48
+		}
+
+		p1base := base(project1)
+		p2base := base(project2)
+		p3base := base(project3)
 
 		getValue := func(i, j int, base uint64) int64 {
 			a := uint64((i+1)*(j+1)) ^ base
@@ -561,11 +511,19 @@ func TestUsageRollups(t *testing.T) {
 		var rollups []orders.BucketBandwidthRollup
 
 		var buckets []string
+		placement := func(projectID uuid.UUID) *storj.PlacementConstraint {
+			p := storj.PlacementConstraint(base(projectID))
+			return &p
+		}
+		userAgent := func(projectID uuid.UUID) []byte {
+			return []byte(fmt.Sprintf("partner-%s", projectID.String()))
+		}
 		for i := 0; i < numBuckets; i++ {
 			bucketName := fmt.Sprintf("bucket-%d", i)
 
-			err := planet.Uplinks[0].CreateBucket(ctx, planet.Satellites[0], bucketName)
-			require.NoError(t, err)
+			require.NoError(t, planet.Uplinks[0].CreateBucket(ctx, planet.Satellites[0], bucketName))
+			require.NoError(t, db.Attribution().UpdateUserAgent(ctx, project1, bucketName, userAgent(project1)))
+			require.NoError(t, db.Attribution().UpdatePlacement(ctx, project1, bucketName, placement(project1)))
 
 			// project 1
 			for _, action := range actions {
@@ -581,8 +539,9 @@ func TestUsageRollups(t *testing.T) {
 				require.NoError(t, err)
 			}
 
-			err = planet.Uplinks[1].CreateBucket(ctx, planet.Satellites[0], bucketName)
-			require.NoError(t, err)
+			require.NoError(t, planet.Uplinks[1].CreateBucket(ctx, planet.Satellites[0], bucketName))
+			require.NoError(t, db.Attribution().UpdateUserAgent(ctx, project2, bucketName, userAgent(project2)))
+			require.NoError(t, db.Attribution().UpdatePlacement(ctx, project2, bucketName, placement(project2)))
 
 			// project 2
 			for _, action := range actions {
@@ -598,8 +557,9 @@ func TestUsageRollups(t *testing.T) {
 				require.NoError(t, err)
 			}
 
-			err = planet.Uplinks[2].CreateBucket(ctx, planet.Satellites[0], bucketName)
-			require.NoError(t, err)
+			require.NoError(t, planet.Uplinks[2].CreateBucket(ctx, planet.Satellites[0], bucketName))
+			require.NoError(t, db.Attribution().UpdateUserAgent(ctx, project3, bucketName, userAgent(project3)))
+			require.NoError(t, db.Attribution().UpdatePlacement(ctx, project3, bucketName, placement(project3)))
 
 			// project 3
 			for _, action := range actions {
@@ -688,6 +648,31 @@ func TestUsageRollups(t *testing.T) {
 
 		usageRollups := db.ProjectAccounting()
 
+		t.Run("buckets since and before", func(t *testing.T) {
+			for _, projectID := range []uuid.UUID{project1, project2, project3} {
+				bucketInfos, err := usageRollups.GetBucketsSinceAndBefore(ctx, projectID, start, now, false)
+				require.NoError(t, err)
+				require.Len(t, bucketInfos, 5)
+				for _, info := range bucketInfos {
+					require.Nil(t, info.Placement)
+					require.Nil(t, info.UserAgent)
+				}
+			}
+
+			for _, projectID := range []uuid.UUID{project1, project2, project3} {
+				bucketInfos, err := usageRollups.GetBucketsSinceAndBefore(ctx, projectID, start, now /*withInfo*/, true)
+				require.NoError(t, err)
+				require.Len(t, bucketInfos, 5)
+				for _, info := range bucketInfos {
+					require.NotNil(t, info.Placement)
+					require.NotNil(t, info.UserAgent)
+
+					require.Equal(t, placement(projectID), info.Placement)
+					require.Equal(t, userAgent(projectID), info.UserAgent)
+				}
+			}
+		})
+
 		t.Run("project total", func(t *testing.T) {
 			projTotal1, err := usageRollups.GetProjectTotal(ctx, project1, start, now)
 			require.NoError(t, err)
@@ -713,95 +698,25 @@ func TestUsageRollups(t *testing.T) {
 		})
 
 		t.Run("bucket usage rollups", func(t *testing.T) {
-			rollups1, err := usageRollups.GetBucketUsageRollups(ctx, project1, start, now)
+			rollups1, err := usageRollups.GetBucketUsageRollups(ctx, project1, start, now, false)
 			require.NoError(t, err)
 			require.NotNil(t, rollups1)
 
-			rollups2, err := usageRollups.GetBucketUsageRollups(ctx, project2, start, now)
+			rollups2, err := usageRollups.GetBucketUsageRollups(ctx, project2, start, now, false)
 			require.NoError(t, err)
 			require.NotNil(t, rollups2)
 
-			rollups3, err := usageRollups.GetBucketUsageRollups(ctx, project3, start, now)
+			rollups3, err := usageRollups.GetBucketUsageRollups(ctx, project3, start, now, false)
 			require.NoError(t, err)
 			require.NotNil(t, rollups3)
 
-			rollups3Prev2Hours, err := usageRollups.GetBucketUsageRollups(ctx, project3, now.Add(-time.Hour*2), now.Add(-time.Hour*1))
+			rollups3Prev2Hours, err := usageRollups.GetBucketUsageRollups(ctx, project3, now.Add(-time.Hour*2), now.Add(-time.Hour*1), false)
 			require.NoError(t, err)
 			require.NotNil(t, rollups3Prev2Hours)
 
-			rollups3Prev3Hours, err := usageRollups.GetBucketUsageRollups(ctx, project3, now.Add(-time.Hour*3), now.Add(-time.Hour*2))
+			rollups3Prev3Hours, err := usageRollups.GetBucketUsageRollups(ctx, project3, now.Add(-time.Hour*3), now.Add(-time.Hour*2), false)
 			require.NoError(t, err)
 			require.NotNil(t, rollups3Prev3Hours)
-		})
-
-		t.Run("bucket totals", func(t *testing.T) {
-			cursor := accounting.BucketUsageCursor{
-				Limit: 20,
-				Page:  1,
-			}
-
-			totals1, err := usageRollups.GetBucketTotals(ctx, project1, cursor, now)
-			require.NoError(t, err)
-			require.NotNil(t, totals1)
-
-			totals2, err := usageRollups.GetBucketTotals(ctx, project2, cursor, now)
-			require.NoError(t, err)
-			require.NotNil(t, totals2)
-
-			totals3, err := usageRollups.GetBucketTotals(ctx, project3, cursor, now)
-			require.NoError(t, err)
-			require.NotNil(t, totals3)
-
-			totals3Prev2Hours, err := usageRollups.GetBucketTotals(ctx, project3, cursor, now.Add(-time.Hour*2))
-			require.NoError(t, err)
-			require.NotNil(t, totals3Prev2Hours)
-
-			totals3Prev3Hours, err := usageRollups.GetBucketTotals(ctx, project3, cursor, now.Add(-time.Hour*3))
-			require.NoError(t, err)
-			require.NotNil(t, totals3Prev3Hours)
-		})
-
-		t.Run("Get paged", func(t *testing.T) {
-			// sql injection test. F.E '%SomeText%' = > ''%SomeText%' OR 'x' != '%'' will be true
-			bucketsPage, err := usageRollups.GetBucketTotals(ctx, project1, accounting.BucketUsageCursor{Limit: 5, Search: "buck%' OR 'x' != '", Page: 1}, now)
-			require.NoError(t, err)
-			require.NotNil(t, bucketsPage)
-			assert.Equal(t, uint64(0), bucketsPage.TotalCount)
-			assert.Equal(t, uint(0), bucketsPage.CurrentPage)
-			assert.Equal(t, uint(0), bucketsPage.PageCount)
-			assert.Equal(t, 0, len(bucketsPage.BucketUsages))
-
-			bucketsPage, err = usageRollups.GetBucketTotals(ctx, project1, accounting.BucketUsageCursor{Limit: 3, Search: "", Page: 1}, now)
-			require.NoError(t, err)
-			require.NotNil(t, bucketsPage)
-			assert.Equal(t, uint64(5), bucketsPage.TotalCount)
-			assert.Equal(t, uint(1), bucketsPage.CurrentPage)
-			assert.Equal(t, uint(2), bucketsPage.PageCount)
-			assert.Equal(t, 3, len(bucketsPage.BucketUsages))
-
-			bucketsPage, err = usageRollups.GetBucketTotals(ctx, project1, accounting.BucketUsageCursor{Limit: 5, Search: "buck", Page: 1}, now)
-			require.NoError(t, err)
-			require.NotNil(t, bucketsPage)
-			assert.Equal(t, uint64(5), bucketsPage.TotalCount)
-			assert.Equal(t, uint(1), bucketsPage.CurrentPage)
-			assert.Equal(t, uint(1), bucketsPage.PageCount)
-			assert.Equal(t, 5, len(bucketsPage.BucketUsages))
-
-			bucketsPage, err = usageRollups.GetBucketTotals(ctx, project1, accounting.BucketUsageCursor{Limit: 5, Search: "bucket-0", Page: 1}, now)
-			require.NoError(t, err)
-			require.NotNil(t, bucketsPage)
-			assert.Equal(t, uint64(1), bucketsPage.TotalCount)
-			assert.Equal(t, uint(1), bucketsPage.CurrentPage)
-			assert.Equal(t, uint(1), bucketsPage.PageCount)
-			assert.Equal(t, 1, len(bucketsPage.BucketUsages))
-
-			bucketsPage, err = usageRollups.GetBucketTotals(ctx, project1, accounting.BucketUsageCursor{Limit: 5, Search: "buck\xff", Page: 1}, now)
-			require.NoError(t, err)
-			require.NotNil(t, bucketsPage)
-			assert.Equal(t, uint64(0), bucketsPage.TotalCount)
-			assert.Equal(t, uint(0), bucketsPage.CurrentPage)
-			assert.Equal(t, uint(0), bucketsPage.PageCount)
-			assert.Equal(t, 0, len(bucketsPage.BucketUsages))
 		})
 
 		t.Run("versioning & object lock status", func(t *testing.T) {
@@ -821,14 +736,13 @@ func TestUsageRollups(t *testing.T) {
 
 			cursor := accounting.BucketUsageCursor{Limit: 20, Page: 1}
 
-			totals, err := usageRollups.GetBucketTotals(ctx, project1, cursor, now)
+			totals, err := usageRollups.GetBucketTotals(ctx, project1, cursor, since, now)
 			require.NoError(t, err)
 			require.NotNil(t, totals)
 			require.NotZero(t, len(totals.BucketUsages))
 
 			for _, usage := range totals.BucketUsages {
 				require.Equal(t, satbuckets.VersioningEnabled, usage.Versioning)
-				require.False(t, usage.ObjectLockEnabled)
 			}
 
 			for _, bucket := range buckets {
@@ -839,7 +753,7 @@ func TestUsageRollups(t *testing.T) {
 				require.NoError(t, err)
 			}
 
-			totals, err = usageRollups.GetBucketTotals(ctx, project1, cursor, now)
+			totals, err = usageRollups.GetBucketTotals(ctx, project1, cursor, since, now)
 			require.NoError(t, err)
 			require.NotNil(t, totals)
 
@@ -888,11 +802,10 @@ func TestUsageRollups(t *testing.T) {
 			require.NoError(t, err)
 
 			cursor.Search = lockedBucket
-			totals, err = usageRollups.GetBucketTotals(ctx, project1, cursor, now)
+			totals, err = usageRollups.GetBucketTotals(ctx, project1, cursor, since, now)
 			require.NoError(t, err)
 			require.NotNil(t, totals)
 			require.Len(t, totals.BucketUsages, 1)
-			require.True(t, totals.BucketUsages[0].ObjectLockEnabled)
 			require.Equal(t, storj.ComplianceMode, totals.BucketUsages[0].DefaultRetentionMode)
 			require.Nil(t, totals.BucketUsages[0].DefaultRetentionYears)
 			require.NotNil(t, totals.BucketUsages[0].DefaultRetentionDays)
@@ -916,7 +829,7 @@ func TestUsageRollups(t *testing.T) {
 				_, err = db.Buckets().UpdateBucket(ctx, b)
 				require.NoError(t, err)
 			}
-			page, err := usageRollups.GetBucketTotals(ctx, planet.Uplinks[0].Projects[0].ID, accounting.BucketUsageCursor{Limit: 100, Page: 1}, time.Now())
+			page, err := usageRollups.GetBucketTotals(ctx, planet.Uplinks[0].Projects[0].ID, accounting.BucketUsageCursor{Limit: 100, Page: 1}, since, now)
 			require.NoError(t, err)
 			require.NotNil(t, page)
 			for _, b := range page.BucketUsages {
@@ -926,6 +839,292 @@ func TestUsageRollups(t *testing.T) {
 				require.NoError(t, err)
 				require.True(t, int(b.DefaultPlacement) == n)
 			}
+		})
+	})
+}
+
+func TestGetBucketTotals(t *testing.T) {
+	testplanet.Run(t, testplanet.Config{
+		SatelliteCount: 1, StorageNodeCount: 0, UplinkCount: 1,
+	}, func(t *testing.T, ctx *testcontext.Context, planet *testplanet.Planet) {
+		sat := planet.Satellites[0]
+		db := sat.DB
+		now := time.Now().UTC()
+
+		sat.Accounting.Tally.Loop.Pause()
+		sat.Accounting.Rollup.Loop.Pause()
+		sat.Accounting.RollupArchive.Loop.Pause()
+
+		currentMonthStart := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC)
+		previousMonthStart := time.Date(now.Year(), now.Month()-1, 1, 0, 0, 0, 0, time.UTC)
+		twoMonthsAgoStart := time.Date(now.Year(), now.Month()-2, 1, 0, 0, 0, 0, time.UTC)
+
+		upl := planet.Uplinks[0]
+		projectID := upl.Projects[0].ID
+
+		buckets := []struct {
+			name           string
+			createdAt      time.Time
+			currentBW      int64 // current month bandwidth
+			previousBW     int64 // previous month bandwidth
+			twoMonthsAgoBW int64 // two months ago bandwidth
+			storage        int64
+		}{
+			{"bucket-0", currentMonthStart.Add(2 * 24 * time.Hour), 1000, 2000, 3000, 10000},
+			{"bucket-1", currentMonthStart.Add(-60 * 24 * time.Hour), 4000, 5000, 6000, 11000},
+			{"bucket-2", currentMonthStart.Add(-15 * 24 * time.Hour), 7000, 8000, 9000, 12000},
+			{"bucket-3", currentMonthStart.Add(-5 * 24 * time.Hour), 0, 0, 0, 0},
+		}
+
+		// Create buckets and add test data.
+		for _, b := range buckets {
+			require.NoError(t, upl.TestingCreateBucket(ctx, sat, b.name))
+
+			require.NoError(t, db.Orders().UpdateBucketBandwidthSettle(ctx, projectID, []byte(b.name),
+				pb.PieceAction_GET, b.currentBW, 0, currentMonthStart.Add(24*time.Hour)))
+			require.NoError(t, db.Orders().UpdateBucketBandwidthSettle(ctx, projectID, []byte(b.name),
+				pb.PieceAction_GET, b.previousBW, 0, previousMonthStart.Add(24*time.Hour)))
+			require.NoError(t, db.Orders().UpdateBucketBandwidthSettle(ctx, projectID, []byte(b.name),
+				pb.PieceAction_GET, b.twoMonthsAgoBW, 0, twoMonthsAgoStart.Add(24*time.Hour)))
+
+			require.NoError(t, db.Orders().UpdateBucketBandwidthInline(ctx, projectID, []byte(b.name),
+				pb.PieceAction_GET, b.currentBW/10, currentMonthStart.Add(24*time.Hour)))
+
+			bucketLoc := metabase.BucketLocation{
+				ProjectID:  projectID,
+				BucketName: metabase.BucketName(b.name),
+			}
+			tally := &accounting.BucketTally{
+				BucketLocation: bucketLoc,
+				TotalBytes:     b.storage,
+			}
+			bucketTallies := map[metabase.BucketLocation]*accounting.BucketTally{bucketLoc: tally}
+
+			require.NoError(t, db.ProjectAccounting().SaveTallies(ctx, currentMonthStart.Add(24*time.Hour), bucketTallies))
+		}
+
+		usageRollups := db.ProjectAccounting()
+
+		// If 'now' is within the first 24h of the new month, bump it forward
+		// so that all of our “current‐month” test data (which is written at
+		// currentMonthStart.Add(24h)) falls before this new 'now'.
+		if now.Before(currentMonthStart.Add(24 * time.Hour)) {
+			now = currentMonthStart.Add(48 * time.Hour) // bump to day 3.
+		}
+
+		listSince, listBefore := twoMonthsAgoStart, now
+
+		t.Run("Basic functionality", func(t *testing.T) {
+			cursor := accounting.BucketUsageCursor{Limit: 10, Page: 1}
+
+			totals, err := usageRollups.GetBucketTotals(ctx, projectID, cursor, listSince, listBefore)
+			require.NoError(t, err)
+			require.Equal(t, uint64(4), totals.TotalCount)
+			require.Equal(t, uint(1), totals.CurrentPage)
+			require.Equal(t, uint(1), totals.PageCount)
+			require.Len(t, totals.BucketUsages, 4)
+
+			names := make(map[string]struct{}, 4)
+			for _, u := range totals.BucketUsages {
+				names[u.BucketName] = struct{}{}
+			}
+			require.Contains(t, names, "bucket-0")
+			require.Contains(t, names, "bucket-1")
+			require.Contains(t, names, "bucket-2")
+			require.Contains(t, names, "bucket-3")
+		})
+
+		t.Run("Pagination", func(t *testing.T) {
+			cursor := accounting.BucketUsageCursor{Limit: 2, Page: 1}
+
+			t1, err := usageRollups.GetBucketTotals(ctx, projectID, cursor, listSince, listBefore)
+			require.NoError(t, err)
+			require.Equal(t, uint64(4), t1.TotalCount)
+			require.Equal(t, uint(1), t1.CurrentPage)
+			require.Equal(t, uint(2), t1.PageCount)
+			require.Len(t, t1.BucketUsages, 2)
+
+			cursor.Page = 2
+			t2, err := usageRollups.GetBucketTotals(ctx, projectID, cursor, listSince, listBefore)
+			require.NoError(t, err)
+			require.Equal(t, uint64(4), t2.TotalCount)
+			require.Equal(t, uint(2), t2.CurrentPage)
+			require.Equal(t, uint(2), t2.PageCount)
+			require.Len(t, t2.BucketUsages, 2)
+		})
+
+		t.Run("Search functionality", func(t *testing.T) {
+			cursor := accounting.BucketUsageCursor{Limit: 10, Page: 1, Search: "bucket-2"}
+
+			totals, err := usageRollups.GetBucketTotals(ctx, projectID, cursor, listSince, listBefore)
+			require.NoError(t, err)
+			require.Equal(t, uint64(1), totals.TotalCount)
+			require.Len(t, totals.BucketUsages, 1)
+			require.Equal(t, "bucket-2", totals.BucketUsages[0].BucketName)
+
+			cursor.Search = "buck%' OR 'x' != '"
+			totals, err = usageRollups.GetBucketTotals(ctx, projectID, cursor, listSince, listBefore)
+			require.NoError(t, err)
+			require.Equal(t, uint64(0), totals.TotalCount)
+			require.Len(t, totals.BucketUsages, 0)
+		})
+
+		t.Run("Usage calculated since beginning of month", func(t *testing.T) {
+			cursor := accounting.BucketUsageCursor{Limit: 10, Page: 1}
+
+			// current month: since = first of this month, before = now.
+			totals, err := usageRollups.GetBucketTotals(ctx, projectID, cursor, currentMonthStart, now)
+			require.NoError(t, err)
+
+			for _, usage := range totals.BucketUsages {
+				var expectedBW, expectedInline, expectedSt int64
+				for _, b := range buckets {
+					if b.name == usage.BucketName {
+						expectedBW = b.currentBW
+						expectedInline = b.currentBW / 10
+						expectedSt = b.storage
+					}
+				}
+
+				expectedEgress := float64(expectedBW+expectedInline) / float64(1<<30)
+				expectedStorage := float64(expectedSt) / float64(1<<30)
+				require.InDeltaf(t, expectedEgress, usage.Egress, 1e-6,
+					"Current month egress for bucket %s incorrect. Expected: %v, Got: %v",
+					usage.BucketName, expectedEgress, usage.Egress)
+				require.InDeltaf(t, expectedStorage, usage.Storage, 1e-6,
+					"Current month storage for bucket %s incorrect. Expected: %v, Got: %v",
+					usage.BucketName, expectedStorage, usage.Storage)
+			}
+
+			// previous month: since = first of previous, before = last instant of previous
+			prevLast := currentMonthStart.Add(-time.Second)
+			t2, err := usageRollups.GetBucketTotals(ctx, projectID, cursor, previousMonthStart, prevLast)
+			require.NoError(t, err)
+
+			for _, usage := range t2.BucketUsages {
+				var expectedBW int64
+				for _, b := range buckets {
+					if b.name == usage.BucketName {
+						expectedBW = b.previousBW
+					}
+				}
+
+				expectedEgress := float64(expectedBW) / float64(1<<30)
+				require.InDeltaf(t, expectedEgress, usage.Egress, 1e-6,
+					"Previous month egress for bucket %s incorrect. Expected: %v, Got: %v",
+					usage.BucketName, expectedEgress, usage.Egress)
+			}
+
+			// two months ago: since = first of that month, before = last instant of that month
+			twoLast := previousMonthStart.Add(-time.Second)
+			t3, err := usageRollups.GetBucketTotals(ctx, projectID, cursor, twoMonthsAgoStart, twoLast)
+
+			require.NoError(t, err)
+			for _, usage := range t3.BucketUsages {
+				var expectedBW int64
+				for _, b := range buckets {
+					if b.name == usage.BucketName {
+						expectedBW = b.twoMonthsAgoBW
+					}
+				}
+
+				expectedEgress := float64(expectedBW) / float64(1<<30)
+				require.InDeltaf(t, expectedEgress, usage.Egress, 1e-6,
+					"Two months ago egress for bucket %s incorrect. Expected: %v, Got: %v",
+					usage.BucketName, expectedEgress, usage.Egress)
+			}
+		})
+
+		t.Run("Error conditions", func(t *testing.T) {
+			// page zero
+			_, err := usageRollups.GetBucketTotals(ctx, projectID, accounting.BucketUsageCursor{Limit: 10, Page: 0}, twoMonthsAgoStart, now)
+			require.Error(t, err)
+			require.Contains(t, err.Error(), "page can not be 0")
+
+			// page out of range
+			_, err = usageRollups.GetBucketTotals(ctx, projectID, accounting.BucketUsageCursor{Limit: 10, Page: 999}, twoMonthsAgoStart, now)
+			require.Error(t, err)
+			require.Contains(t, err.Error(), "page is out of range")
+
+			// limit capped
+			largeCursor := accounting.BucketUsageCursor{Limit: 1000000, Page: 1}
+			totals, err := usageRollups.GetBucketTotals(ctx, projectID, largeCursor, twoMonthsAgoStart, now)
+			require.NoError(t, err)
+			require.Less(t, totals.Limit, uint(1000000))
+		})
+
+		t.Run("CreatorEmail visibility and search", func(t *testing.T) {
+			memberUser, err := sat.AddUser(ctx, console.CreateUser{
+				FullName: "Member User",
+				Email:    "member@example.com",
+			}, 1)
+			require.NoError(t, err)
+
+			member, err := db.Console().ProjectMembers().Insert(ctx, memberUser.ID, projectID, console.RoleMember)
+			require.NoError(t, err)
+
+			bucketName := "member-bucket"
+
+			_, err = db.Buckets().CreateBucket(ctx, satbuckets.Bucket{
+				Name:       bucketName,
+				ProjectID:  projectID,
+				Versioning: satbuckets.Unversioned,
+				CreatedBy:  memberUser.ID,
+			})
+			require.NoError(t, err)
+
+			cursor := accounting.BucketUsageCursor{Limit: 10, Page: 1, Search: memberUser.Email}
+			totals, err := usageRollups.GetBucketTotals(ctx, projectID, cursor, listSince, listBefore)
+			require.NoError(t, err)
+			require.NotNil(t, totals)
+			require.NotNil(t, totals.BucketUsages)
+			require.Len(t, totals.BucketUsages, 1)
+			require.Equal(t, bucketName, totals.BucketUsages[0].BucketName)
+			require.Equal(t, memberUser.Email, totals.BucketUsages[0].CreatorEmail)
+
+			err = db.Console().ProjectMembers().Delete(ctx, member.MemberID, projectID)
+			require.NoError(t, err)
+
+			cursor.Search = ""
+			totals, err = usageRollups.GetBucketTotals(ctx, projectID, cursor, listSince, listBefore)
+			require.NoError(t, err)
+
+			var found bool
+			for _, u := range totals.BucketUsages {
+				if u.BucketName == bucketName {
+					found = true
+					require.Equal(t, "", u.CreatorEmail, "ex-member's email must be hidden")
+				}
+			}
+			require.True(t, found)
+		})
+
+		t.Run("Bucket eventing status", func(t *testing.T) {
+			bucketName := "bucket-2"
+			cursor := accounting.BucketUsageCursor{
+				Limit:  10,
+				Page:   1,
+				Search: bucketName,
+			}
+			totals, err := usageRollups.GetBucketTotals(ctx, projectID, cursor, listSince, listBefore)
+			require.NoError(t, err)
+			require.Len(t, totals.BucketUsages, 1)
+			require.Equal(t, bucketName, totals.BucketUsages[0].BucketName)
+			require.False(t, totals.BucketUsages[0].EventingEnabled)
+
+			// insert eventing config for the bucket
+			err = db.Buckets().UpdateBucketNotificationConfig(ctx, []byte(bucketName), projectID, satbuckets.NotificationConfig{
+				ConfigID:  "config-1",
+				TopicName: "@log",
+				Events:    []string{s3event.ObjectCreatedAll.S3Name()},
+			})
+			require.NoError(t, err)
+
+			totals, err = usageRollups.GetBucketTotals(ctx, projectID, cursor, listSince, listBefore)
+			require.NoError(t, err)
+			require.Len(t, totals.BucketUsages, 1)
+			require.Equal(t, bucketName, totals.BucketUsages[0].BucketName)
+			require.True(t, totals.BucketUsages[0].EventingEnabled)
 		})
 	})
 }
@@ -1027,9 +1226,9 @@ func TestProjectUsageBandwidthResetAfter3days(t *testing.T) {
 				return tt.now
 			})
 
-			actualExceeded, _, err := projectUsage.ExceedsBandwidthUsage(ctx, accounting.ProjectLimits{ProjectID: bucket.ProjectID})
+			bwLimit, err := projectUsage.ExceedsBandwidthUsage(ctx, accounting.ProjectLimits{ProjectID: bucket.ProjectID}, false)
 			require.NoError(t, err)
-			require.Equal(t, tt.expectedExceeds, actualExceeded, tt.description)
+			require.Equal(t, tt.expectedExceeds, bwLimit.Exceeds, tt.description)
 		}
 	})
 

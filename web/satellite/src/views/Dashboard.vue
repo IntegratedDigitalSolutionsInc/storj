@@ -2,34 +2,38 @@
 // See LICENSE for copying information.
 
 <template>
-    <v-container class="pb-15">
+    <v-container>
+        <announcement-banner />
+
+        <opt-in-pricing-banner />
+
         <trial-expiration-banner v-if="isTrialExpirationBanner && isUserProjectOwner" :expired="isExpired" />
 
         <card-expire-banner />
 
+        <failed-payment-banner />
+
         <next-steps-container />
 
-        <low-token-balance-banner
-            v-if="isLowBalance && billingEnabled"
-            cta-label="Go to billing"
-            @click="redirectToBilling"
-        />
         <limit-warning-banners v-if="billingEnabled" />
-        <versioning-beta-banner v-if="!versioningBetaBannerDismissed" />
 
         <v-row align="center" justify="space-between">
             <v-col cols="12" md="auto">
+                <v-chip v-if="selectedProject.isClassic" variant="tonal" color="warning" size="large" class="font-weight-bold">
+                    Classic
+                    <v-tooltip activator="parent" location="top">Pricing from before Nov 2025.</v-tooltip>
+                </v-chip>
                 <PageTitleComponent
-                    title="Project dashboard"
+                    title="Project Dashboard"
                     extra-info="Project usage statistics are not real-time. Recent uploads, downloads, or other actions may not be immediately reflected."
                 />
                 <PageSubtitleComponent
-                    subtitle="View your project statistics, check daily usage, and set project limits."
-                    link="https://docs.storj.io/support/projects"
+                    subtitle="View your project statistics and set limits."
+                    :link="configStore.isDefaultBrand ? 'https://docs.storj.io/support/projects' : undefined"
                 />
             </v-col>
             <v-col cols="auto" class="pt-0 mt-0 pt-md-5">
-                <v-btn v-if="!isPaidTier && billingEnabled" variant="outlined" color="default" :prepend-icon="CircleArrowUp" @click="appStore.toggleUpgradeFlow(true)">
+                <v-btn v-if="isUserProjectOwner && !isPaidTier && billingEnabled" variant="outlined" color="default" :prepend-icon="CircleArrowUp" @click="appStore.toggleUpgradeFlow(true)">
                     Upgrade
                 </v-btn>
             </v-col>
@@ -37,105 +41,54 @@
 
         <team-passphrase-banner v-if="isTeamPassphraseBanner" />
 
-        <v-row class="d-flex align-center mt-2">
-            <v-col cols="6" md="4" lg="2">
-                <CardStatsComponent
-                    title="Objects"
-                    subtitle="Project total"
-                    :data="limits.objectCount.toLocaleString()"
-                    :to="ROUTES.Buckets.path"
-                    extra-info="Project usage statistics are not real-time. Recent uploads, downloads, or other actions may not be immediately reflected."
-                />
-            </v-col>
-            <v-col v-if="!emissionImpactViewEnabled" cols="6" md="4" lg="2">
-                <CardStatsComponent title="Segments" subtitle="All object pieces" :data="limits.segmentCount.toLocaleString()" :to="ROUTES.Buckets.path" />
-            </v-col>
-            <v-col cols="6" md="4" lg="2">
-                <CardStatsComponent title="Buckets" subtitle="In this project" :data="bucketsCount.toLocaleString()" :to="ROUTES.Buckets.path" />
-            </v-col>
-            <v-col cols="6" md="4" lg="2">
-                <CardStatsComponent title="Access Keys" subtitle="Total keys" :data="accessGrantsCount.toLocaleString()" :to="ROUTES.Access.path" />
-            </v-col>
-            <v-col cols="6" md="4" lg="2">
-                <CardStatsComponent title="Team" subtitle="Project members" :data="teamSize.toLocaleString()" :to="ROUTES.Team.path" />
-            </v-col>
-            <template v-if="emissionImpactViewEnabled">
-                <v-col cols="12" sm="6" md="4" lg="2">
-                    <emissions-dialog />
-                    <v-tooltip
-                        activator="parent"
-                        location="top"
-                        offset="-20"
-                        opacity="80"
-                    >
-                        Click to learn more
-                    </v-tooltip>
-                    <CardStatsComponent title="CO₂ Estimated" subtitle="For this project" :data="co2Estimated" link />
-                </v-col>
-                <v-col cols="12" sm="6" md="4" lg="2">
-                    <emissions-dialog />
-                    <v-tooltip
-                        activator="parent"
-                        location="top"
-                        offset="-20"
-                        opacity="80"
-                    >
-                        Click to learn more
-                    </v-tooltip>
-                    <CardStatsComponent title="CO₂ Avoided" subtitle="By using Storj" :data="co2Saved" color="success" link />
-                </v-col>
-            </template>
-            <v-col v-if="billingEnabled && !emissionImpactViewEnabled" cols="6" md="4" lg="2">
-                <CardStatsComponent title="Billing" :subtitle="`${paidTierString} account`" :data="paidTierString" :to="ROUTES.Account.with(ROUTES.Billing).path" />
-            </v-col>
-        </v-row>
-
-        <v-row class="d-flex align-center justify-center mb-5">
-            <v-col cols="12" md="6">
+        <v-row align="center" justify="center">
+            <v-col cols="12" md="6" :xl="usageRowXlColSize">
                 <UsageProgressComponent
-                    icon="cloud"
+                    icon="storage"
                     title="Storage"
                     :progress="storageUsedPercent"
                     :used="`${usedLimitFormatted(limits.storageUsed)} Used`"
                     :limit="storageLimitTxt"
                     :available="storageAvailableTxt"
                     :cta="storageCTA"
-                    :no-limit="noLimitsUiEnabled && isProjectOwnerPaidTier && !limits.userSetStorageLimit"
+                    :no-limit="noLimitsUiEnabled && ownerHasPaidPrivileges && !limits.userSetStorageLimit"
                     extra-info="Project usage statistics are not real-time. Recent uploads, downloads, or other actions may not be immediately reflected."
                     @cta-click="onNeedMoreClicked(LimitToChange.Storage)"
                 />
             </v-col>
-            <v-col cols="12" md="6">
+            <v-col cols="12" md="6" :xl="usageRowXlColSize">
                 <UsageProgressComponent
-                    icon="arrow-down"
+                    icon="download"
                     title="Download"
                     :progress="egressUsedPercent"
                     :used="`${usedLimitFormatted(limits.bandwidthUsed)} Used`"
                     :limit="bandwidthLimitTxt"
                     :available="bandwidthAvailableTxt"
                     :cta="bandwidthCTA"
-                    :no-limit="noLimitsUiEnabled && isProjectOwnerPaidTier && !limits.userSetBandwidthLimit"
-                    extra-info="The download bandwidth usage is only for the current billing period of one month."
+                    :no-limit="noLimitsUiEnabled && ownerHasPaidPrivileges && !limits.userSetBandwidthLimit"
+                    :extra-info="billingEnabled ? 'The download bandwidth usage is only for the current billing period of one month.' : ''"
                     @cta-click="onNeedMoreClicked(LimitToChange.Bandwidth)"
                 />
             </v-col>
-            <v-col cols="12" md="6">
+            <v-col v-if="!newPricingEnabled && segmentsUIEnabled" cols="12" md="6" :xl="usageRowXlColSize">
                 <UsageProgressComponent
-                    icon="globe"
+                    icon="segments"
                     title="Segments"
                     :progress="segmentUsedPercent"
                     :used="`${limits.segmentUsed.toLocaleString()} Used`"
                     :limit="`Limit: ${limits.segmentLimit.toLocaleString()}`"
                     :available="`${availableSegment.toLocaleString()} Available`"
                     :cta="getCTALabel(segmentUsedPercent, true)"
+                    :hide-cta="!configStore.isDefaultBrand"
                     @cta-click="onSegmentsCTAClicked"
                 >
                     <template #extraInfo>
                         <p>
                             Segments are the encrypted parts of an uploaded object.
                             <a
+                                v-if="configStore.isDefaultBrand"
                                 class="link"
-                                href="https://docs.storj.io/dcs/pricing#per-segment-fee"
+                                href="https://storj.dev/dcs/pricing/legacy#segment-fees"
                                 target="_blank"
                                 rel="noopener noreferrer"
                             >
@@ -145,21 +98,21 @@
                     </template>
                 </UsageProgressComponent>
             </v-col>
-            <v-col cols="12" md="6">
+            <v-col v-if="isCouponCard || (!newPricingEnabled && bucketLimitsUIEnabled)" cols="12" md="6" :xl="usageRowXlColSize">
                 <UsageProgressComponent
                     v-if="isCouponCard"
-                    icon="check"
+                    icon="coupon"
                     :title="isFreeTierCoupon ? 'Free Usage' : 'Coupon'"
                     :progress="couponProgress"
                     :used="`${couponProgress}% Used`"
                     :limit="`Included free usage: ${couponValue}`"
                     :available="`${couponRemainingPercent}% Available`"
-                    :hide-cta="!isProjectOwner"
+                    :hide-cta="!isUserProjectOwner"
                     :cta="isFreeTierCoupon ? 'Learn more' : 'View Coupons'"
                     @cta-click="onCouponCTAClicked"
                 />
                 <UsageProgressComponent
-                    v-else
+                    v-else-if="!newPricingEnabled && bucketLimitsUIEnabled"
                     icon="bucket"
                     title="Buckets"
                     :progress="bucketsUsedPercent"
@@ -174,91 +127,16 @@
 
         <v-row align="center" justify="space-between">
             <v-col cols="12" md="auto">
-                <v-card-title class="font-weight-bold pl-0">Daily usage</v-card-title>
-                <p class="text-medium-emphasis">
-                    Select date range to view daily usage statistics.
-                </p>
-            </v-col>
-            <v-col cols="auto" class="pt-0 mt-0 pt-md-7">
-                <v-date-input
-                    v-model="chartDateRange"
-                    label="Select Date Range"
-                    min-width="260px"
-                    multiple="range"
-                    prepend-icon=""
-                    density="comfortable"
-                    variant="outlined"
-                    :loading="isLoading"
-                    class="bg-surface"
-                    show-adjacent-months
-                    hide-details
-                >
-                    <v-icon class="mr-2" size="20" icon="$calendar" />
-                </v-date-input>
-            </v-col>
-        </v-row>
-
-        <v-row class="d-flex align-center justify-center mt-2 mb-5">
-            <v-col cols="12" md="6">
-                <v-card ref="chartContainer" class="pb-4">
-                    <template #title>
-                        <v-card-title class="d-flex align-center">
-                            <IconCloud class="mr-2" width="18" height="18" />
-                            Storage
-                        </v-card-title>
-                    </template>
-                    <StorageChart
-                        :width="chartWidth"
-                        :height="160"
-                        :data="storageUsage"
-                        :since="chartsSinceDate"
-                        :before="chartsBeforeDate"
-                    />
-                </v-card>
-            </v-col>
-            <v-col cols="12" md="6">
-                <v-card class="pb-4">
-                    <template #title>
-                        <v-card-title class="d-flex align-center justify-space-between">
-                            <v-row class="ma-0 align-center">
-                                <component :is="ArrowDownToLine" :size="18" class="mr-2" />
-                                Download
-                                <v-tooltip width="250" location="bottom">
-                                    <template #activator="{ props }">
-                                        <v-icon v-bind="props" size="16" :icon="Info" class="ml-2 text-medium-emphasis" />
-                                    </template>
-                                    <template #default>
-                                        <p>
-                                            The most recent data may change as download moves from "allocated" to "settled".
-                                            <a
-                                                class="link"
-                                                href="https://docs.storj.io/dcs/pricing#bandwidth-fee"
-                                                target="_blank"
-                                                rel="noopener noreferrer"
-                                            >
-                                                Learn more
-                                            </a>
-                                        </p>
-                                    </template>
-                                </v-tooltip>
-                            </v-row>
-                        </v-card-title>
-                    </template>
-                    <BandwidthChart
-                        :width="chartWidth"
-                        :height="160"
-                        :data="allocatedBandwidthUsage"
-                        :since="chartsSinceDate"
-                        :before="chartsBeforeDate"
-                    />
-                </v-card>
-            </v-col>
-        </v-row>
-
-        <v-row align="center" justify="space-between">
-            <v-col cols="12" md="auto">
                 <v-card-title class="font-weight-bold pl-0">
-                    Storage buckets
+                    Storage Buckets
+                    <v-tooltip width="240" location="bottom">
+                        <template #activator="activator">
+                            <v-icon v-bind="activator.props" size="14" :icon="Info" color="info" class="ml-1" />
+                        </template>
+                        <template #default>
+                            <p>Project usage statistics are not real-time. Recent uploads, downloads, or other actions may not be immediately reflected.</p>
+                        </template>
+                    </v-tooltip>
                 </v-card-title>
                 <p class="text-medium-emphasis">
                     Buckets are where you upload and organize your data.
@@ -284,115 +162,67 @@
     </v-container>
 
     <edit-project-limit-dialog v-model="isEditLimitDialogShown" :limit-type="limitToChange" />
-    <create-bucket-dialog v-model="isCreateBucketDialogShown" />
     <CreateBucketDialog v-model="isCreateBucketDialogOpen" />
 </template>
 
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue';
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue';
 import {
     VBtn,
-    VCard,
     VCardTitle,
     VCol,
     VContainer,
     VRow,
     VIcon,
     VTooltip,
+    VChip,
 } from 'vuetify/components';
-import { VDateInput } from 'vuetify/labs/components';
-import { ComponentPublicInstance } from '@vue/runtime-core';
 import { useRouter } from 'vue-router';
-import { Info, ArrowDownToLine, CirclePlus, CircleArrowUp } from 'lucide-vue-next';
+import { Info, CirclePlus, CircleArrowUp } from '@lucide/vue';
 
 import { useUsersStore } from '@/store/modules/usersStore';
 import { useProjectsStore } from '@/store/modules/projectsStore';
-import { useProjectMembersStore } from '@/store/modules/projectMembersStore';
-import { useAccessGrantsStore } from '@/store/modules/accessGrantsStore';
 import { useBillingStore } from '@/store/modules/billingStore';
-import { useBucketsStore } from '@/store/modules/bucketsStore';
-import { DataStamp, Emission, LimitToChange, Project, ProjectLimits } from '@/types/projects';
+import { type Project, type ProjectLimits, LimitToChange  } from '@/types/projects';
 import { Dimensions, Size } from '@/utils/bytesSize';
-import { ChartUtils } from '@/utils/chart';
 import { AnalyticsErrorEventSource } from '@/utils/constants/analyticsEventNames';
-import { useNotify } from '@/utils/hooks';
+import { useNotify } from '@/composables/useNotify';
 import { useAppStore } from '@/store/modules/appStore';
-import { ProjectMembersPage, ProjectRole } from '@/types/projectMembers';
-import { AccessGrantsPage } from '@/types/accessGrants';
+import { ProjectRole } from '@/types/projectMembers';
 import { useConfigStore } from '@/store/modules/configStore';
-import { useLowTokenBalance } from '@/composables/useLowTokenBalance';
 import { ROUTES } from '@/router';
-import { AccountBalance, CreditCard } from '@/types/payments';
-import { useLoading } from '@/composables/useLoading';
 import { usePreCheck } from '@/composables/usePreCheck';
 
 import PageTitleComponent from '@/components/PageTitleComponent.vue';
 import PageSubtitleComponent from '@/components/PageSubtitleComponent.vue';
-import CardStatsComponent from '@/components/CardStatsComponent.vue';
 import UsageProgressComponent from '@/components/UsageProgressComponent.vue';
-import BandwidthChart from '@/components/BandwidthChart.vue';
-import StorageChart from '@/components/StorageChart.vue';
 import BucketsDataTable from '@/components/BucketsDataTable.vue';
 import EditProjectLimitDialog from '@/components/dialogs/EditProjectLimitDialog.vue';
 import CreateBucketDialog from '@/components/dialogs/CreateBucketDialog.vue';
-import IconCloud from '@/components/icons/IconCloud.vue';
 import LimitWarningBanners from '@/components/LimitWarningBanners.vue';
-import LowTokenBalanceBanner from '@/components/LowTokenBalanceBanner.vue';
 import NextStepsContainer from '@/components/onboarding/NextStepsContainer.vue';
 import TeamPassphraseBanner from '@/components/TeamPassphraseBanner.vue';
-import EmissionsDialog from '@/components/dialogs/EmissionsDialog.vue';
 import TrialExpirationBanner from '@/components/TrialExpirationBanner.vue';
-import VersioningBetaBanner from '@/components/VersioningBetaBanner.vue';
 import CardExpireBanner from '@/components/CardExpireBanner.vue';
-
-type ValueUnit = {
-    value: number
-    unit: string
-}
+import FailedPaymentBanner from '@/components/FailedPaymentBanner.vue';
+import AnnouncementBanner from '@/components/AnnouncementBanner.vue';
+import OptInPricingBanner from '@/components/OptInPricingBanner.vue';
 
 const appStore = useAppStore();
 const usersStore = useUsersStore();
 const projectsStore = useProjectsStore();
-const pmStore = useProjectMembersStore();
-const agStore = useAccessGrantsStore();
 const billingStore = useBillingStore();
-const bucketsStore = useBucketsStore();
 const configStore = useConfigStore();
 
 const notify = useNotify();
 const router = useRouter();
-const isLowBalance = useLowTokenBalance();
-const { isLoading, withLoading } = useLoading();
 const { isTrialExpirationBanner, isUserProjectOwner, isExpired, withTrialCheck, withManagedPassphraseCheck } = usePreCheck();
 
-const chartWidth = ref<number>(0);
-const chartContainer = ref<ComponentPublicInstance>();
 const isEditLimitDialogShown = ref<boolean>(false);
 const limitToChange = ref<LimitToChange>(LimitToChange.Storage);
-const isCreateBucketDialogShown = ref<boolean>(false);
 const isCreateBucketDialogOpen = ref<boolean>(false);
-const datePickerModel = ref<Date[]>([]);
 
-/**
- * Returns formatted CO2 estimated info.
- */
-const co2Estimated = computed<string>(() => {
-    const formatted = getValueAndUnit(Math.round(emission.value.storjImpact));
-
-    return `${formatted.value.toLocaleString()} ${formatted.unit} CO₂e`;
-});
-
-/**
- * Returns formatted CO2 save info.
- */
-const co2Saved = computed<string>(() => {
-    let value = Math.round(emission.value.hyperscalerImpact) - Math.round(emission.value.storjImpact);
-    if (value < 0) value = 0;
-
-    const formatted = getValueAndUnit(value);
-
-    return `${formatted.value.toLocaleString()} ${formatted.unit} CO₂e`;
-});
+const user = computed(() => usersStore.state.user);
 
 /**
  * Indicates if billing coupon card should be shown.
@@ -401,13 +231,31 @@ const isCouponCard = computed<boolean>(() => {
     return billingStore.state.coupon !== null &&
         billingEnabled.value &&
         !isPaidTier.value &&
-        selectedProject.value.ownerId === usersStore.state.user.id;
+        selectedProject.value.ownerId === user.value.id;
 });
 
 /**
  * Indicates if billing features are enabled.
  */
-const billingEnabled = computed<boolean>(() => configStore.getBillingEnabled(usersStore.state.user.hasVarPartner));
+const billingEnabled = computed<boolean>(() => configStore.getBillingEnabled(user.value));
+
+/**
+ * Whether this project has new pricing.
+ */
+const newPricingEnabled = computed<boolean>(() => {
+    if (!billingEnabled.value) return false;
+    return configStore.getProjectHasNewPricing(selectedProject.value.createdAt);
+});
+
+/**
+ * Calculates usage row column size based on enabled cards.
+ */
+const usageRowXlColSize = computed(() => {
+    let cards = 4;
+    if (newPricingEnabled.value || !segmentsUIEnabled.value) cards--;
+    if (!isCouponCard.value && newPricingEnabled.value) cards--;
+    return Math.floor(12 / cards);
+});
 
 /**
  * Returns percent of coupon used.
@@ -416,7 +264,8 @@ const couponProgress = computed((): number => {
     if (!billingStore.state.coupon) {
         return 0;
     }
-    const charges = billingStore.state.projectCharges.getPrice();
+
+    const charges = billingStore.state.productCharges.getPrice();
     const couponValue = billingStore.state.coupon.amountOff;
     if (charges > couponValue) {
         return 100;
@@ -462,21 +311,16 @@ const noLimitsUiEnabled = computed((): boolean => {
  * Whether the user is in paid tier.
  */
 const isPaidTier = computed((): boolean => {
-    return usersStore.state.user.paidTier;
+    return user.value.isPaid;
 });
+
+const isMemberAccount = computed<boolean>(() => user.value.isMember);
 
 /**
  * Whether project members passphrase banner should be shown.
  */
 const isTeamPassphraseBanner = computed<boolean>(() => {
-    return !usersStore.state.settings.noticeDismissal.projectMembersPassphrase && teamSize.value > 1;
-});
-
-/**
- * Returns user account tier string.
- */
-const paidTierString = computed((): string => {
-    return isPaidTier.value ? 'Pro' : 'Free';
+    return !usersStore.state.settings.noticeDismissal.projectMembersPassphrase && teamSize.value > 1 && !hasManagedPassphrase.value;
 });
 
 /**
@@ -502,14 +346,11 @@ const segmentUsedPercent = computed((): number => {
 });
 
 /**
- * Returns whether this project is owned by a paid tier user.
+ * Returns whether the owner of this project has paid privileges
  */
-const isProjectOwnerPaidTier = computed(() => projectsStore.selectedProjectConfig.isOwnerPaidTier);
+const ownerHasPaidPrivileges = computed(() => projectsStore.selectedProjectConfig.hasPaidPrivileges);
 
-/**
- * Returns whether this project is owned by the current user.
- */
-const isProjectOwner = computed(() => selectedProject.value.ownerId === usersStore.state.user.id);
+const hasManagedPassphrase = computed<boolean>(() => projectsStore.selectedProjectConfig.hasManagedPassphrase);
 
 /**
  * Returns whether this project is owned by the current user
@@ -517,7 +358,7 @@ const isProjectOwner = computed(() => selectedProject.value.ownerId === usersSto
  */
 const isProjectOwnerOrAdmin = computed(() => {
     const isAdmin = projectsStore.selectedProjectConfig.role === ProjectRole.Admin;
-    return isProjectOwner.value || isAdmin;
+    return isUserProjectOwner.value || isAdmin;
 });
 
 /**
@@ -525,7 +366,7 @@ const isProjectOwnerOrAdmin = computed(() => {
  */
 const availableEgress = computed((): number => {
     let diff = (limits.value.userSetBandwidthLimit || limits.value.bandwidthLimit) - limits.value.bandwidthUsed;
-    if (isProjectOwnerPaidTier.value && noLimitsUiEnabled.value && !limits.value.userSetBandwidthLimit) {
+    if (ownerHasPaidPrivileges.value && noLimitsUiEnabled.value && !limits.value.userSetBandwidthLimit) {
         diff = Number.MAX_SAFE_INTEGER;
     } else if (!noLimitsUiEnabled.value) {
         diff = limits.value.bandwidthLimit - limits.value.bandwidthUsed;
@@ -544,7 +385,7 @@ const egressUsedPercent = computed((): number => {
  * Returns the CTA text on the bandwidth usage card.
  */
 const bandwidthCTA = computed((): string => {
-    if (!isProjectOwnerPaidTier.value) {
+    if (!ownerHasPaidPrivileges.value) {
         return getCTALabel(egressUsedPercent.value);
     }
     if (limits.value.userSetBandwidthLimit) {
@@ -558,7 +399,7 @@ const bandwidthCTA = computed((): string => {
  * Returns the used bandwidth text for the storage usage card.
  */
 const bandwidthLimitTxt = computed((): string => {
-    if (isProjectOwnerPaidTier.value && noLimitsUiEnabled.value && !limits.value.userSetBandwidthLimit) {
+    if (ownerHasPaidPrivileges.value && noLimitsUiEnabled.value && !limits.value.userSetBandwidthLimit) {
         return 'This Month';
     }
     return `Limit: ${usedLimitFormatted(limits.value.userSetBandwidthLimit || limits.value.bandwidthLimit)}`;
@@ -579,7 +420,7 @@ const bandwidthAvailableTxt = computed((): string => {
  */
 const availableStorage = computed((): number => {
     let diff = (limits.value.userSetStorageLimit || limits.value.storageLimit) - limits.value.storageUsed;
-    if (isProjectOwnerPaidTier.value && noLimitsUiEnabled.value && !limits.value.userSetStorageLimit) {
+    if (ownerHasPaidPrivileges.value && noLimitsUiEnabled.value && !limits.value.userSetStorageLimit) {
         diff = Number.MAX_SAFE_INTEGER;
     } else if (!noLimitsUiEnabled.value) {
         diff = limits.value.storageLimit - limits.value.storageUsed;
@@ -598,7 +439,7 @@ const storageUsedPercent = computed((): number => {
  * Returns the CTA text on the storage usage card.
  */
 const storageCTA = computed((): string => {
-    if (!isProjectOwnerPaidTier.value) {
+    if (!ownerHasPaidPrivileges.value) {
         return getCTALabel(storageUsedPercent.value);
     }
     if (limits.value.userSetStorageLimit) {
@@ -612,7 +453,7 @@ const storageCTA = computed((): string => {
  * Returns the used storage text for the storage usage card.
  */
 const storageLimitTxt = computed((): string => {
-    if (isProjectOwnerPaidTier.value && noLimitsUiEnabled.value && !limits.value.userSetStorageLimit) {
+    if (ownerHasPaidPrivileges.value && noLimitsUiEnabled.value && !limits.value.userSetStorageLimit) {
         return 'Total';
     }
     return `Limit: ${usedLimitFormatted(limits.value.userSetStorageLimit || limits.value.storageLimit)}`;
@@ -654,112 +495,19 @@ const selectedProject = computed((): Project => {
  * Returns current team size from store.
  */
 const teamSize = computed((): number => {
-    return pmStore.state.page.totalCount;
+    return projectsStore.state.selectedProjectConfig.membersCount;
 });
 
 /**
- * Returns access grants count from store.
+ * Indicates if segments UI should be shown.
  */
-const accessGrantsCount = computed((): number => {
-    return agStore.state.page.totalCount;
+const segmentsUIEnabled = computed<boolean>(() => {
+    return configStore.state.config.segmentsUIEnabled;
 });
 
-/**
- * Returns access grants count from store.
- */
-const bucketsCount = computed((): number => {
-    return bucketsStore.state.page.totalCount;
+const bucketLimitsUIEnabled = computed<boolean>(() => {
+    return configStore.state.config.bucketLimitsUIEnabled;
 });
-
-/**
- * Returns charts since date from store.
- */
-const chartsSinceDate = computed((): Date => {
-    return projectsStore.state.chartDataSince;
-});
-
-/**
- * Returns charts before date from store.
- */
-const chartsBeforeDate = computed((): Date => {
-    return projectsStore.state.chartDataBefore;
-});
-
-/**
- * Return a new 7 days range if datePickerModel is empty.
- */
-const chartDateRange = computed<Date[]>({
-    get: () => {
-        const dates: Date[] = [...datePickerModel.value];
-        if (!dates.length) {
-            for (let i = 6; i >= 0; i--) {
-                const d = new Date();
-                d.setDate(d.getDate() - i);
-                dates.push(d);
-            }
-        }
-        return dates;
-    },
-    set: newValue => {
-        const newRange = [...newValue];
-        if (newRange.length === 0) {
-            return;
-        }
-        if (newRange.length < 2) {
-            const d = new Date();
-            d.setDate(newRange[0].getDate() + 1);
-            newRange.push(d);
-        }
-        datePickerModel.value = newRange;
-    },
-});
-
-/**
- * Returns storage chart data from store.
- */
-const storageUsage = computed((): DataStamp[] => {
-    return ChartUtils.populateEmptyUsage(
-        projectsStore.state.storageChartData, chartsSinceDate.value, chartsBeforeDate.value,
-    );
-});
-
-/**
- * Returns allocated bandwidth chart data from store.
- */
-const allocatedBandwidthUsage = computed((): DataStamp[] => {
-    return ChartUtils.populateEmptyUsage(
-        projectsStore.state.allocatedBandwidthChartData, chartsSinceDate.value, chartsBeforeDate.value,
-    );
-});
-
-/**
- * Indicates if emission impact view should be shown.
- */
-const emissionImpactViewEnabled = computed<boolean>(() => {
-    return configStore.state.config.emissionImpactViewEnabled;
-});
-
-/**
- * Returns project's emission impact.
- */
-const emission = computed<Emission>(()  => {
-    return projectsStore.state.emission;
-});
-
-/**
- * Whether the user has dismissed the versioning beta banner.
- */
-const versioningBetaBannerDismissed = computed(() => !!usersStore.noticeDismissal?.versioningBetaBanner);
-
-/**
- * Returns adjusted value and unit.
- */
-function getValueAndUnit(value: number): ValueUnit {
-    const unitUpgradeThreshold = 999999;
-    const [newValue, unit] = value > unitUpgradeThreshold ? [value / 1000, 't'] : [value, 'kg'];
-
-    return { value: newValue, unit };
-}
 
 /**
  * Starts create bucket flow if user's free trial is not expired.
@@ -790,22 +538,15 @@ function formattedValue(value: Size): string {
 }
 
 /**
- * Used container size recalculation for charts resizing.
- */
-function recalculateChartWidth(): void {
-    chartWidth.value = chartContainer.value?.$el.getBoundingClientRect().width - 16 || 0;
-}
-
-/**
  * Conditionally opens the upgrade dialog
  * or the edit limit dialog.
  */
 function onNeedMoreClicked(source: LimitToChange): void {
-    if (isProjectOwner.value && !isPaidTier.value && billingEnabled.value) {
+    if (isUserProjectOwner.value && !isPaidTier.value && billingEnabled.value) {
         appStore.toggleUpgradeFlow(true);
         return;
     }
-    if (!isProjectOwnerPaidTier.value) {
+    if (!ownerHasPaidPrivileges.value) {
         notify.notify('Contact project owner to upgrade to edit limits');
         return;
     }
@@ -821,7 +562,7 @@ function onNeedMoreClicked(source: LimitToChange): void {
  * Returns CTA label based on paid tier status and current usage.
  */
 function getCTALabel(usage: number, isSegment = false): string {
-    if (isProjectOwner.value && !isPaidTier.value && billingEnabled.value) {
+    if (isUserProjectOwner.value && !isPaidTier.value && billingEnabled.value) {
         if (usage >= 100) {
             return 'Upgrade now';
         }
@@ -843,12 +584,12 @@ function getCTALabel(usage: number, isSegment = false): string {
  * Conditionally opens the upgrade dialog or docs link.
  */
 function onSegmentsCTAClicked(): void {
-    if (isProjectOwner.value && !isPaidTier.value && billingEnabled.value) {
+    if (isUserProjectOwner.value && !isPaidTier.value && billingEnabled.value) {
         appStore.toggleUpgradeFlow(true);
         return;
     }
 
-    window.open('https://docs.storj.io/dcs/pricing#per-segment-fee', '_blank', 'noreferrer');
+    window.open('https://storj.dev/support/usage-limit-increases#segment-limit', '_blank', 'noreferrer');
 }
 
 /**
@@ -867,11 +608,11 @@ function onCouponCTAClicked(): void {
  * Opens limit increase request link in a new tab.
  */
 function onBucketsCTAClicked(): void {
-    if (isProjectOwner.value && !isPaidTier.value && billingEnabled.value) {
+    if (isUserProjectOwner.value && !isPaidTier.value && billingEnabled.value) {
         appStore.toggleUpgradeFlow(true);
         return;
     }
-    if (!isProjectOwnerPaidTier.value) {
+    if (!ownerHasPaidPrivileges.value) {
         notify.notify('Contact project owner to upgrade to edit limits');
         return;
     }
@@ -880,7 +621,7 @@ function onBucketsCTAClicked(): void {
         return;
     }
 
-    window.open(configStore.state.config.projectLimitsIncreaseRequestURL, '_blank', 'noreferrer');
+    window.open(configStore.projectLimitsIncreaseRequestURL, '_blank', 'noreferrer');
 }
 
 /**
@@ -892,83 +633,23 @@ function redirectToBilling(): void {
 
 /**
  * Lifecycle hook after initial render.
- * Fetches project limits.
  */
 onMounted(async (): Promise<void> => {
-    const projectID = selectedProject.value.id;
-    const FIRST_PAGE = 1;
-
-    window.addEventListener('resize', recalculateChartWidth);
-    recalculateChartWidth();
-
-    const promises: Promise<void | ProjectMembersPage | AccessGrantsPage | AccountBalance | CreditCard[]>[] = [
-        projectsStore.getDailyProjectData({ since: chartDateRange.value[0], before: chartDateRange.value[chartDateRange.value.length - 1] }),
-        pmStore.getProjectMembers(FIRST_PAGE, projectID),
-        agStore.getAccessGrants(FIRST_PAGE, projectID),
-        bucketsStore.getBuckets(FIRST_PAGE, projectID),
-    ];
-
-    if (emissionImpactViewEnabled.value) {
-        promises.push(projectsStore.getEmissionImpact(projectID));
-    }
-
-    if (billingEnabled.value) {
-        promises.push(
-            billingStore.getProjectUsageAndChargesCurrentRollup(),
-            billingStore.getBalance(),
-            billingStore.getCreditCards(),
-            billingStore.getCoupon(),
-        );
-    }
-
-    if (configStore.state.config.nativeTokenPaymentsEnabled && billingEnabled.value) {
-        promises.push(billingStore.getNativePaymentsHistory());
-    }
+    if (!billingEnabled.value || isMemberAccount.value) return;
 
     try {
-        await Promise.all(promises);
+        await Promise.all([
+            billingStore.getCreditCards(),
+            billingStore.getCoupon(),
+            billingStore.getProductUsageAndChargesCurrentRollup(),
+            billingStore.getFailedInvoice(),
+        ]);
     } catch (error) {
         notify.notifyError(error, AnalyticsErrorEventSource.PROJECT_DASHBOARD_PAGE);
     }
 });
 
-/**
- * Lifecycle hook before component destruction.
- * Removes event listener on window resizing.
- */
 onBeforeUnmount((): void => {
-    window.removeEventListener('resize', recalculateChartWidth);
     appStore.toggleHasJustLoggedIn(false);
 });
-
-watch(datePickerModel, async (newRange) => {
-    if (newRange.length < 2) return;
-
-    await withLoading(async () => {
-        let startDate = newRange[0];
-        let endDate = newRange[newRange.length - 1];
-        if (startDate.getTime() > endDate.getTime()) {
-            [startDate, endDate] = [endDate, startDate];
-        }
-
-        const since = new Date(startDate);
-        const before = new Date(endDate);
-        before.setHours(23, 59, 59, 999);
-
-        try {
-            await projectsStore.getDailyProjectData({ since, before });
-        } catch (error) {
-            notify.notifyError(error, AnalyticsErrorEventSource.PROJECT_DASHBOARD_PAGE);
-        }
-    });
-});
 </script>
-<style scoped lang="scss">
-:deep(.v-field__input) {
-    cursor: pointer;
-
-    input {
-        cursor: pointer;
-    }
-}
-</style>

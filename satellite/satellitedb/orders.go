@@ -44,7 +44,8 @@ var (
 )
 
 type ordersDB struct {
-	db *satelliteDB
+	db             *satelliteDB
+	maxCommitDelay *time.Duration
 }
 
 type bandwidth struct {
@@ -133,62 +134,6 @@ func (db *ordersDB) UpdateBucketBandwidthAllocation(ctx context.Context, project
 
 			return errlist.Err()
 		})
-	case dbutil.Spanner:
-		return db.db.WithTx(ctx, func(ctx context.Context, tx *dbx.Tx) error {
-			updateBBR := `
-				UPDATE bucket_bandwidth_rollups AS bbr
-				SET  bbr.allocated = bbr.allocated + ?  WHERE project_id = ? AND bucket_name = ? AND interval_start = ? AND action = ?
-			`
-			result, err := tx.Tx.ExecContext(ctx, updateBBR, uint64(amount), projectID, bucketName, intervalStart, int64(action))
-			if err != nil {
-				return errs.Wrap(err)
-			}
-
-			affected, err := result.RowsAffected()
-			if err != nil {
-				return errs.Wrap(err)
-			}
-
-			if affected == 0 {
-				insertBDR := `
-					INSERT OR IGNORE INTO bucket_bandwidth_rollups (project_id, bucket_name, interval_start, interval_seconds, action, inline, allocated, settled)
-					VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-				`
-				_, err := tx.Tx.ExecContext(ctx, insertBDR, projectID, bucketName, intervalStart, defaultIntervalSeconds, int64(action), 0, uint64(amount), 0)
-				if err != nil {
-					return errs.Wrap(err)
-				}
-			}
-
-			if action == pb.PieceAction_GET {
-				civilDailyIntervalDate := civil.DateOf(dailyInterval)
-				updatePBDR := `
-					UPDATE project_bandwidth_daily_rollups AS pbdr
-					SET pbdr.egress_allocated = pbdr.egress_allocated + ? WHERE project_id = ? AND interval_day = ?
-				`
-				result, err = tx.Tx.ExecContext(ctx, updatePBDR, uint64(amount), projectID, civilDailyIntervalDate)
-				if err != nil {
-					return err
-				}
-
-				affected, err = result.RowsAffected()
-				if err != nil {
-					return errs.Wrap(err)
-				}
-
-				if affected == 0 {
-					insertPBDR := `
-						INSERT OR IGNORE INTO project_bandwidth_daily_rollups (project_id, interval_day, egress_allocated, egress_settled, egress_dead)
-						VALUES (?, ?, ?, ?, ?)
-					`
-					_, err = tx.Tx.ExecContext(ctx, insertPBDR, projectID, civilDailyIntervalDate, uint64(amount), 0, 0)
-					if err != nil {
-						return err
-					}
-				}
-			}
-			return err
-		})
 	default:
 		return errs.Wrap(fmt.Errorf("unsupported database dialect: %s", db.db.impl))
 	}
@@ -231,52 +176,6 @@ func (db *ordersDB) UpdateBucketBandwidthSettle(ctx context.Context, projectID u
 			}
 			return nil
 		})
-	case dbutil.Spanner:
-		return db.db.WithTx(ctx, func(ctx context.Context, tx *dbx.Tx) error {
-			updateBBRStatement := tx.Rebind(
-				`UPDATE bucket_bandwidth_rollups AS bbr SET  bbr.settled = bbr.settled + ? WHERE project_id = ? AND bucket_name =? AND interval_start = ?  AND action = ?`,
-			)
-			_, err := tx.Tx.ExecContext(ctx, updateBBRStatement,
-				uint64(settledAmount), projectID, bucketName, intervalStart.UTC(), int64(action),
-			)
-			if err != nil {
-				return ErrUpdateBucketBandwidthSettle.Wrap(err)
-			}
-
-			insertBBRStatement := tx.Rebind(
-				`INSERT OR IGNORE INTO bucket_bandwidth_rollups (project_id, bucket_name, interval_start, interval_seconds, action, inline, allocated, settled)
-					VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-			)
-			_, err = tx.Tx.ExecContext(ctx, insertBBRStatement,
-				projectID, bucketName, intervalStart.UTC(), defaultIntervalSeconds, int64(action), 0, 0, uint64(settledAmount), uint64(settledAmount),
-			)
-			if err != nil {
-				return ErrUpdateBucketBandwidthSettle.Wrap(err)
-			}
-
-			if action == pb.PieceAction_GET {
-				dailyInterval := time.Date(intervalStart.Year(), intervalStart.Month(), intervalStart.Day(), 0, 0, 0, 0, time.UTC)
-				civilIntervalDate := civil.DateOf(dailyInterval)
-				updatePBDRStatement := tx.Rebind(
-					`UPDATE project_bandwidth_daily_rollups AS pbdr SET pbdr.egress_settled = pbdr.egress_settled + ?, pbdr.egress_dead = pbdr.egress_dead + ?
-					WHERE (project_id = ? AND interval_day = ? )`,
-				)
-				_, err = tx.Tx.ExecContext(ctx, updatePBDRStatement, uint64(settledAmount), uint64(deadAmount), projectID, civilIntervalDate)
-				if err != nil {
-					return ErrUpdateBucketBandwidthSettle.Wrap(err)
-				}
-
-				insertPBDRStatement := tx.Rebind(
-					`INSERT OR IGNORE INTO project_bandwidth_daily_rollups (project_id, interval_day, egress_allocated, egress_settled, egress_dead)
-						VALUES (?, ?, ?, ?, ?)`,
-				)
-				_, err = tx.Tx.ExecContext(ctx, insertPBDRStatement, projectID, civilIntervalDate, 0, uint64(settledAmount), uint64(deadAmount))
-				if err != nil {
-					return ErrUpdateBucketBandwidthSettle.Wrap(err)
-				}
-			}
-			return nil
-		})
 	default:
 		return ErrUpdateBucketBandwidthSettle.New("unsupported database dialect: %s", db.db.impl)
 	}
@@ -301,36 +200,6 @@ func (db *ordersDB) UpdateBucketBandwidthInline(ctx context.Context, projectID u
 			return errs.Wrap(err)
 		}
 		return nil
-	case dbutil.Spanner:
-		return db.db.WithTx(ctx, func(ctx context.Context, tx *dbx.Tx) error {
-			updateStatement := tx.Rebind(
-				`UPDATE bucket_bandwidth_rollups AS bbr SET  bbr.inline = bbr.inline + ? WHERE project_id = ? AND bucket_name = ? AND interval_start = ? AND action = ?`,
-			)
-			result, err := tx.Tx.ExecContext(ctx, updateStatement,
-				uint64(amount), projectID, bucketName, intervalStart.UTC(), int64(action),
-			)
-			if err != nil {
-				return errs.Wrap(err)
-			}
-
-			affected, err := result.RowsAffected()
-			if err != nil {
-				return errs.Wrap(err)
-			}
-
-			if affected == 0 {
-				insertStatement := tx.Rebind(
-					`INSERT OR IGNORE INTO bucket_bandwidth_rollups (project_id, bucket_name, interval_start, interval_seconds, action, inline, allocated, settled) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-				)
-				_, err = tx.Tx.ExecContext(ctx, insertStatement,
-					projectID, bucketName, intervalStart.UTC(), defaultIntervalSeconds, int64(action), uint64(amount), 0, 0,
-				)
-				if err != nil {
-					return errs.Wrap(err)
-				}
-			}
-			return nil
-		})
 	default:
 		return errs.New("unsupported database dialect: %s", db.db.impl)
 	}
@@ -355,50 +224,9 @@ func (db *ordersDB) UpdateStoragenodeBandwidthSettle(ctx context.Context, storag
 			return err
 		}
 		return nil
-	case dbutil.Spanner:
-		updateStatement := db.db.Rebind(
-			`UPDATE storagenode_bandwidth_rollups AS sbr SET  sbr.settled = sbr.settled + ?  WHERE storagenode_id = ? AND interval_start = ? AND action = ?`,
-		)
-		result, err := db.db.ExecContext(ctx, updateStatement,
-			uint64(amount), storageNode, intervalStart.UTC(), uint64(action),
-		)
-		if err != nil {
-			return errs.Wrap(err)
-		}
-
-		affected, err := result.RowsAffected()
-		if err != nil {
-			return errs.Wrap(err)
-		}
-
-		if affected == 0 {
-			insertStatement := db.db.Rebind(
-				`INSERT OR IGNORE INTO storagenode_bandwidth_rollups (storagenode_id, interval_start, interval_seconds, action, settled) VALUES (?, ?, ?, ?, ?)`,
-			)
-			_, err = db.db.ExecContext(ctx, insertStatement,
-				storageNode, intervalStart.UTC(), defaultIntervalSeconds, uint64(action), uint64(amount),
-			)
-			if err != nil {
-				return errs.Wrap(err)
-			}
-		}
-		return nil
 	default:
 		return errs.New("unsupported database dialect: %s", db.db.impl)
 	}
-}
-
-// GetBucketBandwidth gets total bucket bandwidth from period of time.
-func (db *ordersDB) GetBucketBandwidth(ctx context.Context, projectID uuid.UUID, bucketName []byte, from, to time.Time) (_ int64, err error) {
-	defer mon.Task()(&ctx)(&err)
-
-	var sum *int64
-	query := `SELECT SUM(settled) FROM bucket_bandwidth_rollups WHERE project_id = ? AND bucket_name = ? AND interval_start > ? AND interval_start <= ?`
-	err = db.db.QueryRow(ctx, db.db.Rebind(query), projectID, bucketName, from.UTC(), to.UTC()).Scan(&sum)
-	if errors.Is(err, sql.ErrNoRows) || sum == nil {
-		return 0, nil
-	}
-	return *sum, Error.Wrap(err)
 }
 
 // TestGetBucketBandwidth gets total bucket bandwidth (allocated,inline,settled).
@@ -406,42 +234,52 @@ func (db *ordersDB) TestGetBucketBandwidth(ctx context.Context, projectID uuid.U
 	defer mon.Task()(&ctx)(&err)
 
 	query := `SELECT SUM(allocated),SUM(inline), SUM(settled) FROM bucket_bandwidth_rollups WHERE project_id = ? AND bucket_name = ? AND interval_start > ? AND interval_start <= ?`
-	err = db.db.QueryRow(ctx, db.db.Rebind(query), projectID, bucketName, from.UTC(), to.UTC()).Scan(&allocated, &inline, &settled)
-	if errors.Is(err, sql.ErrNoRows) {
-		return 0, 0, 0, nil
+
+	var (
+		a sql.NullInt64
+		i sql.NullInt64
+		s sql.NullInt64
+	)
+	err = db.db.QueryRowContext(ctx, db.db.Rebind(query), projectID, bucketName, from.UTC(), to.UTC()).Scan(&a, &i, &s)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return 0, 0, 0, nil
+		}
+
+		return 0, 0, 0, Error.Wrap(err)
 	}
-	return allocated, inline, settled, Error.Wrap(err)
+
+	if a.Valid {
+		allocated = a.Int64
+	}
+	if i.Valid {
+		inline = i.Int64
+	}
+	if s.Valid {
+		settled = s.Int64
+	}
+	return allocated, inline, settled, nil
 }
 
 // GetStorageNodeBandwidth gets total storage node bandwidth from period of time.
 func (db *ordersDB) GetStorageNodeBandwidth(ctx context.Context, nodeID storj.NodeID, from, to time.Time) (_ int64, err error) {
 	defer mon.Task()(&ctx)(&err)
 
-	var sum1, sum2 int64
+	var sum int64
 
-	err1 := db.db.QueryRow(ctx, db.db.Rebind(`
+	err = db.db.QueryRowContext(ctx, db.db.Rebind(`
 		SELECT COALESCE(SUM(settled), 0)
 		FROM storagenode_bandwidth_rollups
 		WHERE storagenode_id = ?
 			AND interval_start > ?
 			AND interval_start <= ?
-	`), nodeID, from.UTC(), to.UTC()).Scan(&sum1)
+	`), nodeID, from.UTC(), to.UTC()).Scan(&sum)
 
-	err2 := db.db.QueryRow(ctx, db.db.Rebind(`
-		SELECT COALESCE(SUM(settled), 0)
-		FROM storagenode_bandwidth_rollups_phase2
-		WHERE storagenode_id = ?
-			AND interval_start > ?
-			AND interval_start <= ?
-	`), nodeID, from.UTC(), to.UTC()).Scan(&sum2)
-
-	if err1 != nil && !errors.Is(err1, sql.ErrNoRows) {
-		return 0, err1
-	} else if err2 != nil && !errors.Is(err2, sql.ErrNoRows) {
-		return 0, err2
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return 0, err
 	}
 
-	return sum1 + sum2, nil
+	return sum, nil
 }
 
 // UpdateBandwidthBatch updates bucket and project bandwidth rollups in the database.
@@ -452,8 +290,31 @@ func (db *ordersDB) UpdateBandwidthBatch(ctx context.Context, rollups []orders.B
 		return nil
 	}
 
+	switch db.db.impl {
+	case dbutil.Postgres, dbutil.Cockroach:
+		return db.updateBandwidthBatchPostgres(ctx, rollups)
+	default:
+		return errs.New("unsupported database dialect: %s", db.db.impl)
+	}
+}
+
+// updateBandwidthBatchPostgres updates bucket and project bandwidth rollups in the database.
+func (db *ordersDB) updateBandwidthBatchPostgres(ctx context.Context, rollups []orders.BucketBandwidthRollup) (err error) {
+	defer mon.Task()(&ctx)(&err)
+
 	return db.db.WithTx(ctx, func(ctx context.Context, tx *dbx.Tx) error {
 		defer mon.Task()(&ctx)(&err)
+
+		var (
+			bucketUpdates  = int(0)
+			projectUpdates = int(0)
+		)
+		defer func() {
+			if err == nil {
+				mon.Meter("update_bandwidth_batch_bucket_items_successful").Mark(bucketUpdates)
+				mon.Meter("update_bandwidth_batch_project_items_successful").Mark(projectUpdates)
+			}
+		}()
 
 		// TODO reorg code to make clear what we are inserting/updating to
 		// bucket_bandwidth_rollups and project_bandwidth_daily_rollups
@@ -489,10 +350,9 @@ func (db *ordersDB) UpdateBandwidthBatch(ctx context.Context, rollups []orders.B
 		// allocated must be not-null so lets keep slice until we will change DB schema
 		emptyAllocatedSlice := make([]int64, len(projectIDs))
 
+		bucketUpdates = len(projectIDs)
 		if len(projectIDs) > 0 {
-			switch db.db.impl {
-			case dbutil.Postgres, dbutil.Cockroach:
-				_, err = tx.Tx.ExecContext(ctx, `
+			_, err := tx.Tx.ExecContext(ctx, `
 				INSERT INTO bucket_bandwidth_rollups (
 					project_id, bucket_name,
 					interval_start, interval_seconds,
@@ -506,76 +366,10 @@ func (db *ordersDB) UpdateBandwidthBatch(ctx context.Context, rollups []orders.B
 					inline = bucket_bandwidth_rollups.inline + EXCLUDED.inline,
 					settled = bucket_bandwidth_rollups.settled + EXCLUDED.settled
 			`, pgutil.UUIDArray(projectIDs), pgutil.ByteaArray(bucketNames), pgutil.TimestampTZArray(intervalStartSlice),
-					defaultIntervalSeconds,
-					pgutil.Int4Array(actionSlice), pgutil.Int8Array(inlineSlice), pgutil.Int8Array(emptyAllocatedSlice), pgutil.Int8Array(settledSlice))
-				if err != nil {
-					return errs.New("bucket bandwidth rollup batch flush failed: %w", err)
-				}
-			case dbutil.Spanner:
-				// TODO(spanner): optimize this by not constructing the intermediate slices.
-
-				// This is a two-phased approach instead of just a single query like Postgres/Cockroach since
-				// Spanner does not support updating only a subset of a tables columns when inserting and updating rows
-				// at the same time (using INSERT OR UPDATE). First, we update the subset of columns for the existing rows,
-				// and then second we insert the data into the table ignoring rows that already exist.
-				type rollupUpdate struct {
-					ProjectID       []byte
-					BucketName      []byte
-					IntervalStart   time.Time
-					IntervalSeconds int64
-					Action          int64
-					Inline          int64
-					Allocated       int64
-					Settled         int64
-				}
-
-				rollups := make([]rollupUpdate, len(projectIDs))
-				for i := range rollups {
-					rollups[i] = rollupUpdate{
-						ProjectID:       projectIDs[i].Bytes(),
-						BucketName:      bucketNames[i],
-						IntervalStart:   intervalStartSlice[i],
-						IntervalSeconds: int64(defaultIntervalSeconds),
-						Action:          int64(actionSlice[i]),
-						Inline:          inlineSlice[i],
-						Allocated:       emptyAllocatedSlice[i],
-						Settled:         settledSlice[i],
-					}
-				}
-
-				// TODO(spanner): this is a candidate for performance optimization from application performance testing
-				// This is currently executed as a single update for each row as a single query to update all rows would
-				// first need to have a WHERE clause utilizing INNER JOIN and UNNEST in a similar structure as the
-				// INSERT OR IGNORE statement below, and second would need to combine the input query parameter slices
-				// for each column (inline and settled) in order to update the columns for a row with the correct values.
-				// Doing so is a much more complex query that is prone to errors, and it is not yet clear whether that
-				// query would perform better in production-like use cases.
-				updateBBRStatement := tx.Rebind(`
-					UPDATE bucket_bandwidth_rollups bbr
-					SET bbr.inline = bbr.inline + ?,
-						bbr.settled = bbr.settled + ?
-					WHERE bbr.project_id = ? AND bbr.bucket_name = ? AND bbr.interval_start = ? AND bbr.action = ?
-				`)
-
-				for _, r := range rollups {
-					_, err = tx.Tx.ExecContext(ctx, updateBBRStatement, r.Inline, r.Settled, r.ProjectID, r.BucketName, r.IntervalStart, r.Action)
-					if err != nil {
-						return errs.New("bucket bandwidth rollup batch update failed: %w", err)
-					}
-				}
-
-				_, err = tx.Tx.ExecContext(ctx, tx.Rebind(`
-					INSERT OR IGNORE INTO bucket_bandwidth_rollups (
-						project_id, bucket_name,
-						interval_start, interval_seconds,
-						action, inline, allocated, settled)
-					(SELECT ProjectID, BucketName, IntervalStart, IntervalSeconds, Action, Inline, Allocated, Settled FROM UNNEST(?))
-				`), rollups)
-				if err != nil {
-					return errs.New("bucket bandwidth rollup batch insert failed: %w", err)
-				}
-			default:
-				return errs.New("unsupported database dialect: %s", db.db.impl)
+				defaultIntervalSeconds,
+				pgutil.Int4Array(actionSlice), pgutil.Int8Array(inlineSlice), pgutil.Int8Array(emptyAllocatedSlice), pgutil.Int8Array(settledSlice))
+			if err != nil {
+				return errs.New("bucket bandwidth rollup batch flush failed: %w", err)
 			}
 		}
 
@@ -606,11 +400,10 @@ func (db *ordersDB) UpdateBandwidthBatch(ctx context.Context, rollups []orders.B
 			deadSlice = append(deadSlice, usage.Dead)
 		}
 
+		projectUpdates = len(projectIDs)
 		if len(projectIDs) > 0 {
-			switch db.db.impl {
-			case dbutil.Postgres, dbutil.Cockroach:
-				// TODO: explore updating project_bandwidth_daily_rollups table to use "timestamp with time zone" for interval_day
-				_, err = tx.Tx.ExecContext(ctx, `
+			// TODO: explore updating project_bandwidth_daily_rollups table to use "timestamp with time zone" for interval_day
+			_, err := tx.Tx.ExecContext(ctx, `
 				INSERT INTO project_bandwidth_daily_rollups(project_id, interval_day, egress_allocated, egress_settled, egress_dead)
 					SELECT unnest($1::bytea[]), unnest($2::date[]), unnest($3::bigint[]), unnest($4::bigint[]), unnest($5::bigint[])
 				ON CONFLICT(project_id, interval_day)
@@ -619,67 +412,8 @@ func (db *ordersDB) UpdateBandwidthBatch(ctx context.Context, rollups []orders.B
 					egress_settled   = project_bandwidth_daily_rollups.egress_settled   + EXCLUDED.egress_settled::bigint,
 					egress_dead      = project_bandwidth_daily_rollups.egress_dead      + EXCLUDED.egress_dead::bigint
 			`, pgutil.UUIDArray(projectIDs), pgutil.DateArray(intervalStartSlice), pgutil.Int8Array(allocatedSlice), pgutil.Int8Array(settledSlice), pgutil.Int8Array(deadSlice))
-				if err != nil {
-					return errs.New("project bandwidth daily rollup batch flush failed: %w", err)
-				}
-			case dbutil.Spanner:
-				// TODO(spanner): optimize this by not constructing the intermediate slices.
-
-				// This is a two-phased approach instead of just a single query like Postgres/Cockroach since
-				// Spanner does not support updating only a subset of a tables columns when inserting and updating rows
-				// at the same time (using INSERT OR UPDATE). First, we update the subset of columns for the existing rows,
-				// and then second we insert the data into the table ignoring rows that already exist.
-
-				type rollupUpdate struct {
-					ProjectID       []byte
-					IntervalDay     civil.Date
-					EgressAllocated int64
-					EgressSettled   int64
-					EgressDead      int64
-				}
-
-				rollups := make([]rollupUpdate, len(projectIDs))
-				for i := range rollups {
-					rollups[i] = rollupUpdate{
-						ProjectID:       projectIDs[i].Bytes(),
-						IntervalDay:     civil.DateOf(intervalStartSlice[i]),
-						EgressAllocated: allocatedSlice[i],
-						EgressSettled:   settledSlice[i],
-						EgressDead:      deadSlice[i],
-					}
-				}
-
-				// TODO(spanner): this is a candidate for performance optimization from application performance testing
-				// This is currently executed as a single update for each row as a single query to update all rows would
-				// first need to have a WHERE clause utilizing INNER JOIN and UNNEST in a similar structure as the
-				// INSERT OR IGNORE statement below, and second would need to combine the input query parameter slices
-				// for each column (inline and settled) in order to update the columns for a row with the correct values.
-				// Doing so is a much more complex query that is prone to errors, and it is not yet clear whether that
-				// query would perform better in production-like use cases.
-				updatePBDRRStatement := tx.Rebind(`
-					UPDATE project_bandwidth_daily_rollups pbdr
-					SET pbdr.egress_allocated = pbdr.egress_allocated + ?,
-						pbdr.egress_settled = pbdr.egress_settled + ?,
-						pbdr.egress_dead = pbdr.egress_dead + ?
-					WHERE project_id = ? AND interval_day = ?
-				`)
-
-				for _, r := range rollups {
-					_, err = tx.Tx.ExecContext(ctx, updatePBDRRStatement, r.EgressAllocated, r.EgressSettled, r.EgressDead, r.ProjectID, r.IntervalDay)
-					if err != nil {
-						return errs.New("project bandwidth daily rollup batch update failed: %w", err)
-					}
-				}
-
-				_, err = tx.Tx.ExecContext(ctx, tx.Rebind(`
-					INSERT OR IGNORE INTO project_bandwidth_daily_rollups (project_id, interval_day, egress_allocated, egress_settled, egress_dead)
-						(SELECT ProjectID, IntervalDay, EgressAllocated, EgressSettled, EgressDead FROM UNNEST(?))
-				`), rollups)
-				if err != nil {
-					return errs.New("project bandwidth daily rollup batch insert failed: %w", err)
-				}
-			default:
-				return errs.New("unsupported database dialect: %s", db.db.impl)
+			if err != nil {
+				return errs.New("project bandwidth daily rollup batch flush failed: %w", err)
 			}
 		}
 		return nil
@@ -700,6 +434,9 @@ func (db *ordersDB) UpdateStoragenodeBandwidthSettleWithWindow(ctx context.Conte
 	var retryCount int
 	for {
 		err = db.db.WithTx(ctx, func(ctx context.Context, tx *dbx.Tx) error {
+			batchStatus = 0
+			alreadyProcessed = false
+
 			// try to get all rows from the storage node bandwidth table for the 1 hr window
 			// if there are already existing rows for the 1 hr window that means these orders have
 			// already been processed

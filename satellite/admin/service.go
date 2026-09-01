@@ -1,0 +1,401 @@
+// Copyright (C) 2023 Storj Labs, Inc.
+// See LICENSE for copying information.
+
+package admin
+
+import (
+	"context"
+	"database/sql"
+	"encoding/hex"
+	"errors"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/zeebo/errs"
+	"go.uber.org/zap"
+
+	"storj.io/common/storj"
+	"storj.io/common/uuid"
+	"storj.io/storj/private/api"
+	"storj.io/storj/satellite/accounting"
+	"storj.io/storj/satellite/admin/auditlogger"
+	"storj.io/storj/satellite/admin/changehistory"
+	"storj.io/storj/satellite/analytics"
+	"storj.io/storj/satellite/attribution"
+	"storj.io/storj/satellite/buckets"
+	"storj.io/storj/satellite/console"
+	"storj.io/storj/satellite/console/restapikeys"
+	"storj.io/storj/satellite/entitlements"
+	"storj.io/storj/satellite/mailservice"
+	"storj.io/storj/satellite/metabase"
+	"storj.io/storj/satellite/nodeselection"
+	"storj.io/storj/satellite/overlay"
+	"storj.io/storj/satellite/payments"
+	"storj.io/storj/satellite/revocation"
+)
+
+// Defaults contains default values for limits which are not stored in the DB.
+type Defaults struct {
+	MaxBuckets int
+	RateLimit  int
+}
+
+// Service provides functionality for administrating satellites.
+type Service struct {
+	log *zap.Logger
+
+	authorizer  *Authorizer
+	auditLogger *auditlogger.Logger
+
+	attributionDB attribution.DB
+	accountingDB  accounting.ProjectAccounting
+	consoleDB     console.DB
+	history       changehistory.DB
+	metabase      *metabase.DB
+	overlayDB     overlay.DB
+	revocationDB  revocation.DB
+
+	accountFreeze *console.AccountFreezeService
+	accounting    *accounting.Service
+	buckets       *buckets.Service
+	analytics     *analytics.Service
+	entitlements  *entitlements.Service
+	restKeys      restapikeys.Service
+	payments      payments.Accounts
+	mailService   *mailservice.Service
+
+	placement nodeselection.PlacementDefinitions
+	products  map[int32]payments.ProductUsagePriceModel
+	defaults  Defaults
+
+	adminConfig   Config
+	consoleConfig console.Config
+
+	tenantID *string
+
+	nowFn func() time.Time
+}
+
+// NewService creates a new satellite administration service.
+func NewService(
+	log *zap.Logger,
+	consoleDB console.DB,
+	history changehistory.DB,
+	attributionDB attribution.DB,
+	accountingDB accounting.ProjectAccounting,
+	accounting *accounting.Service,
+	authorizer *Authorizer,
+	accountFreeze *console.AccountFreezeService,
+	analytics *analytics.Service,
+	buckets *buckets.Service,
+	entitlements *entitlements.Service,
+	metabaseDB *metabase.DB,
+	overlayDB overlay.DB,
+	revocationDB revocation.DB,
+	logger *auditlogger.Logger,
+	payments payments.Accounts,
+	restKeys restapikeys.Service,
+	mailService *mailservice.Service,
+	placement nodeselection.PlacementDefinitions,
+	products map[int32]payments.ProductUsagePriceModel,
+	defaults Defaults,
+	adminConfig Config,
+	consoleConfig console.Config,
+) *Service {
+	return &Service{
+		log:           log,
+		consoleDB:     consoleDB,
+		history:       history,
+		restKeys:      restKeys,
+		analytics:     analytics,
+		attributionDB: attributionDB,
+		accountingDB:  accountingDB,
+		accounting:    accounting,
+		accountFreeze: accountFreeze,
+		authorizer:    authorizer,
+		auditLogger:   logger,
+		buckets:       buckets,
+		entitlements:  entitlements,
+		metabase:      metabaseDB,
+		overlayDB:     overlayDB,
+		revocationDB:  revocationDB,
+		payments:      payments,
+		mailService:   mailService,
+		placement:     placement,
+		products:      products,
+		defaults:      defaults,
+		adminConfig:   adminConfig,
+		consoleConfig: consoleConfig,
+		tenantID:      tenantIDFromConfig(consoleConfig.SingleWhiteLabel.TenantID),
+		nowFn:         time.Now,
+	}
+}
+
+// tenantIDFromConfig converts an empty string to nil, so s.tenantID == nil
+// means "no tenant scoping" throughout the service.
+func tenantIDFromConfig(s string) *string {
+	if s == "" {
+		return nil
+	}
+	return &s
+}
+
+// StatusInfo contains the name and value of a status.
+type StatusInfo struct {
+	Name  string `json:"name"`
+	Value int    `json:"value"`
+}
+
+// SearchResult contains the result of a search for users or projects.
+type SearchResult struct {
+	// projects are only "searched" by their ID, so only one project is returned.
+	Project  *Project      `json:"project"`
+	Accounts []AccountMin  `json:"accounts"`
+	Nodes    []NodeMinInfo `json:"nodes"`
+}
+
+// SearchUsersProjectsOrNodes searches for users and projects matching the given term.
+func (s *Service) SearchUsersProjectsOrNodes(ctx context.Context, authInfo *AuthInfo, term string) (*SearchResult, api.HTTPError) {
+	var err error
+	defer mon.Task()(&ctx)(&err)
+
+	apiError := func(status int, err error) api.HTTPError {
+		return api.HTTPError{
+			Status: status, Err: Error.Wrap(err),
+		}
+	}
+
+	if !s.authorizer.IsAuthorized(authInfo) {
+		return nil, apiError(http.StatusUnauthorized, errs.New("not authorized"))
+	}
+
+	hasPerm := func(perm Permission) bool {
+		return s.authorizer.HasPermissions(authInfo, perm)
+	}
+
+	if !hasPerm(PermAccountView) && !hasPerm(PermProjectView) && !hasPerm(PermNodesView) {
+		return nil, apiError(http.StatusForbidden, errs.New("not authorized"))
+	}
+
+	if hasPerm(PermProjectView) {
+		if id, err := uuidFromSearchTerm(term); err == nil {
+			p, apiErr := s.GetProject(ctx, authInfo, id)
+			if apiErr.Err != nil && apiErr.Status != http.StatusNotFound {
+				return nil, apiErr
+			}
+			if p != nil {
+				return &SearchResult{Project: p}, api.HTTPError{}
+			}
+		}
+	}
+
+	if s.tenantID == nil && hasPerm(PermNodesView) {
+		if id, err := storj.NodeIDFromString(term); err == nil {
+			n, apiErr := s.getNodeByID(ctx, id)
+			if apiErr.Err != nil && apiErr.Status != http.StatusNotFound {
+				return nil, apiErr
+			}
+			if n != nil {
+				info := NodeMinInfo{
+					ID:           n.ID,
+					Online:       time.Since(n.LastContactSuccess) < 4*time.Hour,
+					Disqualified: n.Disqualified != nil,
+					CreatedAt:    n.CreatedAt,
+				}
+				return &SearchResult{Nodes: []NodeMinInfo{info}}, api.HTTPError{}
+			}
+		}
+	}
+
+	emptyResult := SearchResult{Accounts: []AccountMin{}, Nodes: []NodeMinInfo{}}
+
+	if !hasPerm(PermAccountView) {
+		return &emptyResult, api.HTTPError{}
+	}
+
+	users, apiErr := s.SearchUsers(ctx, term)
+	if apiErr.Err != nil {
+		return nil, apiErr
+	}
+
+	nodes := make([]NodeMinInfo, 0)
+	if s.tenantID != nil || !hasPerm(PermNodesView) {
+		return &SearchResult{Accounts: users, Nodes: nodes}, api.HTTPError{}
+	}
+
+	if strings.Contains(term, "@") {
+		nodes, err = s.getNodesByEmail(ctx, term)
+		if err != nil {
+			return nil, apiError(http.StatusInternalServerError, err)
+		}
+	}
+
+	if len(users) == 0 && len(nodes) == 0 {
+		return &emptyResult, api.HTTPError{}
+	}
+
+	return &SearchResult{Accounts: users, Nodes: nodes}, api.HTTPError{}
+}
+
+// GetChangeHistory retrieves the change history for a specific user, project, and bucket.
+func (s *Service) GetChangeHistory(ctx context.Context, exact string, itemType string, id string) ([]changehistory.ChangeLog, api.HTTPError) {
+	var err error
+	defer mon.Task()(&ctx)(&err)
+
+	apiError := func(status int, err error) ([]changehistory.ChangeLog, api.HTTPError) {
+		return nil, api.HTTPError{
+			Status: status, Err: Error.Wrap(err),
+		}
+	}
+
+	var changes []changehistory.ChangeLog
+	switch changehistory.ItemType(itemType) {
+	case changehistory.ItemTypeUser:
+		uuID, err := uuid.FromString(id)
+		if err != nil {
+			return apiError(http.StatusBadRequest, errs.New("invalid user ID"))
+		}
+
+		if s.tenantID != nil {
+			user, err := s.consoleDB.Users().Get(ctx, uuID)
+			if err != nil {
+				status := http.StatusInternalServerError
+				if errors.Is(err, sql.ErrNoRows) {
+					status = http.StatusNotFound
+					err = errs.New("user not found")
+				}
+				return apiError(status, err)
+			}
+			if !s.userMatchesTenant(user.TenantID) {
+				return apiError(http.StatusNotFound, errs.New("user not found"))
+			}
+		}
+
+		changes, err = s.history.GetChangesByUserID(ctx, uuID, exact == "true")
+		if err != nil {
+			return nil, api.HTTPError{
+				Status: http.StatusInternalServerError,
+				Err:    Error.Wrap(err),
+			}
+		}
+	case changehistory.ItemTypeProject:
+		uuID, err := uuid.FromString(id)
+		if err != nil {
+			return apiError(http.StatusBadRequest, errs.New("invalid project ID"))
+		}
+
+		if s.tenantID != nil {
+			project, err := s.consoleDB.Projects().GetByPublicID(ctx, uuID)
+			if err != nil {
+				status := http.StatusInternalServerError
+				if errors.Is(err, sql.ErrNoRows) {
+					status = http.StatusNotFound
+					err = errs.New("project not found")
+				}
+				return apiError(status, err)
+			}
+			if apiErr := s.checkProjectOwnerTenant(ctx, project.OwnerID); apiErr.Err != nil {
+				return nil, apiErr
+			}
+		}
+
+		changes, err = s.history.GetChangesByProjectID(ctx, uuID, exact == "true")
+		if err != nil {
+			return nil, api.HTTPError{
+				Status: http.StatusInternalServerError,
+				Err:    Error.Wrap(err),
+			}
+		}
+	case changehistory.ItemTypeBucket:
+		if s.tenantID != nil {
+			return apiError(http.StatusForbidden, errs.New("not available for tenant-scoped admin"))
+		}
+		changes, err = s.history.GetChangesByBucketName(ctx, id)
+		if err != nil {
+			return nil, api.HTTPError{
+				Status: http.StatusInternalServerError,
+				Err:    Error.Wrap(err),
+			}
+		}
+	default:
+		return nil, api.HTTPError{
+			Status: http.StatusBadRequest,
+			Err:    Error.New("at least one of userID, projectID, or bucketID must be provided"),
+		}
+	}
+
+	return changes, api.HTTPError{}
+}
+
+// TestSetRoleAdmin sets a role to admin for testing purposes.
+func (s *Service) TestSetRoleAdmin(role string) {
+	s.authorizer.groupsRoles[role] = RoleAdmin
+}
+
+// TestSetRoleViewer sets a role to viewer for testing purposes.
+func (s *Service) TestSetRoleViewer(role string) {
+	s.authorizer.groupsRoles[role] = RoleViewer
+}
+
+// TestSetBypassAuth sets whether to bypass authentication. This is only for testing purposes.
+func (s *Service) TestSetBypassAuth(bypass bool) {
+	s.authorizer.enabled = !bypass
+}
+
+// TestSetAllowedHost sets the allowed host for oauth. This is only for testing purposes.
+func (s *Service) TestSetAllowedHost(host string) {
+	s.authorizer.allowedHost = host
+}
+
+// TestSetNowFn sets the function to get the current time. This is only for testing purposes.
+func (s *Service) TestSetNowFn(nowFn func() time.Time) {
+	s.nowFn = nowFn
+}
+
+// TestSetTenantID sets the tenant ID restriction for testing purposes.
+// Pass nil to simulate a general (unrestricted) admin.
+func (s *Service) TestSetTenantID(tenantID *string) {
+	s.tenantID = tenantID
+}
+
+// TestSetHideFreezeActions sets the HideFreezeActions config flag for testing purposes.
+func (s *Service) TestSetHideFreezeActions(hide bool) {
+	s.adminConfig.HideFreezeActions = hide
+}
+
+// TestSetBillingFeaturesEnabled sets the BillingFeaturesEnabled config flag for testing purposes.
+func (s *Service) TestSetBillingFeaturesEnabled(enabled bool) {
+	s.consoleConfig.BillingFeaturesEnabled = enabled
+}
+
+// TestToggleAuditLogger enables or disables the audit logger for testing purposes.
+func (s *Service) TestToggleAuditLogger(enabled bool) {
+	s.auditLogger.TestToggleAuditLogger(enabled)
+}
+
+// kindInfoForTenant returns the KindInfo for a user, overriding HasPaidPrivileges
+// for white-label users when billing is disabled.
+func (s *Service) kindInfoForTenant(kind console.UserKind, tenantID *string) console.KindInfo {
+	info := kind.Info()
+	if tenantID != nil && *tenantID != "" && !s.consoleConfig.BillingFeaturesEnabled {
+		info.HasPaidPrivileges = true
+	}
+	return info
+}
+
+// uuidFromSearchTerm parses a UUID from a search term, accepting both
+// the standard dashed format (36 chars) and the compact hex format (32 chars).
+func uuidFromSearchTerm(s string) (uuid.UUID, error) {
+	if len(s) == 36 {
+		return uuid.FromString(s)
+	}
+	if len(s) == 32 {
+		b, err := hex.DecodeString(s)
+		if err != nil {
+			return uuid.UUID{}, err
+		}
+		return uuid.FromBytes(b)
+	}
+	return uuid.UUID{}, errs.New("not a UUID")
+}

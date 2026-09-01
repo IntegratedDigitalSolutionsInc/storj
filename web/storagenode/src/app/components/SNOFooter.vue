@@ -8,13 +8,11 @@
                 v-if="isDarkMode"
                 class="footer__content-holder__icon"
                 alt="storj icon"
-                @click="scrollUp"
             />
             <StorjIconLight
                 v-else
                 class="footer__content-holder__icon"
                 alt="storj icon"
-                @click="scrollUp"
             />
             <div class="footer__content-holder__links-area">
                 <a
@@ -38,37 +36,26 @@
     </div>
 </template>
 
-<script lang="ts">
-import { Component, Vue } from 'vue-property-decorator';
+<script setup lang="ts">
+import { computed } from 'vue';
+import { useRoute } from 'vue-router';
 
 import { RouteConfig } from '@/app/router';
-
+import { useAppStore } from '@/app/store/modules/appStore';
 import StorjIconLight from '@/../static/images/storjIcon.svg';
 import StorjIconDark from '@/../static/images/storjIconDark.svg';
 
-// @vue/component
-@Component({
-    components: {
-        StorjIconLight,
-        StorjIconDark,
-    },
-})
-export default class SNOFooter extends Vue {
-    public scrollUp(): void {
-        window.scrollTo(0, 0);
-    }
+const route = useRoute();
 
-    /**
-     * Indicates if footer should appear.
-     */
-    public get isShown(): boolean {
-        return this.$route.name !== RouteConfig.Notifications.name;
-    }
+const appStore = useAppStore();
 
-    public get isDarkMode(): boolean {
-        return this.$store.state.appStateModule.isDarkMode;
-    }
-}
+const isShown = computed<boolean>(() => {
+    return route.name !== RouteConfig.Notifications.name;
+});
+
+const isDarkMode = computed<boolean>(() => {
+    return appStore.state.isDarkMode;
+});
 </script>
 
 <style scoped lang="scss">
@@ -89,7 +76,6 @@ export default class SNOFooter extends Vue {
 
             &__icon {
                 min-width: 125px;
-                cursor: pointer;
             }
 
             &__links-area {
@@ -112,11 +98,11 @@ export default class SNOFooter extends Vue {
         }
     }
 
-    .storj-logo ::v-deep path {
+    .storj-logo :deep(path) {
         fill: var(--icon-color) !important;
     }
 
-    @media screen and (max-width: 600px) {
+    @media screen and (width <= 600px) {
 
         .footer {
             height: auto;

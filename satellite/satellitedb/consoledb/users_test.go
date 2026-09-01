@@ -5,6 +5,7 @@ package consoledb_test
 
 import (
 	"database/sql"
+	"fmt"
 	"math/rand"
 	"testing"
 	"time"
@@ -36,14 +37,17 @@ func TestGetExpiresBeforeWithStatus(t *testing.T) {
 		})
 		require.NoError(t, err)
 
-		boolPtr := true
+		active := console.Active
+
+		kind := console.PaidUser
 		require.NoError(t, users.Update(ctx, proUser, console.UpdateUserRequest{
-			PaidTier: &boolPtr,
+			Kind:   &kind,
+			Status: &active,
 		}))
 
 		u, err := users.Get(ctx, proUser)
 		require.NoError(t, err)
-		require.True(t, u.PaidTier)
+		require.Equal(t, console.PaidUser, u.Kind)
 		require.Nil(t, u.TrialExpiration)
 		require.Zero(t, u.TrialNotifications)
 
@@ -62,9 +66,13 @@ func TestGetExpiresBeforeWithStatus(t *testing.T) {
 		})
 		require.NoError(t, err)
 
+		require.NoError(t, users.Update(ctx, trialUserNeedsReminder, console.UpdateUserRequest{
+			Status: &active,
+		}))
+
 		u, err = users.Get(ctx, trialUserNeedsReminder)
 		require.NoError(t, err)
-		require.False(t, u.PaidTier)
+		require.Equal(t, console.FreeUser, u.Kind)
 		require.WithinDuration(t, tomorrow.Truncate(time.Millisecond), u.TrialExpiration.Truncate(time.Millisecond), time.Nanosecond)
 		require.Zero(t, u.TrialNotifications)
 
@@ -82,11 +90,12 @@ func TestGetExpiresBeforeWithStatus(t *testing.T) {
 		notifiedStatus := console.TrialExpirationReminder
 		require.NoError(t, users.Update(ctx, trialUserAlreadyReminded, console.UpdateUserRequest{
 			TrialNotifications: &notifiedStatus,
+			Status:             &active,
 		}))
 
 		u, err = users.Get(ctx, trialUserAlreadyReminded)
 		require.NoError(t, err)
-		require.False(t, u.PaidTier)
+		require.Equal(t, console.FreeUser, u.Kind)
 		require.WithinDuration(t, tomorrow.Truncate(time.Millisecond), u.TrialExpiration.Truncate(time.Millisecond), time.Nanosecond)
 		require.Equal(t, int(notifiedStatus), u.TrialNotifications)
 
@@ -94,29 +103,72 @@ func TestGetExpiresBeforeWithStatus(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, int(console.TrialExpirationReminder), u.TrialNotifications)
 
+		// insert inactive free trial user with no trial notification and expires tomorrow
+		// to ensure it is never returned from GetExpiresBeforeWithStatus.
+		inactiveTrialUser := testrand.UUID()
+		u, err = users.Insert(ctx, &console.User{
+			ID:              inactiveTrialUser,
+			FullName:        "test",
+			Email:           "userthree@mail.test",
+			PasswordHash:    []byte("testpassword"),
+			TrialExpiration: &tomorrow,
+		})
+		require.NoError(t, err)
+		require.Equal(t, console.Inactive, u.Status)
+
 		// test with var now as expiresBefore arg. Expect trialUserNeedsReminder not returned
 		// since expiration, tomorrow, is after expiresBefore arg.
-		needExpirationReminder, err := users.GetExpiresBeforeWithStatus(ctx, console.NoTrialNotification, now)
+		needExpirationReminder, err := users.GetExpiresBeforeWithStatus(ctx, console.NoTrialNotification, now, nil)
 		require.NoError(t, err)
 		require.Len(t, needExpirationReminder, 0)
 
 		// test with var dayAfterTomorrow as expiresBefore arg. Expect trialUserNeedsReminder returned
 		// since expiration, tomorrow, is before expiresBefore arg and trial_notifications matches notificationStatus arg.
-		needExpirationReminder, err = users.GetExpiresBeforeWithStatus(ctx, console.NoTrialNotification, dayAfterTomorrow)
+		// inactiveTrialUser also matches these filters but is not returned because it is not active.
+		needExpirationReminder, err = users.GetExpiresBeforeWithStatus(ctx, console.NoTrialNotification, dayAfterTomorrow, nil)
 		require.NoError(t, err)
 		require.Len(t, needExpirationReminder, 1)
 		require.Equal(t, trialUserNeedsReminder, needExpirationReminder[0].ID)
 
 		// test with var now as expiresBefore arg. Expect trialUserAlreadyReminded not returned
 		// since expiration, tomorrow, is after expiresBefore arg.
-		needExpiredNotification, err := users.GetExpiresBeforeWithStatus(ctx, console.TrialExpirationReminder, now)
+		needExpiredNotification, err := users.GetExpiresBeforeWithStatus(ctx, console.TrialExpirationReminder, now, nil)
 		require.NoError(t, err)
 		require.Len(t, needExpiredNotification, 0)
 
-		needExpiredNotification, err = users.GetExpiresBeforeWithStatus(ctx, console.TrialExpirationReminder, dayAfterTomorrow)
+		needExpiredNotification, err = users.GetExpiresBeforeWithStatus(ctx, console.TrialExpirationReminder, dayAfterTomorrow, nil)
 		require.NoError(t, err)
 		require.Len(t, needExpiredNotification, 1)
 		require.Equal(t, trialUserAlreadyReminded, needExpiredNotification[0].ID)
+
+		// insert active free trial user belonging to a tenant.
+		tenant := "tenant"
+		tenantTrialUser := testrand.UUID()
+		_, err = users.Insert(ctx, &console.User{
+			ID:              tenantTrialUser,
+			FullName:        "test",
+			Email:           "userfour@mail.test",
+			PasswordHash:    []byte("testpassword"),
+			TrialExpiration: &tomorrow,
+			TenantID:        &tenant,
+		})
+		require.NoError(t, err)
+
+		require.NoError(t, users.Update(ctx, tenantTrialUser, console.UpdateUserRequest{
+			Status: &active,
+		}))
+
+		// test with a tenant ID. Expect only the tenant's user returned.
+		needExpirationReminder, err = users.GetExpiresBeforeWithStatus(ctx, console.NoTrialNotification, dayAfterTomorrow, &tenant)
+		require.NoError(t, err)
+		require.Len(t, needExpirationReminder, 1)
+		require.Equal(t, tenantTrialUser, needExpirationReminder[0].ID)
+
+		// the tenant's user is not returned when no tenant is specified.
+		needExpirationReminder, err = users.GetExpiresBeforeWithStatus(ctx, console.NoTrialNotification, dayAfterTomorrow, nil)
+		require.NoError(t, err)
+		require.Len(t, needExpirationReminder, 1)
+		require.Equal(t, trialUserNeedsReminder, needExpirationReminder[0].ID)
 	})
 }
 
@@ -159,8 +211,8 @@ func TestGetUnverifiedNeedingReminderCutoff(t *testing.T) {
 	})
 }
 
-// Spanner does not record time zones and instead uses an absolute time system. TIMESTAMP values are always returned via time.Time
-// values in UTC (see: https://pkg.go.dev/cloud.google.com/go/spanner#Row). pgx, for Postgres/Cockroach/etc., returns time.Time
+// Some backends do not record time zones and instead use an absolute time system. TIMESTAMP values are always returned via time.Time
+// values in UTC. pgx, for Postgres/Cockroach/etc., returns time.Time
 // values always in the session local time, time.Local, (see: https://github.com/jackc/pgx/issues/2117). As such, we can't use require.Equal
 // for comparing two time.Time values as require.Equal uses strict equality (two objects are only equal if ALL fields recursively are identical).
 // e.g. two time.Time objects representing the same instant of time in two different timezones will evaluate to false by require.Equal.
@@ -193,7 +245,7 @@ func TestUpdateUser(t *testing.T) {
 			ProjectBandwidthLimit:  1,
 			ProjectStorageLimit:    1,
 			ProjectSegmentLimit:    1,
-			PaidTier:               true,
+			Kind:                   console.PaidUser,
 			MFAEnabled:             true,
 			MFASecretKey:           "secretKey",
 			MFARecoveryCodes:       []string{"code1", "code2"},
@@ -219,7 +271,7 @@ func TestUpdateUser(t *testing.T) {
 		require.NotEqual(t, u.ProjectBandwidthLimit, newInfo.ProjectBandwidthLimit)
 		require.NotEqual(t, u.ProjectStorageLimit, newInfo.ProjectStorageLimit)
 		require.NotEqual(t, u.ProjectSegmentLimit, newInfo.ProjectSegmentLimit)
-		require.NotEqual(t, u.PaidTier, newInfo.PaidTier)
+		require.NotEqual(t, u.Kind, newInfo.Kind)
 		require.NotEqual(t, u.MFAEnabled, newInfo.MFAEnabled)
 		require.NotEqual(t, u.MFASecretKey, newInfo.MFASecretKey)
 		require.NotEqual(t, u.MFARecoveryCodes, newInfo.MFARecoveryCodes)
@@ -335,7 +387,7 @@ func TestUpdateUser(t *testing.T) {
 
 		// update just paid tier
 		updateReq = console.UpdateUserRequest{
-			PaidTier: &newInfo.PaidTier,
+			Kind: &newInfo.Kind,
 		}
 
 		err = users.Update(ctx, id, updateReq)
@@ -344,7 +396,7 @@ func TestUpdateUser(t *testing.T) {
 		updatedUser, err = users.Get(ctx, id)
 		require.NoError(t, err)
 
-		u.PaidTier = newInfo.PaidTier
+		u.Kind = newInfo.Kind
 		usersAreEqual(t, u, updatedUser)
 
 		// update just mfa enabled
@@ -420,9 +472,10 @@ func TestUpdateUser(t *testing.T) {
 		usersAreEqual(t, u, updatedUser)
 
 		// update just the placement
-		defaultPlacement := &newInfo.DefaultPlacement
+		defaultPlacement := new(*storj.PlacementConstraint)
+		*defaultPlacement = &newInfo.DefaultPlacement
 		updateReq = console.UpdateUserRequest{
-			DefaultPlacement: *defaultPlacement,
+			DefaultPlacement: defaultPlacement,
 		}
 
 		err = users.Update(ctx, id, updateReq)
@@ -461,7 +514,7 @@ func TestUpdateUser(t *testing.T) {
 		newDatePtr := &newDate
 		updateReq = console.UpdateUserRequest{
 			TrialExpiration: &newDatePtr,
-			UpgradeTime:     &newDate,
+			UpgradeTime:     &newDatePtr,
 		}
 
 		err = users.Update(ctx, id, updateReq)
@@ -471,6 +524,64 @@ func TestUpdateUser(t *testing.T) {
 		require.NoError(t, err)
 		require.WithinDuration(t, newDate, *updatedUser.TrialExpiration, time.Minute)
 		require.WithinDuration(t, newDate, *updatedUser.UpgradeTime, time.Minute)
+	})
+}
+
+func TestUpdateExternalIDWithActivationCode(t *testing.T) {
+	satellitedbtest.Run(t, func(ctx *testcontext.Context, t *testing.T, db satellite.DB) {
+		users := db.Console().Users()
+
+		userID := testrand.UUID()
+		activationCode := "123456"
+		_, err := users.Insert(ctx, &console.User{
+			ID:             userID,
+			FullName:       "Test User",
+			Email:          "sso.link@test.example",
+			PasswordHash:   []byte("testpassword"),
+			Status:         console.Inactive,
+			ActivationCode: activationCode,
+		})
+		require.NoError(t, err)
+
+		rows, err := users.UpdateExternalIDWithActivationCode(ctx, userID, activationCode, "general:sub-1")
+		require.NoError(t, err)
+		require.Equal(t, int64(1), rows)
+
+		updated, err := users.Get(ctx, userID)
+		require.NoError(t, err)
+		require.NotNil(t, updated.ExternalID)
+		require.Equal(t, "general:sub-1", *updated.ExternalID)
+		require.Empty(t, updated.ActivationCode)
+		require.Equal(t, console.Active, updated.Status)
+
+		rows, err = users.UpdateExternalIDWithActivationCode(ctx, userID, activationCode, "general:sub-1")
+		require.NoError(t, err)
+		require.Equal(t, int64(0), rows)
+
+		userID2 := testrand.UUID()
+		_, err = users.Insert(ctx, &console.User{
+			ID:             userID2,
+			FullName:       "Test User 2",
+			Email:          "sso.link2@test.example",
+			PasswordHash:   []byte("testpassword"),
+			Status:         console.Inactive,
+			ActivationCode: "654321",
+		})
+		require.NoError(t, err)
+
+		rows, err = users.UpdateExternalIDWithActivationCode(ctx, userID2, "000000", "general:sub-2")
+		require.NoError(t, err)
+		require.Equal(t, int64(0), rows)
+
+		ext := "general:existing"
+		extPtr := &ext
+		require.NoError(t, users.Update(ctx, userID2, console.UpdateUserRequest{
+			ExternalID: &extPtr,
+		}))
+
+		rows, err = users.UpdateExternalIDWithActivationCode(ctx, userID2, "654321", "general:sub-2")
+		require.NoError(t, err)
+		require.Equal(t, int64(0), rows)
 	})
 }
 
@@ -517,12 +628,12 @@ func TestUpdateDefaultPlacement(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, storj.PlacementConstraint(12), user.DefaultPlacement)
 
-		err = usersRepo.UpdateDefaultPlacement(ctx, user.ID, storj.EveryCountry)
+		err = usersRepo.UpdateDefaultPlacement(ctx, user.ID, storj.DefaultPlacement)
 		require.NoError(t, err)
 
 		user, err = usersRepo.Get(ctx, user.ID)
 		require.NoError(t, err)
-		require.Equal(t, storj.EveryCountry, user.DefaultPlacement)
+		require.Equal(t, storj.DefaultPlacement, user.DefaultPlacement)
 	})
 }
 
@@ -543,14 +654,69 @@ func TestGetUpgradeTime(t *testing.T) {
 		require.Nil(t, upgradeTime)
 
 		now := time.Now()
+		nowPtr := &now
 
-		err = usersRepo.Update(ctx, user.ID, console.UpdateUserRequest{UpgradeTime: &now})
+		err = usersRepo.Update(ctx, user.ID, console.UpdateUserRequest{UpgradeTime: &nowPtr})
 		require.NoError(t, err)
 
 		upgradeTime, err = usersRepo.GetUpgradeTime(ctx, user.ID)
 		require.NoError(t, err)
 		require.NotNil(t, upgradeTime)
 		require.WithinDuration(t, now, *upgradeTime, time.Minute)
+	})
+}
+
+func TestListUsersToOptOutFreezeExcludedUserAgents(t *testing.T) {
+	satellitedbtest.Run(t, func(ctx *testcontext.Context, t *testing.T, db satellite.DB) {
+		users := db.Console().Users()
+
+		active := console.Active
+		paid := console.PaidUser
+
+		makeEligibleUser := func(email string, userAgent []byte) uuid.UUID {
+			id := testrand.UUID()
+			_, err := users.Insert(ctx, &console.User{
+				ID:           id,
+				FullName:     "test",
+				Email:        email,
+				PasswordHash: []byte("testpassword"),
+				UserAgent:    userAgent,
+			})
+			require.NoError(t, err)
+			// Active + paid with no freeze events and no opt-in status makes the user eligible
+			// for the opt-out freeze.
+			require.NoError(t, users.Update(ctx, id, console.UpdateUserRequest{
+				Status: &active,
+				Kind:   &paid,
+			}))
+			return id
+		}
+
+		userID := makeEligibleUser("control@mail.test", nil)
+		cohortUserID := makeEligibleUser("cohort@mail.test", []byte("legacy-pricing-user-agent"))
+
+		listIDs := func(opts console.ListUsersToOptOutFreezeOptions) map[uuid.UUID]bool {
+			opts.Limit = 100
+			page, err := users.ListUsersToOptOutFreeze(ctx, opts)
+			require.NoError(t, err)
+			out := make(map[uuid.UUID]bool, len(page.IDs))
+			for _, id := range page.IDs {
+				out[id] = true
+			}
+			return out
+		}
+
+		// Without the filter, both users are eligible to be opt-out frozen.
+		all := listIDs(console.ListUsersToOptOutFreezeOptions{})
+		require.True(t, all[userID], "control user should be eligible")
+		require.True(t, all[cohortUserID], "cohort user should be eligible without the filter")
+
+		// With the carve-out user agent excluded, only the cohort user is filtered out.
+		filtered := listIDs(console.ListUsersToOptOutFreezeOptions{
+			ExcludedUserAgents: [][]byte{[]byte("legacy-pricing-user-agent")},
+		})
+		require.True(t, filtered[userID], "control user should still be eligible")
+		require.False(t, filtered[cohortUserID], "cohort user must be excluded by user agent")
 	})
 }
 
@@ -628,6 +794,37 @@ func TestUserSettings(t *testing.T) {
 			require.Equal(t, newBool, settings.PassphrasePrompt)
 		})
 
+		t.Run("test opt in status", func(t *testing.T) {
+			id = testrand.UUID()
+
+			require.NoError(t, users.UpsertSettings(ctx, id, console.UpsertUserSettingsRequest{}))
+			settings, err := users.GetSettings(ctx, id)
+			require.NoError(t, err)
+			require.Equal(t, console.NoAction, settings.OptInStatus)
+
+			optedIn := console.OptedIn
+			require.NoError(t, users.UpsertSettings(ctx, id, console.UpsertUserSettingsRequest{
+				OptInStatus: &optedIn,
+			}))
+			settings, err = users.GetSettings(ctx, id)
+			require.NoError(t, err)
+			require.Equal(t, console.OptedIn, settings.OptInStatus)
+
+			// omitting OptInStatus on subsequent upsert should leave the existing value unchanged.
+			require.NoError(t, users.UpsertSettings(ctx, id, console.UpsertUserSettingsRequest{}))
+			settings, err = users.GetSettings(ctx, id)
+			require.NoError(t, err)
+			require.Equal(t, console.OptedIn, settings.OptInStatus)
+
+			optedOut := console.OptedOut
+			require.NoError(t, users.UpsertSettings(ctx, id, console.UpsertUserSettingsRequest{
+				OptInStatus: &optedOut,
+			}))
+			settings, err = users.GetSettings(ctx, id)
+			require.NoError(t, err)
+			require.Equal(t, console.OptedOut, settings.OptInStatus)
+		})
+
 		t.Run("test notice dismissal", func(t *testing.T) {
 			id = testrand.UUID()
 			noticeDismissal := console.NoticeDismissal{
@@ -636,7 +833,6 @@ func TestUserSettings(t *testing.T) {
 				PartnerUpgradeBanner:     false,
 				ProjectMembersPassphrase: false,
 				UploadOverwriteWarning:   false,
-				VersioningBetaBanner:     false,
 			}
 
 			require.NoError(t, users.UpsertSettings(ctx, id, console.UpsertUserSettingsRequest{}))
@@ -649,7 +845,6 @@ func TestUserSettings(t *testing.T) {
 			noticeDismissal.PartnerUpgradeBanner = true
 			noticeDismissal.ProjectMembersPassphrase = true
 			noticeDismissal.UploadOverwriteWarning = true
-			noticeDismissal.VersioningBetaBanner = true
 			require.NoError(t, users.UpsertSettings(ctx, id, console.UpsertUserSettingsRequest{
 				NoticeDismissal: &noticeDismissal,
 			}))
@@ -706,5 +901,169 @@ func TestDeleteUnverifiedBefore(t *testing.T) {
 		require.NoError(t, err)
 		_, err = usersDB.Get(ctx, oldActive)
 		require.NoError(t, err)
+	})
+}
+
+func TestUsersSetStatusPendingDeletion(t *testing.T) {
+	t.Parallel()
+	// There are 2 loops around satellitedbtest.Run and 3 inside because having all of them inside
+	// exhaust the test database. I don't know the reasons, I founded with a trial and error
+	// approach.
+	for _, kind := range []console.UserKind{console.FreeUser, console.PaidUser} {
+		for status := console.UserStatus(0); status < console.UserStatusCount; status++ {
+			t.Run(fmt.Sprintf("kind=%v,status=%v", kind, status), func(t *testing.T) {
+				testUsersSetStatusPendingDeletion(t, kind, status)
+			})
+		}
+	}
+}
+
+func testUsersSetStatusPendingDeletion(t *testing.T, kind console.UserKind, status console.UserStatus) {
+	const defaultDaysTillEscalation = 2
+
+	satellitedbtest.Run(t, func(ctx *testcontext.Context, t *testing.T, db satellite.DB) {
+		usersRepo := db.Console().Users()
+
+		var thirdPartyProject uuid.UUID
+		{ // Create a user and project to add the users of the following combination of tests to be
+			// member of it for the project member test combinations.
+			user, err := usersRepo.Insert(ctx, &console.User{
+				ID:           testrand.UUID(),
+				FullName:     "Third party project owner",
+				Email:        "third-party-project-owner@mail.test",
+				PasswordHash: []byte("password"),
+			})
+			require.NoError(t, err)
+
+			project, err := db.Console().Projects().Insert(
+				ctx, &console.Project{
+					Name:    "third-party-project",
+					OwnerID: user.ID,
+				},
+			)
+			require.NoError(t, err)
+
+			thirdPartyProject = project.ID
+		}
+
+		userStatus := status
+
+		// -1 means not being a member.
+		for m := -1; m <= int(console.RoleMember); m++ {
+			memberType := console.ProjectMemberRole(m)
+
+			// This loop finishes by a conditional at the end of the loop block.
+			for event := console.AccountFreezeEventType(0); true; event++ {
+				// Days until escalation. -1 is null in the DB
+				for days := -1; days <= 1; days++ {
+					t.Run(fmt.Sprintf(
+						"PaidTier=%t_Status=%s_Member=%s_Event=%s=DaysUntilEscalation=%d",
+						kind == console.PaidUser, userStatus.String(), memberType, event, days,
+					), func(t *testing.T) {
+						// Create user and set the account freeze event.
+						user, err := usersRepo.Insert(ctx, &console.User{
+							ID:           testrand.UUID(),
+							FullName:     "Test User",
+							Email:        fmt.Sprintf("test-%s@mail.test", testrand.UUID().String()),
+							PasswordHash: []byte("password"),
+							Kind:         kind,
+						})
+						require.NoError(t, err)
+
+						{ // Set the status because Insert ignores the status field.
+							updateReq := console.UpdateUserRequest{
+								Status: &userStatus,
+							}
+							err = usersRepo.Update(ctx, user.ID, updateReq)
+							require.NoError(t, err)
+						}
+
+						{ // Create a project and create an entry in project members because all the owners are
+							// admin member of their projects
+							project, err := db.Console().Projects().Insert(
+								ctx, &console.Project{
+									Name:    user.Email,
+									OwnerID: user.ID,
+								},
+							)
+							require.NoError(t, err)
+
+							_, err = db.Console().ProjectMembers().Insert(
+								ctx, user.ID, project.ID, console.RoleAdmin,
+							)
+							require.NoError(t, err)
+						}
+
+						if memberType.String() != "" {
+							_, err = db.Console().ProjectMembers().Insert(ctx, user.ID, thirdPartyProject, memberType)
+							require.NoError(t, err)
+						}
+
+						// We check that's a valid event, otherwise we skip it to have checks without without a
+						// freeze event.
+						if event.String() != "" {
+							var daysp *int
+							if days >= 0 {
+								daysp = &days
+							}
+							_, err = db.Console().AccountFreezeEvents().Upsert(ctx, &console.AccountFreezeEvent{
+								UserID: user.ID,
+								Type:   event,
+								Limits: &console.AccountFreezeEventLimits{
+									User:     console.UsageLimits{},
+									Projects: make(map[uuid.UUID]console.UsageLimits),
+								},
+								DaysTillEscalation: daysp,
+							})
+							require.NoError(t, err)
+						}
+
+						// Call SetSatusPendingDeletion for this user.
+						err = db.Console().Users().SetStatusPendingDeletion(ctx, user.ID, defaultDaysTillEscalation)
+
+						// Verify the result.
+						require.GreaterOrEqual(t, defaultDaysTillEscalation, 2,
+							"days till escalation is required to be at least 2 for this test setup",
+						)
+						if kind == console.FreeUser &&
+							userStatus == console.Active &&
+							event == console.TrialExpirationFreeze &&
+							days == 0 &&
+							memberType.String() == "" {
+
+							require.NoError(t, err)
+
+							updatedUser, err := db.Console().Users().Get(ctx, user.ID)
+							require.NoError(t, err)
+							require.Equal(t, console.PendingDeletion, updatedUser.Status)
+							require.NotNil(t, updatedUser.StatusUpdatedAt, "StatusUpdateAt")
+							// Delta is 10 seconds to reduce the chances to fail the test because of the test database
+							// running slower.
+							require.WithinDuration(
+								t, time.Now().UTC(), *updatedUser.StatusUpdatedAt, 10*time.Second, "StatusUpdatedAt",
+							)
+						} else {
+							require.ErrorIs(t, err, sql.ErrNoRows)
+						}
+					})
+				}
+
+				// If the event doesn't have a string representation is an invalid event. Event values
+				// are consecutive positive integers, hence, the previous iteration reached the event
+				// type with maximum value and this one was to check a user without a freeze event.
+				if event.String() == "" {
+					break
+				}
+			}
+		}
+	})
+}
+
+func TestUsersSetStatusPendingDeletion_UserMissing(t *testing.T) {
+	satellitedbtest.Run(t, func(ctx *testcontext.Context, t *testing.T, db satellite.DB) {
+		t.Run("unexisting_user_account", func(t *testing.T) {
+			err := db.Console().Users().SetStatusPendingDeletion(ctx, testrand.UUID(), 0)
+			require.ErrorIs(t, err, sql.ErrNoRows)
+		})
 	})
 }

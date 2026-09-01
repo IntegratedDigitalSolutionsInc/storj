@@ -20,10 +20,30 @@ model user (
 		where user.external_id != null
 	)
 
+	index (
+		name users_status_status_updated_at_index
+		fields status status_updated_at
+		where user.status_updated_at != null
+	)
+
+	index (
+		name users_tenant_id_index
+		fields tenant_id
+		where user.tenant_id != null
+	)
+
+	index (
+		name users_normalized_email_tenant_id_status_index
+		fields normalized_email tenant_id status
+		where user.tenant_id != null
+	)
+
 	// id is an uuid for the user.
 	field id                 blob
 	// external_id is a user id provided by an external source, such as a single-sign-on identity provider.
 	field external_id        text      ( updatable, nullable )
+	// tenant_id is is used to associate the user with a tenant, allowing the same email to be used in different tenants.
+	field tenant_id          text      ( updatable, nullable )
 	// email is the user specified email.
 	field email              text      ( updatable )
 	// normalized_email is the email transformed by usual rules, e.g. case-insensitive.
@@ -63,8 +83,9 @@ model user (
 	field project_storage_limit    int64     ( updatable, default 0 )
 	// segment_limit is project default on how many segments can be stored in the project.
 	field project_segment_limit    int64     ( updatable, default 0 )
-	// paid_tier indicates whether user is paying for access.
-	field paid_tier                bool      ( updatable, default false )
+
+	// kind indicates the user kind. Free = 0, Paid = 1.
+	field kind                	   int      ( updatable, default 0 )
 
 	// position is user-specified position in a company.
 	field position           text      ( updatable, nullable )
@@ -116,6 +137,9 @@ model user (
 	field trial_expiration timestamp ( updatable, nullable )
 	// upgrade_time is used to track when user upgraded to paid tier.
 	field upgrade_time timestamp ( updatable, nullable )
+
+	// hubspot_object_id is a HubSpot object ID corresponding to the current user.
+	field hubspot_object_id text ( updatable, nullable )
 )
 
 create user ( )
@@ -124,11 +148,26 @@ delete user ( where user.id = ? )
 
 read all (
 	select user
+)
+
+read all (
+	select user
 	where user.normalized_email = ?
+)
+read all (
+	select user
+	where user.normalized_email = ?
+	where user.tenant_id = ?
 )
 read one (
 	select user
 	where user.normalized_email = ?
+	where user.status != 0
+)
+read one (
+	select user
+	where user.normalized_email = ?
+	where user.tenant_id = ?
 	where user.status != 0
 )
 read one (
@@ -140,7 +179,7 @@ read one (
 	where user.id = ?
 )
 read one (
-	select user.paid_tier
+	select user.kind
 	where user.id = ?
 )
 read one (
@@ -150,12 +189,14 @@ read one (
 read one (
 	select user
 	where user.external_id = ?
+	where user.tenant_id = ?
 )
 
 read paged (
 	select account_freeze_event
 	join account_freeze_event.user_id = user.id
 	where user.status != ?
+	where user.tenant_id = ?
 	where account_freeze_event.event = ?
 )
 
@@ -223,6 +264,25 @@ model registration_token (
 	// project_limit is the default limit on how many projects the user can create.
 	field project_limit int
 
+	// storage_limit is the storage limit in bytes for accounts created with this token.
+	field storage_limit   int64     ( nullable )
+	// bandwidth_limit is the bandwidth limit in bytes for accounts created with this token.
+	field bandwidth_limit int64     ( nullable )
+	// segment_limit is the segment limit for accounts created with this token.
+	field segment_limit   int64     ( nullable )
+
+	// expires_at is when this token expires. Null means no expiration.
+	field expires_at    timestamp  ( nullable )
+
+	// user_kind indicates the user kind for accounts created with this token.
+	// Free = 0, Paid = 1, NFR = 2, Member = 3. See console.UserKind for details.
+	// Null means no specific kind is associated with this token so Free will be used during creation.
+	field user_kind int ( nullable )
+
+	// partner is the optional parameter, used to inform 'partner' when the user registers with this token.
+	field partner text ( nullable )
+
+	// created_at indicates when the token was created.
 	field created_at    timestamp  ( autoinsert )
 )
 
@@ -324,6 +384,15 @@ model user_settings (
 	field onboarding_step text ( nullable, updatable )
 	// notice_dismissal keeps track of the notices that the user has dismissed or not.
 	field notice_dismissal json ( updatable, default "{}" )
+	// opt_in_status tracks whether a user has opted into an account-level change. Possible values:
+	// 0 or null - no_action
+	// 1         - opted_in
+	// 2         - opted_out
+	// 3         - excluded
+	field opt_in_status int ( nullable, updatable )
+	// inactivity_exempt indicates that this account has been manually exempted from
+	// inactivity-based suspension by an admin. Null is treated as false.
+	field inactivity_exempt bool ( nullable, updatable )
 )
 
 create user_settings ( noreturn )

@@ -20,6 +20,8 @@ type ProjectMembers interface {
 	GetByMemberIDAndProjectID(ctx context.Context, memberID, projectID uuid.UUID) (*ProjectMember, error)
 	// GetPagedWithInvitationsByProjectID is a method for querying project members and invitations from the database by projectID and cursor.
 	GetPagedWithInvitationsByProjectID(ctx context.Context, projectID uuid.UUID, cursor ProjectMembersCursor) (*ProjectMembersPage, error)
+	// GetTotalCountByProjectID is a method for getting total count of project members by projectID.
+	GetTotalCountByProjectID(ctx context.Context, projectID uuid.UUID) (uint64, error)
 	// UpdateRole is a method for updating project member role in the database.
 	UpdateRole(ctx context.Context, memberID, projectID uuid.UUID, newRole ProjectMemberRole) (*ProjectMember, error)
 	// Insert is a method for inserting project member into the database.
@@ -38,6 +40,12 @@ type ProjectMember struct {
 	Role ProjectMemberRole
 
 	CreatedAt time.Time
+
+	// The following fields are populated when the member is retrieved with user information.
+	// These are optional and only set when explicitly requested (e.g., in GetPagedWithInvitationsByProjectID).
+	Email     string
+	FullName  string
+	ShortName string
 }
 
 // ProjectMembersCursor holds info for project members cursor pagination.
@@ -64,6 +72,12 @@ type ProjectMembersPage struct {
 	TotalCount     uint64
 }
 
+// DeleteMembersAndInvitationsRequest holds data for remove members and invitations request.
+type DeleteMembersAndInvitationsRequest struct {
+	Emails         []string `json:"emails"`
+	RemoveAccesses bool     `json:"removeAccesses"`
+}
+
 // ProjectMemberOrder is used for querying project members in specified order.
 type ProjectMemberOrder int8
 
@@ -85,3 +99,14 @@ const (
 	// RoleMember indicates that the member has regular member rights.
 	RoleMember ProjectMemberRole = 1
 )
+
+func (mr ProjectMemberRole) String() string {
+	switch mr {
+	case RoleAdmin:
+		return "admin"
+	case RoleMember:
+		return "member"
+	}
+
+	return ""
+}

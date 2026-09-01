@@ -28,7 +28,7 @@
                     </v-card-title>
                     <template #append>
                         <v-btn
-                            icon="$close"
+                            :icon="X"
                             variant="text"
                             size="small"
                             color="default"
@@ -88,7 +88,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, Component, watch } from 'vue';
+import { type Component, ref, watch  } from 'vue';
 import {
     VDialog,
     VCard,
@@ -102,12 +102,13 @@ import {
     VBtn,
     VChip,
 } from 'vuetify/components';
+import { X } from '@lucide/vue';
 
 import { AnalyticsErrorEventSource } from '@/utils/constants/analyticsEventNames';
 import { useLoading } from '@/composables/useLoading';
-import { useNotify } from '@/utils/hooks';
+import { useNotify } from '@/composables/useNotify';
 import { Time } from '@/utils/time';
-import { BrowserObject, useObjectBrowserStore } from '@/store/modules/objectBrowserStore';
+import { type BrowserObject, useObjectBrowserStore  } from '@/store/modules/objectBrowserStore';
 
 import IconRestore from '@/components/icons/IconRestore.vue';
 

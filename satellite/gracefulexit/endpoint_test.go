@@ -378,16 +378,14 @@ func TestManyNodesGracefullyExiting(t *testing.T) {
 		// we expect ~78% of segments to be in the repair queue (the chance that a
 		// segment still has at least 3 pieces in not-exiting nodes). but since things
 		// will fluctuate, let's just expect half
-		count, err := satellite.DB.RepairQueue().Count(ctx)
+		count, err := satellite.Repair.Queue.Count(ctx)
 		require.NoError(t, err)
 		require.GreaterOrEqual(t, count, numObjects/2)
 
 		// perform the repairs, which should get every piece so that it will still be
 		// reconstructable without the exiting nodes.
-		satellite.Repair.Repairer.Loop.Restart()
 		satellite.Repair.Repairer.Loop.TriggerWait()
-		satellite.Repair.Repairer.Loop.Pause()
-		satellite.Repair.Repairer.WaitForPendingRepairs()
+		require.NoError(t, satellite.Repair.Repairer.WaitForPendingRepairs(ctx))
 
 		// turn off the exiting nodes entirely
 		for i := 0; i < len(planet.StorageNodes)/2; i++ {

@@ -22,8 +22,8 @@ var ErrAccountFreeze = errs.Class("account freeze service")
 // ErrNoFreezeStatus is the error for when a user doesn't have a particular freeze status.
 var ErrNoFreezeStatus = errs.New("this freeze event does not exist for this user")
 
-// FreezeEventsByEventAndUserStatusCursor is a cursor for getting freeze events by event and user status.
-type FreezeEventsByEventAndUserStatusCursor = dbx.Paged_AccountFreezeEvent_By_User_Status_Not_And_AccountFreezeEvent_Event_Continuation
+// FreezeEventsByEventAndUserStatusCursor is a cursor for paginating freeze events filtered by event type, user status, and tenant.
+type FreezeEventsByEventAndUserStatusCursor = dbx.Paged_AccountFreezeEvent_By_User_Status_Not_And_User_TenantId_And_AccountFreezeEvent_Event_Continuation
 
 // AccountFreezeEvents exposes methods to manage the account freeze events table in database.
 //
@@ -33,11 +33,24 @@ type AccountFreezeEvents interface {
 	Upsert(ctx context.Context, event *AccountFreezeEvent) (*AccountFreezeEvent, error)
 	// Get is a method for querying account freeze event from the database by user ID and event type.
 	Get(ctx context.Context, userID uuid.UUID, eventType AccountFreezeEventType) (*AccountFreezeEvent, error)
+	// HasEvents checks if there's a freeze event of the specified types for the given user ID.
+	HasEvents(ctx context.Context, userID uuid.UUID, eventTypes ...AccountFreezeEventType) (bool, error)
 	// GetAllEvents is a method for querying all account freeze events from the database.
 	GetAllEvents(ctx context.Context, cursor FreezeEventsCursor, optionalEventTypes []AccountFreezeEventType) (events *FreezeEventsPage, err error)
 	// GetTrialExpirationFreezesToEscalate is a method that gets free trial expiration freezes that correspond to users
 	// that are not pending deletion (have not been escalated).
-	GetTrialExpirationFreezesToEscalate(ctx context.Context, limit int, cursor *FreezeEventsByEventAndUserStatusCursor) ([]AccountFreezeEvent, *FreezeEventsByEventAndUserStatusCursor, error)
+	// tenantID filters by tenant: nil returns users with no tenant, non-nil returns users with that tenant.
+	GetTrialExpirationFreezesToEscalate(ctx context.Context, tenantID *string, limit int, cursor *FreezeEventsByEventAndUserStatusCursor) ([]AccountFreezeEvent, *FreezeEventsByEventAndUserStatusCursor, error)
+	// GetOptOutFreezes is a method that gets opt-out freezes that correspond to users
+	// that are not deleted. This includes already-escalated (PendingDeletion) users so that they
+	// can be unfrozen if their opt-in status changes.
+	// tenantID filters by tenant: nil returns users with no tenant, non-nil returns users with that tenant.
+	GetOptOutFreezes(ctx context.Context, tenantID *string, limit int, cursor *FreezeEventsByEventAndUserStatusCursor) ([]AccountFreezeEvent, *FreezeEventsByEventAndUserStatusCursor, error)
+	// GetEscalatedEventsBefore is used to get a list of freeze events of some types that were escalated
+	// before the given time (corresponding users have status=PendingDeletion and status_updated_at before olderThan).
+	// NB: This method is specifically used to list events for deletion, so a specific event that is not deleted
+	// will continue to be returned.
+	GetEscalatedEventsBefore(ctx context.Context, params GetEscalatedEventsBeforeParams) (_ []EventWithUser, err error)
 	// GetAll is a method for querying all account freeze events from the database by user ID.
 	GetAll(ctx context.Context, userID uuid.UUID) (freezes *UserFreezeEvents, err error)
 	// DeleteAllByUserID is a method for deleting all account freeze events from the database by user ID.
@@ -58,6 +71,32 @@ type AccountFreezeEvent struct {
 	CreatedAt          time.Time
 }
 
+// EventWithUser contains a freeze event type and the corresponding user ID.
+// Returned by GetEscalatedEventsBefore method.
+type EventWithUser struct {
+	Type   AccountFreezeEventType
+	UserID uuid.UUID
+}
+
+// GetEscalatedEventsBeforeParams contains parameters for the
+// GetEscalatedEventsBefore method.
+type GetEscalatedEventsBeforeParams struct {
+	Limit int
+	// Offset is the number of leading rows to skip, ordered by status_updated_at ascending.
+	// Callers that do not delete every returned event (e.g. because data is retained) must advance
+	// the offset past the retained events, otherwise the same events are returned on every call.
+	Offset     int
+	EventTypes []EventTypeAndTime
+}
+
+// EventTypeAndTime contains an event type and a time.
+// Used to specify which events to query that were created
+// before a certain time.
+type EventTypeAndTime struct {
+	EventType AccountFreezeEventType
+	OlderThan time.Time
+}
+
 // AccountFreezeEventLimits represents the usage limits for a user's account and projects before they were frozen.
 type AccountFreezeEventLimits struct {
 	User     UsageLimits               `json:"user"`
@@ -72,6 +111,10 @@ type FreezeEventsCursor struct {
 	// StartingAfter is the last user ID of the previous page.
 	// The next page will start after this user ID.
 	StartingAfter *uuid.UUID
+
+	// TenantID filters events to users belonging to the specified tenant.
+	// If nil, only events for users with no tenant (tenant_id IS NULL) are returned.
+	TenantID *string
 }
 
 // FreezeEventsPage returns paginated freeze events.
@@ -83,7 +126,8 @@ type FreezeEventsPage struct {
 
 // UserFreezeEvents holds the freeze events for a user.
 type UserFreezeEvents struct {
-	BillingFreeze, BillingWarning, ViolationFreeze, LegalFreeze, DelayedBotFreeze, BotFreeze, TrialExpirationFreeze *AccountFreezeEvent
+	BillingFreeze, BillingWarning, ViolationFreeze, LegalFreeze, DelayedBotFreeze, BotFreeze, TrialExpirationFreeze, OptOutFreeze *AccountFreezeEvent
+	InactivityWarning, InactivityFreeze                                                                                           *AccountFreezeEvent
 }
 
 // AccountFreezeEventType is used to indicate the account freeze event's type.
@@ -105,6 +149,15 @@ const (
 	BotFreeze AccountFreezeEventType = 5
 	// TrialExpirationFreeze signifies that the user has been frozen because their free trial has expired.
 	TrialExpirationFreeze AccountFreezeEventType = 6
+	// OptOutFreeze signifies that the user has been frozen because they opted out of an
+	// account-level change (see OptInStatus).
+	OptOutFreeze AccountFreezeEventType = 7
+	// InactivityWarning signifies that the user has been warned that their account will be frozen
+	// due to sustained zero effective usage across consecutive billing cycles.
+	InactivityWarning AccountFreezeEventType = 8
+	// InactivityFreeze signifies that the user has been frozen due to sustained zero effective
+	// usage across consecutive billing cycles.
+	InactivityFreeze AccountFreezeEventType = 9
 )
 
 var (
@@ -143,6 +196,12 @@ func (et AccountFreezeEventType) String() string {
 		return "Bot Freeze"
 	case TrialExpirationFreeze:
 		return "Trial Expiration Freeze"
+	case OptOutFreeze:
+		return "Opt Out Freeze"
+	case InactivityWarning:
+		return "Inactivity Warning"
+	case InactivityFreeze:
+		return "Inactivity Freeze"
 	default:
 		return ""
 	}
@@ -150,10 +209,21 @@ func (et AccountFreezeEventType) String() string {
 
 // AccountFreezeConfig contains configurable values for account freeze service.
 type AccountFreezeConfig struct {
-	BillingWarnGracePeriod           time.Duration `help:"How long to wait between a billing warning event and billing freezing an account." default:"360h"`
-	BillingFreezeGracePeriod         time.Duration `help:"How long to wait between a billing freeze event and setting pending deletion account status." default:"1440h"`
+	BillingWarnGracePeriod           time.Duration `help:"How long to wait between a billing warning event and billing freezing an account." default:"240h"`
+	BillingFreezeGracePeriod         time.Duration `help:"How long to wait between a billing freeze event and setting pending deletion account status." default:"480h"`
 	TrialExpirationFreezeGracePeriod time.Duration `help:"How long to wait between a trail expiration freeze event and setting pending deletion account status. 0 disables escalation." default:"0" testDefault:"720h" devDefault:"720h"`
 	TrialExpirationRateLimits        int64         `help:"Specifies the rate and burst limit for 'head', list' and 'delete' operations when a trial account has expired." default:"20"`
+	OptOutFreezeDate                 string        `help:"The date (RFC3339) on or after which non-OptedIn users are opt-out frozen. Leave empty to disable" default:"2026-07-31T00:00:00Z"`
+	OptOutFreezeGracePeriod          time.Duration `help:"How long to wait between an opt-out freeze event and setting pending deletion account status." default:"1080h"`
+	InactivityGracePeriod            time.Duration `help:"How long to wait between an inactivity warning event and freezing the account." default:"720h"`
+}
+
+// OptOutFreezeStartTime parses the configured OptOutFreezeDate as an RFC3339 time.
+func (c AccountFreezeConfig) OptOutFreezeStartTime() (time.Time, error) {
+	if c.OptOutFreezeDate == "" {
+		return time.Time{}, nil
+	}
+	return time.Parse(time.RFC3339, c.OptOutFreezeDate)
 }
 
 // AccountFreezeService encapsulates operations concerning account freezes.
@@ -186,22 +256,20 @@ func (s *AccountFreezeService) IsUserViolationFrozen(ctx context.Context, userID
 }
 
 // IsUserFrozen returns whether the user specified by the given ID has an eventType freeze.
-func (s *AccountFreezeService) IsUserFrozen(ctx context.Context, userID uuid.UUID, eventType AccountFreezeEventType) (_ bool, err error) {
+func (s *AccountFreezeService) IsUserFrozen(ctx context.Context, userID uuid.UUID, eventType ...AccountFreezeEventType) (frozen bool, err error) {
 	defer mon.Task()(&ctx)(&err)
 
-	_, err = s.freezeEventsDB.Get(ctx, userID, eventType)
-	switch {
-	case errors.Is(err, sql.ErrNoRows):
-		return false, nil
-	case err != nil:
+	frozen, err = s.freezeEventsDB.HasEvents(ctx, userID, eventType...)
+	if err != nil {
 		return false, ErrAccountFreeze.Wrap(err)
-	default:
-		return true, nil
 	}
+
+	return frozen, nil
 }
 
-// BillingFreezeUser freezes the user specified by the given ID due to nonpayment of invoices.
-func (s *AccountFreezeService) BillingFreezeUser(ctx context.Context, userID uuid.UUID) (err error) {
+// billingFreezeUser is a private implementation function that freezes the user specified by the given ID due to nonpayment of invoices.
+// The adminInitiated parameter indicates whether this freeze was initiated by an admin or automatically by the satellite.
+func (s *AccountFreezeService) billingFreezeUser(ctx context.Context, userID uuid.UUID, adminInitiated bool) (err error) {
 	defer mon.Task()(&ctx)(&err)
 
 	err = s.store.WithTx(ctx, func(ctx context.Context, tx DBTx) error {
@@ -244,7 +312,10 @@ func (s *AccountFreezeService) BillingFreezeUser(ctx context.Context, userID uui
 				return err
 			}
 		}
-		s.tracker.TrackAccountFrozen(userID, user.Email)
+
+		// Track using both the old specific method and the new generic method
+		s.tracker.TrackAccountFrozen(userID, user.Email, user.HubspotObjectID)
+		s.tracker.TrackGenericFreeze(userID, user.Email, BillingFreeze.String(), adminInitiated, user.HubspotObjectID)
 
 		return nil
 	})
@@ -252,8 +323,21 @@ func (s *AccountFreezeService) BillingFreezeUser(ctx context.Context, userID uui
 	return ErrAccountFreeze.Wrap(err)
 }
 
-// BillingUnfreezeUser reverses the billing freeze placed on the user specified by the given ID.
-func (s *AccountFreezeService) BillingUnfreezeUser(ctx context.Context, userID uuid.UUID) (err error) {
+// BillingFreezeUser freezes the user specified by the given ID due to nonpayment of invoices.
+// This is an automatically triggered freeze (not admin-initiated).
+func (s *AccountFreezeService) BillingFreezeUser(ctx context.Context, userID uuid.UUID) (err error) {
+	return s.billingFreezeUser(ctx, userID, false)
+}
+
+// AdminBillingFreezeUser freezes the user specified by the given ID due to nonpayment of invoices.
+// This is an admin-initiated freeze.
+func (s *AccountFreezeService) AdminBillingFreezeUser(ctx context.Context, userID uuid.UUID) (err error) {
+	return s.billingFreezeUser(ctx, userID, true)
+}
+
+// billingUnfreezeUser is a private implementation function that reverses the billing freeze placed on the user specified by the given ID.
+// The adminInitiated parameter indicates whether this unfreeze was initiated by an admin or automatically by the satellite.
+func (s *AccountFreezeService) billingUnfreezeUser(ctx context.Context, userID uuid.UUID, adminInitiated bool) (err error) {
 	defer mon.Task()(&ctx)(&err)
 
 	err = s.store.WithTx(ctx, func(ctx context.Context, tx DBTx) error {
@@ -263,8 +347,12 @@ func (s *AccountFreezeService) BillingUnfreezeUser(ctx context.Context, userID u
 		}
 
 		event, err := tx.AccountFreezeEvents().Get(ctx, userID, BillingFreeze)
-		if errors.Is(err, sql.ErrNoRows) {
-			return ErrNoFreezeStatus
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return ErrNoFreezeStatus
+			}
+
+			return err
 		}
 
 		if event.Limits == nil {
@@ -299,7 +387,9 @@ func (s *AccountFreezeService) BillingUnfreezeUser(ctx context.Context, userID u
 			}
 		}
 
-		s.tracker.TrackAccountUnfrozen(userID, user.Email)
+		// Track using both the old specific method and the new generic method
+		s.tracker.TrackAccountUnfrozen(userID, user.Email, user.HubspotObjectID)
+		s.tracker.TrackGenericUnfreeze(userID, user.Email, BillingFreeze.String(), adminInitiated, user.HubspotObjectID)
 
 		return nil
 	})
@@ -307,9 +397,23 @@ func (s *AccountFreezeService) BillingUnfreezeUser(ctx context.Context, userID u
 	return ErrAccountFreeze.Wrap(err)
 }
 
-// BillingWarnUser adds a billing warning event to the freeze events table.
-func (s *AccountFreezeService) BillingWarnUser(ctx context.Context, userID uuid.UUID) (err error) {
+// BillingUnfreezeUser reverses the billing freeze placed on the user specified by the given ID.
+// This is an automatically triggered unfreeze (not admin-initiated).
+func (s *AccountFreezeService) BillingUnfreezeUser(ctx context.Context, userID uuid.UUID) (err error) {
+	return s.billingUnfreezeUser(ctx, userID, false)
+}
+
+// AdminBillingUnfreezeUser reverses the billing freeze placed on the user specified by the given ID.
+// This is an admin-initiated unfreeze.
+func (s *AccountFreezeService) AdminBillingUnfreezeUser(ctx context.Context, userID uuid.UUID) (err error) {
+	return s.billingUnfreezeUser(ctx, userID, true)
+}
+
+// billingWarnUser is a private implementation function that adds a billing warning event to the freeze events table.
+// The adminInitiated parameter indicates whether this warning was initiated by an admin or automatically by the satellite.
+func (s *AccountFreezeService) billingWarnUser(ctx context.Context, userID uuid.UUID, adminInitiated bool) (err error) {
 	defer mon.Task()(&ctx)(&err)
+
 	err = s.store.WithTx(ctx, func(ctx context.Context, tx DBTx) error {
 		user, err := tx.Users().Get(ctx, userID)
 		if err != nil {
@@ -318,11 +422,11 @@ func (s *AccountFreezeService) BillingWarnUser(ctx context.Context, userID uuid.
 
 		freezes, err := tx.AccountFreezeEvents().GetAll(ctx, userID)
 		if err != nil {
-			return ErrAccountFreeze.Wrap(err)
+			return err
 		}
 
 		if freezes.ViolationFreeze != nil || freezes.BillingFreeze != nil || freezes.LegalFreeze != nil {
-			return ErrAccountFreeze.New("User is already frozen")
+			return errs.New("User is already frozen")
 		}
 
 		if freezes.BillingWarning != nil {
@@ -336,19 +440,34 @@ func (s *AccountFreezeService) BillingWarnUser(ctx context.Context, userID uuid.
 			DaysTillEscalation: &daysTillEscalation,
 		})
 		if err != nil {
-			return ErrAccountFreeze.Wrap(err)
+			return err
 		}
 
-		s.tracker.TrackAccountFreezeWarning(userID, user.Email)
+		// Track using both the old specific method and the new generic method
+		s.tracker.TrackAccountFreezeWarning(userID, user.Email, user.HubspotObjectID)
+		s.tracker.TrackGenericFreeze(userID, user.Email, BillingWarning.String(), adminInitiated, user.HubspotObjectID)
 
 		return nil
 	})
 
-	return err
+	return ErrAccountFreeze.Wrap(err)
 }
 
-// BillingUnWarnUser reverses the warning placed on the user specified by the given ID.
-func (s *AccountFreezeService) BillingUnWarnUser(ctx context.Context, userID uuid.UUID) (err error) {
+// BillingWarnUser adds a billing warning event to the freeze events table.
+// This is an automatically triggered warning (not admin-initiated).
+func (s *AccountFreezeService) BillingWarnUser(ctx context.Context, userID uuid.UUID) (err error) {
+	return s.billingWarnUser(ctx, userID, false)
+}
+
+// AdminBillingWarnUser adds a billing warning event to the freeze events table.
+// This is an admin-initiated warning.
+func (s *AccountFreezeService) AdminBillingWarnUser(ctx context.Context, userID uuid.UUID) (err error) {
+	return s.billingWarnUser(ctx, userID, true)
+}
+
+// billingUnWarnUser is a private implementation function that reverses the warning placed on the user specified by the given ID.
+// The adminInitiated parameter indicates whether this unwarning was initiated by an admin or automatically by the satellite.
+func (s *AccountFreezeService) billingUnWarnUser(ctx context.Context, userID uuid.UUID, adminInitiated bool) (err error) {
 	defer mon.Task()(&ctx)(&err)
 
 	err = s.store.WithTx(ctx, func(ctx context.Context, tx DBTx) error {
@@ -358,24 +477,43 @@ func (s *AccountFreezeService) BillingUnWarnUser(ctx context.Context, userID uui
 		}
 
 		_, err = tx.AccountFreezeEvents().Get(ctx, userID, BillingWarning)
-		if errors.Is(err, sql.ErrNoRows) {
-			return ErrAccountFreeze.Wrap(errs.Combine(err, ErrNoFreezeStatus))
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return ErrNoFreezeStatus
+			}
+
+			return err
 		}
 
-		err = ErrAccountFreeze.Wrap(tx.AccountFreezeEvents().DeleteByUserIDAndEvent(ctx, userID, BillingWarning))
+		err = tx.AccountFreezeEvents().DeleteByUserIDAndEvent(ctx, userID, BillingWarning)
 		if err != nil {
 			return err
 		}
 
-		s.tracker.TrackAccountUnwarned(userID, user.Email)
+		// Track using both the old specific method and the new generic method
+		s.tracker.TrackAccountUnwarned(userID, user.Email, user.HubspotObjectID)
+		s.tracker.TrackGenericUnfreeze(userID, user.Email, BillingWarning.String(), adminInitiated, user.HubspotObjectID)
 
 		return nil
 	})
 
-	return err
+	return ErrAccountFreeze.Wrap(err)
+}
+
+// BillingUnWarnUser reverses the warning placed on the user specified by the given ID.
+// This is an automatically triggered unwarn (not admin-initiated).
+func (s *AccountFreezeService) BillingUnWarnUser(ctx context.Context, userID uuid.UUID) (err error) {
+	return s.billingUnWarnUser(ctx, userID, false)
+}
+
+// AdminBillingUnWarnUser reverses the warning placed on the user specified by the given ID.
+// This is an admin-initiated unwarn.
+func (s *AccountFreezeService) AdminBillingUnWarnUser(ctx context.Context, userID uuid.UUID) (err error) {
+	return s.billingUnWarnUser(ctx, userID, true)
 }
 
 // ViolationFreezeUser freezes the user specified by the given ID due to ToS violation.
+// This is always an admin-initiated action.
 func (s *AccountFreezeService) ViolationFreezeUser(ctx context.Context, userID uuid.UUID) (err error) {
 	defer mon.Task()(&ctx)(&err)
 
@@ -435,6 +573,9 @@ func (s *AccountFreezeService) ViolationFreezeUser(ctx context.Context, userID u
 			}
 		}
 
+		// Track the violation freeze using the generic method - always admin initiated
+		s.tracker.TrackGenericFreeze(userID, user.Email, ViolationFreeze.String(), true, user.HubspotObjectID)
+
 		return nil
 	})
 
@@ -442,13 +583,23 @@ func (s *AccountFreezeService) ViolationFreezeUser(ctx context.Context, userID u
 }
 
 // ViolationUnfreezeUser reverses the violation freeze placed on the user specified by the given ID.
+// This is always an admin-initiated action.
 func (s *AccountFreezeService) ViolationUnfreezeUser(ctx context.Context, userID uuid.UUID) (err error) {
 	defer mon.Task()(&ctx)(&err)
 
 	err = s.store.WithTx(ctx, func(ctx context.Context, tx DBTx) error {
+		user, err := tx.Users().Get(ctx, userID)
+		if err != nil {
+			return err
+		}
+
 		event, err := tx.AccountFreezeEvents().Get(ctx, userID, ViolationFreeze)
-		if errors.Is(err, sql.ErrNoRows) {
-			return ErrNoFreezeStatus
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return ErrNoFreezeStatus
+			}
+
+			return err
 		}
 
 		if event.Limits == nil {
@@ -481,6 +632,9 @@ func (s *AccountFreezeService) ViolationUnfreezeUser(ctx context.Context, userID
 			return err
 		}
 
+		// Track the violation unfreeze using the generic method - always admin initiated
+		s.tracker.TrackGenericUnfreeze(userID, user.Email, ViolationFreeze.String(), true, user.HubspotObjectID)
+
 		return nil
 	})
 
@@ -488,6 +642,7 @@ func (s *AccountFreezeService) ViolationUnfreezeUser(ctx context.Context, userID
 }
 
 // LegalFreezeUser freezes the user specified by the given ID for legal review.
+// This is always an admin-initiated action.
 func (s *AccountFreezeService) LegalFreezeUser(ctx context.Context, userID uuid.UUID) (err error) {
 	defer mon.Task()(&ctx)(&err)
 
@@ -553,6 +708,9 @@ func (s *AccountFreezeService) LegalFreezeUser(ctx context.Context, userID uuid.
 			return err
 		}
 
+		// Track the legal freeze using the generic method - always admin initiated
+		s.tracker.TrackGenericFreeze(userID, user.Email, LegalFreeze.String(), true, user.HubspotObjectID)
+
 		return nil
 	})
 
@@ -560,6 +718,7 @@ func (s *AccountFreezeService) LegalFreezeUser(ctx context.Context, userID uuid.
 }
 
 // LegalUnfreezeUser reverses the legal freeze placed on the user specified by the given ID.
+// This is always an admin-initiated action.
 func (s *AccountFreezeService) LegalUnfreezeUser(ctx context.Context, userID uuid.UUID) (err error) {
 	defer mon.Task()(&ctx)(&err)
 
@@ -570,8 +729,12 @@ func (s *AccountFreezeService) LegalUnfreezeUser(ctx context.Context, userID uui
 		}
 
 		event, err := tx.AccountFreezeEvents().Get(ctx, userID, LegalFreeze)
-		if errors.Is(err, sql.ErrNoRows) {
-			return ErrNoFreezeStatus
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return ErrNoFreezeStatus
+			}
+
+			return err
 		}
 
 		if event.Limits == nil {
@@ -606,6 +769,9 @@ func (s *AccountFreezeService) LegalUnfreezeUser(ctx context.Context, userID uui
 			}
 		}
 
+		// Track the legal unfreeze using the generic method - always admin initiated
+		s.tracker.TrackGenericUnfreeze(userID, user.Email, LegalFreeze.String(), true, user.HubspotObjectID)
+
 		return nil
 	})
 
@@ -613,8 +779,14 @@ func (s *AccountFreezeService) LegalUnfreezeUser(ctx context.Context, userID uui
 }
 
 // DelayedBotFreezeUser sets the user specified by the given ID for bot review with some delay.
+// This is automatically triggered by the satellite's bot detection, if enabled.
 func (s *AccountFreezeService) DelayedBotFreezeUser(ctx context.Context, userID uuid.UUID, days *int) (err error) {
 	defer mon.Task()(&ctx)(&err)
+
+	user, err := s.store.Users().Get(ctx, userID)
+	if err != nil {
+		return ErrAccountFreeze.Wrap(err)
+	}
 
 	_, err = s.store.AccountFreezeEvents().Upsert(ctx, &AccountFreezeEvent{
 		UserID:             userID,
@@ -625,10 +797,14 @@ func (s *AccountFreezeService) DelayedBotFreezeUser(ctx context.Context, userID 
 		return ErrAccountFreeze.Wrap(err)
 	}
 
+	// Track the delayed bot freeze using the generic method - not admin initiated
+	s.tracker.TrackGenericFreeze(userID, user.Email, DelayedBotFreeze.String(), false, user.HubspotObjectID)
+
 	return nil
 }
 
 // BotFreezeUser freezes the user specified by the given ID for bot review.
+// This is an automatically triggered action, not admin-initiated.
 func (s *AccountFreezeService) BotFreezeUser(ctx context.Context, userID uuid.UUID) (err error) {
 	defer mon.Task()(&ctx)(&err)
 
@@ -690,6 +866,9 @@ func (s *AccountFreezeService) BotFreezeUser(ctx context.Context, userID uuid.UU
 			return err
 		}
 
+		// Track the bot freeze using the generic method
+		s.tracker.TrackGenericFreeze(userID, user.Email, BotFreeze.String(), false, user.HubspotObjectID)
+
 		return nil
 	})
 
@@ -697,15 +876,22 @@ func (s *AccountFreezeService) BotFreezeUser(ctx context.Context, userID uuid.UU
 }
 
 // BotUnfreezeUser reverses the bot freeze placed on the user specified by the given ID.
+// This is an automatically triggered action, not admin-initiated.
 func (s *AccountFreezeService) BotUnfreezeUser(ctx context.Context, userID uuid.UUID) (err error) {
 	defer mon.Task()(&ctx)(&err)
 
 	err = s.store.WithTx(ctx, func(ctx context.Context, tx DBTx) error {
+		user, err := tx.Users().Get(ctx, userID)
+		if err != nil {
+			return err
+		}
+
 		event, err := tx.AccountFreezeEvents().Get(ctx, userID, BotFreeze)
 		if err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				return ErrNoFreezeStatus
 			}
+
 			return err
 		}
 
@@ -737,14 +923,18 @@ func (s *AccountFreezeService) BotUnfreezeUser(ctx context.Context, userID uuid.
 			return err
 		}
 
+		// Track the bot unfreeze using the generic method (this is always admin-initiated)
+		s.tracker.TrackGenericUnfreeze(userID, user.Email, BotFreeze.String(), true, user.HubspotObjectID)
+
 		return nil
 	})
 
 	return ErrAccountFreeze.Wrap(err)
 }
 
-// TrialExpirationFreezeUser freezes the user specified by the given ID due to expired free trial.
-func (s *AccountFreezeService) TrialExpirationFreezeUser(ctx context.Context, userID uuid.UUID) (err error) {
+// trialExpirationFreezeUser is a private implementation function that freezes the user specified by the given ID due to expired free trial.
+// The adminInitiated parameter indicates whether this freeze was initiated by an admin or automatically by the satellite.
+func (s *AccountFreezeService) trialExpirationFreezeUser(ctx context.Context, userID uuid.UUID, adminInitiated bool) (err error) {
 	defer mon.Task()(&ctx)(&err)
 
 	err = s.store.WithTx(ctx, func(ctx context.Context, tx DBTx) error {
@@ -796,15 +986,31 @@ func (s *AccountFreezeService) TrialExpirationFreezeUser(ctx context.Context, us
 			return err
 		}
 
+		// Track the trial expiration freeze using the generic method
+		s.tracker.TrackGenericFreeze(userID, user.Email, TrialExpirationFreeze.String(), adminInitiated, user.HubspotObjectID)
+
 		return nil
 	})
 
 	return ErrAccountFreeze.Wrap(err)
 }
 
-// TrialExpirationUnfreezeUser reverses the trial expiration freeze placed on the user specified by the given ID.
+// TrialExpirationFreezeUser freezes the user specified by the given ID due to expired free trial.
+// This is an automatically triggered freeze (not admin-initiated).
+func (s *AccountFreezeService) TrialExpirationFreezeUser(ctx context.Context, userID uuid.UUID) (err error) {
+	return s.trialExpirationFreezeUser(ctx, userID, false)
+}
+
+// AdminTrialExpirationFreezeUser freezes the user specified by the given ID due to expired free trial.
+// This is an admin-initiated freeze.
+func (s *AccountFreezeService) AdminTrialExpirationFreezeUser(ctx context.Context, userID uuid.UUID) (err error) {
+	return s.trialExpirationFreezeUser(ctx, userID, true)
+}
+
+// trialExpirationUnfreezeUser is a private implementation function that reverses the trial expiration freeze placed on the user specified by the given ID.
 // It potentially upgrades a user, setting new limits.
-func (s *AccountFreezeService) TrialExpirationUnfreezeUser(ctx context.Context, userID uuid.UUID) (err error) {
+// The adminInitiated parameter indicates whether this unfreeze was initiated by an admin or automatically by the satellite.
+func (s *AccountFreezeService) trialExpirationUnfreezeUser(ctx context.Context, userID uuid.UUID, adminInitiated bool) (err error) {
 	defer mon.Task()(&ctx)(&err)
 
 	err = s.store.WithTx(ctx, func(ctx context.Context, tx DBTx) error {
@@ -814,8 +1020,12 @@ func (s *AccountFreezeService) TrialExpirationUnfreezeUser(ctx context.Context, 
 		}
 
 		event, err := tx.AccountFreezeEvents().Get(ctx, userID, TrialExpirationFreeze)
-		if errors.Is(err, sql.ErrNoRows) {
-			return ErrNoFreezeStatus
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return ErrNoFreezeStatus
+			}
+
+			return err
 		}
 
 		if event.Limits == nil {
@@ -850,10 +1060,166 @@ func (s *AccountFreezeService) TrialExpirationUnfreezeUser(ctx context.Context, 
 			}
 		}
 
+		// Track the trial expiration unfreeze using the generic method
+		s.tracker.TrackGenericUnfreeze(userID, user.Email, TrialExpirationFreeze.String(), adminInitiated, user.HubspotObjectID)
+
 		return nil
 	})
 
 	return ErrAccountFreeze.Wrap(err)
+}
+
+// TrialExpirationUnfreezeUser reverses the trial expiration freeze placed on the user specified by the given ID.
+// It potentially upgrades a user, setting new limits.
+// This is an automatically triggered unfreeze (not admin-initiated).
+func (s *AccountFreezeService) TrialExpirationUnfreezeUser(ctx context.Context, userID uuid.UUID) (err error) {
+	return s.trialExpirationUnfreezeUser(ctx, userID, false)
+}
+
+// AdminTrialExpirationUnfreezeUser reverses the trial expiration freeze placed on the user specified by the given ID.
+// It potentially upgrades a user, setting new limits.
+// This is an admin-initiated unfreeze.
+func (s *AccountFreezeService) AdminTrialExpirationUnfreezeUser(ctx context.Context, userID uuid.UUID) (err error) {
+	return s.trialExpirationUnfreezeUser(ctx, userID, true)
+}
+
+func (s *AccountFreezeService) optOutFreezeUser(ctx context.Context, userID uuid.UUID, adminInitiated bool) (err error) {
+	defer mon.Task()(&ctx)(&err)
+
+	err = s.store.WithTx(ctx, func(ctx context.Context, tx DBTx) error {
+		user, err := tx.Users().Get(ctx, userID)
+		if err != nil {
+			return err
+		}
+
+		if user.Kind != PaidUser {
+			return errs.New("cannot opt-out-freeze a non-paid user")
+		}
+
+		freezes, err := tx.AccountFreezeEvents().GetAll(ctx, userID)
+		if err != nil {
+			return err
+		}
+		if freezes.ViolationFreeze != nil {
+			return errs.New("User is already frozen due to ToS violation")
+		}
+		if freezes.LegalFreeze != nil {
+			return errs.New("User is already frozen for legal review")
+		}
+		if freezes.DelayedBotFreeze != nil {
+			return errs.New("User is already set to be frozen for bot review")
+		}
+		if freezes.BotFreeze != nil {
+			return errs.New("User is already frozen for bot review")
+		}
+		if freezes.BillingFreeze != nil {
+			return errs.New("User is already frozen for billing reasons")
+		}
+		if freezes.TrialExpirationFreeze != nil {
+			return errs.New("User is already frozen for trial expiration")
+		}
+
+		daysTillEscalation := int(s.config.OptOutFreezeGracePeriod.Hours() / 24)
+		err = s.upsertFreezeEvent(ctx, tx, &upsertData{
+			user:               user,
+			newFreezeEvent:     freezes.OptOutFreeze,
+			daysTillEscalation: &daysTillEscalation,
+			eventType:          OptOutFreeze,
+		})
+		if err != nil {
+			return err
+		}
+
+		s.tracker.TrackGenericFreeze(userID, user.Email, OptOutFreeze.String(), adminInitiated, user.HubspotObjectID)
+
+		return nil
+	})
+
+	return ErrAccountFreeze.Wrap(err)
+}
+
+// OptOutFreezeUser freezes the user specified by the given ID because they opted out of an
+// account-level change (see OptInStatus).
+func (s *AccountFreezeService) OptOutFreezeUser(ctx context.Context, userID uuid.UUID) (err error) {
+	return s.optOutFreezeUser(ctx, userID, false)
+}
+
+// AdminOptOutFreezeUser freezes the user specified by the given ID because they opted out of an
+// account-level change (see OptInStatus).
+// This is an admin-initiated freeze.
+func (s *AccountFreezeService) AdminOptOutFreezeUser(ctx context.Context, userID uuid.UUID) (err error) {
+	return s.optOutFreezeUser(ctx, userID, true)
+}
+
+func (s *AccountFreezeService) optOutUnfreezeUser(ctx context.Context, userID uuid.UUID, adminInitiated bool) (err error) {
+	defer mon.Task()(&ctx)(&err)
+
+	var user *User
+	err = s.store.WithTx(ctx, func(ctx context.Context, tx DBTx) error {
+		user, err = tx.Users().Get(ctx, userID)
+		if err != nil {
+			return err
+		}
+
+		event, err := tx.AccountFreezeEvents().Get(ctx, userID, OptOutFreeze)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return ErrNoFreezeStatus
+			}
+			return err
+		}
+
+		if event.Limits == nil {
+			return errs.New("freeze event limits are nil")
+		}
+
+		for id, limits := range event.Limits.Projects {
+			limitUpdates := limitUpdatesFromLimits(limits)
+			err = tx.Projects().UpdateLimitsGeneric(ctx, id, limitUpdates)
+			if err != nil {
+				return err
+			}
+		}
+
+		err = tx.Users().UpdateUserProjectLimits(ctx, userID, event.Limits.User)
+		if err != nil {
+			return err
+		}
+
+		err = tx.AccountFreezeEvents().DeleteByUserIDAndEvent(ctx, userID, OptOutFreeze)
+		if err != nil {
+			return err
+		}
+
+		if user.Status == PendingDeletion {
+			status := Active
+			err = tx.Users().Update(ctx, userID, UpdateUserRequest{
+				Status: &status,
+			})
+			if err != nil {
+				return err
+			}
+		}
+
+		return nil
+	})
+
+	if err != nil {
+		s.tracker.TrackGenericUnfreeze(userID, user.Email, OptOutFreeze.String(), adminInitiated, user.HubspotObjectID)
+	}
+
+	return ErrAccountFreeze.Wrap(err)
+}
+
+// OptOutUnfreezeUser reverses the opt-out freeze placed on the user specified by the given ID.
+func (s *AccountFreezeService) OptOutUnfreezeUser(ctx context.Context, userID uuid.UUID) (err error) {
+	return s.optOutUnfreezeUser(ctx, userID, false)
+}
+
+// AdminOptOutUnfreezeUser reverses the opt-out freeze placed on the user specified by the given ID.
+// This is an admin-initiated unfreeze.
+func (s *AccountFreezeService) AdminOptOutUnfreezeUser(ctx context.Context, userID uuid.UUID) (err error) {
+	return s.optOutUnfreezeUser(ctx, userID, true)
 }
 
 // Get returns an event of a specific type for a user.
@@ -905,10 +1271,22 @@ func (s *AccountFreezeService) GetAllEventsByType(ctx context.Context, cursor Fr
 }
 
 // GetTrialExpirationFreezesToEscalate returns trial expiration freezes that need to be escalated.
-func (s *AccountFreezeService) GetTrialExpirationFreezesToEscalate(ctx context.Context, limit int, cursor *FreezeEventsByEventAndUserStatusCursor) (events []AccountFreezeEvent, next *FreezeEventsByEventAndUserStatusCursor, err error) {
+func (s *AccountFreezeService) GetTrialExpirationFreezesToEscalate(ctx context.Context, tenantID *string, limit int, cursor *FreezeEventsByEventAndUserStatusCursor) (events []AccountFreezeEvent, next *FreezeEventsByEventAndUserStatusCursor, err error) {
 	defer mon.Task()(&ctx)(&err)
 
-	events, next, err = s.freezeEventsDB.GetTrialExpirationFreezesToEscalate(ctx, limit, cursor)
+	events, next, err = s.freezeEventsDB.GetTrialExpirationFreezesToEscalate(ctx, tenantID, limit, cursor)
+	if err != nil {
+		return nil, nil, ErrAccountFreeze.Wrap(err)
+	}
+
+	return events, next, nil
+}
+
+// GetOptOutFreezesToEscalate returns opt-out freezes that need to be escalated.
+func (s *AccountFreezeService) GetOptOutFreezesToEscalate(ctx context.Context, tenantID *string, limit int, cursor *FreezeEventsByEventAndUserStatusCursor) (events []AccountFreezeEvent, next *FreezeEventsByEventAndUserStatusCursor, err error) {
+	defer mon.Task()(&ctx)(&err)
+
+	events, next, err = s.freezeEventsDB.GetOptOutFreezes(ctx, tenantID, limit, cursor)
 	if err != nil {
 		return nil, nil, ErrAccountFreeze.Wrap(err)
 	}
@@ -942,21 +1320,21 @@ func (s *AccountFreezeService) GetDaysTillEscalation(event AccountFreezeEvent, n
 func (s *AccountFreezeService) EscalateFreezeEvent(ctx context.Context, userID uuid.UUID, event AccountFreezeEvent) (err error) {
 	defer mon.Task()(&ctx)(&err)
 
-	event.DaysTillEscalation = nil
-
 	err = s.store.WithTx(ctx, func(ctx context.Context, tx DBTx) error {
 		// check if event still exists
-		_, err = tx.AccountFreezeEvents().Get(ctx, userID, event.Type)
-		switch {
-		case errors.Is(err, sql.ErrNoRows):
-			return ErrAccountFreeze.New("freeze event does not exist")
-		case err != nil:
-			return ErrAccountFreeze.Wrap(err)
-		}
-
-		_, err := tx.AccountFreezeEvents().Upsert(ctx, &event)
+		existing, err := tx.AccountFreezeEvents().Get(ctx, userID, event.Type)
 		if err != nil {
-			return ErrAccountFreeze.Wrap(err)
+			if errors.Is(err, sql.ErrNoRows) {
+				return errs.New("freeze event does not exist")
+			}
+
+			return err
+		}
+		existing.DaysTillEscalation = nil
+
+		_, err = tx.AccountFreezeEvents().Upsert(ctx, existing)
+		if err != nil {
+			return err
 		}
 
 		status := PendingDeletion
@@ -964,13 +1342,13 @@ func (s *AccountFreezeService) EscalateFreezeEvent(ctx context.Context, userID u
 			Status: &status,
 		})
 		if err != nil {
-			return ErrAccountFreeze.Wrap(err)
+			return err
 		}
 
 		return nil
 	})
 
-	return err
+	return ErrAccountFreeze.Wrap(err)
 }
 
 // ShouldEscalateFreezeEvent checks whether an event's escalation period has elapsed.
@@ -999,7 +1377,7 @@ func (s *AccountFreezeService) ShouldEscalateFreezeEvent(ctx context.Context, ev
 		return shouldEscalate, nil
 	}
 
-	projects, err := s.store.Projects().GetByUserID(ctx, event.UserID)
+	projects, err := s.store.Projects().GetActiveByUserID(ctx, event.UserID)
 	if err != nil {
 		return false, ErrAccountFreeze.Wrap(err)
 	}
@@ -1016,6 +1394,176 @@ func (s *AccountFreezeService) ShouldEscalateFreezeEvent(ctx context.Context, ev
 	return shouldEscalate, nil
 }
 
+// GetEscalatedEventsBefore is used to get a list of freeze events of some types that were escalated
+// before the given time.
+// NB: This method is specifically used to list events for deletion, so a specific event that is not deleted
+// will continue to be returned.
+func (s *AccountFreezeService) GetEscalatedEventsBefore(ctx context.Context, params GetEscalatedEventsBeforeParams) (_ []EventWithUser, err error) {
+	defer mon.Task()(&ctx)(&err)
+
+	events, err := s.freezeEventsDB.GetEscalatedEventsBefore(ctx, params)
+	if err != nil {
+		return nil, ErrAccountFreeze.Wrap(err)
+	}
+
+	return events, nil
+}
+
+// InactivityWarnUser adds an inactivity warning event to the freeze events table.
+func (s *AccountFreezeService) InactivityWarnUser(ctx context.Context, userID uuid.UUID) (err error) {
+	defer mon.Task()(&ctx)(&err)
+
+	err = s.store.WithTx(ctx, func(ctx context.Context, tx DBTx) error {
+		freezes, err := tx.AccountFreezeEvents().GetAll(ctx, userID)
+		if err != nil {
+			return err
+		}
+
+		if freezes.BillingFreeze != nil || freezes.ViolationFreeze != nil || freezes.LegalFreeze != nil ||
+			freezes.BotFreeze != nil || freezes.TrialExpirationFreeze != nil ||
+			freezes.OptOutFreeze != nil || freezes.InactivityFreeze != nil {
+			return errs.New("user is already frozen")
+		}
+
+		if freezes.InactivityWarning != nil {
+			return nil
+		}
+
+		daysTillEscalation := int(s.config.InactivityGracePeriod.Hours() / 24)
+		_, err = tx.AccountFreezeEvents().Upsert(ctx, &AccountFreezeEvent{
+			UserID:             userID,
+			Type:               InactivityWarning,
+			DaysTillEscalation: &daysTillEscalation,
+		})
+		return err
+	})
+
+	return ErrAccountFreeze.Wrap(err)
+}
+
+// InactivityFreezeUser freezes a user due to sustained zero effective usage.
+func (s *AccountFreezeService) InactivityFreezeUser(ctx context.Context, userID uuid.UUID) (err error) {
+	defer mon.Task()(&ctx)(&err)
+
+	err = s.store.WithTx(ctx, func(ctx context.Context, tx DBTx) error {
+		user, err := tx.Users().Get(ctx, userID)
+		if err != nil {
+			return err
+		}
+
+		freezes, err := tx.AccountFreezeEvents().GetAll(ctx, userID)
+		if err != nil {
+			return err
+		}
+
+		if freezes.BillingFreeze != nil || freezes.ViolationFreeze != nil || freezes.LegalFreeze != nil ||
+			freezes.BotFreeze != nil || freezes.TrialExpirationFreeze != nil ||
+			freezes.OptOutFreeze != nil || freezes.InactivityFreeze != nil {
+			return errs.New("user is already frozen")
+		}
+
+		err = s.upsertFreezeEvent(ctx, tx, &upsertData{
+			user:           user,
+			newFreezeEvent: freezes.InactivityFreeze,
+			eventType:      InactivityFreeze,
+		})
+		if err != nil {
+			return err
+		}
+
+		if freezes.InactivityWarning != nil {
+			err = tx.AccountFreezeEvents().DeleteByUserIDAndEvent(ctx, userID, InactivityWarning)
+			if err != nil {
+				return err
+			}
+		}
+
+		s.tracker.TrackGenericFreeze(userID, user.Email, InactivityFreeze.String(), false, user.HubspotObjectID)
+
+		return nil
+	})
+
+	return ErrAccountFreeze.Wrap(err)
+}
+
+// InactivityUnwarnUser removes the inactivity warning event for the given user.
+func (s *AccountFreezeService) InactivityUnwarnUser(ctx context.Context, userID uuid.UUID) (err error) {
+	defer mon.Task()(&ctx)(&err)
+
+	err = s.store.WithTx(ctx, func(ctx context.Context, tx DBTx) error {
+		_, err = tx.AccountFreezeEvents().Get(ctx, userID, InactivityWarning)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return ErrNoFreezeStatus
+			}
+			return err
+		}
+		return tx.AccountFreezeEvents().DeleteByUserIDAndEvent(ctx, userID, InactivityWarning)
+	})
+
+	return ErrAccountFreeze.Wrap(err)
+}
+
+// InactivityUnfreezeUser reverses an inactivity freeze, restoring the user's limits.
+func (s *AccountFreezeService) InactivityUnfreezeUser(ctx context.Context, userID uuid.UUID) (err error) {
+	defer mon.Task()(&ctx)(&err)
+
+	err = s.store.WithTx(ctx, func(ctx context.Context, tx DBTx) error {
+		user, err := tx.Users().Get(ctx, userID)
+		if err != nil {
+			return err
+		}
+
+		event, err := tx.AccountFreezeEvents().Get(ctx, userID, InactivityFreeze)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return ErrNoFreezeStatus
+			}
+			return err
+		}
+
+		if event.Limits == nil {
+			return errs.New("freeze event limits are nil")
+		}
+
+		for id, limits := range event.Limits.Projects {
+			err = tx.Projects().UpdateLimitsGeneric(ctx, id, limitUpdatesFromLimits(limits))
+			if err != nil {
+				return err
+			}
+		}
+
+		err = tx.Users().UpdateUserProjectLimits(ctx, userID, event.Limits.User)
+		if err != nil {
+			return err
+		}
+
+		err = tx.AccountFreezeEvents().DeleteByUserIDAndEvent(ctx, userID, InactivityFreeze)
+		if err != nil {
+			return err
+		}
+
+		if user.Status == PendingDeletion {
+			status := Active
+			err = tx.Users().Update(ctx, userID, UpdateUserRequest{Status: &status})
+			if err != nil {
+				return err
+			}
+		}
+
+		s.tracker.TrackGenericUnfreeze(userID, user.Email, InactivityFreeze.String(), false, user.HubspotObjectID)
+
+		return nil
+	})
+
+	return ErrAccountFreeze.Wrap(err)
+}
+
+// TestSetInactivityGracePeriod overrides the inactivity grace period for tests.
+func (s *AccountFreezeService) TestSetInactivityGracePeriod(period time.Duration) {
+	s.config.InactivityGracePeriod = period
+}
+
 // TestChangeFreezeTracker changes the freeze tracker service for tests.
 func (s *AccountFreezeService) TestChangeFreezeTracker(t analytics.FreezeTracker) {
 	s.tracker = t
@@ -1024,6 +1572,16 @@ func (s *AccountFreezeService) TestChangeFreezeTracker(t analytics.FreezeTracker
 // TestSetTrialExpirationFreezeGracePeriod changes the trial expiration freeze grace period for tests.
 func (s *AccountFreezeService) TestSetTrialExpirationFreezeGracePeriod(period time.Duration) {
 	s.config.TrialExpirationFreezeGracePeriod = period
+}
+
+// TestSetOptOutFreezeConfig overrides the opt-out freeze date and grace period for tests.
+func (s *AccountFreezeService) TestSetOptOutFreezeConfig(freezeDate time.Time, freezeGrace time.Duration) {
+	if freezeDate.IsZero() {
+		s.config.OptOutFreezeDate = ""
+	} else {
+		s.config.OptOutFreezeDate = freezeDate.Format(time.RFC3339)
+	}
+	s.config.OptOutFreezeGracePeriod = freezeGrace
 }
 
 func limitUpdatesFromLimits(limits UsageLimits) []Limit {
@@ -1094,7 +1652,7 @@ func (s *AccountFreezeService) upsertFreezeEvent(ctx context.Context, tx DBTx, d
 		data.newFreezeEvent.Limits.User = userLimits
 	}
 
-	projects, err := tx.Projects().GetOwn(ctx, data.user.ID)
+	projects, err := tx.Projects().GetOwnActive(ctx, data.user.ID)
 	if err != nil {
 		return err
 	}
@@ -1202,5 +1760,5 @@ func (s *AccountFreezeService) upsertFreezeEvent(ctx context.Context, tx DBTx, d
 
 // IncrementNotificationsCount is a method for incrementing the notification count for a user's account freeze event.
 func (s *AccountFreezeService) IncrementNotificationsCount(ctx context.Context, userID uuid.UUID, eventType AccountFreezeEventType) error {
-	return Error.Wrap(s.freezeEventsDB.IncrementNotificationsCount(ctx, userID, eventType))
+	return ErrAccountFreeze.Wrap(s.freezeEventsDB.IncrementNotificationsCount(ctx, userID, eventType))
 }

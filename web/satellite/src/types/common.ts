@@ -1,10 +1,11 @@
 // Copyright (C) 2019 Storj Labs, Inc.
 // See LICENSE for copying information.
 
-import { computed, ComputedRef, ref } from 'vue';
+import { type ComputedRef, computed, ref  } from 'vue';
 
 import { Validator } from '@/utils/validation';
 import { useConfigStore } from '@/store/modules/configStore';
+import { useUsersStore } from '@/store/modules/usersStore';
 
 export enum SortDirection {
     asc = 1,
@@ -12,23 +13,29 @@ export enum SortDirection {
 }
 
 export class PricingPlanInfo {
-    constructor(
-        public type: PricingPlanType = PricingPlanType.FREE,
-        // Info for the pricing plan container
-        public title: string = '',
-        public containerSubtitle: string = '',
-        public containerDescription: string = '',
-        public containerFooterHTML: string | null = null,
-        public activationButtonText: string | null = null,
-        // Info for the pricing plan modal (pre-activation)
-        public activationSubtitle: string | null = null,
-        public activationDescriptionHTML: string = '',
-        public activationPriceHTML: string | null = null,
-        // Info for the pricing plan modal (post-activation)
-        public successSubtitle: string = '',
-        public bannerTitle: string = '',
-        public bannerText: string = '',
-    ) {}
+    public type: PricingPlanType = PricingPlanType.FREE;
+    // Info for the pricing plan container
+    public activationButtonText: string | null = null;
+    // Info for the pricing plan modal (pre-activation)
+    public activationSubtitle: string | null = null;
+    // Info for the pricing plan modal (post-activation)
+    public bannerTitle: string = '';
+    public bannerText: string = '';
+    // the following are used in the new upgrade/account setup
+    // dialogs.
+    public planTitle: string = '';
+    public planSubtitle: string = '';
+    public planCost: string = '';
+    public planCostInfo: string = '';
+    public planMinimumFeeInfo: string = '';
+    public planUpfrontCharge: string = '';
+    public planBalanceCredit: string = '';
+    public planCTA: string = '';
+    public planInfo: string[] = [];
+
+    constructor(init?: Partial<PricingPlanInfo>) {
+        Object.assign(this, init);
+    }
 }
 
 export interface OnboardingInfo {
@@ -43,38 +50,12 @@ export enum PricingPlanType {
     PRO = 'pro',
 }
 
-export const PRO_PLAN_INFO = new PricingPlanInfo(
-    PricingPlanType.PRO,
-    'Pro Account',
-    'Pay-as-you-go, no minimum',
-    'Pay for what you need. $4/TB storage per month, $7/TB for download bandwidth.',
-    'Additional per-segment fee of $0.0000088 applies.',
-    null,
-    null,
-    'Add a credit card to activate your pro account. Only pay for what you use, no minimum. Billed monthly.',
-    'No charge today',
-    '',
-);
-
-export const FREE_PLAN_INFO = new PricingPlanInfo(
-    PricingPlanType.FREE,
-    'Free Trial',
-    'Limited 30-day trial',
-    'Try Storj for free with 25GB of storage and 25GB download bandwidth for 30 days.',
-    'Upgrade anytime to Pro account to continue using Storj.',
-    null,
-    null,
-    'Start for free to try Storj and upgrade later.',
-    null,
-    'Limited 25',
-);
-
 // TODO: fully implement these types and their methods according to their Go counterparts
-export type UUID = string
-export type MemorySize = string
-export type Time = string
+export type UUID = string;
+export type MemorySize = string;
+export type Time = string;
 
-export function tableSizeOptions(itemCount: number, isObjectBrowser = false): {title: string, value: number}[] {
+export function tableSizeOptions(itemCount: number, isObjectBrowser = false): { title: string, value: number }[] {
     const opts = [
         { title: '10', value: 10 },
         { title: '25', value: 25 },
@@ -93,7 +74,8 @@ export type DataTableHeader = {
     align?: 'start' | 'end' | 'center';
     sortable?: boolean;
     width?: number | string;
-}
+    maxWidth?: number | string;
+};
 
 export type SortItem = {
     key: string;
@@ -114,10 +96,30 @@ export function DomainRule(value: string): string | boolean {
     return Validator.domainName(value) || 'Domain must be valid.';
 }
 
+export function GoodPasswordRule(value: unknown): string | boolean {
+    const badPasswords = useUsersStore().state.badPasswords;
+
+    return badPasswords.has(value as string) ? 'Password is on the list of disallowed passwords.' : true;
+}
+
 export function MaxNameLengthRule(value: string): string | boolean {
     const { maxNameCharacters } = useConfigStore().state.config;
 
     return Validator.nameLength(value, maxNameCharacters) || `The value must be less than or equal to ${maxNameCharacters}.`;
+}
+
+export function PhoneNumberRule(value: string): string | boolean {
+    return Validator.phoneNumber(value) || 'Phone number must be valid.';
+}
+
+export function PublicSSHKeyRule(value: string): string | boolean {
+    return Validator.publicSSHKey(value) || 'SSH public key must be valid.';
+}
+
+export function HostnameRule(value: string): string | boolean {
+    if (!value) return true;
+
+    return Validator.hostname(value) || 'Hostname must be valid.';
 }
 
 export interface IDialogFlowStep {
@@ -167,7 +169,8 @@ interface StepInfoData<T> {
     prev?: SetupLocation<T>,
     prevText?: string,
     next?: SetupLocation<T>,
-    nextText?: string,
+    nextText?: string | (() => string),
+    beforePrev?: () => void,
     beforeNext?: () => Promise<void>,
     setup?: () => void | Promise<void>,
     validate?: () => boolean,
@@ -179,7 +182,8 @@ export class StepInfo<T> {
     public prev?: ComputedRef<T | undefined>;
     public next?: ComputedRef<T | undefined>;
     public prevText?: string;
-    public nextText?: string;
+    public nextText?: ComputedRef<string>;
+    public beforePrev?: () => void;
     public beforeNext?: () => Promise<void>;
     public setup?: () => void | Promise<void>;
     public validate?: () => boolean;
@@ -190,11 +194,23 @@ export class StepInfo<T> {
         }
         this.prev = data.prev ? computed<T | undefined>(data.prev) : undefined;
         this.next = data.next ? computed<T | undefined>(data.next) : undefined;
+        this.beforePrev = data.beforePrev;
         this.beforeNext = data.beforeNext;
         this.setup = data.setup;
         this.validate = data.validate;
 
         this.prevText = data.prevText ? data.prevText : (!data.prev) ? 'Cancel' : 'Back';
-        this.nextText = data.nextText ? data.nextText : (!data.next) ? 'Done' : 'Next';
+
+        this.nextText = computed(() => {
+            if (typeof data.nextText === 'function') {
+                return data.nextText();
+            }
+            return data.nextText ? data.nextText : (!data.next ? 'Done' : 'Next');
+        });
     }
+}
+
+export interface StripeForm {
+    onSubmit(): Promise<string>;
+    initStripe(): Promise<string>;
 }

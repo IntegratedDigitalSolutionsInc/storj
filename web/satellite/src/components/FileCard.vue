@@ -2,7 +2,7 @@
 // See LICENSE for copying information.
 
 <template>
-    <v-card variant="outlined" rounded="lg">
+    <v-card variant="flat" rounded="md">
         <div class="h-100 d-flex flex-column justify-space-between">
             <a role="button" class="h-100" @click="previewClicked">
                 <template v-if="previewType === PreviewType.Image">
@@ -25,7 +25,7 @@
                                     :src="item.typeInfo.icon"
                                     :alt="item.typeInfo.title + 'icon'"
                                     :aria-roledescription="item.typeInfo.title + 'icon'"
-                                    height="52"
+                                    height="70"
                                 >
                             </div>
                         </template>
@@ -47,8 +47,8 @@
                                 :src="item.typeInfo.icon"
                                 :alt="item.typeInfo.title + 'icon'"
                                 :aria-roledescription="item.typeInfo.title + 'icon'"
-                                class="bg-background rounded-xlg"
-                                height="52"
+                                class="bg-blue6 rounded-xxlg"
+                                height="70"
                             >
                             </div>
                         </div>
@@ -62,7 +62,7 @@
                         :src="item.typeInfo.icon"
                         :alt="item.typeInfo.title + 'icon'"
                         :aria-roledescription="item.typeInfo.title + 'icon'"
-                        height="52"
+                        height="70"
                     >
                 </div>
             </a>
@@ -78,14 +78,19 @@
                 @lock-object-click="emit('lockObjectClick', item.browserObject)"
                 @legal-hold-click="emit('legalHoldClick', item.browserObject)"
                 @locked-object-delete="(fullObject) => emit('lockedObjectDelete', fullObject)"
+                @download-folder-click="emit('downloadFolderClick', item.browserObject)"
             />
             <v-card-item class="pt-0">
                 <v-card-title>
-                    <small :title="item.browserObject.Key">
+                    <small
+                        class="link text-decoration-none"
+                        :title="item.browserObject.Key"
+                        @click="() => emit('previewClick', item.browserObject)"
+                    >
                         {{ item.browserObject.Key }}
                     </small>
                 </v-card-title>
-                <v-card-subtitle class="text-caption">
+                <v-card-subtitle class="text-body-small">
                     {{ item.browserObject.type === 'folder' ? '&nbsp;': getFormattedDate(item.browserObject) }}
                 </v-card-subtitle>
             </v-card-item>
@@ -98,9 +103,9 @@ import { computed, ref } from 'vue';
 import { VCard, VCardItem, VCardSubtitle, VCardTitle, VImg, VProgressLinear } from 'vuetify/components';
 
 import {
-    BrowserObject,
-    FullBrowserObject,
-    PreviewCache,
+    type BrowserObject,
+    type FullBrowserObject,
+    type PreviewCache,
     useObjectBrowserStore,
 } from '@/store/modules/objectBrowserStore';
 import { useBucketsStore } from '@/store/modules/bucketsStore';
@@ -135,6 +140,7 @@ const emit = defineEmits<{
     lockObjectClick: [BrowserObject];
     legalHoldClick: [BrowserObject];
     lockedObjectDelete: [FullBrowserObject];
+    downloadFolderClick: [BrowserObject];
 }>();
 
 const videoEl = ref<HTMLVideoElement>();
@@ -202,7 +208,7 @@ function getFormattedDate(file: BrowserObject): string {
     return Time.formattedDate(file.LastModified);
 }
 
-function previewClicked() {
+function previewClicked(): void {
     if (filesBeingDeleted.value.has(props.item.browserObject.path + props.item.browserObject.Key)) {
         return;
     }

@@ -5,20 +5,17 @@ package metabase
 
 import (
 	"database/sql/driver"
-	"encoding/base64"
 	"encoding/binary"
 	"fmt"
 	"math"
 	"sort"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/zeebo/errs"
 
 	"storj.io/common/storj"
 	"storj.io/common/uuid"
-	"storj.io/storj/shared/dbutil/spannerutil"
 )
 
 var (
@@ -32,23 +29,21 @@ var (
 	ErrPermissionDenied = errs.Class("permission denied")
 	// ErrMethodNotAllowed general error when operation is not allowed.
 	ErrMethodNotAllowed = errs.Class("method not allowed")
+	// ErrUnimplemented is used to indicate an option was not implemented.
+	ErrUnimplemented = errs.Class("not implemented")
 )
 
 // Common constants for segment keys.
 const (
-	Delimiter        = '/'
+	Delimiter = "/"
+	// DelimiterNext is the string that comes immediately after Delimiter="/".
+	DelimiterNext    = "0"
 	LastSegmentName  = "l"
 	LastSegmentIndex = uint32(math.MaxUint32)
 )
 
 // ListLimit is the maximum number of items the client can request for listing.
 const ListLimit = intLimitRange(1000)
-
-// MoveSegmentLimit is the maximum number of segments that can be moved.
-const MoveSegmentLimit = int64(10000)
-
-// CopySegmentLimit is the maximum number of segments that can be copied.
-const CopySegmentLimit = int64(10000)
 
 // batchsizeLimit specifies up to how many items fetch from the storage layer at
 // a time.
@@ -151,7 +146,7 @@ func (b BucketName) Value() (driver.Value, error) {
 }
 
 // Scan extracts a BucketName from a database field.
-func (b *BucketName) Scan(value interface{}) error {
+func (b *BucketName) Scan(value any) error {
 	switch value := value.(type) {
 	case []byte:
 		*b = BucketName(value)
@@ -159,20 +154,6 @@ func (b *BucketName) Scan(value interface{}) error {
 	default:
 		return Error.New("unable to scan %T into BucketName", value)
 	}
-}
-
-// EncodeSpanner implements spanner.Encoder.
-func (b BucketName) EncodeSpanner() (any, error) {
-	return string(b), nil
-}
-
-// DecodeSpanner implements spanner.Decoder.
-func (b *BucketName) DecodeSpanner(value any) error {
-	if x, ok := value.(string); ok {
-		*b = BucketName(x)
-		return nil
-	}
-	return Error.New("unable to scan %T into BucketName", value)
 }
 
 // ObjectKey is an encrypted object key encoded using Path Component Encoding.
@@ -185,7 +166,7 @@ func (o ObjectKey) Value() (driver.Value, error) {
 }
 
 // Scan extracts a ObjectKey from a database field.
-func (o *ObjectKey) Scan(value interface{}) error {
+func (o *ObjectKey) Scan(value any) error {
 	switch value := value.(type) {
 	case []byte:
 		*o = ObjectKey(value)
@@ -193,24 +174,6 @@ func (o *ObjectKey) Scan(value interface{}) error {
 	default:
 		return Error.New("unable to scan %T into ObjectKey", value)
 	}
-}
-
-// EncodeSpanner implements spanner.Encoder.
-func (o ObjectKey) EncodeSpanner() (any, error) {
-	return o.Value()
-}
-
-// DecodeSpanner implements spanner.Decoder.
-func (o *ObjectKey) DecodeSpanner(value any) error {
-	if base64Val, ok := value.(string); ok {
-		bytesVal, err := base64.StdEncoding.DecodeString(base64Val)
-		if err != nil {
-			return Error.Wrap(err)
-		}
-		*o = ObjectKey(bytesVal)
-		return nil
-	}
-	return Error.New("unable to scan %T into ObjectKey", value)
 }
 
 // ObjectLocation is decoded object key information.
@@ -385,8 +348,6 @@ func (obj *ObjectStream) Verify() error {
 		return ErrInvalidRequest.New("BucketName missing")
 	case len(obj.ObjectKey) == 0:
 		return ErrInvalidRequest.New("ObjectKey missing")
-	case obj.Version < 0:
-		return ErrInvalidRequest.New("Version invalid: %v", obj.Version)
 	case obj.StreamID.IsZero():
 		return ErrInvalidRequest.New("StreamID missing")
 	}
@@ -400,6 +361,11 @@ func (obj *ObjectStream) Location() ObjectLocation {
 		BucketName: obj.BucketName,
 		ObjectKey:  obj.ObjectKey,
 	}
+}
+
+// StreamIDSuffix returns the object's stream ID suffix.
+func (obj *ObjectStream) StreamIDSuffix() StreamIDSuffix {
+	return StreamIDSuffix(obj.StreamID[8:])
 }
 
 // PendingObjectStream uniquely defines an pending object and stream.
@@ -445,28 +411,6 @@ func (pos SegmentPosition) Encode() uint64 { return uint64(pos.Part)<<32 | uint6
 // Less returns whether pos should before b.
 func (pos SegmentPosition) Less(b SegmentPosition) bool { return pos.Encode() < b.Encode() }
 
-// DecodeSpanner implements spanner.Decoder.
-func (pos *SegmentPosition) DecodeSpanner(val any) (err error) {
-	switch value := val.(type) {
-	case int64:
-		*pos = SegmentPositionFromEncoded(uint64(value))
-	case string:
-		parsedValue, err := strconv.ParseInt(value, 10, 64)
-		if err != nil {
-			return Error.New("unable to scan %T into SegmentPosition: %v", val, err)
-		}
-		*pos = SegmentPositionFromEncoded(uint64(parsedValue))
-	default:
-		return Error.New("unable to scan %T into SegmentPosition", val)
-	}
-	return nil
-}
-
-// EncodeSpanner implements spanner.Encoder.
-func (pos SegmentPosition) EncodeSpanner() (any, error) {
-	return int64(pos.Encode()), nil
-}
-
 // Version is used to uniquely identify objects with the same key.
 type Version int64
 
@@ -482,54 +426,37 @@ const DefaultVersion = Version(1)
 // It uses `MaxInt64 - 64` to avoid issues with `-MaxVersion`.
 const MaxVersion = Version(math.MaxInt64 - 64)
 
-// Retention represents an object version's Object Lock retention configuration.
-type Retention struct {
-	Mode        storj.RetentionMode
-	RetainUntil time.Time
+// NullableVersion represents a nullable Version type.
+// TODO: replace with sql.Null[Version] when we can use Go 1.22+
+type NullableVersion struct {
+	Version Version
+	Valid   bool
 }
 
-// Enabled returns whether the retention configuration is enabled.
-func (r *Retention) Enabled() bool {
-	return r.Mode != storj.NoRetention
-}
-
-// Active returns whether the retention configuration is enabled and active as of the given time.
-func (r *Retention) Active(now time.Time) bool {
-	return r.Enabled() && now.Before(r.RetainUntil)
-}
-
-// ActiveNow returns whether the retention configuration is enabled and active as of the current time.
-func (r *Retention) ActiveNow() bool {
-	return r.Active(time.Now())
-}
-
-// Verify verifies the retention configuration.
-func (r *Retention) Verify() error {
-	if r.Mode == storj.GovernanceMode {
-		if r.RetainUntil.IsZero() {
-			return errs.New("retention period expiration must be set if retention mode is set")
-		}
+// Scan implements sql.Scanner interface.
+func (v *NullableVersion) Scan(val any) error {
+	if val == nil {
+		v.Version, v.Valid = 0, false
 		return nil
 	}
-	return r.verifyWithoutGovernance()
+	v.Valid = true
+	return v.Version.Scan(val)
 }
 
-// verifyWithoutGovernance verifies the retention configuration. It's used by metabase DB methods that haven't
-// yet been adjusted to support governance mode, so it treats governance mode as invalid.
-func (r *Retention) verifyWithoutGovernance() error {
-	switch r.Mode {
-	case storj.ComplianceMode:
-		if r.RetainUntil.IsZero() {
-			return errs.New("retention period expiration must be set if retention mode is set")
-		}
-	case storj.NoRetention:
-		if !r.RetainUntil.IsZero() {
-			return errs.New("retention period expiration must not be set if retention mode is not set")
-		}
+// Scan implements sql.Scanner interface.
+func (v *Version) Scan(val any) error {
+	switch value := val.(type) {
+	case int64:
+		*v = Version(value)
+		return nil
 	default:
-		return errs.New("invalid retention mode %d", r.Mode)
+		return Error.New("unable to scan %T into Version", value)
 	}
-	return nil
+}
+
+// Value converts a Version to a database field.
+func (v Version) Value() (driver.Value, error) {
+	return int64(v), nil
 }
 
 // StreamVersionID represents combined Version and StreamID suffix for purposes of public API.
@@ -539,19 +466,38 @@ func (r *Retention) verifyWithoutGovernance() error {
 // avoid confusion.
 type StreamVersionID uuid.UUID
 
+// StreamIDSuffix is the last 8 bytes of an object's stream ID. It's used together with
+// an object's internal version ID to produce a version ID for the public API.
+type StreamIDSuffix [8]byte
+
+// IsZero returns whether all bytes in the StreamIDSuffix are 0.
+func (s StreamIDSuffix) IsZero() bool {
+	return s == StreamIDSuffix{}
+}
+
 // Version returns Version encoded into stream version id.
 func (s StreamVersionID) Version() Version {
 	return Version(binary.BigEndian.Uint64(s[:8]))
 }
 
 // StreamIDSuffix returns StreamID suffix encoded into stream version id.
-func (s StreamVersionID) StreamIDSuffix() []byte {
-	return s[8:]
+func (s StreamVersionID) StreamIDSuffix() StreamIDSuffix {
+	return StreamIDSuffix(s[8:])
+}
+
+// SetStreamID encodes the provided stream ID into the stream version ID.
+func (s *StreamVersionID) SetStreamID(streamID uuid.UUID) {
+	copy(s[8:], streamID[8:])
 }
 
 // Bytes returnes stream version id bytes.
 func (s StreamVersionID) Bytes() []byte {
 	return s[:]
+}
+
+// IsZero returns whether all bytes in the StreamVersionID are 0.
+func (s StreamVersionID) IsZero() bool {
+	return s == StreamVersionID{}
 }
 
 // NewStreamVersionID returns a new stream version id.
@@ -609,6 +555,7 @@ const (
 	Prefix = ObjectStatus(7)
 
 	// Constants that can be used while constructing SQL queries.
+
 	statusPending                 = "1"
 	statusCommittedUnversioned    = "3"
 	statusCommittedVersioned      = "4"
@@ -617,13 +564,11 @@ const (
 	statusDeleteMarkerUnversioned = "6"
 	statusesDeleteMarker          = "(" + statusDeleteMarkerUnversioned + "," + statusDeleteMarkerVersioned + ")"
 	statusesUnversioned           = "(" + statusCommittedUnversioned + "," + statusDeleteMarkerUnversioned + ")"
+	statusesVersioned             = "(" + statusCommittedVersioned + "," + statusDeleteMarkerVersioned + ")"
+	statusesVisible               = "(" + statusCommittedUnversioned + "," + statusCommittedVersioned + "," + statusDeleteMarkerUnversioned + "," + statusDeleteMarkerVersioned + ")"
 
-	retentionModeNone                        = "0"
-	retentionModeCompliance                  = "1"
-	retentionModeGovernance                  = "2"
-	retentionModeComplianceAndGovernanceMask = "3"
-	retentionModeLegalHold                   = "4"
-	retentionModesComplianceAndGovernance    = "(" + retentionModeCompliance + "," + retentionModeGovernance + ")"
+	// DefaultStatus is the default status for new objects.
+	DefaultStatus = Pending
 )
 
 func committedWhereVersioned(versioned bool) ObjectStatus {
@@ -631,6 +576,11 @@ func committedWhereVersioned(versioned bool) ObjectStatus {
 		return CommittedVersioned
 	}
 	return CommittedUnversioned
+}
+
+// IsPending returns whether the status is pending.
+func (status ObjectStatus) IsPending() bool {
+	return status == Pending
 }
 
 // IsDeleteMarker return whether the status is a delete marker.
@@ -670,14 +620,35 @@ func (status ObjectStatus) String() string {
 	}
 }
 
-// EncodeSpanner implements spanner.Encoder.
-func (status ObjectStatus) EncodeSpanner() (any, error) {
-	return int64(status), nil
+// NullableObjectStatus represents a nullable ObjectStatus type.
+// TODO: replace with sql.Null[ObjectStatus] when we can use Go 1.22+
+type NullableObjectStatus struct {
+	ObjectStatus ObjectStatus
+	Valid        bool
 }
 
-// DecodeSpanner implements spanner.Decoder.
-func (status *ObjectStatus) DecodeSpanner(val any) (err error) {
-	return spannerutil.Int(status).DecodeSpanner(val)
+// Scan implements sql.Scanner interface.
+func (v *NullableObjectStatus) Scan(val any) error {
+	if val == nil {
+		v.ObjectStatus, v.Valid = 0, false
+		return nil
+	}
+	v.Valid = true
+	return v.ObjectStatus.Scan(val)
+}
+
+// Scan implements sql.Scanner interface.
+func (status *ObjectStatus) Scan(val any) error {
+	switch value := val.(type) {
+	case int64:
+		if int64(ObjectStatus(value)) != value {
+			return Error.New("value out of bounds for ObjectStatus: %d", value)
+		}
+		*status = ObjectStatus(value)
+		return nil
+	default:
+		return Error.New("unable to scan %T into ObjectStatus", value)
+	}
 }
 
 // Pieces defines information for pieces.
@@ -824,4 +795,34 @@ func (p Pieces) FindByNum(pieceNum int) (_ Piece, found bool) {
 		}
 	}
 	return Piece{}, false
+}
+
+// IfNoneMatch is an option for conditional writes.
+//
+// Currently it only supports a single value of "*" (all), which means the
+// commit should only succeed if the object doesn't exist, or is a delete marker.
+//
+// In future we may support other values like ETag.
+type IfNoneMatch []string
+
+// Verify verifies IfNoneMatch is correct.
+//
+// S3 returns unimplemented errors if requesting any value other than "*" or
+// empty for uploads, so we do the same here.
+func (i IfNoneMatch) Verify() error {
+	if len(i) == 0 {
+		return nil
+	}
+	if len(i) > 1 || i[0] != "*" {
+		return ErrUnimplemented.New("IfNoneMatch only supports a single value of '*'")
+	}
+	return nil
+}
+
+// All returns whether IfNoneMatch value is "*".
+func (i IfNoneMatch) All() bool {
+	if len(i) != 1 {
+		return false
+	}
+	return i[0] == "*"
 }

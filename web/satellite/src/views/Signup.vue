@@ -2,21 +2,38 @@
 // See LICENSE for copying information.
 
 <template>
-    <signup-confirmation v-if="codeActivationEnabled && confirmCode" :email="isInvited ? queryEmail : email" :signup-req-id="signupID" />
-    <v-container v-else class="fill-height">
+    <v-container v-if="authMigrationModeEnabled" class="fill-height align-content-center">
         <v-row justify="center">
-            <v-col cols="12" sm="10" md="6" lg="5" xl="4" xxl="3">
-                <v-card title="Create your Storj account." subtitle="No credit card needed to create an account." class="pa-2 pa-sm-6 overflow-visible mt-1 mb-7 my-sm-8 my-md-0">
+            <v-col cols="12" sm="10" md="6" lg="5" xl="4" xxl="5">
+                <v-card class="pa-2 pa-sm-6 mt-1 mb-7 my-sm-8 my-md-0">
+                    <v-card-item>
+                        <v-alert type="info" variant="tonal">
+                            <template #title>Registration temporarily unavailable</template>
+                            <template #text>
+                                We are migrating to a new authentication system. New account registration is temporarily unavailable. Please try again later.
+                            </template>
+                        </v-alert>
+                    </v-card-item>
+                    <v-card-text>
+                        <p class="text-center text-body-medium mt-2">Already have an account? <router-link class="link font-weight-bold" :to="ROUTES.Login.path">Login</router-link></p>
+                    </v-card-text>
+                </v-card>
+            </v-col>
+        </v-row>
+    </v-container>
+    <v-container v-else class="fill-height align-content-center">
+        <v-row justify="center">
+            <v-col cols="12" sm="10" md="6" lg="5" xl="5" xxl="5">
+                <v-card :title="title" subtitle="No credit card needed to create an account." class="pa-2 pa-sm-6 overflow-visible mt-1 mb-7 my-sm-8 my-md-0">
                     <v-card-item v-if="isInvited">
                         <v-alert
                             variant="tonal"
                             color="info"
-                            rounded="lg"
                             density="comfortable"
                             border
                         >
                             <template #text>
-                                {{ inviterEmail }} has invited you to a project on Storj. Create an account on the {{ satellite.satellite }} region to join it.
+                                {{ inviterEmail }} has invited you to a project on {{ configStore.brandName }}. Create an account on the {{ satellite.satellite }} region to join it.
                             </template>
                         </v-alert>
                     </v-card-item>
@@ -24,6 +41,7 @@
                     <v-card-text>
                         <v-form ref="form" v-model="formValid" class="pt-3" @submit.prevent="onSignupClick">
                             <v-select
+                                v-if="configStore.isDefaultBrand"
                                 v-model="satellite"
                                 label="Satellite (Metadata Region)"
                                 :items="satellites"
@@ -38,7 +56,7 @@
 
                             <v-text-field
                                 v-if="isInvited"
-                                id="Email Address"
+                                id="email"
                                 :model-value="queryEmail"
                                 class="mb-5"
                                 label="Email address"
@@ -46,6 +64,7 @@
                                 hide-details="auto"
                                 name="email"
                                 type="email"
+                                autocomplete="username"
                                 :rules="emailRules"
                                 flat
                                 disabled
@@ -54,7 +73,7 @@
 
                             <v-text-field
                                 v-else
-                                id="Email Address"
+                                id="email"
                                 v-model="email"
                                 class="mb-5"
                                 label="Email address"
@@ -63,6 +82,7 @@
                                 maxlength="72"
                                 name="email"
                                 type="email"
+                                autocomplete="username"
                                 :rules="emailRules"
                                 flat
                                 clearable
@@ -74,31 +94,41 @@
                                 class="pos-relative"
                                 :class="{ hidden: !ssoUnavailable }"
                             >
-                                <v-text-field
-                                    id="Password"
-                                    v-model="password"
-                                    class="mb-5"
-                                    label="Password"
-                                    placeholder="Enter a password"
-                                    color="secondary"
-                                    hide-details="auto"
-                                    :type="showPassword ? 'text' : 'password'"
-                                    :rules="passwordRules"
-                                    required
-                                    @update:focused="showPasswordStrength = !showPasswordStrength"
-                                >
-                                    <template #append-inner>
-                                        <password-input-eye-icons
-                                            :is-visible="showPassword"
-                                            type="password"
-                                            @toggleVisibility="showPassword = !showPassword"
+                                <div class="password-field-container">
+                                    <v-text-field
+                                        id="password"
+                                        v-model="password"
+                                        class="mb-5"
+                                        label="Password"
+                                        placeholder="Enter a password"
+                                        name="password"
+                                        color="secondary"
+                                        hide-details="auto"
+                                        :type="showPassword ? 'text' : 'password'"
+                                        autocomplete="new-password"
+                                        :rules="passwordRules"
+                                        required
+                                        @focus="showPasswordStrength = true"
+                                    >
+                                        <template #append-inner>
+                                            <password-input-eye-icons
+                                                :is-visible="showPassword"
+                                                type="password"
+                                                :aria-label="showPassword ? 'Hide password' : 'Show password'"
+                                                @toggle-visibility="showPassword = !showPassword"
+                                            />
+                                        </template>
+                                    </v-text-field>
+
+                                    <transition name="fade">
+                                        <password-strength
+                                            v-if="showPasswordStrength && password"
+                                            :email="email"
+                                            :password="password"
+                                            class="password-strength-indicator"
                                         />
-                                    </template>
-                                </v-text-field>
-                                <password-strength
-                                    v-if="showPasswordStrength"
-                                    :password="password"
-                                />
+                                    </transition>
+                                </div>
                             </div>
 
                             <v-text-field
@@ -118,7 +148,7 @@
                                     <password-input-eye-icons
                                         :is-visible="showPassword"
                                         type="password"
-                                        @toggleVisibility="showPassword = !showPassword"
+                                        @toggle-visibility="showPassword = !showPassword"
                                     />
                                 </template>
                             </v-text-field>
@@ -128,7 +158,6 @@
                                 class="my-2"
                                 variant="tonal"
                                 color="warning"
-                                rounded="lg"
                                 density="comfortable"
                                 border
                             >
@@ -151,7 +180,7 @@
                                     deleted at any time and your storage/download limits
                                     can fluctuate. To use our production service please
                                     create an account on one of our production Satellites.
-                                    <a href="https://storj.io/v2/signup/" target="_blank" rel="noopener noreferrer">https://storj.io/v2/signup/</a>
+                                    <a href="https://us1.storj.io/signup" target="_blank" rel="noopener noreferrer">https://us1.storj.io/signup</a>
                                 </template>
                             </v-alert>
 
@@ -165,11 +194,15 @@
                                 required
                             >
                                 <template #label>
-                                    <p class="text-body-2">
+                                    <p class="text-body-medium terms-text">
                                         I agree to the
-                                        <a class="link font-weight-medium" href="https://storj.io/terms-of-service/" target="_blank" rel="noopener">terms of service</a>
-                                        and
-                                        <a class="link font-weight-medium" href="https://storj.io/privacy-policy/" target="_blank" rel="noopener">privacy policy</a>.
+                                        <a class="link font-weight-medium" :href="termsLink" target="_blank" rel="noopener">terms of service</a>
+                                        {{ objectMountTermsUrl ? ',' : 'and' }}
+                                        <a class="link font-weight-medium" :href="privacyLink" target="_blank" rel="noopener">privacy policy</a>
+                                        <template v-if="objectMountTermsUrl">
+                                            and
+                                            <a class="link font-weight-medium" :href="objectMountTermsUrl" target="_blank" rel="noopener">Object Mount terms</a>
+                                        </template>.
                                     </p>
                                 </template>
                             </v-checkbox>
@@ -182,8 +215,23 @@
                                 size="large"
                                 block
                             >
-                                Start your free trial
+                                {{ configStore.isDefaultBrand ? 'Start your free trial' : 'Sign up' }}
                             </v-btn>
+
+                            <template v-if="generalSsoEnabled">
+                                <v-btn
+                                    v-for="provider in generalSsoProviders"
+                                    :key="provider"
+                                    color="secondary"
+                                    variant="outlined"
+                                    size="large"
+                                    block
+                                    class="mt-4"
+                                    @click="onGeneralSsoClick(provider)"
+                                >
+                                    Sign up with&nbsp;<span class="text-capitalize">{{ provider }}</span>
+                                </v-btn>
+                            </template>
                         </v-form>
                     </v-card-text>
                 </v-card>
@@ -196,79 +244,93 @@
                     size="invisible"
                     @verify="onCaptchaVerified"
                     @expired="onCaptchaError"
+                    @challenge-expired="onCaptchaError"
+                    @error="onCaptchaError"
+                    @closed="onCaptchaClosed"
+                />
+                <TurnstileWidget
+                    v-if="captchaConfig?.turnstile.enabled"
+                    ref="turnstile"
+                    :site-key="captchaConfig.turnstile.siteKey"
+                    @verify="onCaptchaVerified"
+                    @expired="onCaptchaError"
                     @error="onCaptchaError"
                 />
             </v-col>
-            <template v-if="partnerConfig && partnerConfig.title && partnerConfig.description">
-                <v-col cols="12" sm="10" md="6" lg="5" xl="4" xxl="3">
-                    <v-card class="pa-2 pa-sm-6 h-100 no-position">
-                        <v-card-item>
-                            <v-card-title class="text-wrap">
-                                {{ partnerConfig.title }}
-                            </v-card-title>
-                            <v-card-subtitle class="text-wrap">
-                                {{ partnerConfig.description }}
-                            </v-card-subtitle>
-                        </v-card-item>
-                        <v-card-text>
-                            <!-- eslint-disable-next-line vue/no-v-html -->
-                            <div v-if="partnerConfig.customHtmlDescription" v-html="partnerConfig.customHtmlDescription" />
-                            <a v-if="partnerConfig.partnerLogoBottomUrl" :href="partnerConfig.partnerUrl">
-                                <img
-                                    :src="partnerConfig.partnerLogoBottomUrl" :srcset="partnerConfig.partnerLogoBottomUrl"
-                                    :alt="partnerConfig.name + ' logo'"
-                                    height="44"
-                                    class="mt-6 rounded white-background"
-                                >
-                            </a>
-                        </v-card-text>
-                    </v-card>
-                </v-col>
+
+            <template v-if="configStore.isDefaultBrand">
+                <template v-if="partnerConfig && partnerConfig.title && partnerConfig.description">
+                    <v-col cols="12" sm="10" md="6" lg="5" xl="5" xxl="3">
+                        <v-card class="pa-2 pa-sm-6 h-100 no-position">
+                            <v-card-item>
+                                <v-card-title class="text-wrap">
+                                    {{ partnerConfig.title }}
+                                </v-card-title>
+                                <v-card-subtitle class="text-wrap">
+                                    {{ partnerConfig.description }}
+                                </v-card-subtitle>
+                            </v-card-item>
+                            <v-card-text>
+                                <!-- eslint-disable-next-line vue/no-v-html -->
+                                <div v-if="partnerConfig.customHtmlDescription" v-html="partnerConfig.customHtmlDescription" />
+                                <a v-if="partnerConfig.partnerLogoBottomUrl" :href="partnerConfig.partnerUrl">
+                                    <img
+                                        :src="partnerConfig.partnerLogoBottomUrl" :srcset="partnerConfig.partnerLogoBottomUrl"
+                                        :alt="partnerConfig.name + ' logo'"
+                                        height="44"
+                                        class="mt-6 rounded white-background"
+                                    >
+                                </a>
+                            </v-card-text>
+                        </v-card>
+                    </v-col>
+                </template>
+                <template v-else>
+                    <v-col cols="12" sm="10" md="6" lg="5" xl="5" xxl="5">
+                        <v-card class="pa-2 pa-sm-6 h-100 no-position d-flex align-center">
+                            <v-card-text>
+                                <h1 class="font-weight-black signup-heading">
+                                    <template v-if="partnerConfig && partnerConfig.name">Start using {{ configStore.brandName }} on {{ partnerConfig.name }} today.</template>
+                                    <template v-else>Start using {{ configStore.brandName }} today.</template>
+                                </h1>
+                                <p class="text-title-medium mt-4">
+                                    Whether migrating your data or just testing out {{ configStore.brandName }}, your journey starts here.
+                                </p>
+
+                                <p class="mt-6">
+                                    <v-icon color="primary"><Check :stroke-width="4" /></v-icon>
+                                    Upload and download 25GB free for 30 days.
+                                </p>
+
+                                <p class="mt-4">
+                                    <v-icon color="primary"><Check :stroke-width="4" /></v-icon>
+                                    Integrate with any S3 compatible application.
+                                </p>
+
+                                <p class="mt-4">
+                                    <v-icon color="primary"><Check :stroke-width="4" /></v-icon>
+                                    Total set up takes less than 5 min.
+                                </p>
+
+                                <p class="mt-4">
+                                    <v-icon color="primary"><Check :stroke-width="4" /></v-icon>
+                                    No credit card required.
+                                </p>
+
+                                <p class="mt-6">
+                                    Need help figuring out if {{ configStore.brandName }} is a fit for your business? <a :href="getInTouchUrl" target="_blank" rel="noopener noreferrer" class="link font-weight-bold">Schedule a meeting</a>.
+                                </p>
+                            </v-card-text>
+                        </v-card>
+                    </v-col>
+                </template>
             </template>
-            <template v-else>
-                <v-col cols="12" sm="10" md="6" lg="5" xl="4" xxl="3">
-                    <v-card class="pa-2 pa-sm-6 h-100 no-position d-flex align-center">
-                        <v-card-text>
-                            <h1 class="font-weight-black signup-heading">
-                                <template v-if="partnerConfig && partnerConfig.name">Start using Storj on {{ partnerConfig.name }} today.</template>
-                                <template v-else>Start using Storj today.</template>
-                            </h1>
-                            <p class="text-subtitle-1 mt-4">
-                                Whether migrating your data or just testing out Storj, your journey starts here.
-                            </p>
-
-                            <p class="mt-6">
-                                <v-icon color="primary"><Check :stroke-width="4" /></v-icon>
-                                Upload and download 25GB free for 30 days.
-                            </p>
-
-                            <p class="mt-4">
-                                <v-icon color="primary"><Check :stroke-width="4" /></v-icon>
-                                Integrate with any S3 compatible application.
-                            </p>
-
-                            <p class="mt-4">
-                                <v-icon color="primary"><Check :stroke-width="4" /></v-icon>
-                                Total set up takes less than 5 min.
-                            </p>
-
-                            <p class="mt-4">
-                                <v-icon color="primary"><Check :stroke-width="4" /></v-icon>
-                                No credit card required.
-                            </p>
-
-                            <p class="mt-6">
-                                Need help figuring out if Storj is a fit for your business? <a href="https://meetings.hubspot.com/tom144/meeting-with-tom-troy" target="_blank" class="link font-weight-bold">Schedule a meeting</a>.
-                            </p>
-                        </v-card-text>
-                    </v-card>
-                </v-col>
-            </template>
-            <v-row justify="center" class="v-col-12">
-                <v-col>
-                    <p class="pt-9 text-center text-body-2">Already have an account? <router-link class="link font-weight-bold" :to="ROUTES.Login.path">Login</router-link></p>
-                </v-col>
-            </v-row>
+        </v-row>
+        <v-row justify="center">
+            <v-col>
+                <p class="pt-9 text-center text-body-medium">Already have an account? <router-link class="link font-weight-bold" :to="ROUTES.Login.path">Login</router-link></p>
+                <p v-if="!openRegistrationEnabled" class="mt-3 text-center text-body-medium">Need to verify your email? <router-link class="link font-weight-bold" :to="ROUTES.SignupConfirmation.path">Complete activation</router-link></p>
+            </v-col>
         </v-row>
     </v-container>
 </template>
@@ -291,31 +353,33 @@ import {
     VTextField,
     VIcon,
 } from 'vuetify/components';
-import { computed, ComputedRef, onBeforeMount, ref, watch } from 'vue';
+import { type ComputedRef, computed, onBeforeMount, ref, watch  } from 'vue';
 import VueHcaptcha from '@hcaptcha/vue3-hcaptcha';
 import { useRoute, useRouter } from 'vue-router';
-import { Check } from 'lucide-vue-next';
+import { Check } from '@lucide/vue';
 
 import { useConfigStore } from '@/store/modules/configStore';
-import { EmailRule, RequiredRule, ValidationRule } from '@/types/common';
-import { MultiCaptchaConfig } from '@/types/config.gen';
-import { PartnerConfig } from '@/types/partners';
+import { EmailRule, GoodPasswordRule, RequiredRule } from '@/types/common';
+import type { MultiCaptchaConfig } from '@/types/config.gen';
+import type { PartnerConfig } from '@/types/partners';
 import { AuthHttpApi } from '@/api/auth';
-import { useNotify } from '@/utils/hooks';
+import { useNotify } from '@/composables/useNotify';
 import { useAnalyticsStore } from '@/store/modules/analyticsStore';
 import { AnalyticsEvent } from '@/utils/constants/analyticsEventNames';
 import { ROUTES } from '@/router';
 import { SsoCheckState } from '@/types/users';
 import { APIError } from '@/utils/error';
+import { useUsersStore } from '@/store/modules/usersStore';
 
-import SignupConfirmation from '@/views/SignupConfirmation.vue';
 import PasswordInputEyeIcons from '@/components/PasswordInputEyeIcons.vue';
 import PasswordStrength from '@/components/PasswordStrength.vue';
+import TurnstileWidget from '@/components/TurnstileWidget.vue';
 
 const auth = new AuthHttpApi();
 
 const analyticsStore = useAnalyticsStore();
 const configStore = useConfigStore();
+const usersStore = useUsersStore();
 
 const router = useRouter();
 const notify = useNotify();
@@ -327,8 +391,6 @@ const formValid = ref<boolean>(false);
 const acceptedBetaTerms = ref(false);
 const acceptedTerms = ref(false);
 const showPassword = ref(false);
-const captchaError = ref(false);
-const confirmCode = ref(false);
 const showPasswordStrength = ref(false);
 
 const signupID = ref('');
@@ -346,9 +408,16 @@ const queryEmail = queryRef('email');
 const inviterEmail = queryRef('inviter_email');
 
 const hcaptcha = ref<VueHcaptcha | null>(null);
+const turnstile = ref<InstanceType<typeof TurnstileWidget> | null>(null);
 const form = ref<VForm | null>(null);
+
+/**
+ * Returns the active captcha widget instance (hCaptcha or Turnstile), whichever is mounted.
+ */
+function getCaptcha(): { execute(): void; reset(): void } | null {
+    return (hcaptcha.value ?? turnstile.value) as { execute(): void; reset(): void } | null;
+}
 const repPasswordField = ref<VTextField | null>(null);
-const partnerConfig = ref<PartnerConfig | null>(null);
 const ssoCheckTimeout = ref<NodeJS.Timeout>();
 
 const satellitesHints = [
@@ -364,7 +433,24 @@ const emailRules: ((_: string) => boolean | string)[] = [
     (value) => EmailRule(value, true),
 ];
 
+const partnerConfig = computed<PartnerConfig | null>(() =>
+    (configStore.signupConfig.get(route.query.partner?.toString() ?? '') ?? null) as PartnerConfig | null,
+);
+
+const badPasswords = computed<Set<string>>(() => usersStore.state.badPasswords);
+const liveCheckBadPassword = computed<boolean>(() => configStore.state.config.liveCheckBadPasswords);
+
+const openRegistrationEnabled = computed<boolean>(() => configStore.state.config.openRegistrationEnabled);
+const authMigrationModeEnabled = computed<boolean>(() => configStore.state.config.authMigrationModeEnabled);
+const objectMountTermsUrl = computed(() => configStore.state.config.objectMountTermsURL);
 const ssoEnabled = computed(() => configStore.state.config.ssoEnabled);
+const generalSsoEnabled = computed(() => configStore.state.config.generalSsoEnabled);
+const generalSsoProviders = computed(() => configStore.state.config.generalSsoProviders ?? []);
+
+const title = computed<string>(() => `Create your ${configStore.brandName} account.`);
+const termsLink = computed<string>(() => configStore.state.branding.termsOfServiceUrl);
+const privacyLink = computed<string>(() => configStore.state.branding.privacyPolicyUrl);
+const getInTouchUrl = computed<string>(() => configStore.state.branding.getInTouchUrl);
 
 const passwordRules = computed(() => {
     const rules = [
@@ -373,6 +459,8 @@ const passwordRules = computed(() => {
             ? `Password must be between ${passMinLength.value} and ${passMaxLength.value} characters`
             : true,
     ];
+    if (liveCheckBadPassword.value) rules.push(GoodPasswordRule);
+
     if (!ssoEnabled.value) {
         return rules;
     }
@@ -461,7 +549,7 @@ const codeActivationEnabled = computed((): boolean => {
  * Indicates if satellite is in beta.
  */
 const isBetaSatellite = computed((): boolean => {
-    return configStore.state.config.isBetaSatellite;
+    return configStore.state.config.isBetaSatellite && configStore.isDefaultBrand;
 });
 
 /**
@@ -495,7 +583,6 @@ function queryRef(key: string): ComputedRef<string> {
  */
 function onCaptchaVerified(response: string): void {
     captchaResponseToken.value = response;
-    captchaError.value = false;
     signup();
 }
 
@@ -503,8 +590,19 @@ function onCaptchaVerified(response: string): void {
  * Handles captcha error and expiry.
  */
 function onCaptchaError(): void {
+    getCaptcha()?.reset();
     captchaResponseToken.value = '';
-    captchaError.value = true;
+    notify.error('Captcha verification failed. If you are using a VPN, try disabling it.', null);
+    isLoading.value = false;
+}
+
+/**
+ * Handles the captcha challenge being closed without completion.
+ */
+function onCaptchaClosed(): void {
+    if (captchaResponseToken.value) return;
+    getCaptcha()?.reset();
+    isLoading.value = false;
 }
 
 function checkSSO(mail: string) {
@@ -536,7 +634,7 @@ function checkSSO(mail: string) {
         // check if the URL is valid.
             new URL(urlStr);
             ssoUrl.value = urlStr;
-        } catch (_) {
+        } catch {
             ssoUrl.value = SsoCheckState.Failed;
         }
     }, 1000);
@@ -552,8 +650,9 @@ async function onSignupClick(): Promise<void> {
     }
 
     async function triggerSignup() {
-        if (hcaptcha.value && !captchaResponseToken.value) {
-            hcaptcha.value?.execute();
+        const captcha = getCaptcha();
+        if (captcha && !captchaResponseToken.value && !secret.value) {
+            captcha.execute();
             return;
         }
         await signup();
@@ -578,6 +677,13 @@ async function onSignupClick(): Promise<void> {
     }
 }
 
+function onGeneralSsoClick(provider: string): void {
+    if (!generalSsoEnabled.value || !provider) {
+        return;
+    }
+    window.open(`/sso/${provider}`, '_self');
+}
+
 /**
  * Creates user.
  */
@@ -590,6 +696,7 @@ async function signup(): Promise<void> {
             partner: partner.value,
             signupPromoCode: signupPromoCode.value,
             isMinimal: true,
+            inviterEmail: inviterEmail.value,
         }, secret.value, captchaResponseToken.value);
 
         if (!codeActivationEnabled.value) {
@@ -598,26 +705,23 @@ async function signup(): Promise<void> {
             // signups outside of the brave browser may use a configured URL to track conversions
             // if the URL is not configured, the RegisterSuccess path will be used for non-Brave browsers
             const internalRegisterSuccessPath = ROUTES.SignupConfirmation.path;
-            const configuredRegisterSuccessPath = configStore.state.config.optionalSignupSuccessURL || internalRegisterSuccessPath;
-
-            const nonBraveSuccessPath = `${configuredRegisterSuccessPath}?email=${encodeURIComponent(email.value)}`;
-            const braveSuccessPath = `${internalRegisterSuccessPath}?email=${encodeURIComponent(email.value)}`;
-
-            const altRoute = `${window.location.origin}/${nonBraveSuccessPath}`;
 
             if (await detectBraveBrowser()) {
-                await router.push(braveSuccessPath);
+                await router.push(`${internalRegisterSuccessPath}?email=${encodeURIComponent(finalEmail)}`);
             } else {
-                window.location.href = altRoute;
+                const configuredRegisterSuccessPath = configStore.state.config.optionalSignupSuccessURL || internalRegisterSuccessPath;
+                const nonBraveSuccessPath = `${configuredRegisterSuccessPath}?email=${encodeURIComponent(finalEmail)}`;
+
+                window.location.href = new URL(nonBraveSuccessPath, window.location.origin).toString();
             }
         } else {
-            confirmCode.value = true;
+            await router.push({ name: ROUTES.SignupConfirmation.name, query: { email: finalEmail, signupReqId: signupID.value } });
         }
     } catch (error) {
         notify.notifyError(error);
     }
 
-    hcaptcha.value?.reset();
+    getCaptcha()?.reset();
     captchaResponseToken.value = '';
     isLoading.value = false;
 }
@@ -630,6 +734,15 @@ async function detectBraveBrowser(): Promise<boolean> {
 }
 
 onBeforeMount(async () => {
+    if (!configStore.state.config.openRegistrationEnabled && !secret.value && !isInvited.value) {
+        router.push(ROUTES.Login.path);
+        return;
+    }
+
+    if (liveCheckBadPassword.value && badPasswords.value.size === 0) {
+        usersStore.getBadPasswords().catch(() => {});
+    }
+
     if (route.query.partner) {
         partner.value = route.query.partner.toString();
     }
@@ -638,15 +751,8 @@ onBeforeMount(async () => {
         signupPromoCode.value = route.query.promo.toString();
     }
 
-    // If partner.value is true, attempt to load the partner-specific configuration
-    if (partner.value) {
-        try {
-            const config = (await import('@/configs/registrationViewConfig.json')).default;
-            partnerConfig.value = config[partner.value];
-        } catch {
-            // Handle errors, such as a missing configuration file
-            notify.error('No configuration file for registration page.');
-        }
+    if (queryEmail.value) {
+        checkSSO(queryEmail.value);
     }
 });
 
@@ -656,3 +762,27 @@ watch(password, () => {
     }
 });
 </script>
+
+<style scoped>
+.password-field-container {
+    position: relative;
+}
+
+.password-strength-indicator {
+    margin-top: 4px;
+}
+
+.fade-enter-active,
+.fade-leave-active {
+    transition: opacity 0.3s ease;
+}
+
+.fade-enter-from,
+.fade-leave-to {
+    opacity: 0;
+}
+
+.terms-text {
+    letter-spacing: -0.3px !important;
+}
+</style>

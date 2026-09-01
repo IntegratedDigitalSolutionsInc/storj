@@ -14,6 +14,7 @@ import (
 	"storj.io/common/macaroon"
 	"storj.io/common/memory"
 	"storj.io/common/testcontext"
+	"storj.io/common/testrand"
 	"storj.io/common/uuid"
 	"storj.io/storj/satellite"
 	"storj.io/storj/satellite/console"
@@ -24,6 +25,8 @@ func TestApiKeysRepository(t *testing.T) {
 	satellitedbtest.Run(t, func(ctx *testcontext.Context, t *testing.T, db satellite.DB) {
 		projects := db.Console().Projects()
 		apikeys := db.Console().APIKeys()
+		users := db.Console().Users()
+		pm := db.Console().ProjectMembers()
 
 		project, err := projects.Insert(ctx, &console.Project{
 			Name:        "ProjectName",
@@ -445,6 +448,138 @@ func TestApiKeysRepository(t *testing.T) {
 			keys, err := apikeys.GetAllNamesByProjectID(ctx, pr.ID)
 			require.NoError(t, err)
 			require.Equal(t, []string{"key1"}, keys)
+		})
+
+		t.Run("DeleteAllByProjectIDAndOwnerID", func(t *testing.T) {
+			pr, err := projects.Insert(ctx, &console.Project{
+				Name: "ProjectForOwnerDelete",
+			})
+			require.NoError(t, err)
+
+			owner1, err := users.Insert(ctx, &console.User{
+				ID:           testrand.UUID(),
+				Email:        "owner1@example.com",
+				PasswordHash: []byte("password"),
+			})
+			require.NoError(t, err)
+			owner2, err := users.Insert(ctx, &console.User{
+				ID:           testrand.UUID(),
+				Email:        "owner2@example.com",
+				PasswordHash: []byte("password"),
+			})
+			require.NoError(t, err)
+
+			secret, err := macaroon.NewSecret()
+			require.NoError(t, err)
+
+			// Create 2 keys owned by owner1.
+			key1, err := macaroon.NewAPIKey(secret)
+			require.NoError(t, err)
+			key2, err := macaroon.NewAPIKey(secret)
+			require.NoError(t, err)
+			// Create 1 key owned by owner2.
+			key3, err := macaroon.NewAPIKey(secret)
+			require.NoError(t, err)
+
+			_, err = apikeys.Create(ctx, key1.Head(), console.APIKeyInfo{
+				Name:      "owner1-key1",
+				ProjectID: pr.ID,
+				Secret:    secret,
+				CreatedBy: owner1.ID,
+			})
+			require.NoError(t, err)
+			_, err = apikeys.Create(ctx, key2.Head(), console.APIKeyInfo{
+				Name:      "owner1-key2",
+				ProjectID: pr.ID,
+				Secret:    secret,
+				CreatedBy: owner1.ID,
+			})
+			require.NoError(t, err)
+			_, err = apikeys.Create(ctx, key3.Head(), console.APIKeyInfo{
+				Name:      "owner2-key1",
+				ProjectID: pr.ID,
+				Secret:    secret,
+				CreatedBy: owner2.ID,
+			})
+			require.NoError(t, err)
+
+			cursor := console.APIKeyCursor{Page: 1, Limit: 10}
+			keys, err := apikeys.GetPagedByProjectID(ctx, pr.ID, cursor, "")
+			require.NoError(t, err)
+			require.Len(t, keys.APIKeys, 3)
+
+			// Delete all keys owned by owner1.
+			err = apikeys.DeleteAllByProjectIDAndOwnerID(ctx, pr.ID, owner1.ID)
+			require.NoError(t, err)
+
+			// Only owner2's key should remain.
+			keys, err = apikeys.GetPagedByProjectID(ctx, pr.ID, cursor, "")
+			require.NoError(t, err)
+			require.Len(t, keys.APIKeys, 1)
+			require.Equal(t, "owner2-key1", keys.APIKeys[0].Name)
+
+			// Deleting again should be a no-op (no error).
+			err = apikeys.DeleteAllByProjectIDAndOwnerID(ctx, pr.ID, owner1.ID)
+			require.NoError(t, err)
+
+			// Verify nothing changed.
+			keys, err = apikeys.GetPagedByProjectID(ctx, pr.ID, cursor, "")
+			require.NoError(t, err)
+			require.Len(t, keys.APIKeys, 1)
+		})
+
+		t.Run("CreatorEmail visibility and search", func(t *testing.T) {
+			memberEmail := "member@example.com"
+			memberUser, err := users.Insert(ctx, &console.User{
+				ID:           testrand.UUID(),
+				Email:        memberEmail,
+				PasswordHash: []byte("password"),
+			})
+			require.NoError(t, err)
+
+			member, err := pm.Insert(ctx, memberUser.ID, project.ID, console.RoleMember)
+			require.NoError(t, err)
+
+			secret, err := macaroon.NewSecret()
+			require.NoError(t, err)
+			key, err := macaroon.NewAPIKey(secret)
+			require.NoError(t, err)
+
+			createdKey, err := apikeys.Create(ctx, key.Head(), console.APIKeyInfo{
+				Name:      "keyForMember",
+				ProjectID: project.ID,
+				Secret:    secret,
+				CreatedBy: memberUser.ID,
+			})
+			require.NoError(t, err)
+
+			// member‐search — the key be returned with CreatorEmail set to member's email.
+			cursor := console.APIKeyCursor{Page: 1, Limit: 10, Search: memberEmail}
+			page, err := apikeys.GetPagedByProjectID(ctx, project.ID, cursor, "")
+			require.NoError(t, err)
+			require.NotNil(t, page)
+			require.NotNil(t, page.APIKeys)
+			require.Len(t, page.APIKeys, 1)
+			require.Equal(t, memberEmail, page.APIKeys[0].CreatorEmail)
+
+			err = pm.Delete(ctx, member.MemberID, project.ID)
+			require.NoError(t, err)
+
+			// blank‐search — the key should still be returned, but CreatorEmail must now be empty
+			cursor.Search = ""
+			page, err = apikeys.GetPagedByProjectID(ctx, project.ID, cursor, "")
+			require.NoError(t, err)
+			require.NotNil(t, page)
+			require.NotNil(t, page.APIKeys)
+
+			var seen bool
+			for _, ak := range page.APIKeys {
+				if ak.ID == createdKey.ID {
+					seen = true
+					require.Equal(t, "", ak.CreatorEmail, "email of ex-member must be hidden")
+				}
+			}
+			require.True(t, seen, "expected to find keyForMember in the results")
 		})
 	})
 }

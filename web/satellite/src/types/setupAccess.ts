@@ -23,6 +23,7 @@ export enum SetupStep {
     EnterNewPassphrase = 'enterNewPassphrase',
     ChoosePermissionsStep = 'choosePermission',
     ObjectLockPermissionsStep = 'objectLockPermissions',
+    BucketNotificationPermissionsStep = 'bucketNotificationPermissions',
     SelectBucketsStep = 'selectBuckets',
     OptionalExpirationStep = 'optionalExpiration',
     ConfirmDetailsStep = 'confirmDetails',
@@ -49,25 +50,16 @@ export enum ObjectLockPermission {
     BypassGovernanceRetention = 'BypassGovernanceRetention',
     PutObjectLegalHold = 'PutObjectLegalHold',
     GetObjectLegalHold = 'GetObjectLegalHold',
+    PutObjectLockConfiguration = 'PutObjectLockConfiguration',
+    GetObjectLockConfiguration = 'GetObjectLockConfiguration',
+}
+
+export enum BucketNotificationPermission {
+    PutBucketNotificationConfiguration = 'PutBucketNotificationConfiguration',
+    GetBucketNotificationConfiguration = 'GetBucketNotificationConfiguration',
 }
 
 export enum BucketsOption {
     All = 'all',
     Select = 'select',
-}
-
-export interface PermissionsMessage {
-    type: string;
-    buckets: string;
-    apiKey: string;
-    isDownload: boolean;
-    isUpload: boolean;
-    isList: boolean;
-    isDelete: boolean;
-    notBefore: string;
-    isPutObjectRetention?: boolean;
-    isGetObjectRetention?: boolean;
-    isBypassGovernanceRetention?: boolean;
-    isPutObjectLegalHold?: boolean;
-    isGetObjectLegalHold?: boolean;
 }

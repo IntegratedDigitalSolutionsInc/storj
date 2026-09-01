@@ -22,12 +22,13 @@ import (
 	"storj.io/common/context2"
 	"storj.io/common/leak"
 	"storj.io/common/traces"
+	"storj.io/storj/shared/flightrecorder"
 )
 
 var mon = monkit.Package()
 
-// Open opens *sql.DB and wraps the implementation with tagging.
-func Open(ctx context.Context, driverName, dataSourceName string) (DB, error) {
+// Open opens *sql.DB and wraps the implementation with tagging and flight recorder.
+func Open(ctx context.Context, driverName, dataSourceName string, recorder *flightrecorder.Box) (DB, error) {
 	var sdb *sql.DB
 	var err error
 	pprof.Do(ctx, pprof.Labels("db", driverName), func(ctx context.Context) {
@@ -39,10 +40,10 @@ func Open(ctx context.Context, driverName, dataSourceName string) (DB, error) {
 
 	err = sdb.PingContext(ctx)
 	if err != nil {
-		return nil, err
+		return nil, errs.Combine(err, sdb.Close())
 	}
 
-	return Wrap(sdb), nil
+	return WrapWithRecorder(sdb, recorder), nil
 }
 
 // Wrap turns a *sql.DB into a DB-matching interface.
@@ -59,6 +60,24 @@ func Wrap(db *sql.DB) DB {
 		useContext:   support.Basic(),
 		useTxContext: support.Transactions(),
 		tracker:      leak.Root(1),
+	}
+}
+
+// WrapWithRecorder turns a *sql.DB into a DB-matching interface including flight recorder.
+func WrapWithRecorder(db *sql.DB, recorder *flightrecorder.Box) DB {
+	support, err := DetectContextSupport(db)
+	if err != nil {
+		// When we reach here it is definitely a programmer error.
+		// Add any new database drivers into DetectContextSupport
+		panic(err)
+	}
+
+	return &sqlDB{
+		db:           db,
+		useContext:   support.Basic(),
+		useTxContext: support.Transactions(),
+		tracker:      leak.Root(1),
+		box:          recorder,
 	}
 }
 
@@ -89,20 +108,14 @@ func AllowContext(db *sql.DB) DB {
 type DB interface {
 	Name() string
 
-	// To be deprecated, the following take ctx as argument,
-	// however do not pass it forward to the underlying database.
-	Begin(ctx context.Context) (Tx, error)
-	Exec(ctx context.Context, query string, args ...interface{}) (sql.Result, error)
-	Ping(ctx context.Context) error
-	Prepare(ctx context.Context, query string) (Stmt, error)
-	Query(ctx context.Context, query string, args ...interface{}) (Rows, error)
-	QueryRow(ctx context.Context, query string, args ...interface{}) *sql.Row
-
 	BeginTx(ctx context.Context, txOptions *sql.TxOptions) (Tx, error)
 	Conn(ctx context.Context) (Conn, error)
 	ExecContext(ctx context.Context, query string, args ...interface{}) (sql.Result, error)
 	PingContext(ctx context.Context) error
 	PrepareContext(ctx context.Context, query string) (Stmt, error)
+	// Prepared returns the statement prepared against this DB, preparing it on
+	// first use and keeping it until Close. See Statement.
+	Prepared(statement Statement) Prepared
 	QueryContext(ctx context.Context, query string, args ...interface{}) (Rows, error)
 	QueryRowContext(ctx context.Context, query string, args ...interface{}) *sql.Row
 
@@ -120,6 +133,8 @@ type sqlDB struct {
 	useContext   bool
 	useTxContext bool
 	tracker      leak.Ref
+	box          *flightrecorder.Box
+	prepared     preparedCache
 }
 
 const (
@@ -130,11 +145,11 @@ const (
 	// PostgresName is the name when tagsql wraps a Cockroach DB connection.
 	PostgresName string = "postgres"
 
-	// SpannerName is the name when tagsql wraps a Cockroach DB connection.
-	SpannerName string = "spanner"
-
 	// SqliteName is the name when tagsql wraps a SQLite3 connection.
 	SqliteName string = "sqlite"
+
+	// TiDBName is the name when tagsql wraps a TiDB connection over the MySQL wire protocol.
+	TiDBName string = "tidb"
 )
 
 func (s *sqlDB) Name() string {
@@ -144,10 +159,11 @@ func (s *sqlDB) Name() string {
 		return CockroachName
 	case strings.Contains(driverType, "postgres"):
 		return PostgresName
-	case strings.Contains(driverType, "spanner"):
-		return SpannerName
 	case strings.Contains(driverType, "sqlite3.SQLiteDriver"):
 		return SqliteName
+	case strings.Contains(driverType, "tidbutil.Driver"),
+		strings.Contains(driverType, "mysql.MySQLDriver"):
+		return TiDBName
 	// only used by golang benchmark
 	case strings.Contains(driverType, "stdlib.Driver"):
 		return PostgresName
@@ -160,19 +176,6 @@ func (s *sqlDB) Name() string {
 
 }
 
-func (s *sqlDB) Begin(ctx context.Context) (Tx, error) {
-	traces.Tag(ctx, traces.TagDB)
-	tx, err := s.db.Begin()
-	if err != nil {
-		return nil, err
-	}
-	return &sqlTx{
-		tx:         tx,
-		useContext: s.useContext && s.useTxContext,
-		tracker:    s.tracker.Child("sqlTx", 1),
-	}, err
-}
-
 func (s *sqlDB) BeginTx(ctx context.Context, txOptions *sql.TxOptions) (Tx, error) {
 	if txOptions != nil {
 		return nil, errors.New("txOptions not supported")
@@ -182,7 +185,7 @@ func (s *sqlDB) BeginTx(ctx context.Context, txOptions *sql.TxOptions) (Tx, erro
 	var tx *sql.Tx
 	var err error
 	if !s.useContext {
-		tx, err = s.db.Begin()
+		tx, err = s.db.Begin() //nolint:noctx // fallback for non-context behaviour
 	} else {
 		tx, err = s.db.BeginTx(ctx, nil)
 	}
@@ -193,13 +196,16 @@ func (s *sqlDB) BeginTx(ctx context.Context, txOptions *sql.TxOptions) (Tx, erro
 
 	return &sqlTx{
 		tx:         tx,
+		name:       s.Name(),
 		useContext: s.useContext && s.useTxContext,
 		tracker:    s.tracker.Child("sqlTx", 1),
+		box:        s.box,
 	}, err
 }
 
 func (s *sqlDB) Close() error {
-	return errs.Combine(s.tracker.Close(), s.db.Close())
+	s.record()
+	return errs.Combine(s.prepared.close(), s.tracker.Close(), s.db.Close())
 }
 
 func (s *sqlDB) Conn(ctx context.Context) (Conn, error) {
@@ -222,56 +228,30 @@ func (s *sqlDB) Conn(ctx context.Context) (Conn, error) {
 	monConnOpen.Inc(1)
 	return &sqlConn{
 		conn:         conn,
+		name:         s.Name(),
 		useContext:   s.useContext,
 		useTxContext: s.useTxContext,
 		tracker:      s.tracker.Child("sqlConn", 1),
 	}, nil
 }
 
-func (s *sqlDB) Exec(ctx context.Context, query string, args ...interface{}) (_ sql.Result, err error) {
-	traces.Tag(ctx, traces.TagDB)
-	defer mon.Task()(&ctx, query, args)(&err)
-
-	return s.db.Exec(query, args...)
-}
-
 func (s *sqlDB) ExecContext(ctx context.Context, query string, args ...interface{}) (_ sql.Result, err error) {
+	s.record()
 	traces.Tag(ctx, traces.TagDB)
 	defer mon.Task()(&ctx, query, args)(&err)
 
 	if !s.useContext {
-		return s.db.Exec(query, args...)
+		return s.db.Exec(query, args...) //nolint:noctx // fallback for non-context behaviour
 	}
 	return s.db.ExecContext(ctx, query, args...)
-}
-
-func (s *sqlDB) Ping(ctx context.Context) error {
-	traces.Tag(ctx, traces.TagDB)
-	return s.db.Ping()
 }
 
 func (s *sqlDB) PingContext(ctx context.Context) error {
 	traces.Tag(ctx, traces.TagDB)
 	if !s.useContext {
-		return s.db.Ping()
+		return s.db.Ping() //nolint:noctx // fallback for non-context behaviour
 	}
 	return s.db.PingContext(ctx)
-}
-
-func (s *sqlDB) Prepare(ctx context.Context, query string) (_ Stmt, err error) {
-	traces.Tag(ctx, traces.TagDB)
-	defer mon.Task()(&ctx, query)(&err)
-
-	stmt, err := s.db.Prepare(query)
-	if err != nil {
-		return nil, err
-	}
-	return &sqlStmt{
-		query:      query,
-		stmt:       stmt,
-		useContext: s.useContext,
-		tracker:    s.tracker.Child("sqlStmt", 1),
-	}, nil
 }
 
 func (s *sqlDB) PrepareContext(ctx context.Context, query string) (_ Stmt, err error) {
@@ -280,7 +260,7 @@ func (s *sqlDB) PrepareContext(ctx context.Context, query string) (_ Stmt, err e
 
 	var stmt *sql.Stmt
 	if !s.useContext {
-		stmt, err = s.db.Prepare(query)
+		stmt, err = s.db.Prepare(query) //nolint:noctx // fallback for non-context behaviour
 		if err != nil {
 			return nil, err
 		}
@@ -295,39 +275,32 @@ func (s *sqlDB) PrepareContext(ctx context.Context, query string) (_ Stmt, err e
 		stmt:       stmt,
 		useContext: s.useContext,
 		tracker:    s.tracker.Child("sqlStmt", 1),
+		box:        s.box,
 	}, nil
 }
 
-func (s *sqlDB) Query(ctx context.Context, query string, args ...interface{}) (_ Rows, err error) {
-	traces.Tag(ctx, traces.TagDB)
-	defer mon.Task()(&ctx, query, args)(&err)
-
-	return s.wrapRows(s.db.Query(query, args...))
+func (s *sqlDB) Prepared(statement Statement) Prepared {
+	return s.prepared.get(s, statement)
 }
 
 func (s *sqlDB) QueryContext(ctx context.Context, query string, args ...interface{}) (_ Rows, err error) {
+	s.record()
 	traces.Tag(ctx, traces.TagDB)
 	defer mon.Task()(&ctx, query, args)(&err)
 
 	if !s.useContext {
-		return s.wrapRows(s.db.Query(query, args...))
+		return s.wrapRows(s.db.Query(query, args...)) //nolint:noctx // fallback for non-context behaviour
 	}
 	return s.wrapRows(s.db.QueryContext(ctx, query, args...))
 }
 
-func (s *sqlDB) QueryRow(ctx context.Context, query string, args ...interface{}) *sql.Row {
-	traces.Tag(ctx, traces.TagDB)
-	defer mon.Task()(&ctx, query, args)(nil)
-
-	return s.db.QueryRow(query, args...)
-}
-
 func (s *sqlDB) QueryRowContext(ctx context.Context, query string, args ...interface{}) *sql.Row {
+	s.record()
 	traces.Tag(ctx, traces.TagDB)
 	defer mon.Task()(&ctx, query, args)(nil)
 
 	if !s.useContext {
-		return s.db.QueryRow(query, args...)
+		return s.db.QueryRow(query, args...) //nolint:noctx // fallback for non-context behaviour
 	}
 	return s.db.QueryRowContext(ctx, query, args...)
 }
@@ -346,4 +319,12 @@ func (s *sqlDB) SetMaxOpenConns(n int) {
 
 func (s *sqlDB) Stats() sql.DBStats {
 	return s.db.Stats()
+}
+
+func (s *sqlDB) record() {
+	if s.box == nil {
+		return
+	}
+
+	s.box.Enqueue(flightrecorder.EventTypeDB, 1) // 1 to skip record call.
 }

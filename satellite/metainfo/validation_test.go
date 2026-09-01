@@ -247,7 +247,10 @@ func TestEndpoint_checkRate(t *testing.T) {
 			Satellite: func(log *zap.Logger, index int, config *satellite.Config) {
 				// make global rate/burst limit 1
 				config.Metainfo.RateLimiter.Rate = 1
+				config.Metainfo.RateLimiter.CacheExpiration = time.Hour
+				config.Metainfo.DownloadLimiter.Enabled = false
 			},
+			SatelliteDBOptions: testplanet.SatelliteDBDisableCaches,
 		},
 	},
 		func(t *testing.T, ctx *testcontext.Context, planet *testplanet.Planet) {
@@ -281,6 +284,13 @@ func TestEndpoint_checkRate(t *testing.T) {
 				},
 				Direction: buckets.DirectionForward,
 			}
+
+			// Mock the rate limiter time to depend on the execution time
+			rateLimiterTime := time.Now()
+			endpoint.TestingSetRateLimiterTime(func() time.Time {
+				return rateLimiterTime
+			})
+
 			_, err = endpoint.ListBuckets(ctx, listReq)
 			require.NoError(t, err)
 			_, err = endpoint.ListBuckets(ctx, listReq)
@@ -294,12 +304,6 @@ func TestEndpoint_checkRate(t *testing.T) {
 			burstList := int64(5)
 			burstDelete := int64(6)
 			burstPut := int64(7)
-
-			// Mock the rate limiter time to depend on the execution time
-			rateLimiterTime := time.Now()
-			endpoint.TestingSetRateLimiterTime(func() time.Time {
-				return rateLimiterTime
-			})
 
 			// switch project so that cached rate limiter isn't used for next test stage
 			peerctx := rpcpeer.NewContext(ctx, &rpcpeer.Peer{
@@ -461,7 +465,7 @@ func TestEndpoint_checkUserStatus(t *testing.T) {
 			endpoint := sat.Metainfo.Endpoint
 			users := sat.API.DB.Console().Users()
 
-			user, err := users.GetByEmail(ctx, planet.Uplinks[0].User[sat.ID()].Email)
+			user, err := users.GetByEmailAndTenant(ctx, planet.Uplinks[0].User[sat.ID()].Email, nil)
 			require.NoError(t, err)
 			require.Equal(t, console.Active, user.Status)
 

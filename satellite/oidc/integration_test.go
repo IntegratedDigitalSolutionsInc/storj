@@ -5,7 +5,6 @@ package oidc_test
 
 import (
 	"bytes"
-	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -44,7 +43,7 @@ func send(t *testing.T, body io.Reader, response interface{}, status int, parts 
 		method = http.MethodGet
 	}
 
-	req, err := http.NewRequestWithContext(context.Background(), method, parts[0], body)
+	req, err := http.NewRequestWithContext(t.Context(), method, parts[0], body)
 	require.NoError(t, err)
 
 	auth := parts[2]
@@ -98,7 +97,7 @@ func TestOIDC(t *testing.T) {
 	}, func(t *testing.T, ctx *testcontext.Context, planet *testplanet.Planet) {
 		sat := planet.Satellites[0]
 
-		adminAddr := sat.Admin.Admin.Listener.Addr().String()
+		adminAddr := sat.Admin.Admin.Listener.Addr().String() + "/legacy"
 		consoleAddr := sat.API.Console.Listener.Addr().String()
 
 		issuer := "http://" + consoleAddr + "/"
@@ -115,7 +114,7 @@ func TestOIDC(t *testing.T) {
 			FullName: "User",
 			Email:    "u@mail.test",
 			Password: "password",
-		}, regToken.Secret)
+		}, regToken)
 		require.NoError(t, err)
 
 		activationToken, err := sat.API.Console.Service.GenerateActivationToken(ctx, user.ID, user.Email)
@@ -124,7 +123,15 @@ func TestOIDC(t *testing.T) {
 		user, err = sat.API.Console.Service.ActivateAccount(ctx, activationToken)
 		require.NoError(t, err)
 
-		tokenInfo, err := sat.API.Console.Service.GenerateSessionToken(ctx, user.ID, user.Email, "", "", nil)
+		tokenInfo, err := sat.API.Console.Service.GenerateSessionToken(ctx, console.SessionTokenRequest{
+			UserID:          user.ID,
+			Email:           user.Email,
+			IP:              "",
+			UserAgent:       "",
+			AnonymousID:     "",
+			CustomDuration:  nil,
+			HubspotObjectID: user.HubspotObjectID,
+		})
 		require.NoError(t, err)
 
 		// Set up a test project and bucket

@@ -22,7 +22,7 @@ export interface AccessGrantsApi {
      * @returns AccessGrant
      * @throws Error
      */
-    create(projectId: string, name: string): Promise<AccessGrant>;
+    create(projectId: string, name: string, csrfProtectionToken: string): Promise<AccessGrant>;
 
     /**
      * Delete existing access grant
@@ -30,7 +30,7 @@ export interface AccessGrantsApi {
      * @returns null
      * @throws Error
      */
-    delete(ids: string[]): Promise<void>;
+    delete(ids: string[], csrfProtectionToken: string): Promise<void>;
 
     /**
      * Delete existing access grant by name and project id
@@ -38,7 +38,7 @@ export interface AccessGrantsApi {
      * @returns null
      * @throws Error
      */
-    deleteByNameAndProjectID(name: string, projectID: string): Promise<void>;
+    deleteByNameAndProjectID(name: string, projectID: string, csrfProtectionToken: string): Promise<void>;
 
     /**
      * Fetch all API key names.
@@ -63,6 +63,7 @@ export interface AccessGrantsApi {
 export enum AccessGrantsOrderBy {
     name = 1,
     createdAt = 2,
+    creatorEmail = 3,
 }
 
 /**
@@ -105,26 +106,10 @@ export class AccessGrant {
         public name: string = '',
         public createdAt: Date = new Date(),
         public secret: string = '',
+        public creatorEmail: string = '',
     ) {
         this.isSelected = false;
     }
-
-    /**
-     * Returns created date as a local string.
-     */
-    public localDate(): string {
-        return this.createdAt.toLocaleString('en-US', { timeZone: 'UTC', timeZoneName: 'short' });
-    }
-}
-
-/**
- * DurationPermission class holds info for access grant's duration permission.
- */
-export class DurationPermission {
-    constructor(
-        public notBefore: Date | null = null,
-        public notAfter: Date | null = null,
-    ) {}
 }
 
 /**
@@ -137,5 +122,6 @@ export class EdgeCredentials {
         public accessKeyId: string = '',
         public secretKey: string = '',
         public endpoint: string = '',
+        public freeTierRestrictedExpiration: Date | null = null,
     ) {}
 }

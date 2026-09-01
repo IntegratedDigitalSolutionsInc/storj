@@ -5,11 +5,9 @@ package satellitedb
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"time"
 
-	"cloud.google.com/go/civil"
 	"github.com/zeebo/errs"
 
 	"storj.io/common/storj"
@@ -46,25 +44,6 @@ func (db *StoragenodeAccounting) SaveTallies(ctx context.Context, latestTally ti
 					unnest($2::bytea[]), unnest($3::float8[])`),
 				latestTally,
 				pgutil.NodeIDArray(nodeIDs), pgutil.Float8Array(totals))
-		case dbutil.Spanner:
-			type storageTally struct {
-				NodeID    []byte
-				DataTotal float64
-			}
-
-			storageTallies := make([]storageTally, len(nodeIDs))
-
-			for i := range nodeIDs {
-				storageTallies[i] = storageTally{
-					NodeID:    nodeIDs[i].Bytes(),
-					DataTotal: totals[i],
-				}
-			}
-
-			_, err = tx.Tx.ExecContext(ctx, `
-				INSERT INTO storagenode_storage_tallies (
-					interval_end_time, node_id, data_total
-				) ( SELECT ?, NodeID, DataTotal FROM UNNEST(?));`, latestTally, storageTallies)
 		default:
 			return Error.New("unsupported implementation")
 		}
@@ -164,40 +143,6 @@ func (db *StoragenodeAccounting) getBandwidthByNodeSince(ctx context.Context, la
 	}
 }
 
-func (db *StoragenodeAccounting) getBandwidthPhase2ByNodeSince(ctx context.Context, latestRollup time.Time, nodeid []byte,
-	cb func(context.Context, *accounting.StoragenodeBandwidthRollup) error) (err error) {
-	defer mon.Task()(&ctx)(&err)
-
-	pageLimit := db.db.opts.ReadRollupBatchSize
-	if pageLimit <= 0 {
-		pageLimit = 10000
-	}
-
-	var cursor *dbx.Paged_StoragenodeBandwidthRollupPhase2_By_StoragenodeId_And_IntervalStart_GreaterOrEqual_Continuation
-	for {
-		rollups, next, err := db.db.Paged_StoragenodeBandwidthRollupPhase2_By_StoragenodeId_And_IntervalStart_GreaterOrEqual(ctx,
-			dbx.StoragenodeBandwidthRollupPhase2_StoragenodeId(nodeid), dbx.StoragenodeBandwidthRollupPhase2_IntervalStart(latestRollup),
-			pageLimit, cursor)
-		if err != nil {
-			return Error.Wrap(err)
-		}
-		cursor = next
-		for _, r := range rollups {
-			v, err := fromDBXStoragenodeBandwidthRollupPhase2(r)
-			if err != nil {
-				return Error.Wrap(err)
-			}
-			err = cb(ctx, &v)
-			if err != nil {
-				return err
-			}
-		}
-		if cursor == nil {
-			return nil
-		}
-	}
-}
-
 // GetBandwidthSince retrieves all storagenode_bandwidth_rollup entires since latestRollup.
 func (db *StoragenodeAccounting) GetBandwidthSince(ctx context.Context, latestRollup time.Time,
 	cb func(context.Context, *accounting.StoragenodeBandwidthRollup) error) (err error) {
@@ -220,11 +165,6 @@ func (db *StoragenodeAccounting) GetBandwidthSince(ctx context.Context, latestRo
 
 	for _, nodeid := range nodeids {
 		err = db.getBandwidthByNodeSince(ctx, latestRollup, nodeid, cb)
-		if err != nil {
-			return err
-		}
-
-		err = db.getBandwidthPhase2ByNodeSince(ctx, latestRollup, nodeid, cb)
 		if err != nil {
 			return err
 		}
@@ -258,7 +198,7 @@ func (db *StoragenodeAccounting) SaveRollup(ctx context.Context, latestRollup ti
 	insertBatch := func(ctx context.Context, db *dbx.DB, batch []*accounting.Rollup) (err error) {
 		defer mon.Task()(&ctx)(&err)
 		n := len(batch)
-		return db.WithTx(ctx, func(ctx context.Context, tx *dbx.Tx) error {
+		return db.WithTx(ctx, func(ctx context.Context, tx *dbx.Tx) (err error) {
 			defer mon.Task()(&ctx)(&err)
 
 			nodeID := make([]storj.NodeID, n)
@@ -315,65 +255,6 @@ func (db *StoragenodeAccounting) SaveRollup(ctx context.Context, latestRollup ti
 					pgutil.Float8Array(atRestTotal),
 					pgutil.TimestampTZArray(intervalEndTime))
 
-			case dbutil.Spanner:
-
-				type accountingRollup struct {
-					NodeID          []byte
-					StartTime       time.Time
-					PutTotal        int64
-					GetTotal        int64
-					GetAuditTotal   int64
-					GetRepairTotal  int64
-					PutRepairTotal  int64
-					AtRestTotal     float64
-					IntervalEndTime time.Time
-				}
-
-				accountingRollups := make([]accountingRollup, len(nodeID))
-
-				for i := range accountingRollups {
-					accountingRollups[i] = accountingRollup{
-						NodeID:          nodeID[i].Bytes(),
-						StartTime:       startTime[i],
-						PutTotal:        putTotal[i],
-						GetTotal:        getTotal[i],
-						GetAuditTotal:   getAuditTotal[i],
-						GetRepairTotal:  getRepairTotal[i],
-						PutRepairTotal:  putRepairTotal[i],
-						AtRestTotal:     atRestTotal[i],
-						IntervalEndTime: intervalEndTime[i],
-					}
-				}
-
-				updateARStatement := tx.Rebind(`
-					UPDATE accounting_rollups ar
-					SET ar.put_total = ?, ar.get_total = ?, ar.get_audit_total = ?, ar.get_repair_total = ?,
-						ar.put_repair_total = ?, ar.at_rest_total = ?, ar.interval_end_time = ?
-					WHERE ar.node_id = ? AND ar.start_time = ?`,
-				)
-
-				for i := range nodeID {
-					_, err = tx.Tx.ExecContext(ctx, updateARStatement,
-						putTotal[i], getTotal[i], getAuditTotal[i], getRepairTotal[i],
-						putRepairTotal[i], atRestTotal[i], intervalEndTime[i], nodeID[i].Bytes(),
-						startTime[i])
-
-					if err != nil {
-						return errs.New("bucket bandwidth rollup batch update failed: %w", err)
-					}
-				}
-
-				insertARStatement := tx.Rebind(
-					`INSERT OR IGNORE INTO accounting_rollups (
-						node_id, start_time, put_total, get_total, get_audit_total,
-						get_repair_total, put_repair_total, at_rest_total, interval_end_time
-					) ( SELECT NodeID, StartTime, PutTotal, GetTotal, GetAuditTotal, GetRepairTotal,
-							PutRepairTotal, AtRestTotal, IntervalEndTime FROM UNNEST(?));`,
-				)
-				_, err = tx.Tx.ExecContext(ctx, insertARStatement, accountingRollups)
-				if err != nil {
-					return errs.New("accounting rollups batch insert failed: %w", err)
-				}
 			}
 			return Error.Wrap(err)
 		})
@@ -406,10 +287,11 @@ func (db *StoragenodeAccounting) SaveRollup(ctx context.Context, latestRollup ti
 }
 
 // LastTimestamp records the greatest last tallied time.
-func (db *StoragenodeAccounting) LastTimestamp(ctx context.Context, timestampType string) (_ time.Time, err error) {
+func (db *StoragenodeAccounting) LastTimestamp(ctx context.Context, timestampType string) (lastTally time.Time, err error) {
 	defer mon.Task()(&ctx)(&err)
-	lastTally := time.Time{}
+
 	err = db.db.WithTx(ctx, func(ctx context.Context, tx *dbx.Tx) error {
+		lastTally = time.Time{}
 		lt, err := tx.Find_AccountingTimestamps_Value_By_Name(ctx, dbx.AccountingTimestamps_Name(timestampType))
 		if lt == nil {
 			return tx.ReplaceNoReturn_AccountingTimestamps(ctx,
@@ -462,6 +344,12 @@ func (db *StoragenodeAccounting) QueryPaymentInfo(ctx context.Context, start tim
 // QueryStorageNodePeriodUsage returns usage invoices for nodes for a compensation period.
 func (db *StoragenodeAccounting) QueryStorageNodePeriodUsage(ctx context.Context, period compensation.Period) (_ []accounting.StorageNodePeriodUsage, err error) {
 	defer mon.Task()(&ctx)(&err)
+	return db.QueryStorageNodePeriodUsageRange(ctx, period.StartDate(), period.EndDateExclusive())
+}
+
+// QueryStorageNodePeriodUsageRange returns usage invoices for nodes over the given [start, endExclusive) range.
+func (db *StoragenodeAccounting) QueryStorageNodePeriodUsageRange(ctx context.Context, start, endExclusive time.Time) (_ []accounting.StorageNodePeriodUsage, err error) {
+	defer mon.Task()(&ctx)(&err)
 
 	query := db.db.Rebind(`
 		SELECT
@@ -482,7 +370,7 @@ func (db *StoragenodeAccounting) QueryStorageNodePeriodUsage(ctx context.Context
 			node_id ASC
 	`)
 
-	rows, err := db.db.DB.QueryContext(ctx, query, period.StartDate(), period.EndDateExclusive())
+	rows, err := db.db.DB.QueryContext(ctx, query, start, endExclusive)
 	if err != nil {
 		return nil, Error.Wrap(err)
 	}
@@ -582,168 +470,48 @@ func (db *StoragenodeAccounting) QueryStorageNodeUsage(ctx context.Context, node
 		}
 
 		return nodeStorageUsages, rows.Err()
-	case dbutil.Spanner:
-		var nodeStorageUsages []accounting.StorageNodeUsage
-		query := `
-			SELECT SUM(r1.at_rest_total) AS at_rest_total,
-				DATE(r1.start_time, 'UTC') AS start_time,
-				COALESCE(MAX(r1.interval_end_time), MAX(r1.start_time)) AS interval_end_time
-			FROM accounting_rollups r1
-			WHERE r1.node_id = @node_id
-			AND @start <= r1.start_time
-			AND r1.start_time <= @end
-			GROUP BY DATE(r1.start_time, 'UTC')
-
-			UNION DISTINCT
-
-			SELECT SUM(t.data_total) AS at_rest_total,
-				DATE(t.interval_end_time, 'UTC') AS start_time,
-				MAX(t.interval_end_time) AS interval_end_time
-				FROM storagenode_storage_tallies t
-				WHERE t.node_id = @node_id
-				AND NOT EXISTS (
-					SELECT node_id FROM accounting_rollups r2
-					WHERE r2.node_id = @node_id
-					AND @start <= r2.start_time
-					AND r2.start_time <= @end
-					AND DATE(r2.start_time, 'UTC') = DATE(t.interval_end_time, 'UTC')
-				)
-				AND (SELECT value FROM accounting_timestamps WHERE name = @name) < t.interval_end_time
-				AND t.interval_end_time <= @end
-				GROUP BY DATE(t.interval_end_time, 'UTC')
-			ORDER BY start_time;
-			`
-		rows, err := db.db.QueryContext(ctx, query,
-			sql.Named("node_id", nodeID.Bytes()),
-			sql.Named("start", start),
-			sql.Named("end", end),
-			sql.Named("name", accounting.LastRollup))
-
-		if err != nil {
-			return nil, Error.Wrap(err)
-		}
-		defer func() { err = errs.Combine(err, rows.Close()) }()
-
-		for rows.Next() {
-			var atRestTotal float64
-			var startTime civil.Date
-			var intervalEndTime time.Time
-
-			err = rows.Scan(&atRestTotal, &startTime, &intervalEndTime)
-			if err != nil {
-				return nil, Error.Wrap(err)
-			}
-
-			nodeStorageUsages = append(nodeStorageUsages, accounting.StorageNodeUsage{
-				NodeID:          nodeID,
-				StorageUsed:     atRestTotal,
-				Timestamp:       startTime.In(intervalEndTime.Location()),
-				IntervalEndTime: intervalEndTime,
-			})
-		}
-
-		return nodeStorageUsages, rows.Err()
 	default:
 		return nil, errors.New("not supported database implementation")
 	}
 }
 
 // DeleteTalliesBefore deletes all raw tallies prior to some time.
-func (db *StoragenodeAccounting) DeleteTalliesBefore(ctx context.Context, latestRollup time.Time, batchSize int) (err error) {
+func (db *StoragenodeAccounting) DeleteTalliesBefore(ctx context.Context, before time.Time, batchSize int) (err error) {
 	defer mon.Task()(&ctx)(&err)
 
-	if batchSize <= 0 {
-		batchSize = 10000
+	// Find the earliest record to determine the start point
+	row, err := db.db.First_StoragenodeStorageTally_IntervalEndTime_OrderBy_Asc_IntervalEndTime(ctx)
+	if err != nil {
+		return Error.Wrap(err)
+	}
+	if row == nil {
+		return nil
 	}
 
-	switch db.db.impl {
-	case dbutil.Cockroach:
-		query := `
-			DELETE FROM storagenode_storage_tallies
-			WHERE interval_end_time < ?
-			LIMIT ?`
-		query = db.db.Rebind(query)
-		for {
-			res, err := db.db.DB.ExecContext(ctx, query, latestRollup.UTC(), batchSize)
-			if err != nil {
-				if errs.Is(err, sql.ErrNoRows) {
-					return nil
-				}
-				return Error.Wrap(err)
-			}
+	// Delete in 24-hour chunks
+	chunkDuration := 24 * time.Hour
+	currentBefore := row.IntervalEndTime
 
-			affected, err := res.RowsAffected()
-			if err != nil {
-				return Error.Wrap(err)
-			}
-			if affected == 0 {
-				return nil
-			}
+	for currentBefore.Before(before) {
+		currentEnd := currentBefore.Add(chunkDuration)
+		if currentEnd.After(before) {
+			currentEnd = before
 		}
 
-	case dbutil.Postgres:
-		query := `
-			DELETE FROM storagenode_storage_tallies
-			WHERE ctid IN (
-				SELECT ctid
-				FROM storagenode_storage_tallies
-				WHERE interval_end_time < ?
-				ORDER BY interval_end_time
-				LIMIT ?
-			)`
-		query = db.db.Rebind(query)
-		for {
-			res, err := db.db.DB.ExecContext(ctx, query, latestRollup.UTC(), batchSize)
-			if err != nil {
-				if errs.Is(err, sql.ErrNoRows) {
-					return nil
-				}
-				return Error.Wrap(err)
-			}
-
-			affected, err := res.RowsAffected()
+		switch db.db.impl {
+		case dbutil.Cockroach, dbutil.Postgres:
+			_, err := db.db.Delete_StoragenodeStorageTally_By_IntervalEndTime_Less(ctx, dbx.StoragenodeStorageTally_IntervalEndTime(currentEnd))
 			if err != nil {
 				return Error.Wrap(err)
 			}
-			if affected == 0 {
-				return nil
-			}
+		default:
+			return Error.New("unsupported database: %v", db.db.impl)
 		}
 
-	case dbutil.Spanner:
-		query := `
-			DELETE FROM storagenode_storage_tallies
-			WHERE node_id IN (
-					SELECT node_id
-					FROM storagenode_storage_tallies
-					WHERE interval_end_time < ?
-					ORDER BY interval_end_time
-					LIMIT ?
-				) AND interval_end_time < ?;
-			`
-		query = db.db.Rebind(query)
-		for {
-			res, err := db.db.DB.ExecContext(ctx, query, latestRollup.UTC(), batchSize, latestRollup.UTC())
-			if err != nil {
-				if errs.Is(err, sql.ErrNoRows) {
-					return nil
-				}
-				return Error.Wrap(err)
-			}
-
-			affected, err := res.RowsAffected()
-			if err != nil {
-				return Error.Wrap(err)
-			}
-			if affected == 0 {
-				return nil
-			}
-		}
-
-	default:
-		err = Error.New("unsupported database: %v", db.db.impl)
+		currentBefore = currentEnd
 	}
-	return err
+
+	return nil
 }
 
 // ArchiveRollupsBefore archives rollups older than a given time.
@@ -757,7 +525,7 @@ func (db *StoragenodeAccounting) ArchiveRollupsBefore(ctx context.Context, befor
 	switch db.db.impl {
 	case dbutil.Cockroach:
 		for {
-			row := db.db.QueryRow(ctx, `
+			row := db.db.QueryRowContext(ctx, `
 			WITH rollups_to_move AS (
 				DELETE FROM storagenode_bandwidth_rollups
 				WHERE interval_start <= $1
@@ -792,67 +560,13 @@ func (db *StoragenodeAccounting) ArchiveRollupsBefore(ctx context.Context, befor
 			)
 			SELECT count(*) FROM moved_rollups
 		`
-		row := db.db.DB.QueryRow(ctx, storagenodeStatement, before)
+		row := db.db.DB.QueryRowContext(ctx, storagenodeStatement, before)
 		err = row.Scan(&nodeRollupsDeleted)
 		return nodeRollupsDeleted, err
-
-	case dbutil.Spanner:
-		query := `
-					INSERT INTO storagenode_bandwidth_rollup_archives
-					(storagenode_id, interval_start, interval_seconds, action, allocated, settled)
-					(SELECT
-					storagenode_id, interval_start, interval_seconds, action, allocated, settled
-					FROM storagenode_bandwidth_rollups
-					WHERE interval_start <= ? LIMIT ?) THEN RETURN storagenode_id, interval_start, action`
-
-		type storagenodeToDelete struct {
-			StoragenodeID []byte
-			IntervalStart time.Time
-			Action        int64
-		}
-
-		err = db.db.WithTx(ctx, func(ctx context.Context, tx *dbx.Tx) error {
-			for rowCount := int64(batchSize); rowCount >= int64(batchSize); {
-				err := withRows(tx.Tx.QueryContext(ctx, query, before, batchSize))(func(rows tagsql.Rows) error {
-					var storagenodesToDelete []storagenodeToDelete
-					for rows.Next() {
-						var s storagenodeToDelete
-						if err := rows.Scan(&s.StoragenodeID, &s.IntervalStart, &s.Action); err != nil {
-							err = errs.Combine(err, rows.Err(), rows.Close())
-							return err
-						}
-						storagenodesToDelete = append(storagenodesToDelete, s)
-					}
-
-					res, err := tx.Tx.ExecContext(ctx,
-						`DELETE FROM storagenode_bandwidth_rollups WHERE STRUCT<StoragenodeID BYTES, IntervalStart TIMESTAMP, Action INT64>(storagenode_id, interval_start, action) IN UNNEST(?)`,
-						storagenodesToDelete)
-					if err != nil {
-						return err
-					}
-
-					rowCount, err = res.RowsAffected()
-					if err != nil {
-						return err
-					}
-					nodeRollupsDeleted += int(rowCount)
-
-					return nil
-				})
-				if err != nil {
-					return err
-				}
-			}
-			return nil
-		})
-		if err != nil {
-			return 0, Error.Wrap(err)
-		}
 
 	default:
 		return 0, Error.New("unsupported database: %v", db.db.impl)
 	}
-	return nodeRollupsDeleted, Error.Wrap(err)
 }
 
 // GetRollupsSince retrieves all archived bandwidth rollup records since a given time.
@@ -930,19 +644,6 @@ func fromDBXStoragenodeStorageTally(r *dbx.StoragenodeStorageTally) (*accounting
 }
 
 func fromDBXStoragenodeBandwidthRollup(v *dbx.StoragenodeBandwidthRollup) (r accounting.StoragenodeBandwidthRollup, _ error) {
-	id, err := storj.NodeIDFromBytes(v.StoragenodeId)
-	if err != nil {
-		return r, Error.Wrap(err)
-	}
-	return accounting.StoragenodeBandwidthRollup{
-		NodeID:        id,
-		IntervalStart: v.IntervalStart,
-		Action:        v.Action,
-		Settled:       v.Settled,
-	}, nil
-}
-
-func fromDBXStoragenodeBandwidthRollupPhase2(v *dbx.StoragenodeBandwidthRollupPhase2) (r accounting.StoragenodeBandwidthRollup, _ error) {
 	id, err := storj.NodeIDFromBytes(v.StoragenodeId)
 	if err != nil {
 		return r, Error.Wrap(err)

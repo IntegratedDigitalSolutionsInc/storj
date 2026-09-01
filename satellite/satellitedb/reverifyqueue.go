@@ -40,11 +40,6 @@ func (rq *reverifyQueue) Insert(ctx context.Context, piece *audit.PieceLocator) 
 				VALUES ($1, $2, $3, $4)
 			ON CONFLICT ("node_id", "stream_id", "position") DO NOTHING
 		`
-	case dbutil.Spanner:
-		insertQuery = `
-			INSERT OR IGNORE INTO reverification_audits (node_id, stream_id, position, piece_num)
-			VALUES (?, ?, ?, ?)
-		`
 	default:
 		return audit.Error.New("unsupported database dialect: %s", rq.db.impl)
 	}
@@ -108,25 +103,6 @@ func (rq *reverifyQueue) GetNextJob(ctx context.Context, retryInterval time.Dura
 		`
 		row := rq.db.QueryRowContext(ctx, selectQuery, retryInterval.Microseconds())
 		job, err = scanJobFunc(row)
-		return job, err
-	case dbutil.Spanner:
-		err = rq.db.WithTx(ctx, func(ctx context.Context, tx *dbx.Tx) error {
-			selectQuery := `
-			UPDATE reverification_audits
-			SET last_attempt = CURRENT_TIMESTAMP(),
-				reverify_count = reverify_count + 1
-			WHERE (node_id, stream_id, position) IN (
-				SELECT (node_id, stream_id, position)
-				FROM reverification_audits
-				WHERE COALESCE(last_attempt, inserted_at) < TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL ? nanosecond)
-				ORDER BY inserted_at
-				LIMIT 1
-			)
-			THEN RETURN node_id, stream_id, position, piece_num, inserted_at, reverify_count`
-			row := tx.QueryRowContext(ctx, selectQuery, retryInterval.Nanoseconds())
-			job, err = scanJobFunc(row)
-			return err
-		})
 		return job, err
 	default:
 		return nil, audit.Error.New("unsupported database dialect: %s", rq.db.impl)

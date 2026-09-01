@@ -5,6 +5,7 @@ package satellite_test
 
 import (
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 
@@ -17,6 +18,7 @@ import (
 func TestGCBFUseRangedLoop(t *testing.T) {
 	testplanet.Run(t, testplanet.Config{
 		SatelliteCount: 1,
+		UplinkCount:    1,
 	}, func(t *testing.T, ctx *testcontext.Context, planet *testplanet.Planet) {
 		config := planet.Satellites[0].Config
 
@@ -24,7 +26,14 @@ func TestGCBFUseRangedLoop(t *testing.T) {
 		require.NoError(t, err)
 		defer ctx.Check(revocationDB.Close)
 
+		accessGrant, err := planet.Uplinks[0].Access[planet.Satellites[0].ID()].Serialize()
+		require.NoError(t, err)
+
+		// the run fails when an observer does, and the bloom filter observer
+		// refuses to start without somewhere to upload to
 		config.GarbageCollectionBF.RunOnce = true
+		config.GarbageCollectionBF.AccessGrant = accessGrant
+		config.GarbageCollectionBF.Bucket = "bloomfilters"
 
 		gcbf, err := satellite.NewGarbageCollectionBF(
 			planet.Log().Named("test-gcbf"),
@@ -35,6 +44,7 @@ func TestGCBFUseRangedLoop(t *testing.T) {
 			planet.NewVersionInfo(),
 			&config,
 			nil,
+			time.Time{},
 		)
 		require.NoError(t, err)
 		defer ctx.Check(gcbf.Close)

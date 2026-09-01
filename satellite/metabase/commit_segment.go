@@ -1,0 +1,584 @@
+// Copyright (C) 2020 Storj Labs, Inc.
+// See LICENSE for copying information.
+
+package metabase
+
+import (
+	"context"
+	"time"
+
+	pgxerrcode "github.com/jackc/pgerrcode"
+
+	"storj.io/common/storj"
+	"storj.io/storj/shared/dbutil/pgutil/pgerrcode"
+	"storj.io/storj/shared/dbutil/tidbutil"
+)
+
+// BeginSegment contains options to verify, whether a new segment upload can be started.
+type BeginSegment struct {
+	ObjectStream
+
+	Position SegmentPosition
+
+	// TODO: unused field, can remove
+	RootPieceID storj.PieceID
+
+	Pieces Pieces
+
+	ObjectExistsChecked bool
+}
+
+// BeginSegment verifies, whether a new segment upload can be started.
+func (db *DB) BeginSegment(ctx context.Context, opts BeginSegment) (err error) {
+	defer mon.Task()(&ctx)(&err)
+
+	if err := opts.ObjectStream.Verify(); err != nil {
+		return err
+	}
+
+	if err := opts.Pieces.Verify(); err != nil {
+		return err
+	}
+
+	if opts.RootPieceID.IsZero() {
+		return ErrInvalidRequest.New("RootPieceID missing")
+	}
+
+	if !opts.ObjectExistsChecked {
+		// NOTE: Find a way to safely remove this. This isn't strictly necessary,
+		// since we can also fail this in CommitSegment.
+		// We should prevent creating segments for non-partial objects.
+
+		// Verify that object exists and is partial.
+		exists, err := db.ChooseAdapter(opts.ProjectID).PendingObjectExists(ctx, opts)
+		if err != nil {
+			return Error.New("unable to query object status: %w", err)
+		}
+		if !exists {
+			return ErrPendingObjectMissing.New("")
+		}
+	}
+
+	mon.Meter("segment_begin").Mark(1)
+
+	return nil
+}
+
+// PendingObjectExists checks whether an object already exists.
+func (p *PostgresAdapter) PendingObjectExists(ctx context.Context, opts BeginSegment) (exists bool, err error) {
+	err = p.db.QueryRowContext(ctx, `
+		SELECT EXISTS (
+			SELECT 1
+			FROM objects
+			WHERE (project_id, bucket_name, object_key, version, stream_id) = ($1, $2, $3, $4, $5) AND
+				status = `+statusPending+`
+		)`,
+		opts.ProjectID, opts.BucketName, opts.ObjectKey, opts.Version, opts.StreamID).Scan(&exists)
+	return exists, err
+}
+
+// PendingObjectExists checks whether an object already exists.
+func (t *TiDBAdapter) PendingObjectExists(ctx context.Context, opts BeginSegment) (exists bool, err error) {
+	err = t.db.QueryRowContext(ctx, `
+		SELECT EXISTS (
+			SELECT 1
+			FROM objects
+			WHERE (project_id, bucket_name, object_key, version, stream_id) = (?, ?, ?, ?, ?) AND
+				status = `+statusPending+`
+		)`,
+		opts.ProjectID, opts.BucketName, opts.ObjectKey, opts.Version, opts.StreamID).Scan(&exists)
+	return exists, err
+}
+
+// CommitSegment contains all necessary information about the segment.
+type CommitSegment struct {
+	ObjectStream
+
+	Position    SegmentPosition
+	RootPieceID storj.PieceID
+
+	ExpiresAt *time.Time
+
+	EncryptedKeyNonce []byte
+	EncryptedKey      []byte
+
+	PlainOffset   int64 // offset in the original data stream
+	PlainSize     int32 // size before encryption
+	EncryptedSize int32 // segment size after encryption
+
+	EncryptedETag     []byte
+	EncryptedChecksum []byte
+
+	Redundancy storj.RedundancyScheme
+
+	Pieces Pieces
+
+	Placement storj.PlacementConstraint
+
+	MaxCommitDelay *time.Duration
+}
+
+// CommitSegment commits segment to the database.
+func (db *DB) CommitSegment(ctx context.Context, opts CommitSegment) (err error) {
+	defer mon.Task()(&ctx)(&err)
+
+	if err := opts.ObjectStream.Verify(); err != nil {
+		return err
+	}
+
+	if err := opts.Pieces.Verify(); err != nil {
+		return err
+	}
+
+	switch {
+	case opts.RootPieceID.IsZero():
+		return ErrInvalidRequest.New("RootPieceID missing")
+	case len(opts.EncryptedKey) == 0:
+		return ErrInvalidRequest.New("EncryptedKey missing")
+	case len(opts.EncryptedKeyNonce) == 0:
+		return ErrInvalidRequest.New("EncryptedKeyNonce missing")
+	case opts.EncryptedSize <= 0:
+		return ErrInvalidRequest.New("EncryptedSize negative or zero")
+	case opts.PlainSize <= 0 && ValidatePlainSize:
+		return ErrInvalidRequest.New("PlainSize negative or zero")
+	case opts.PlainOffset < 0:
+		return ErrInvalidRequest.New("PlainOffset negative")
+	case opts.Redundancy.IsZero():
+		return ErrInvalidRequest.New("Redundancy zero")
+	}
+
+	if len(opts.Pieces) < int(opts.Redundancy.OptimalShares) {
+		return ErrInvalidRequest.New("number of pieces is less than redundancy optimal shares value")
+	}
+
+	aliasPieces, err := db.aliasCache.EnsurePiecesToAliases(ctx, opts.Pieces)
+	if err != nil {
+		return Error.New("unable to convert pieces to aliases: %w", err)
+	}
+
+	err = db.ChooseAdapter(opts.ProjectID).CommitPendingObjectSegment(ctx, opts, aliasPieces)
+	if err != nil {
+		if ErrPendingObjectMissing.Has(err) {
+			return err
+		}
+		return Error.New("unable to insert segment: %w", err)
+	}
+
+	mon.Meter("segment_commit").Mark(1)
+	mon.IntVal("segment_commit_encrypted_size").Observe(int64(opts.EncryptedSize))
+
+	return nil
+}
+
+// CommitPendingObjectSegment commits segment to the database.
+func (p *PostgresAdapter) CommitPendingObjectSegment(ctx context.Context, opts CommitSegment, aliasPieces AliasPieces) (err error) {
+	defer mon.Task()(&ctx)(&err)
+
+	values := []any{
+		opts.StreamID, opts.Position,
+		opts.ExpiresAt,
+		opts.RootPieceID, opts.EncryptedKeyNonce, opts.EncryptedKey,
+		opts.EncryptedSize, opts.PlainOffset, opts.PlainSize,
+		opts.EncryptedETag, opts.EncryptedChecksum,
+		opts.Redundancy,
+		aliasPieces,
+
+		opts.Placement,
+
+		opts.ProjectID, opts.BucketName, opts.ObjectKey, opts.Version,
+	}
+
+	// Verify that object exists and is partial.
+	_, err = p.db.ExecContext(ctx, `
+		INSERT INTO segments (
+			stream_id, position, expires_at,
+			root_piece_id, encrypted_key_nonce, encrypted_key,
+			encrypted_size, plain_offset, plain_size,
+			encrypted_etag, encrypted_checksum,
+			redundancy,
+			remote_alias_pieces,
+			placement
+		) VALUES (
+			(
+				SELECT stream_id
+				FROM objects
+				WHERE (project_id, bucket_name, object_key, version, stream_id) = ($15, $16, $17, $18, $1) AND
+					status = `+statusPending+`
+			), $2,
+			$3,
+			$4, $5, $6,
+			$7, $8, $9,
+			$10, $11,
+			$12,
+			$13,
+			$14
+		)
+		ON CONFLICT(stream_id, position)
+		DO UPDATE SET
+			expires_at = $3,
+			root_piece_id = $4, encrypted_key_nonce = $5, encrypted_key = $6,
+			encrypted_size = $7, plain_offset = $8, plain_size = $9,
+			encrypted_etag = $10, encrypted_checksum = $11,
+			redundancy = $12,
+			remote_alias_pieces = $13,
+			placement = $14,
+			-- clear fields in case it was inline segment before
+			inline_data = NULL
+		`, values...,
+	)
+	if err != nil {
+		if code := pgerrcode.FromError(err); code == pgxerrcode.NotNullViolation {
+			return ErrPendingObjectMissing.New("")
+		}
+	}
+
+	return Error.Wrap(err)
+}
+
+// CommitPendingObjectSegment commits segment to the database.
+func (p *CockroachAdapter) CommitPendingObjectSegment(ctx context.Context, opts CommitSegment, aliasPieces AliasPieces) (err error) {
+	defer mon.Task()(&ctx)(&err)
+
+	values := []any{
+		opts.StreamID, opts.Position,
+		opts.ExpiresAt,
+		opts.RootPieceID, opts.EncryptedKeyNonce, opts.EncryptedKey,
+		opts.EncryptedSize, opts.PlainOffset, opts.PlainSize,
+		opts.EncryptedETag, opts.EncryptedChecksum,
+		opts.Redundancy,
+		aliasPieces,
+
+		opts.Placement,
+		opts.ProjectID, opts.BucketName, opts.ObjectKey, opts.Version,
+	}
+
+	// Verify that object exists and is partial.
+	_, err = p.db.ExecContext(ctx, `
+			UPSERT INTO segments (
+				stream_id, position,
+				expires_at, root_piece_id, encrypted_key_nonce, encrypted_key,
+				encrypted_size, plain_offset, plain_size,
+				encrypted_etag, encrypted_checksum,
+				redundancy,
+				remote_alias_pieces,
+				placement,
+				-- clear fields in case it was inline segment before
+				inline_data
+			) VALUES (
+				(
+					SELECT stream_id
+					FROM objects
+					WHERE (project_id, bucket_name, object_key, version, stream_id) = ($15, $16, $17, $18, $1) AND
+						status = `+statusPending+`
+				), $2,
+				$3,
+				$4, $5, $6,
+				$7, $8, $9,
+				$10, $11,
+				$12,
+				$13,
+				$14,
+				NULL
+			)`, values...,
+	)
+	if err != nil {
+		if code := pgerrcode.FromError(err); code == pgxerrcode.NotNullViolation {
+			return ErrPendingObjectMissing.New("")
+		}
+	}
+
+	return Error.Wrap(err)
+}
+
+// CommitPendingObjectSegment commits segment to the database.
+func (t *TiDBAdapter) CommitPendingObjectSegment(ctx context.Context, opts CommitSegment, aliasPieces AliasPieces) (err error) {
+	defer mon.Task()(&ctx)(&err)
+
+	_, err = t.db.ExecContext(ctx, `
+		INSERT INTO segments (
+			stream_id, position, expires_at,
+			root_piece_id, encrypted_key_nonce, encrypted_key,
+			encrypted_size, plain_offset, plain_size,
+			encrypted_etag, encrypted_checksum,
+			redundancy,
+			remote_alias_pieces,
+			placement,
+			-- clear fields in case it was inline segment before
+			inline_data
+		) VALUES (
+			(
+				SELECT stream_id
+				FROM objects
+				WHERE (project_id, bucket_name, object_key, version, stream_id) = (?, ?, ?, ?, ?) AND
+					status = `+statusPending+`
+			), ?,
+			?,
+			?, ?, ?,
+			?, ?, ?,
+			?, ?,
+			?,
+			?,
+			?,
+			NULL
+		)
+		ON DUPLICATE KEY UPDATE
+			expires_at = VALUES(expires_at),
+			root_piece_id = VALUES(root_piece_id),
+			encrypted_key_nonce = VALUES(encrypted_key_nonce),
+			encrypted_key = VALUES(encrypted_key),
+			encrypted_size = VALUES(encrypted_size),
+			plain_offset = VALUES(plain_offset),
+			plain_size = VALUES(plain_size),
+			encrypted_etag = VALUES(encrypted_etag),
+			encrypted_checksum = VALUES(encrypted_checksum),
+			redundancy = VALUES(redundancy),
+			remote_alias_pieces = VALUES(remote_alias_pieces),
+			placement = VALUES(placement),
+			inline_data = NULL
+	`,
+		opts.ProjectID, opts.BucketName, opts.ObjectKey, opts.Version, opts.StreamID,
+		opts.Position,
+		opts.ExpiresAt,
+		opts.RootPieceID, opts.EncryptedKeyNonce, opts.EncryptedKey,
+		opts.EncryptedSize, opts.PlainOffset, opts.PlainSize,
+		opts.EncryptedETag, opts.EncryptedChecksum,
+		opts.Redundancy,
+		aliasPieces,
+		opts.Placement,
+	)
+	if err != nil {
+		// When the inline subquery returns NULL (no pending object), the
+		// stream_id NOT NULL constraint fires before ON DUPLICATE KEY UPDATE.
+		if tidbutil.IsNotNullViolation(err) {
+			return ErrPendingObjectMissing.New("")
+		}
+		return Error.Wrap(err)
+	}
+	return nil
+}
+
+// CommitInlineSegment contains all necessary information about the segment.
+type CommitInlineSegment struct {
+	ObjectStream
+
+	Position SegmentPosition
+
+	ExpiresAt *time.Time
+
+	EncryptedKeyNonce []byte
+	EncryptedKey      []byte
+
+	PlainOffset int64 // offset in the original data stream
+	PlainSize   int32 // size before encryption
+
+	EncryptedETag     []byte
+	EncryptedChecksum []byte
+
+	InlineData []byte
+
+	MaxCommitDelay *time.Duration
+}
+
+// Verify verifies commit inline segment reqest fields.
+func (opts CommitInlineSegment) Verify() error {
+	switch {
+	case len(opts.EncryptedKey) == 0:
+		return ErrInvalidRequest.New("EncryptedKey missing")
+	case len(opts.EncryptedKeyNonce) == 0:
+		return ErrInvalidRequest.New("EncryptedKeyNonce missing")
+	case opts.PlainSize <= 0 && ValidatePlainSize:
+		return ErrInvalidRequest.New("PlainSize negative or zero")
+	case opts.PlainOffset < 0:
+		return ErrInvalidRequest.New("PlainOffset negative")
+	}
+	return nil
+}
+
+// CommitInlineSegment commits inline segment to the database.
+func (db *DB) CommitInlineSegment(ctx context.Context, opts CommitInlineSegment) (err error) {
+	defer mon.Task()(&ctx)(&err)
+
+	if err := opts.ObjectStream.Verify(); err != nil {
+		return err
+	}
+
+	if err := opts.Verify(); err != nil {
+		return err
+	}
+
+	// TODO: do we have a lower limit for inline data?
+	// TODO should we move check for max inline segment from metainfo here
+	err = db.ChooseAdapter(opts.ProjectID).CommitInlineSegment(ctx, opts)
+	if err != nil {
+		if ErrPendingObjectMissing.Has(err) {
+			return err
+		}
+		return Error.New("unable to insert segment: %w", err)
+	}
+	mon.Meter("segment_commit").Mark(1)
+	mon.IntVal("segment_commit_encrypted_size").Observe(int64(len(opts.InlineData)))
+
+	return nil
+}
+
+// CommitInlineSegment commits inline segment to the database.
+func (p *PostgresAdapter) CommitInlineSegment(ctx context.Context, opts CommitInlineSegment) (err error) {
+	values := []any{
+		opts.StreamID, opts.Position, opts.ExpiresAt,
+		storj.PieceID{},
+		opts.EncryptedKeyNonce, opts.EncryptedKey,
+		len(opts.InlineData), opts.PlainOffset, opts.PlainSize,
+		opts.EncryptedETag, opts.EncryptedChecksum,
+		opts.InlineData,
+
+		opts.ProjectID, opts.BucketName, opts.ObjectKey, opts.Version,
+	}
+
+	_, err = p.db.ExecContext(ctx, `
+			INSERT INTO segments (
+				stream_id, position,
+				expires_at,
+				root_piece_id, encrypted_key_nonce, encrypted_key,
+				encrypted_size, plain_offset, plain_size,
+				encrypted_etag, encrypted_checksum,
+				inline_data
+			) VALUES (
+				(
+					SELECT stream_id
+					FROM objects
+					WHERE (project_id, bucket_name, object_key, version, stream_id) = ($13, $14, $15, $16, $1) AND
+						status = `+statusPending+`
+				), $2,
+				$3,
+				$4, $5, $6,
+				$7, $8, $9,
+				$10, $11,
+				$12
+			)
+			ON CONFLICT(stream_id, position)
+			DO UPDATE SET
+				expires_at = $3,
+				root_piece_id = $4, encrypted_key_nonce = $5, encrypted_key = $6,
+				encrypted_size = $7, plain_offset = $8, plain_size = $9,
+				encrypted_etag = $10, encrypted_checksum = $11,
+				inline_data = $12,
+				-- clear columns in case it was remote segment before
+				redundancy = 0, remote_alias_pieces = NULL
+		`, values...,
+	)
+	if err != nil {
+		if code := pgerrcode.FromError(err); code == pgxerrcode.NotNullViolation {
+			return ErrPendingObjectMissing.New("")
+		}
+	}
+
+	return Error.Wrap(err)
+}
+
+// CommitInlineSegment commits inline segment to the database.
+func (p *CockroachAdapter) CommitInlineSegment(ctx context.Context, opts CommitInlineSegment) (err error) {
+	values := []any{
+		opts.StreamID, opts.Position, opts.ExpiresAt,
+		storj.PieceID{},
+		opts.EncryptedKeyNonce, opts.EncryptedKey,
+		len(opts.InlineData), opts.PlainOffset, opts.PlainSize,
+		opts.EncryptedETag, opts.EncryptedChecksum,
+		opts.InlineData,
+	}
+
+	values = append(values, opts.ProjectID, opts.BucketName, opts.ObjectKey, opts.Version)
+
+	_, err = p.db.ExecContext(ctx, `
+			UPSERT INTO segments (
+				stream_id, position,
+				expires_at,
+				root_piece_id, encrypted_key_nonce, encrypted_key,
+				encrypted_size, plain_offset, plain_size,
+				encrypted_etag, encrypted_checksum,
+				inline_data,
+				-- clear columns in case it was remote segment before
+				redundancy, remote_alias_pieces
+			) VALUES (
+				(
+					SELECT stream_id
+					FROM objects
+					WHERE (project_id, bucket_name, object_key, version, stream_id) = ($13, $14, $15, $16, $1) AND
+						status = `+statusPending+`
+				), $2,
+				$3,
+				$4, $5, $6,
+				$7, $8, $9,
+				$10, $11,
+				$12,
+				0, NULL
+			)
+		`, values...,
+	)
+	if err != nil {
+		if code := pgerrcode.FromError(err); code == pgxerrcode.NotNullViolation {
+			return ErrPendingObjectMissing.New("")
+		}
+	}
+
+	return Error.Wrap(err)
+}
+
+// CommitInlineSegment commits inline segment to the database.
+func (t *TiDBAdapter) CommitInlineSegment(ctx context.Context, opts CommitInlineSegment) (err error) {
+	defer mon.Task()(&ctx)(&err)
+
+	_, err = t.db.ExecContext(ctx, `
+		INSERT INTO segments (
+			stream_id, position,
+			expires_at,
+			root_piece_id, encrypted_key_nonce, encrypted_key,
+			encrypted_size, plain_offset, plain_size,
+			encrypted_etag, encrypted_checksum,
+			inline_data,
+			-- clear columns in case it was remote segment before
+			redundancy, remote_alias_pieces
+		) VALUES (
+			(
+				SELECT stream_id
+				FROM objects
+				WHERE (project_id, bucket_name, object_key, version, stream_id) = (?, ?, ?, ?, ?) AND
+					status = `+statusPending+`
+			), ?,
+			?,
+			?, ?, ?,
+			?, ?, ?,
+			?, ?,
+			?,
+			0, NULL
+		)
+		ON DUPLICATE KEY UPDATE
+			expires_at = VALUES(expires_at),
+			root_piece_id = VALUES(root_piece_id),
+			encrypted_key_nonce = VALUES(encrypted_key_nonce),
+			encrypted_key = VALUES(encrypted_key),
+			encrypted_size = VALUES(encrypted_size),
+			plain_offset = VALUES(plain_offset),
+			plain_size = VALUES(plain_size),
+			encrypted_etag = VALUES(encrypted_etag),
+			encrypted_checksum = VALUES(encrypted_checksum),
+			inline_data = VALUES(inline_data),
+			redundancy = 0,
+			remote_alias_pieces = NULL
+	`,
+		opts.ProjectID, opts.BucketName, opts.ObjectKey, opts.Version, opts.StreamID,
+		opts.Position,
+		opts.ExpiresAt,
+		storj.PieceID{}, opts.EncryptedKeyNonce, opts.EncryptedKey,
+		len(opts.InlineData), opts.PlainOffset, opts.PlainSize,
+		opts.EncryptedETag, opts.EncryptedChecksum,
+		opts.InlineData,
+	)
+	if err != nil {
+		// See note in CommitPendingObjectSegment.
+		if tidbutil.IsNotNullViolation(err) {
+			return ErrPendingObjectMissing.New("")
+		}
+		return Error.Wrap(err)
+	}
+	return nil
+}

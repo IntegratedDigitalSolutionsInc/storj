@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+	"go.uber.org/zap/zaptest"
 
 	"storj.io/common/testcontext"
 	"storj.io/storj/shared/dbutil/dbtest"
@@ -22,11 +23,11 @@ func TestTempPostgresDB(t *testing.T) {
 	defer ctx.Cleanup()
 
 	prefix := "name#spaced/Test/DB"
-	testDB, err := tempdb.OpenUnique(ctx, connstr, prefix)
+	testDB, err := tempdb.OpenUnique(ctx, zaptest.NewLogger(t), connstr, prefix)
 	require.NoError(t, err)
 
 	// assert new test db exists and can be connected to again
-	otherConn, err := tagsql.Open(ctx, testDB.Driver, testDB.ConnStr)
+	otherConn, err := tagsql.Open(ctx, testDB.Driver, testDB.ConnStr, nil)
 	require.NoError(t, err)
 	defer ctx.Check(otherConn.Close)
 

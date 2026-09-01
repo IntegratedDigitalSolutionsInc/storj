@@ -14,11 +14,11 @@ import (
 
 	"storj.io/common/pb"
 	"storj.io/common/storj"
-	"storj.io/common/sync2"
 	"storj.io/common/version"
 	"storj.io/storj/satellite/geoip"
 	"storj.io/storj/satellite/nodeevents"
 	"storj.io/storj/satellite/nodeselection"
+	"storj.io/storj/satellite/satellitedb/dbx"
 	"storj.io/storj/shared/location"
 )
 
@@ -43,14 +43,28 @@ var ErrNotEnoughNodes = errs.Class("not enough nodes")
 // ErrLowDifficulty is when the node id's difficulty is too low.
 var ErrLowDifficulty = errs.Class("node id difficulty too low")
 
+// CheckInResult contains information about a node check-in operation.
+type CheckInResult struct {
+	// CameBackOnline is true if the node was previously offline (beyond OnlineWindow)
+	// and is now successfully reachable.
+	CameBackOnline bool
+	// Downtime is the duration since LastContactSuccess. Only meaningful when CameBackOnline is true.
+	Downtime time.Duration
+}
+
 // DB implements the database for overlay.Service.
 //
 // architecture: Database
 type DB interface {
-	// GetOnlineNodesForAuditRepair returns a map of nodes for the supplied nodeIDs.
-	// The return value contains necessary information to create orders as well as nodes'
+	// GetOnlineNodesForAuditAndRepair returns a map of nodes for the supplied nodeIDs.
+	// The return value contains necessary information to create audit and repair orders as well as
+	// 	nodes' current reputation status.
+	GetOnlineNodesForAuditAndRepair(ctx context.Context, nodeIDs []storj.NodeID, onlineWindow time.Duration) (map[storj.NodeID]*NodeReputation, error)
+	// GetAllOnlineNodesForRepair returns a map of all the online and valid nodes for upload repaired
+	// pieces.
+	// The return value contains necessary information to create repair orders as well as nodes'
 	// current reputation status.
-	GetOnlineNodesForAuditRepair(ctx context.Context, nodeIDs []storj.NodeID, onlineWindow time.Duration) (map[storj.NodeID]*NodeReputation, error)
+	GetAllOnlineNodesForRepair(ctx context.Context, onlineWindow time.Duration) (map[storj.NodeID]*NodeReputation, error)
 	// SelectAllStorageNodesUpload returns all nodes that qualify to store data, organized as reputable nodes and new nodes
 	SelectAllStorageNodesUpload(ctx context.Context, selectionCfg NodeSelectionConfig) (reputable, new []*nodeselection.SelectedNode, err error)
 	// SelectAllStorageNodesDownload returns a nodes that are ready for downloading
@@ -58,15 +72,16 @@ type DB interface {
 
 	// Get looks up the node by nodeID
 	Get(ctx context.Context, nodeID storj.NodeID) (*NodeDossier, error)
-	// GetNodes gets records for all specified nodes as of the given system interval. The
-	// onlineWindow is used to determine whether each node is marked as Online. The results are
-	// returned in a slice of the same length as the input nodeIDs, and each index of the returned
-	// list corresponds to the same index in nodeIDs. If a node is not known, or is disqualified
-	// or exited, the corresponding returned SelectedNode will have a zero value.
-	GetNodes(ctx context.Context, nodeIDs storj.NodeIDList, onlineWindow, asOfSystemInterval time.Duration) (_ []nodeselection.SelectedNode, err error)
-	// GetParticipatingNodes returns all known participating nodes (this includes all known nodes
+	// GetParticipatingNodes gets records for nodes that have not exited or disqualified
+	// The onlineWindow is used to determine whether each node is marked as Online.
+	// The results are returned in a slice of the same length as the input nodeIDs,
+	// and each index of the returned list corresponds to the same index in nodeIDs.
+	// If a node is not known, or is disqualified or exited, the corresponding returned
+	// SelectedNode will have a zero value.
+	GetParticipatingNodes(ctx context.Context, nodeIDs storj.NodeIDList, onlineWindow, asOfSystemInterval time.Duration) (_ []nodeselection.SelectedNode, err error)
+	// GetAllParticipatingNodes returns all known participating nodes (this includes all known nodes
 	// excluding nodes that have been disqualified or gracefully exited).
-	GetParticipatingNodes(ctx context.Context, onlineWindow, asOfSystemInterval time.Duration) (_ []nodeselection.SelectedNode, err error)
+	GetAllParticipatingNodes(ctx context.Context, onlineWindow, asOfSystemInterval time.Duration) (_ []nodeselection.SelectedNode, err error)
 	// UpdateReputation updates the DB columns for all reputation fields in ReputationStatus.
 	UpdateReputation(ctx context.Context, id storj.NodeID, request ReputationUpdate) error
 	// UpdateNodeInfo updates node dossier with info requested from the node itself like node type, email, wallet, capacity, and version.
@@ -100,6 +115,8 @@ type DB interface {
 
 	// DisqualifyNode disqualifies a storage node.
 	DisqualifyNode(ctx context.Context, nodeID storj.NodeID, disqualifiedAt time.Time, reason DisqualificationReason) (email string, err error)
+	// UndisqualifyNode clears the disqualification status of a storage node.
+	UndisqualifyNode(ctx context.Context, nodeID storj.NodeID) error
 
 	// GetOfflineNodesForEmail gets offline nodes in need of an email.
 	GetOfflineNodesForEmail(ctx context.Context, offlineWindow time.Duration, cutoff time.Duration, cooldown time.Duration, limit int) (nodes map[storj.NodeID]string, err error)
@@ -123,8 +140,8 @@ type DB interface {
 	TestUnvetNode(ctx context.Context, nodeID storj.NodeID) (err error)
 	// TestSuspendNodeOffline directly sets a node's offline_suspended timestamp to make testing easier
 	TestSuspendNodeOffline(ctx context.Context, nodeID storj.NodeID, suspendedAt time.Time) (err error)
-	// TestNodeCountryCode sets node country code.
-	TestNodeCountryCode(ctx context.Context, nodeID storj.NodeID, countryCode string) (err error)
+	// TestSetNodeCountryCode sets node country code.
+	TestSetNodeCountryCode(ctx context.Context, nodeID storj.NodeID, countryCode string) (err error)
 	// TestUpdateCheckInDirectUpdate tries to update a node info directly. Returns true if it succeeded, false if there were no node with the provided (used for testing).
 	TestUpdateCheckInDirectUpdate(ctx context.Context, node NodeCheckInInfo, timestamp time.Time, semVer version.SemVer, walletFeatures string) (updated bool, err error)
 	// OneTimeFixLastNets updates the last_net values for all node records to be equal to their
@@ -144,6 +161,19 @@ type DB interface {
 
 	// GetLastIPPortByNodeTagNames gets last IP and port from nodes where node exists in node tags with a particular name.
 	GetLastIPPortByNodeTagNames(ctx context.Context, ids storj.NodeIDList, tagName []string) (lastIPPorts map[storj.NodeID]*string, err error)
+
+	// GetNodesByEmail returns all nodes with the specified operator email address.
+	GetNodesByEmail(ctx context.Context, options GetNodesByEmailOptions) ([]*NodeDossier, *NodesByEmailCursor, error)
+}
+
+// NodesByEmailCursor is the cursor type for GetNodesByEmail pagination.
+type NodesByEmailCursor = dbx.Paged_Node_By_Email_Continuation
+
+// GetNodesByEmailOptions contains options for GetNodesByEmail.
+type GetNodesByEmailOptions struct {
+	Email string
+	Limit int
+	Next  *NodesByEmailCursor
 }
 
 // DisqualificationReason is disqualification reason enum type.
@@ -169,6 +199,7 @@ type NodeCheckInInfo struct {
 	LastNet                 string
 	LastIPPort              string
 	IsUp                    bool
+	IsTrusted               bool
 	Operator                *pb.NodeOperator
 	Capacity                *pb.NodeCapacity
 	Version                 *pb.NodeVersion
@@ -188,7 +219,7 @@ type InfoResponse struct {
 type FindStorageNodesRequest struct {
 	RequestedCount  int
 	ExcludedIDs     []storj.NodeID
-	AlreadySelected []*nodeselection.SelectedNode
+	AlreadySelected []storj.NodeID
 	Placement       storj.PlacementConstraint
 	Requester       storj.NodeID
 }
@@ -261,6 +292,7 @@ type NodeDossier struct {
 	LastOfflineEmail        *time.Time
 	LastSoftwareUpdateEmail *time.Time
 	CountryCode             location.CountryCode
+	Tags                    nodeselection.NodeTags
 }
 
 // NodeStats contains statistics about a node.
@@ -309,17 +341,19 @@ type Service struct {
 	config               Config
 
 	GeoIP                  geoip.IPToCountry
-	UploadSelectionCache   *UploadSelectionCache
-	DownloadSelectionCache *DownloadSelectionCache
+	uploadSelectionCache   *UploadSelectionCache
+	downloadSelectionCache *DownloadSelectionCache
 	LastNetFunc            LastNetFunc
 	placementDefinitions   nodeselection.PlacementDefinitions
+	placementLookup        map[string]storj.PlacementConstraint
+	sendNodeEmails         bool
 }
 
 // LastNetFunc is the type of a function that will be used to derive a network from an ip and port.
 type LastNetFunc func(config NodeSelectionConfig, ip net.IP, port string) (string, error)
 
 // NewService returns a new Service.
-func NewService(log *zap.Logger, db DB, nodeEvents nodeevents.DB, placements nodeselection.PlacementDefinitions, satelliteAddr, satelliteName string, config Config) (*Service, error) {
+func NewService(log *zap.Logger, db DB, nodeEvents nodeevents.DB, uploadSelectionCache *UploadSelectionCache, downloadSelectionCache *DownloadSelectionCache, placements nodeselection.PlacementDefinitions, satelliteAddr, satelliteName string, config Config, ncfg nodeevents.Config) (*Service, error) {
 	err := config.Node.AsOfSystemTime.isValid()
 	if err != nil {
 		return nil, errs.Wrap(err)
@@ -333,38 +367,10 @@ func NewService(log *zap.Logger, db DB, nodeEvents nodeevents.DB, placements nod
 		}
 	}
 
-	defaultSelection := nodeselection.NodeFilters{}
-
-	if len(config.Node.UploadExcludedCountryCodes) > 0 {
-		set := location.NewFullSet()
-		for _, country := range config.Node.UploadExcludedCountryCodes {
-			countryCode := location.ToCountryCode(country)
-			if countryCode == location.None {
-				return nil, Error.New("invalid country %q", country)
-			}
-			set.Remove(countryCode)
-		}
-		defaultSelection = defaultSelection.WithCountryFilter(set)
+	placementLookup := make(map[string]storj.PlacementConstraint, len(placements))
+	for _, placement := range placements {
+		placementLookup[placement.Name] = placement.ID
 	}
-
-	uploadSelectionCache, err := NewUploadSelectionCache(log, db,
-		config.NodeSelectionCache.Staleness, config.Node,
-		defaultSelection, placements,
-	)
-	if err != nil {
-		return nil, errs.Wrap(err)
-	}
-	downloadSelectionCache, err := NewDownloadSelectionCache(log, db,
-		placements.CreateFilters,
-		DownloadSelectionCacheConfig{
-			Staleness:      config.NodeSelectionCache.Staleness,
-			OnlineWindow:   config.Node.OnlineWindow,
-			AsOfSystemTime: config.Node.AsOfSystemTime,
-		})
-	if err != nil {
-		return nil, errs.Wrap(err)
-	}
-
 	return &Service{
 		log:                  log,
 		db:                   db,
@@ -376,25 +382,61 @@ func NewService(log *zap.Logger, db DB, nodeEvents nodeevents.DB, placements nod
 
 		GeoIP: geoIP,
 
-		UploadSelectionCache:   uploadSelectionCache,
-		DownloadSelectionCache: downloadSelectionCache,
+		uploadSelectionCache:   uploadSelectionCache,
+		downloadSelectionCache: downloadSelectionCache,
 		LastNetFunc:            MaskOffLastNet,
 
 		placementDefinitions: placements,
+		placementLookup:      placementLookup,
+		sendNodeEmails:       ncfg.SendNodeEmails,
 	}, nil
 }
 
-// Run runs the background processes needed for caches.
-func (service *Service) Run(ctx context.Context) error {
-	return errs.Combine(sync2.Concurrently(
-		func() error { return service.UploadSelectionCache.Run(ctx) },
-		func() error { return service.DownloadSelectionCache.Run(ctx) },
-	)...)
+// TestingNewServiceWithUploadCache creates a minimal Service for testing with only the upload selection cache.
+func TestingNewServiceWithUploadCache(log *zap.Logger, uploadCache *UploadSelectionCache) *Service {
+	return &Service{
+		log:                  log,
+		uploadSelectionCache: uploadCache,
+	}
 }
 
 // Close closes resources.
 func (service *Service) Close() error {
+	if service.GeoIP == nil {
+		return nil
+	}
 	return service.GeoIP.Close()
+}
+
+// NewUploadSelectionCacheFromConfig creates an UploadSelectionCache from overlay config and placement definitions.
+func NewUploadSelectionCacheFromConfig(log *zap.Logger, db DB, config Config, placements nodeselection.PlacementDefinitions) (*UploadSelectionCache, error) {
+	defaultSelection := nodeselection.NodeFilters{}
+	if len(config.Node.UploadExcludedCountryCodes) > 0 {
+		set := location.NewFullSet()
+		for _, country := range config.Node.UploadExcludedCountryCodes {
+			countryCode := location.ToCountryCode(country)
+			if countryCode == location.None {
+				return nil, Error.New("invalid country %q", country)
+			}
+			set.Remove(countryCode)
+		}
+		defaultSelection = defaultSelection.WithCountryFilter(set)
+	}
+	return NewUploadSelectionCache(log, db,
+		config.NodeSelectionCache.Staleness, config.Node,
+		defaultSelection, placements,
+	)
+}
+
+// NewDownloadSelectionCacheFromConfig creates a DownloadSelectionCache from overlay config and placement definitions.
+func NewDownloadSelectionCacheFromConfig(log *zap.Logger, db DB, config Config, placements nodeselection.PlacementDefinitions) (*DownloadSelectionCache, error) {
+	return NewDownloadSelectionCache(log, db,
+		placements.CreateFilters,
+		DownloadSelectionCacheConfig{
+			Staleness:      config.NodeSelectionCache.Staleness,
+			OnlineWindow:   config.Node.OnlineWindow,
+			AsOfSystemTime: config.Node.AsOfSystemTime,
+		})
 }
 
 // Get looks up the provided nodeID from the overlay.
@@ -409,20 +451,45 @@ func (service *Service) Get(ctx context.Context, nodeID storj.NodeID) (_ *NodeDo
 // CachedGetOnlineNodesForGet returns a map of nodes from the download selection cache from the suppliedIDs.
 func (service *Service) CachedGetOnlineNodesForGet(ctx context.Context, nodeIDs []storj.NodeID) (_ map[storj.NodeID]*nodeselection.SelectedNode, err error) {
 	defer mon.Task()(&ctx)(&err)
-	return service.DownloadSelectionCache.GetNodes(ctx, nodeIDs)
+	return service.downloadSelectionCache.GetNodes(ctx, nodeIDs)
 }
 
-// GetOnlineNodesForAuditRepair returns a map of nodes for the supplied nodeIDs.
-func (service *Service) GetOnlineNodesForAuditRepair(ctx context.Context, nodeIDs []storj.NodeID) (_ map[storj.NodeID]*NodeReputation, err error) {
+// CachedGet returns a node from the download selection cache from the supplied nodeID.
+func (service *Service) CachedGet(ctx context.Context, nodeID storj.NodeID) (_ *nodeselection.SelectedNode, err error) {
+	defer mon.Task()(&ctx)(&err)
+	return service.downloadSelectionCache.GetNode(ctx, nodeID)
+}
+
+// GetOnlineNodesForAudit returns a map of nodes for the supplied nodeIDs.
+func (service *Service) GetOnlineNodesForAudit(ctx context.Context, nodeIDs []storj.NodeID) (_ map[storj.NodeID]*NodeReputation, err error) {
 	defer mon.Task()(&ctx)(&err)
 
-	return service.db.GetOnlineNodesForAuditRepair(ctx, nodeIDs, service.config.Node.OnlineWindow)
+	return service.db.GetOnlineNodesForAuditAndRepair(ctx, nodeIDs, service.config.Node.OnlineWindow)
+}
+
+// GetOnlineNodesForRepair returns a map of nodes for the supplied nodeIDs.
+// The passed onlineWindow is used to determine whether each node is marked as Online.
+func (service *Service) GetOnlineNodesForRepair(
+	ctx context.Context, nodeIDs []storj.NodeID, onlineWindow time.Duration,
+) (_ map[storj.NodeID]*NodeReputation, err error) {
+	defer mon.Task()(&ctx)(&err)
+
+	return service.db.GetOnlineNodesForAuditAndRepair(ctx, nodeIDs, onlineWindow)
+}
+
+// GetAllOnlineNodesForRepair returns a map of online and valid nodes to upload repaired pieces.
+// The passed onlineWindow is used to determine whether each node is marked as Online.
+func (service *Service) GetAllOnlineNodesForRepair(
+	ctx context.Context, onlineWindow time.Duration) (_ map[storj.NodeID]*NodeReputation, err error) {
+	defer mon.Task()(&ctx)(&err)
+
+	return service.db.GetAllOnlineNodesForRepair(ctx, onlineWindow)
 }
 
 // GetNodeIPsFromPlacement returns a map of node ip:port for the supplied nodeIDs. Results are filtered out by placement.
 func (service *Service) GetNodeIPsFromPlacement(ctx context.Context, nodeIDs []storj.NodeID, placement storj.PlacementConstraint) (_ map[storj.NodeID]string, err error) {
 	defer mon.Task()(&ctx)(&err)
-	return service.DownloadSelectionCache.GetNodeIPsFromPlacement(ctx, nodeIDs, placement)
+	return service.downloadSelectionCache.GetNodeIPsFromPlacement(ctx, nodeIDs, placement)
 }
 
 // IsOnline checks if a node is 'online' based on the collected statistics.
@@ -433,29 +500,26 @@ func (service *Service) IsOnline(node *NodeDossier) bool {
 // FindStorageNodesForGracefulExit searches the overlay network for nodes that meet the provided requirements for graceful-exit requests.
 func (service *Service) FindStorageNodesForGracefulExit(ctx context.Context, req FindStorageNodesRequest) (_ []*nodeselection.SelectedNode, err error) {
 	defer mon.Task()(&ctx)(&err)
-	return service.UploadSelectionCache.GetNodes(ctx, req)
+	return service.uploadSelectionCache.GetNodes(ctx, req)
 }
 
 // FindStorageNodesForUpload searches the for nodes in the cache that meet the provided requirements for upload.
 func (service *Service) FindStorageNodesForUpload(ctx context.Context, req FindStorageNodesRequest) (_ []*nodeselection.SelectedNode, err error) {
 	defer mon.Task()(&ctx)(&err)
 
-	selectedNodes, err := service.UploadSelectionCache.GetNodes(ctx, req)
-	if err != nil {
-		return selectedNodes, err
-	}
+	selectedNodes, err := service.uploadSelectionCache.GetNodes(ctx, req)
 	if len(selectedNodes) < req.RequestedCount {
 
-		var alreadySelectedIDs []storj.NodeID
-		for _, e := range req.AlreadySelected {
-			alreadySelectedIDs = append(alreadySelectedIDs, e.ID)
+		var errMsg string
+		if err != nil {
+			errMsg = err.Error()
 		}
-
 		service.log.Warn("Not enough nodes are available from Node Cache",
-			zap.Stringers("excludedIDs", req.ExcludedIDs),
-			zap.Stringers("alreadySelected", alreadySelectedIDs),
+			zap.Stringers("excluded_ids", req.ExcludedIDs),
+			zap.Stringers("already_selected", req.AlreadySelected),
 			zap.Int("requested", req.RequestedCount),
 			zap.Int("available", len(selectedNodes)),
+			zap.String("errmsg", errMsg),
 			zap.Uint16("placement", uint16(req.Placement)))
 	}
 	return selectedNodes, err
@@ -465,7 +529,7 @@ func (service *Service) FindStorageNodesForUpload(ctx context.Context, req FindS
 func (service *Service) InsertOfflineNodeEvents(ctx context.Context, cooldown time.Duration, cutoff time.Duration, limit int) (count int, err error) {
 	defer mon.Task()(&ctx)(&err)
 
-	if !service.config.SendNodeEmails {
+	if !service.sendNodeEmails {
 		return 0, nil
 	}
 
@@ -507,24 +571,50 @@ func (service *Service) InsertOfflineNodeEvents(ctx context.Context, cooldown ti
 	return count, err
 }
 
-// GetNodes gets records for all specified nodes. The configured OnlineWindow is used to determine
-// whether each node is marked as Online. The results are returned in a slice of the same length as
-// the input nodeIDs, and each index of the returned list corresponds to the same index in nodeIDs.
-// If a node is not known, or is disqualified or exited, the corresponding returned SelectedNode
-// will have a zero value.
-func (service *Service) GetNodes(ctx context.Context, nodeIDs storj.NodeIDList) (records []nodeselection.SelectedNode, err error) {
-	defer mon.Task()(&ctx)(&err)
-
-	// TODO add as of system time
-	return service.db.GetNodes(ctx, nodeIDs, service.config.Node.OnlineWindow, 0)
-}
-
 // GetParticipatingNodes returns all known participating nodes (this includes all known nodes
 // excluding nodes that have been disqualified or gracefully exited).
-func (service *Service) GetParticipatingNodes(ctx context.Context) (records []nodeselection.SelectedNode, err error) {
+// The configured OnlineWindow is used to determine whether each node is marked as Online.
+// The results are returned in a slice of the same length as the input nodeIDs,
+// and each index of the returned list corresponds to the same index in nodeIDs.
+// If a node is not known, or is disqualified or exited, the corresponding returned SelectedNode
+// will have a zero value.
+func (service *Service) GetParticipatingNodes(ctx context.Context, nodeIDs storj.NodeIDList) (records []nodeselection.SelectedNode, err error) {
 	defer mon.Task()(&ctx)(&err)
 
-	return service.db.GetParticipatingNodes(ctx, service.config.Node.OnlineWindow, service.config.AsOfSystemTime)
+	return service.db.GetParticipatingNodes(ctx, nodeIDs, service.config.Node.OnlineWindow, service.config.AsOfSystemTime)
+}
+
+// GetParticipatingNodesForRepair returns all known participating nodes (this includes all known
+// nodes excluding nodes that have been disqualified or gracefully exited).
+// The passed onlineWindow is used to determine whether each node is marked as Online.
+// The results are returned in a slice of the same length as the input nodeIDs,
+// and each index of the returned list corresponds to the same index in nodeIDs.
+// If a node is not known, or is disqualified or exited, the corresponding returned SelectedNode
+// will have a zero value.
+func (service *Service) GetParticipatingNodesForRepair(
+	ctx context.Context, nodeIDs storj.NodeIDList, onlineWindow time.Duration,
+) (records []nodeselection.SelectedNode, err error) {
+	defer mon.Task()(&ctx)(&err)
+
+	return service.db.GetParticipatingNodes(ctx, nodeIDs, onlineWindow, service.config.AsOfSystemTime)
+}
+
+// GetAllParticipatingNodes returns all known participating nodes (this includes all known nodes
+// excluding nodes that have been disqualified or gracefully exited).
+func (service *Service) GetAllParticipatingNodes(ctx context.Context) (records []nodeselection.SelectedNode, err error) {
+	defer mon.Task()(&ctx)(&err)
+
+	return service.db.GetAllParticipatingNodes(ctx, service.config.Node.OnlineWindow, service.config.AsOfSystemTime)
+}
+
+// GetAllParticipatingNodesForRepair returns all known participating nodes (this includes all known
+// nodes excluding nodes that have been disqualified or gracefully exited).
+// The passed onlineWindow is used to determine whether each node is marked as Online.
+func (service *Service) GetAllParticipatingNodesForRepair(
+	ctx context.Context, onlineWindow time.Duration) (records []nodeselection.SelectedNode, err error) {
+	defer mon.Task()(&ctx)(&err)
+
+	return service.db.GetAllParticipatingNodes(ctx, onlineWindow, service.config.AsOfSystemTime)
 }
 
 // UpdateReputation updates the DB columns for any of the reputation fields.
@@ -536,7 +626,7 @@ func (service *Service) UpdateReputation(ctx context.Context, id storj.NodeID, e
 		return err
 	}
 
-	if service.config.SendNodeEmails {
+	if service.sendNodeEmails {
 		service.insertReputationNodeEvents(ctx, email, id, reputationChanges)
 	}
 
@@ -571,42 +661,48 @@ Note that there can be a race between acquiring the previous entry and
 performing the update, so if two updates happen at about the same time it is
 not defined which one will end up in the database.
 */
-func (service *Service) UpdateCheckIn(ctx context.Context, node NodeCheckInInfo, timestamp time.Time) (err error) {
+func (service *Service) UpdateCheckIn(ctx context.Context, node NodeCheckInInfo, timestamp time.Time) (result CheckInResult, err error) {
 	defer mon.Task()(&ctx)(&err)
 	failureMeter := mon.Meter("geofencing_lookup_failed")
 
 	oldInfo, err := service.Get(ctx, node.NodeID)
 	if err != nil && !ErrNodeNotFound.Has(err) {
-		return Error.New("failed to get node info from DB")
+		return CheckInResult{}, Error.New("failed to get node info from DB: %w", err)
 	}
 
 	if oldInfo == nil {
 		if !node.IsUp {
 			// this is a previously unknown node, and we couldn't pingback to verify that it even
 			// exists. Don't bother putting it in the db.
-			return nil
+			return CheckInResult{}, nil
 		}
 
-		difficulty, err := node.NodeID.Difficulty()
-		if err != nil {
-			// this should never happen
-			return err
-		}
-		if int(difficulty) < service.config.MinimumNewNodeIDDifficulty {
-			return ErrLowDifficulty.New("node id difficulty is %d when %d is the minimum",
-				difficulty, service.config.MinimumNewNodeIDDifficulty)
+		if node.IsTrusted {
+			service.log.Info("trusted node bypassing difficulty check",
+				zap.Stringer("node_id", node.NodeID))
+		} else {
+			difficulty, err := node.NodeID.Difficulty()
+			if err != nil {
+				// this should never happen
+				return CheckInResult{}, err
+			}
+			if int(difficulty) < service.config.MinimumNewNodeIDDifficulty {
+				return CheckInResult{}, ErrLowDifficulty.New("node id difficulty is %d when %d is the minimum",
+					difficulty, service.config.MinimumNewNodeIDDifficulty)
+
+			}
 		}
 
 		node.CountryCode, err = service.GeoIP.LookupISOCountryCode(node.LastIPPort)
 		if err != nil {
 			failureMeter.Mark(1)
 			service.log.Debug("failed to resolve country code for node",
-				zap.String("node address", node.Address.Address),
-				zap.Stringer("Node ID", node.NodeID),
+				zap.String("node_address", node.Address.Address),
+				zap.Stringer("node_id", node.NodeID),
 				zap.Error(err))
 		}
 
-		return service.db.UpdateCheckIn(ctx, node, timestamp, service.config.Node)
+		return CheckInResult{}, service.db.UpdateCheckIn(ctx, node, timestamp, service.config.Node)
 	}
 
 	lastUp, lastDown := oldInfo.Reputation.LastContactSuccess, oldInfo.Reputation.LastContactFailure
@@ -633,19 +729,19 @@ func (service *Service) UpdateCheckIn(ctx context.Context, node NodeCheckInInfo,
 	if err != nil {
 		failureMeter.Mark(1)
 		service.log.Debug("failed to resolve country code for node",
-			zap.String("node address", node.Address.Address),
-			zap.Stringer("Node ID", node.NodeID),
+			zap.String("node_address", node.Address.Address),
+			zap.Stringer("node_id", node.NodeID),
 			zap.Error(err))
 	}
 
-	if service.config.SendNodeEmails && service.config.Node.MinimumVersion != "" {
+	if service.sendNodeEmails && service.config.Node.MinimumVersion != "" {
 		min, err := version.NewSemVer(service.config.Node.MinimumVersion)
 		if err != nil {
-			return err
+			return CheckInResult{}, err
 		}
 		v, err := version.NewSemVer(node.Version.GetVersion())
 		if err != nil {
-			return err
+			return CheckInResult{}, err
 		}
 
 		if v.Compare(min) == -1 {
@@ -667,22 +763,31 @@ func (service *Service) UpdateCheckIn(ctx context.Context, node NodeCheckInInfo,
 		oldInfo.CountryCode != node.CountryCode || node.SoftwareUpdateEmailSent {
 		err = service.db.UpdateCheckIn(ctx, node, timestamp, service.config.Node)
 		if err != nil {
-			return Error.Wrap(err)
+			return CheckInResult{}, Error.Wrap(err)
 		}
 
-		if service.config.SendNodeEmails && node.IsUp && oldInfo.Reputation.LastContactSuccess.Add(service.config.Node.OnlineWindow).Before(timestamp) {
-			_, err = service.nodeEvents.Insert(ctx, node.Operator.Email, nil, node.NodeID, nodeevents.Online)
-			return Error.Wrap(err)
+		// Detect if node came back online after being down
+		var result CheckInResult
+		if node.IsUp && oldInfo.Reputation.LastContactSuccess.Add(service.config.Node.OnlineWindow).Before(timestamp) {
+			result = CheckInResult{
+				CameBackOnline: true,
+				Downtime:       timestamp.Sub(oldInfo.Reputation.LastContactSuccess),
+			}
 		}
-		return nil
+
+		if service.sendNodeEmails && result.CameBackOnline {
+			_, err = service.nodeEvents.Insert(ctx, node.Operator.Email, nil, node.NodeID, nodeevents.Online)
+			return result, Error.Wrap(err)
+		}
+		return result, nil
 	}
 
 	service.log.Debug("ignoring unnecessary check-in",
-		zap.String("node address", node.Address.Address),
-		zap.Stringer("Node ID", node.NodeID))
+		zap.String("node_address", node.Address.Address),
+		zap.Stringer("node_id", node.NodeID))
 	mon.Event("unnecessary_node_check_in")
 
-	return nil
+	return CheckInResult{}, nil
 }
 
 // DQNodesLastSeenBefore disqualifies nodes who have not been contacted since the cutoff time.
@@ -693,7 +798,7 @@ func (service *Service) DQNodesLastSeenBefore(ctx context.Context, cutoff time.T
 	if err != nil {
 		return 0, err
 	}
-	if service.config.SendNodeEmails {
+	if service.sendNodeEmails {
 		for nodeID, email := range nodes {
 			_, err = service.nodeEvents.Insert(ctx, email, nil, nodeID, nodeevents.Disqualified)
 			if err != nil {
@@ -711,7 +816,7 @@ func (service *Service) DisqualifyNode(ctx context.Context, nodeID storj.NodeID,
 	if err != nil {
 		return err
 	}
-	if service.config.SendNodeEmails {
+	if service.sendNodeEmails {
 		_, err = service.nodeEvents.Insert(ctx, email, nil, nodeID, nodeevents.Disqualified)
 		if err != nil {
 			service.log.Error("could not insert node disqualified into node events")
@@ -746,6 +851,12 @@ func (service *Service) GetNodeTags(ctx context.Context, id storj.NodeID) (nodes
 // It comes from the name of the placement (or `nodeselection.Location` in case of legacy config).
 func (service *Service) GetLocationFromPlacement(placement storj.PlacementConstraint) string {
 	return service.placementDefinitions[placement].Name
+}
+
+// GetPlacementConstraintFromName returns the placement constraint given the placement name.
+func (service *Service) GetPlacementConstraintFromName(name string) (id storj.PlacementConstraint, exists bool) {
+	id, exists = service.placementLookup[name]
+	return id, exists
 }
 
 // ResolveIPAndNetwork resolves the target address and determines its IP and appropriate last_net, as indicated.
@@ -809,12 +920,12 @@ func (service *Service) TestAddNodes(ctx context.Context, nodes []*NodeDossier) 
 // TestVetNode directly sets a node's vetted_at timestamp to make testing easier.
 func (service *Service) TestVetNode(ctx context.Context, nodeID storj.NodeID) (vettedTime *time.Time, err error) {
 	vettedTime, err = service.db.TestVetNode(ctx, nodeID)
-	service.log.Warn("node vetted", zap.Stringer("node ID", nodeID), zap.Stringer("vetted time", vettedTime))
+	service.log.Warn("node vetted", zap.Stringer("node_id", nodeID), zap.Stringer("vetted_time", vettedTime))
 	if err != nil {
-		service.log.Warn("error vetting node", zap.Stringer("node ID", nodeID))
+		service.log.Warn("error vetting node", zap.Stringer("node_id", nodeID))
 		return nil, err
 	}
-	err = service.UploadSelectionCache.Refresh(ctx)
+	err = service.uploadSelectionCache.Refresh(ctx)
 	if err != nil {
 		service.log.Warn("nodecache refresh failed", zap.Error(err))
 		return vettedTime, err
@@ -826,10 +937,10 @@ func (service *Service) TestVetNode(ctx context.Context, nodeID storj.NodeID) (v
 func (service *Service) TestUnvetNode(ctx context.Context, nodeID storj.NodeID) (err error) {
 	err = service.db.TestUnvetNode(ctx, nodeID)
 	if err != nil {
-		service.log.Warn("error unvetting node", zap.Stringer("node ID", nodeID), zap.Error(err))
+		service.log.Warn("error unvetting node", zap.Stringer("node_id", nodeID), zap.Error(err))
 		return err
 	}
-	err = service.UploadSelectionCache.Refresh(ctx)
+	err = service.uploadSelectionCache.Refresh(ctx)
 	if err != nil {
 		service.log.Warn("nodecache refresh failed", zap.Error(err))
 		return err
@@ -837,11 +948,11 @@ func (service *Service) TestUnvetNode(ctx context.Context, nodeID storj.NodeID) 
 	return nil
 }
 
-// TestNodeCountryCode directly sets a node's vetted_at timestamp to null to make testing easier.
-func (service *Service) TestNodeCountryCode(ctx context.Context, nodeID storj.NodeID, countryCode string) (err error) {
-	err = service.db.TestNodeCountryCode(ctx, nodeID, countryCode)
+// TestSetNodeCountryCode directly sets a node's vetted_at timestamp to null to make testing easier.
+func (service *Service) TestSetNodeCountryCode(ctx context.Context, nodeID storj.NodeID, countryCode string) (err error) {
+	err = service.db.TestSetNodeCountryCode(ctx, nodeID, countryCode)
 	if err != nil {
-		service.log.Warn("error updating node", zap.Stringer("node ID", nodeID), zap.Error(err))
+		service.log.Warn("error updating node", zap.Stringer("node_id", nodeID), zap.Error(err))
 		return err
 	}
 

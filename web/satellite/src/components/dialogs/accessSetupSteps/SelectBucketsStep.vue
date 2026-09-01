@@ -10,10 +10,10 @@
                     v-model="option"
                     filter
                     mandatory
-                    selected-class="text-info font-weight-bold"
+                    selected-class="font-weight-bold"
                     variant="outlined"
                     class="mt-2 mb-3"
-                    @update:modelValue="onChangeOption"
+                    @update:model-value="onChangeOption"
                 >
                     <v-chip
                         filter
@@ -31,20 +31,19 @@
                 </v-chip-group>
 
                 <v-alert v-if="option === BucketsOption.All" variant="tonal">
-                    <p class="text-subtitle-2 font-weight-bold">All Buckets</p>
-                    <p class="text-subtitle-2">The application can access all of the current and future buckets you create in this project.</p>
+                    <p class="text-title-small font-weight-bold">All Buckets</p>
+                    <p class="text-title-small">The application can access all of the current and future buckets you create in this project.</p>
                 </v-alert>
 
-                <v-alert v-else variant="tonal">
-                    <p class="text-subtitle-2 font-weight-bold">Select Buckets</p>
-                    <p class="text-subtitle-2">The application can access the selected buckets in this project.</p>
+                <v-alert v-else variant="tonal" color="primary">
+                    <p class="text-title-small font-weight-bold">Select Buckets</p>
+                    <p class="text-title-small">The application can access the selected buckets in this project.</p>
                     <v-autocomplete
                         v-model="buckets"
                         v-model:search="bucketSearch"
                         :items="allBucketNames"
                         class="mt-4"
                         variant="outlined"
-                        color="default"
                         label="Buckets"
                         placeholder="Select buckets"
                         no-data-text="No buckets found."

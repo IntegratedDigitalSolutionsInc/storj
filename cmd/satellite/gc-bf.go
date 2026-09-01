@@ -15,6 +15,7 @@ import (
 	"storj.io/storj/private/revocation"
 	"storj.io/storj/satellite"
 	"storj.io/storj/satellite/metabase"
+	"storj.io/storj/satellite/metabase/rangedloop"
 	"storj.io/storj/satellite/satellitedb"
 )
 
@@ -47,7 +48,32 @@ func cmdGCBloomFilterRun(cmd *cobra.Command, args []string) (err error) {
 		err = errs.Combine(err, revocationDB.Close())
 	}()
 
-	peer, err := satellite.NewGarbageCollectionBF(log, db, metabaseDB, revocationDB, version.Build, &runCfg.Config, process.AtomicLevel(cmd))
+	// Pin a TiKV GC safepoint so the whole scan reads one consistent snapshot.
+	if runCfg.RangedLoop.Safepoint.Enabled() && !runCfg.GarbageCollectionBF.RunOnce {
+		return errs.New("safepoint requires run-once mode")
+	}
+	safepoint, err := rangedloop.HoldSafepoint(ctx, log, metabaseDB, runCfg.RangedLoop.Safepoint)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		err = errs.Combine(err, safepoint.Close())
+	}()
+
+	// scan at the pinned timestamp; abort the run if any hold is ever lost
+	ctx, cancel := safepoint.Context(ctx)
+	defer cancel()
+	readTimestamp := safepoint.ReadTime()
+
+	// the modular path enforces this off the bloom filter observer; here
+	// NewGarbageCollectionBF builds the splitter, and testplanet builds that
+	// peer too, so the command checks what its splitter is going to read
+	splitter := rangedloop.NewMetabaseRangeSplitterWithReadTimestamp(log, metabaseDB, runCfg.RangedLoop, readTimestamp)
+	if !splitter.ReadsSnapshot() {
+		return rangedloop.ErrNoSnapshot
+	}
+
+	peer, err := satellite.NewGarbageCollectionBF(log, db, metabaseDB, revocationDB, version.Build, &runCfg.Config, process.AtomicLevel(cmd), readTimestamp)
 	if err != nil {
 		return err
 	}
@@ -56,16 +82,8 @@ func cmdGCBloomFilterRun(cmd *cobra.Command, args []string) (err error) {
 		log.Warn("Failed to initialize telemetry batcher on satellite GC", zap.Error(err))
 	}
 
-	err = metabaseDB.CheckVersion(ctx)
-	if err != nil {
-		log.Error("Failed metabase database version check.", zap.Error(err))
-		return errs.New("failed metabase version check: %+v", err)
-	}
-
-	err = db.CheckVersion(ctx)
-	if err != nil {
-		log.Error("Failed satellite database version check.", zap.Error(err))
-		return errs.New("Error checking version for satellitedb: %+v", err)
+	if err := checkDBVersions(ctx, log, runCfg, db, metabaseDB); err != nil {
+		return err
 	}
 
 	runError := peer.Run(ctx)

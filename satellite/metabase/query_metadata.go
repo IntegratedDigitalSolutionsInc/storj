@@ -114,6 +114,9 @@ func (p *PostgresAdapter) FindObjectsByClearMetadata(ctx context.Context, opts F
 	return result, nil
 }
 
-func (p *SpannerAdapter) FindObjectsByClearMetadata(ctx context.Context, opts FindObjectsByClearMetadata, startAfter ObjectStream, batchSize int) (result FindObjectsByClearMetadataResult, err error) {
+// FindObjectsByClearMetadata is not implemented for TiDB: TiDB is not currently
+// a target backend for the metasearch feature (no clear_metadata column/index
+// exists in its schema).
+func (t *TiDBAdapter) FindObjectsByClearMetadata(ctx context.Context, opts FindObjectsByClearMetadata, startAfter ObjectStream, batchSize int) (result FindObjectsByClearMetadataResult, err error) {
 	return FindObjectsByClearMetadataResult{}, errors.New("not implemented")
 }

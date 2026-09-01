@@ -45,69 +45,43 @@
     </div>
 </template>
 
-<script lang="ts">
-import { Component, Vue } from 'vue-property-decorator';
+<script setup lang="ts">
+import { computed } from 'vue';
 
-import { NOTIFICATIONS_ACTIONS } from '@/app/store/modules/notifications';
 import { UINotification } from '@/app/types/notifications';
+import { useNotificationsStore } from '@/app/store/modules/notificationsStore';
+import BackArrowIcon from '@/../static/images/notifications/backArrow.svg';
 
 import SNONotification from '@/app/components/notifications/SNONotification.vue';
 import VPagination from '@/app/components/VPagination.vue';
 
-import BackArrowIcon from '@/../static/images/notifications/backArrow.svg';
+const notificationsStore = useNotificationsStore();
 
-// @vue/component
-@Component ({
-    components: {
-        VPagination,
-        SNONotification,
-        BackArrowIcon,
-    },
-})
-export default class NotificationsArea extends Vue {
-    /**
-     * Returns notification of current page.
-     */
-    public get notifications(): UINotification[] {
-        return this.$store.state.notificationsModule.notifications;
+const notifications = computed<UINotification[]>(() => {
+    return notificationsStore.state.notifications;
+});
+
+const isMarkAllAsReadButtonDisabled = computed<boolean>(() => {
+    return notificationsStore.state.unreadCount === 0;
+});
+
+const totalPageCount = computed<number>(() => {
+    return notificationsStore.state.pageCount;
+});
+
+async function onPageClick(index: number): Promise<void> {
+    try {
+        await notificationsStore.fetchNotifications(index);
+    } catch (error) {
+        console.error(error);
     }
+}
 
-    /**
-     * Indicates if mark all as read button should be disabled.
-     */
-    public get isMarkAllAsReadButtonDisabled(): boolean {
-        return this.$store.state.notificationsModule.unreadCount === 0;
-    }
-
-    /**
-     * Returns total number of notification pages.
-     */
-    public get totalPageCount(): number {
-        return this.$store.state.notificationsModule.pageCount;
-    }
-
-    /**
-     * onPageClick fetches notifications on selected page.
-     *
-     * @param index number of page
-     */
-    public async onPageClick(index: number): Promise<void> {
-        try {
-            await this.$store.dispatch(NOTIFICATIONS_ACTIONS.GET_NOTIFICATIONS, index);
-        } catch (error) {
-            console.error(error);
-        }
-    }
-
-    /**
-     * markAllAsRead marks all notifications as read and disables button.
-     */
-    public async markAllAsRead(): Promise<void> {
-        try {
-            await this.$store.dispatch(NOTIFICATIONS_ACTIONS.READ_ALL);
-        } catch (error) {
-            console.error(error);
-        }
+async function markAllAsRead(): Promise<void> {
+    try {
+        await notificationsStore.readAll();
+    } catch (error) {
+        console.error(error);
     }
 }
 </script>
@@ -221,7 +195,7 @@ export default class NotificationsArea extends Vue {
         background-color: var(--disabled-background-color);
         pointer-events: none;
 
-        .notifications-container__header__button__svg ::v-deep path {
+        .notifications-container__header__button__svg :deep(path) {
             fill: #979ba7 !important;
         }
 
@@ -230,7 +204,7 @@ export default class NotificationsArea extends Vue {
         }
     }
 
-    @media screen and (max-width: 1000px) {
+    @media screen and (width <= 1000px) {
 
         .notifications-container {
             padding: 0 37px;
@@ -238,7 +212,7 @@ export default class NotificationsArea extends Vue {
         }
     }
 
-    @media screen and (max-width: 450px) {
+    @media screen and (width <= 450px) {
 
         .notifications-container {
 
@@ -259,7 +233,7 @@ export default class NotificationsArea extends Vue {
         }
     }
 
-    @media screen and (max-height: 650px), (max-width: 300px) {
+    @media screen and (height <= 650px), (width <= 300px) {
 
         .notifications-container {
 

@@ -150,27 +150,29 @@ func QuerySchema(ctx context.Context, db dbschema.Queryer) (*dbschema.Schema, er
 				table := schema.EnsureTable(tableName)
 				table.PrimaryKey = columns
 			case "f": // foreign key
-				if len(columns) != 1 {
-					return fmt.Errorf("expected one column, got: %q", columns)
-				}
-
 				table := schema.EnsureTable(tableName)
-				column, ok := table.FindColumn(columns[0])
-				if !ok {
-					return fmt.Errorf("did not find column %q", columns[0])
-				}
 
-				matches := rxPostgresForeignKey.FindStringSubmatch(definition)
+				// All foreign keys (single and composite) are now stored in Table.ForeignKeys
+				matches := rxPostgresCompositeForeignKey.FindStringSubmatch(definition)
 				if len(matches) == 0 {
-					return fmt.Errorf("unable to parse constraint %q", definition)
+					return fmt.Errorf("unable to parse foreign key constraint %q", definition)
 				}
 
-				column.Reference = &dbschema.Reference{
-					Table:    matches[1],
-					Column:   matches[2],
-					OnUpdate: matches[3],
-					OnDelete: matches[4],
+				// Parse foreign columns from matches[3], splitting by comma and trimming spaces
+				foreignColumnsRaw := strings.Split(matches[3], ",")
+				foreignColumns := make([]string, len(foreignColumnsRaw))
+				for i, col := range foreignColumnsRaw {
+					foreignColumns[i] = strings.TrimSpace(col)
 				}
+
+				table.ForeignKeys = append(table.ForeignKeys, &dbschema.ForeignKey{
+					Name:           constraintName,
+					LocalColumns:   columns,
+					ForeignTable:   matches[2],
+					ForeignColumns: foreignColumns,
+					OnUpdate:       matches[4],
+					OnDelete:       matches[5],
+				})
 			case "u": // unique
 				table := schema.EnsureTable(tableName)
 				table.Unique = append(table.Unique, columns)
@@ -180,6 +182,7 @@ func QuerySchema(ctx context.Context, db dbschema.Queryer) (*dbschema.Schema, er
 				// workaround for psql vs crdb differences
 				definition = strings.ReplaceAll(definition, "!=", "<>")
 				table.Checks = append(table.Checks, definition)
+			case "n": // NOT NULL (Postgres 17+) — already represented by column nullability.
 			default:
 				return errs.New("unhandled constraint type %q", constraintType)
 			}
@@ -230,10 +233,10 @@ func QuerySchema(ctx context.Context, db dbschema.Queryer) (*dbschema.Schema, er
 	return schema, nil
 }
 
-// matches FOREIGN KEY (project_id) REFERENCES projects(id) ON UPDATE CASCADE ON DELETE CASCADE.
-var rxPostgresForeignKey = regexp.MustCompile(
-	`^FOREIGN KEY \([[:word:]]+\) ` +
-		`REFERENCES ([[:word:]]+)\(([[:word:]]+)\)` +
+// rxPostgresCompositeForeignKey matches composite (multi-column) foreign key constraints
+var rxPostgresCompositeForeignKey = regexp.MustCompile(
+	`^FOREIGN KEY \(([^)]+)\) ` +
+		`REFERENCES ([[:word:]]+)\(([^)]+)\)` +
 		`(?:\s*ON UPDATE (CASCADE|RESTRICT|SET NULL|SET DEFAULT|NO ACTION))?` +
 		`(?:\s*ON DELETE (CASCADE|RESTRICT|SET NULL|SET DEFAULT|NO ACTION))?$`,
 )
@@ -241,6 +244,7 @@ var rxPostgresForeignKey = regexp.MustCompile(
 var (
 	rxIndex                  = regexp.MustCompile(`^CREATE( UNIQUE)? INDEX (.*) ON .*\.(.*) USING btree \(([^)]+)\)(?: STORING \([^)]+\))?(?: WHERE (.+))?`)
 	indexDirNullsOrderRemove = strings.NewReplacer(" ASC", "", " DESC", "", " NULLS", "", " FIRST", "", " LAST", "")
+	typeDescriptorRx         = regexp.MustCompile(`::(:)?[a-zA-Z0-9_ ]+`)
 )
 
 func parseColumnDefault(columnDefault string) string {
@@ -250,9 +254,7 @@ func parseColumnDefault(columnDefault string) string {
 	}
 
 	// hackity hack: cockroach sometimes adds type descriptors to the default. ignore em!
-	if idx := strings.Index(columnDefault, ":::"); idx >= 0 {
-		columnDefault = columnDefault[:idx]
-	}
+	columnDefault = typeDescriptorRx.ReplaceAllString(columnDefault, "")
 
 	return columnDefault
 }
@@ -314,11 +316,16 @@ func parseIndexDefinition(indexdef string) (*dbschema.Index, error) {
 		name = "storagenode_storage_tallies_pkey"
 	}
 
+	columns := strings.Split(indexDirNullsOrderRemove.Replace(matches[4]), ", ")
+	for i, column := range columns {
+		columns[i] = UnquoteIdentifier(column)
+	}
+
 	return &dbschema.Index{
 		Name:    name,
 		Table:   matches[3],
 		Unique:  matches[1] != "",
-		Columns: strings.Split(indexDirNullsOrderRemove.Replace(matches[4]), ", "),
+		Columns: columns,
 		Partial: matches[5],
 	}, nil
 }

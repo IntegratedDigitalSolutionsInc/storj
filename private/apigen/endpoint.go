@@ -15,6 +15,7 @@ import (
 	"github.com/zeebo/errs"
 
 	"storj.io/common/uuid"
+	"storj.io/storj/private/api"
 )
 
 var (
@@ -54,14 +55,25 @@ type Endpoint struct {
 	// Response is the type that defines the format of the response body.
 	Response interface{}
 	// QueryParams is the list of query parameters that the endpoint accepts.
-	QueryParams []Param
+	QueryParams []QueryParam
 	// PathParams is the list of path parameters that appear in the path associated with this
 	// endpoint.
-	PathParams []Param
+	PathParams []PathParam
 	// ResponseMock is the data to use as a response for the generated mocks.
 	// It must be of the same type than Response.
 	// If a mock generator is called it must not be nil unless Response is nil.
 	ResponseMock interface{}
+	// SkipClientGeneration omits this endpoint from TypeScript client and mock generation.
+	// The Go server handler and documentation are still generated.
+	SkipClientGeneration bool
+	// ResponseType is the MIME content type for non-JSON responses (e.g. "text/csv").
+	// When set, Response must be nil and ResponseDescription must be non-empty.
+	// The generated handler sets this as the Content-Type header and the service method
+	// receives http.ResponseWriter to write the response body directly.
+	ResponseType string
+	// ResponseDocumentation documents the non-JSON response body format.
+	// Required when ResponseType is non-empty.
+	ResponseDocumentation string
 	// Settings is the data to pass to the middleware handlers to adapt the generated
 	// code to this endpoints.
 	//
@@ -73,7 +85,7 @@ type Endpoint struct {
 // Validate validates the endpoint fields values are correct according to the documented constraints.
 func (e *Endpoint) Validate() error {
 	newErr := func(m string, a ...any) error {
-		e := fmt.Sprintf(". Endpoint: %s", e.Name)
+		e := ". Endpoint: " + e.Name
 		m += e
 		return errsEndpoint.New(m, a...)
 	}
@@ -144,6 +156,20 @@ func (e *Endpoint) Validate() error {
 				return newErr(
 					"ResponseMock isn't of the same type than Response. Have=%q Want=%q", m, r,
 				)
+			}
+		}
+	}
+
+	if e.ResponseType != "" {
+		if e.Response != nil {
+			return newErr("ResponseType and Response cannot both be set")
+		}
+		if e.ResponseDocumentation == "" {
+			return newErr("ResponseDocumentation cannot be empty when ResponseType is set")
+		}
+		if e.ResponseMock != nil {
+			if _, ok := e.ResponseMock.([]byte); !ok {
+				return newErr("ResponseMock must be []byte when ResponseType is set")
 			}
 		}
 	}
@@ -265,28 +291,54 @@ func (eg *EndpointGroup) addEndpoint(path, method string, endpoint *Endpoint) {
 	eg.endpoints = append(eg.endpoints, ep)
 }
 
-// Param represents string interpretation of param's name and type.
-type Param struct {
+// UseCORS adds CORS middleware to the endpoint group.
+// This is a convenience method that appends a CORS middleware to the group.
+func (eg *EndpointGroup) UseCORS() {
+	eg.Middleware = append(eg.Middleware, corsMiddleware{})
+}
+
+// corsMiddleware is a standard CORS middleware implementation.
+type corsMiddleware struct {
+	//lint:ignore U1000 this field is used by the API generator to expose in the handler.
+	cors api.CORS
+}
+
+// Generate satisfies the apigen.Middleware interface.
+func (c corsMiddleware) Generate(_ *API, _ *EndpointGroup, _ *FullEndpoint) string {
+	return `isPreflight := h.cors.Handle(w, r)
+	if isPreflight {
+		return
+	}
+	`
+}
+
+// ExtraServiceParams satisfies the apigen.Middleware interface.
+func (c corsMiddleware) ExtraServiceParams(_ *API, _ *EndpointGroup, _ *FullEndpoint) []PathParam {
+	return nil
+}
+
+// PathParam represents string interpretation of param's name and type.
+type PathParam struct {
 	Name string
 	Type reflect.Type
 }
 
-// NewParam constructor which creates new Param entity by given name and type through instance.
+// NewPathParam constructor which creates new PathParam entity by given name and type through instance.
 //
 // instance can only be a unsigned integer (of any size), string, uuid.UUID or time.Time, otherwise
 // it panics.
-func NewParam(name string, instance interface{}) Param {
+func NewPathParam(name string, instance interface{}) PathParam {
 	switch t := reflect.TypeOf(instance); t {
-	case reflect.TypeOf(uuid.UUID{}), reflect.TypeOf(time.Time{}):
+	case reflect.TypeFor[uuid.UUID](), reflect.TypeFor[time.Time]():
 	default:
 		switch k := t.Kind(); k {
-		case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.String:
+		case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.String, reflect.Pointer, reflect.Bool:
 		default:
 			panic(
 				fmt.Sprintf(
-					`Unsupported parameter, only types: %q, %q, string, and "unsigned numbers" are supported . Found type=%q, Kind=%q`,
-					reflect.TypeOf(uuid.UUID{}),
-					reflect.TypeOf(time.Time{}),
+					`Unsupported parameter, only types: %q, %q, string, bool, and "unsigned numbers" are supported . Found type=%q, Kind=%q`,
+					reflect.TypeFor[uuid.UUID](),
+					reflect.TypeFor[time.Time](),
 					t,
 					k,
 				),
@@ -294,10 +346,54 @@ func NewParam(name string, instance interface{}) Param {
 		}
 	}
 
-	return Param{
+	return PathParam{
 		Name: name,
 		Type: reflect.TypeOf(instance),
 	}
+}
+
+// QueryParam represents a query string parameter with an optional default value.
+// If Default is nil and DynamicDefault is nil the parameter is required;
+// otherwise it is optional.
+type QueryParam struct {
+	PathParam
+	// Default holds the concrete static default value for optional params.
+	// Nil means the parameter is required (unless DynamicDefault is set).
+	// For static optional params, the concrete value is embedded as a typed
+	// literal in the generated handler struct field.
+	// Supported types: string, bool, time.Time, uuid.UUID, and unsigned integer types.
+	Default interface{}
+	// DynamicDefault holds a function called at request time to produce the
+	// default value when the query key is absent. When non-nil, the parameter
+	// is optional and Default is ignored. The function is passed as a
+	// constructor parameter in the generated handler, so it can be any closure.
+	// Supported return types: string, bool, time.Time, uuid.UUID, and unsigned integers.
+	DynamicDefault func() interface{}
+}
+
+// NewQueryParam creates a required QueryParam. The type is inferred from instance.
+func NewQueryParam(name string, instance interface{}) QueryParam {
+	return QueryParam{PathParam: NewPathParam(name, instance)}
+}
+
+// NewQueryParamOptional creates an optional QueryParam with a static default.
+// defaultVal is the value used as default when the query parameters isn't sent by
+// the client.
+// Supported concrete types: string, time.Time, uuid.UUID, and unsigned integer types.
+func NewQueryParamOptional(name string, defaultVal interface{}) QueryParam {
+	return QueryParam{PathParam: NewPathParam(name, defaultVal), Default: defaultVal}
+}
+
+// NewQueryParamOptionalDynamic creates an optional QueryParam with a dynamic
+// default. defaultFn is called once here for type inference; at request time
+// the generated handler calls it again to obtain the default value when the
+// query key is absent. Because defaultFn is a runtime value it is passed as a
+// constructor parameter to the generated handler.
+// Supported return types: string, time.Time, uuid.UUID, and unsigned integer types.
+func NewQueryParamOptionalDynamic(name string, defaultFn func() interface{}) QueryParam {
+	// Call once for type inference only.
+	concrete := defaultFn()
+	return QueryParam{PathParam: NewPathParam(name, concrete), DynamicDefault: defaultFn}
 }
 
 // Middleware allows to generate custom code that's executed at the beginning of the handler.
@@ -338,6 +434,9 @@ type Middleware interface {
 	// Make sure to not declare variable with those names in the generated code unless that's wrapped
 	// in a scope.
 	Generate(api *API, group *EndpointGroup, ep *FullEndpoint) string
+	// ExtraServiceParams returns additional parameters that should be passed to the service method.
+	// This allows middleware to inject parameters based on the endpoint context.
+	ExtraServiceParams(api *API, group *EndpointGroup, ep *FullEndpoint) []PathParam
 }
 
 func middlewareImports(m any) []string {

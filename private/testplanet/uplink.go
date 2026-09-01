@@ -22,6 +22,7 @@ import (
 	"storj.io/common/rpc"
 	"storj.io/common/storj"
 	"storj.io/common/uuid"
+	"storj.io/storj/satellite/buckets"
 	"storj.io/storj/satellite/console"
 	"storj.io/uplink"
 	"storj.io/uplink/private/metaclient"
@@ -137,8 +138,6 @@ func (planet *Planet) newUplink(ctx context.Context, index int, log *zap.Logger,
 	planetUplink.Dialer = rpc.NewDefaultDialer(tlsOptions)
 
 	for j, satellite := range planet.Satellites {
-		consoleAPI := satellite.API.Console
-
 		var config UplinkConfig
 		if planet.config.Reconfigure.Uplink != nil {
 			planet.config.Reconfigure.Uplink(log, index, &config)
@@ -146,7 +145,7 @@ func (planet *Planet) newUplink(ctx context.Context, index int, log *zap.Logger,
 
 		projectName := fmt.Sprintf("%s_%d", name, j)
 		user, err := satellite.AddUser(ctx, console.CreateUser{
-			FullName: fmt.Sprintf("User %s", projectName),
+			FullName: "User " + projectName,
 			Email:    fmt.Sprintf("user@%s.test", projectName),
 		}, 10)
 		if err != nil {
@@ -163,11 +162,7 @@ func (planet *Planet) newUplink(ctx context.Context, index int, log *zap.Logger,
 			return nil, errs.Wrap(err)
 		}
 
-		userCtx, err := satellite.UserContext(ctx, user.ID)
-		if err != nil {
-			return nil, errs.Wrap(err)
-		}
-		_, apiKey, err := consoleAPI.Service.CreateAPIKey(userCtx, project.ID, "root", config.APIKeyVersion)
+		apiKey, err := satellite.CreateAPIKey(ctx, project.ID, project.OwnerID, config.APIKeyVersion)
 		if err != nil {
 			return nil, errs.Wrap(err)
 		}
@@ -285,8 +280,8 @@ func (client *Uplink) UploadWithOptions(ctx context.Context, satellite *Satellit
 	}
 	defer func() { err = errs.Combine(err, project.Close()) }()
 
-	_, err = project.EnsureBucket(ctx, bucketName)
-	if err != nil {
+	err = client.TestingCreateBucket(ctx, satellite, bucketName)
+	if err != nil && !buckets.ErrBucketAlreadyExists.Has(err) {
 		return nil, errs.Wrap(err)
 	}
 
@@ -404,7 +399,32 @@ func (client *Uplink) CopyObject(ctx context.Context, satellite *Satellite, oldB
 	return err
 }
 
-// CreateBucket creates a new bucket.
+// TestingCreateBucket creates a new bucket for testing.
+// It's doing it using directly DB API so it avoids a lot of overhead from uplink and satellite.
+func (client *Uplink) TestingCreateBucket(ctx context.Context, satellite *Satellite, bucketName string) (err error) {
+	defer mon.Task()(&ctx)(&err)
+
+	var projectID uuid.UUID
+	for _, project := range client.Projects {
+		if project.Satellite == satellite {
+			projectID = project.ID
+			break
+		}
+	}
+
+	if projectID.IsZero() {
+		return errs.New("project not found for satellite %s", satellite.ID())
+	}
+
+	_, err = satellite.DB.Buckets().CreateBucket(ctx, buckets.Bucket{
+		Name:       bucketName,
+		ProjectID:  projectID,
+		Versioning: buckets.Unversioned,
+	})
+	return errs.Wrap(err)
+}
+
+// CreateBucket creates a new bucket. It's doing it using uplink API.
 func (client *Uplink) CreateBucket(ctx context.Context, satellite *Satellite, bucketName string) (err error) {
 	defer mon.Task()(&ctx)(&err)
 
@@ -414,7 +434,7 @@ func (client *Uplink) CreateBucket(ctx context.Context, satellite *Satellite, bu
 	}
 	defer func() { err = errs.Combine(err, project.Close()) }()
 
-	_, err = project.CreateBucket(ctx, bucketName)
+	_, err = project.EnsureBucket(ctx, bucketName)
 	if err != nil {
 		return errs.Wrap(err)
 	}

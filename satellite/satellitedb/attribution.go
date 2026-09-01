@@ -12,6 +12,7 @@ import (
 
 	"github.com/zeebo/errs"
 
+	"storj.io/common/storj"
 	"storj.io/common/uuid"
 	"storj.io/storj/satellite/attribution"
 	"storj.io/storj/satellite/satellitedb/dbx"
@@ -24,24 +25,22 @@ import (
 //go:embed attribution_value_psql.sql
 var valueAttrCockroachQuery string
 
-//go:embed attribution_value_spanner.sql
-var valueAttrSpannerQuery string
-
 //go:embed attribution_all_value_psql.sql
 var allValueAttrPsqlQuery string
 
-//go:embed attribution_all_value_spanner.sql
-var allValueAttrSpannerQuery string
+type queryer interface {
+	QueryRowContext(ctx context.Context, query string, args ...interface{}) *sql.Row
+}
 
 type attributionDB struct {
 	db *satelliteDB
 }
 
 // Get reads the partner info.
-func (keys *attributionDB) Get(ctx context.Context, projectID uuid.UUID, bucketName []byte) (info *attribution.Info, err error) {
+func (a *attributionDB) Get(ctx context.Context, projectID uuid.UUID, bucketName []byte) (info *attribution.Info, err error) {
 	defer mon.Task()(&ctx)(&err)
 
-	dbxInfo, err := keys.db.Get_ValueAttribution_By_ProjectId_And_BucketName(ctx,
+	dbxInfo, err := a.db.Get_ValueAttribution_By_ProjectId_And_BucketName(ctx,
 		dbx.ValueAttribution_ProjectId(projectID[:]),
 		dbx.ValueAttribution_BucketName(bucketName),
 	)
@@ -56,10 +55,10 @@ func (keys *attributionDB) Get(ctx context.Context, projectID uuid.UUID, bucketN
 }
 
 // UpdateUserAgent updates bucket attribution data.
-func (keys *attributionDB) UpdateUserAgent(ctx context.Context, projectID uuid.UUID, bucketName string, userAgent []byte) (err error) {
+func (a *attributionDB) UpdateUserAgent(ctx context.Context, projectID uuid.UUID, bucketName string, userAgent []byte) (err error) {
 	defer mon.Task()(&ctx)(&err)
 
-	_, err = keys.db.Update_ValueAttribution_By_ProjectId_And_BucketName(ctx,
+	_, err = a.db.Update_ValueAttribution_By_ProjectId_And_BucketName(ctx,
 		dbx.ValueAttribution_ProjectId(projectID[:]),
 		dbx.ValueAttribution_BucketName([]byte(bucketName)),
 		dbx.ValueAttribution_Update_Fields{
@@ -69,66 +68,83 @@ func (keys *attributionDB) UpdateUserAgent(ctx context.Context, projectID uuid.U
 	return err
 }
 
-// Insert implements create partner info.
-func (keys *attributionDB) Insert(ctx context.Context, info *attribution.Info) (_ *attribution.Info, err error) {
+// UpdatePlacement updates bucket placement.
+func (a *attributionDB) UpdatePlacement(ctx context.Context, projectID uuid.UUID, bucketName string, placement *storj.PlacementConstraint) (err error) {
 	defer mon.Task()(&ctx)(&err)
 
-	switch keys.db.impl {
+	updateFields := dbx.ValueAttribution_Update_Fields{}
+	if placement == nil {
+		updateFields.Placement = dbx.ValueAttribution_Placement_Null()
+	} else {
+		updateFields.Placement = dbx.ValueAttribution_Placement(int(*placement))
+	}
+
+	_, err = a.db.Update_ValueAttribution_By_ProjectId_And_BucketName(ctx,
+		dbx.ValueAttribution_ProjectId(projectID[:]),
+		dbx.ValueAttribution_BucketName([]byte(bucketName)),
+		updateFields)
+
+	return err
+}
+
+// TestDelete is used for testing purposes to delete all attribution data for a given project and bucket.
+func (a *attributionDB) TestDelete(ctx context.Context, projectID uuid.UUID, bucketName []byte) (err error) {
+	defer mon.Task()(&ctx)(&err)
+
+	_, err = a.db.Delete_ValueAttribution_By_ProjectId_And_BucketName(ctx,
+		dbx.ValueAttribution_ProjectId(projectID[:]),
+		dbx.ValueAttribution_BucketName(bucketName))
+
+	return err
+}
+
+// Insert implements create partner info.
+func (a *attributionDB) Insert(ctx context.Context, info *attribution.Info) (_ *attribution.Info, err error) {
+	defer mon.Task()(&ctx)(&err)
+	info, err = insertAttribution(ctx, a.db, a.db.impl, info)
+	if err != nil {
+		return nil, Error.Wrap(err)
+	}
+	return info, nil
+}
+
+func insertAttribution(ctx context.Context, db queryer, impl dbutil.Implementation, info *attribution.Info) (_ *attribution.Info, err error) {
+	switch impl {
 	case dbutil.Postgres, dbutil.Cockroach:
-		err = keys.db.QueryRowContext(ctx, `
-				INSERT INTO value_attributions (project_id, bucket_name, user_agent, last_updated) 
-				VALUES ($1, $2, $3, now())
+		err = db.QueryRowContext(ctx, `
+				INSERT INTO value_attributions (project_id, bucket_name, user_agent, placement, last_updated)
+				VALUES ($1, $2, $3, $4, now())
 				ON CONFLICT (project_id, bucket_name) DO NOTHING
-				RETURNING last_updated`, info.ProjectID[:], info.BucketName, info.UserAgent).Scan(&info.CreatedAt)
+				RETURNING last_updated`, info.ProjectID[:], info.BucketName, info.UserAgent, info.Placement).Scan(&info.CreatedAt)
 		// TODO when sql.ErrNoRows is returned then CreatedAt is not set
 		if errors.Is(err, sql.ErrNoRows) {
 			return info, nil
 		}
 		if err != nil {
-			return nil, Error.Wrap(err)
+			return nil, errs.Wrap(err)
 		}
-	case dbutil.Spanner:
-		err := keys.db.WithTx(ctx, func(ctx context.Context, tx *dbx.Tx) error {
-			return tx.QueryRowContext(ctx, `
-				INSERT OR IGNORE INTO value_attributions (project_id, bucket_name, user_agent, last_updated)
-				VALUES (?, ?, ?, CURRENT_TIMESTAMP())
-				THEN RETURN last_updated`, info.ProjectID[:], info.BucketName, info.UserAgent).Scan(&info.CreatedAt)
-			// TODO when sql.ErrNoRows is returned then CreatedAt is not set
-		})
-		if errors.Is(err, sql.ErrNoRows) {
-			return info, nil
-		}
-		if err != nil {
-			return nil, Error.Wrap(err)
-		}
-
 	default:
-		return nil, errs.New("unsupported database dialect: %s", keys.db.impl)
+		return nil, errs.New("unsupported database dialect: %s", impl)
 	}
 
 	return info, nil
 }
 
 // QueryAttribution queries partner bucket attribution data.
-func (keys *attributionDB) QueryAttribution(ctx context.Context, userAgent []byte, start time.Time, end time.Time) (_ []*attribution.BucketUsage, err error) {
+func (a *attributionDB) QueryAttribution(ctx context.Context, userAgent []byte, start time.Time, end time.Time) (_ []*attribution.BucketUsage, err error) {
 	defer mon.Task()(&ctx)(&err)
 
 	var query string
 	var args []interface{}
-	switch keys.db.impl {
+	switch a.db.impl {
 	case dbutil.Cockroach, dbutil.Postgres:
 		query = valueAttrCockroachQuery
 		args = append(args, userAgent, start.UTC(), end.UTC())
-	case dbutil.Spanner:
-		query = valueAttrSpannerQuery
-		args = append(args, sql.Named("user_agent", userAgent))
-		args = append(args, sql.Named("start", start.UTC()))
-		args = append(args, sql.Named("end", end.UTC()))
 	default:
-		return nil, errs.New("unsupported database dialect: %s", keys.db.impl)
+		return nil, errs.New("unsupported database dialect: %s", a.db.impl)
 	}
 
-	rows, err := keys.db.DB.QueryContext(ctx, keys.db.Rebind(query), args...)
+	rows, err := a.db.DB.QueryContext(ctx, a.db.Rebind(query), args...)
 	if err != nil {
 		return nil, Error.Wrap(err)
 	}
@@ -153,24 +169,20 @@ func (keys *attributionDB) QueryAttribution(ctx context.Context, userAgent []byt
 }
 
 // QueryAllAttribution queries all partner bucket attribution data.
-func (keys *attributionDB) QueryAllAttribution(ctx context.Context, start time.Time, end time.Time) (_ []*attribution.BucketUsage, err error) {
+func (a *attributionDB) QueryAllAttribution(ctx context.Context, start time.Time, end time.Time) (_ []*attribution.BucketUsage, err error) {
 	defer mon.Task()(&ctx)(&err)
 
 	var query string
 	var args []interface{}
-	switch keys.db.impl {
+	switch a.db.impl {
 	case dbutil.Cockroach, dbutil.Postgres:
 		query = allValueAttrPsqlQuery
 		args = append(args, start.UTC(), end.UTC())
-	case dbutil.Spanner:
-		query = allValueAttrSpannerQuery
-		args = append(args, sql.Named("start", start.UTC()))
-		args = append(args, sql.Named("end", end.UTC()))
 	default:
-		return nil, errs.New("unsupported database dialect: %s", keys.db.impl)
+		return nil, errs.New("unsupported database dialect: %s", a.db.impl)
 	}
 
-	rows, err := keys.db.DB.QueryContext(ctx, keys.db.Rebind(query), args...)
+	rows, err := a.db.DB.QueryContext(ctx, a.db.Rebind(query), args...)
 	if err != nil {
 		return nil, Error.Wrap(err)
 	}
@@ -199,11 +211,16 @@ func attributionFromDBX(info *dbx.ValueAttribution) (*attribution.Info, error) {
 	if err != nil {
 		return nil, Error.Wrap(err)
 	}
-
+	var placementPtr *storj.PlacementConstraint
+	if info.Placement != nil {
+		placementVal := storj.PlacementConstraint(*info.Placement)
+		placementPtr = &placementVal
+	}
 	return &attribution.Info{
 		ProjectID:  projectID,
 		BucketName: info.BucketName,
 		UserAgent:  userAgent,
+		Placement:  placementPtr,
 		CreatedAt:  info.LastUpdated,
 	}, nil
 }

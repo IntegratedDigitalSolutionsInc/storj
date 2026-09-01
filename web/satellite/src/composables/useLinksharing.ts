@@ -2,7 +2,7 @@
 // See LICENSE for copying information.
 
 import { computed } from 'vue';
-import { HttpRequest } from '@smithy/types';
+import type { HttpRequest } from '@smithy/types';
 import { Sha256 } from '@aws-crypto/sha256-browser';
 import { SignatureV4 } from '@smithy/signature-v4';
 
@@ -11,15 +11,23 @@ import { useConfigStore } from '@/store/modules/configStore';
 import { useProjectsStore } from '@/store/modules/projectsStore';
 import { useBucketsStore } from '@/store/modules/bucketsStore';
 import { useObjectBrowserStore } from '@/store/modules/objectBrowserStore';
-import { AccessGrant, EdgeCredentials } from '@/types/accessGrants';
-import { Project } from '@/types/projects';
-
-const WORKER_ERR_MSG = 'Worker is not defined';
+import type { AccessGrant, EdgeCredentials } from '@/types/accessGrants';
+import type { Project } from '@/types/projects';
+import { Download } from '@/utils/download';
+import type { DownloadPrefixFormat } from '@/types/browser';
+import { type RestrictGrantMessage, useAccessGrantWorker  } from '@/composables/useAccessGrantWorker';
 
 export enum ShareType {
     Object = 'object',
     Folder = 'folder',
     Bucket = 'bucket',
+}
+
+export class ShareInfo {
+    public constructor(
+        public readonly url: string,
+        public readonly freeTrialExpiration: Date | null = null,
+    ) { }
 }
 
 export function useLinksharing() {
@@ -29,7 +37,7 @@ export function useLinksharing() {
     const bucketsStore = useBucketsStore();
     const objectBrowserStore = useObjectBrowserStore();
 
-    const worker = computed((): Worker | null => agStore.state.accessGrantsWebWorker);
+    const { generateAccess, restrictGrant } = useAccessGrantWorker();
 
     const selectedProject = computed<Project>(() => projectsStore.state.selectedProject);
 
@@ -41,32 +49,47 @@ export function useLinksharing() {
         return selectedProject.value.edgeURLOverrides?.publicLinksharing || configStore.state.config.publicLinksharingURL;
     });
 
-    async function generateFileOrFolderShareURL(bucketName: string, prefix: string, objectKey: string, type: ShareType): Promise<string> {
-        return generateShareURL(bucketName, prefix, objectKey, type);
+    async function generateFileOrFolderShareURL(bucketName: string, prefix: string, objectKey: string, type: ShareType, accessName: string, expiration: Date | null): Promise<ShareInfo> {
+        return generateShareURL(bucketName, prefix, objectKey, type, accessName, expiration);
     }
 
-    async function generateBucketShareURL(bucketName: string): Promise<string> {
-        return generateShareURL(bucketName, '', '', ShareType.Bucket);
+    async function generateBucketShareURL(bucketName: string, accessName: string, expiration: Date | null): Promise<ShareInfo> {
+        return generateShareURL(bucketName, '', '', ShareType.Bucket, accessName, expiration);
     }
 
-    async function generateShareURL(bucketName: string, prefix: string, objectKey: string, type: ShareType): Promise<string> {
-        if (!worker.value) throw new Error(WORKER_ERR_MSG);
-
+    async function generateShareURL(bucketName: string, prefix: string, objectKey: string, type: ShareType, accessName: string, expiration: Date | null): Promise<ShareInfo> {
         let fullPath = bucketName;
         if (prefix) fullPath = `${fullPath}/${prefix}`;
         if (objectKey) fullPath = `${fullPath}/${objectKey}`;
         if (type === ShareType.Folder) fullPath = `${fullPath}/`;
 
-        const LINK_SHARING_AG_NAME = `${fullPath}_shared-${type}_${new Date().toISOString()}`;
-        const grant: AccessGrant = await agStore.createAccessGrant(LINK_SHARING_AG_NAME, selectedProject.value.id);
-        const creds: EdgeCredentials = await generatePublicCredentials(grant.secret, fullPath, null);
+        const grant: AccessGrant = await agStore.createAccessGrant(accessName, selectedProject.value.id);
+        const creds: EdgeCredentials = await generatePublicCredentials(grant.secret, fullPath, expiration);
 
         let url = `${publicLinksharingURL.value}/s/${creds.accessKeyId}/${bucketName}`;
         if (prefix) url = `${url}/${encodeURIComponent(prefix.trim())}`;
         if (objectKey) url = `${url}/${encodeURIComponent(objectKey.trim())}`;
         if (type === ShareType.Folder) url = `${url}/`;
 
-        return url;
+        return new ShareInfo(url, creds.freeTierRestrictedExpiration);
+    }
+
+    async function downloadPrefix(bucketName: string, prefix: string, format: DownloadPrefixFormat): Promise<void> {
+        const now = new Date();
+        const expiresAt = new Date();
+        expiresAt.setHours(now.getHours() + 1);
+
+        let fullPath = bucketName;
+        if (prefix) fullPath = `${fullPath}/${prefix}/`;
+
+        const creds = await generatePublicCredentials(bucketsStore.state.apiKey, fullPath, expiresAt, bucketsStore.state.passphrase);
+
+        let link = `${publicLinksharingURL.value}/s/${creds.accessKeyId}/${bucketName}`;
+        if (prefix) link = `${link}/${encodeURIComponent(prefix.trim())}/`;
+
+        const url = new URL(`${link}?download=1&download-kind=${format}`);
+
+        Download.fileByLink(url.href);
     }
 
     async function getObjectDistributionMap(path: string): Promise<Blob> {
@@ -111,57 +134,26 @@ export function useLinksharing() {
     }
 
     async function generatePublicCredentials(cleanAPIKey: string, path: string, expiration: Date | null, passphrase?: string): Promise<EdgeCredentials> {
-        if (!worker.value) throw new Error(WORKER_ERR_MSG);
-
-        const satelliteNodeURL = configStore.state.config.satelliteNodeURL;
-        const salt = await projectsStore.getProjectSalt(selectedProject.value.id);
         if (passphrase === undefined) passphrase = bucketsStore.state.passphrase;
 
-        worker.value.postMessage({
-            'type': 'GenerateAccess',
-            'apiKey': cleanAPIKey,
-            'passphrase': passphrase,
-            'salt': salt,
-            'satelliteNodeURL': satelliteNodeURL,
-        });
+        const macaroon = await generateAccess({
+            apiKey: cleanAPIKey,
+            passphrase: passphrase,
+        }, selectedProject.value.id);
 
-        const grantEvent: MessageEvent = await new Promise(resolve => {
-            if (worker.value) {
-                worker.value.onmessage = resolve;
-            }
-        });
-        const grantData = grantEvent.data;
-        if (grantData.error) {
-            throw new Error(grantData.error);
-        }
-
-        let permissionsMsg = {
-            'type': 'RestrictGrant',
-            'isDownload': true,
-            'isUpload': false,
-            'isList': true,
-            'isDelete': false,
-            'paths': [path],
-            'grant': grantData.value,
+        let permissionsMsg: RestrictGrantMessage = {
+            isDownload: true,
+            isUpload: false,
+            isList: true,
+            isDelete: false,
+            paths: [path],
+            grant: macaroon,
         };
+        if (expiration) permissionsMsg = Object.assign(permissionsMsg, { notAfter: expiration.toISOString() });
 
-        if (expiration) {
-            permissionsMsg = Object.assign(permissionsMsg, { 'notAfter': expiration.toISOString() });
-        }
+        const accessGrant = await restrictGrant(permissionsMsg);
 
-        worker.value.postMessage(permissionsMsg);
-
-        const event: MessageEvent = await new Promise(resolve => {
-            if (worker.value) {
-                worker.value.onmessage = resolve;
-            }
-        });
-        const data = event.data;
-        if (data.error) {
-            throw new Error(data.error);
-        }
-
-        return agStore.getEdgeCredentials(data.value, true);
+        return agStore.getEdgeCredentials(accessGrant, true);
     }
 
     return {
@@ -170,5 +162,6 @@ export function useLinksharing() {
         generateBucketShareURL,
         generateFileOrFolderShareURL,
         getObjectDistributionMap,
+        downloadPrefix,
     };
 }

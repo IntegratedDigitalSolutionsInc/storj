@@ -2,8 +2,29 @@
 // See LICENSE for copying information.
 
 <template>
-    <v-list-item :title="item.Key" class="px-6" height="54" :link="props.item.status === UploadingStatus.Finished">
+    <v-list-item class="px-4 overflow-x-hidden" height="54" :link="props.item.status === UploadingStatus.Finished">
+        <template #title>
+            <p class="text-truncate" :title="item.Key">{{ item.Key }}</p>
+        </template>
         <template #append>
+            <v-tooltip v-if="isBetween5GBand30GB && configStore.isDefaultBrand" location="top">
+                <p>
+                    For files over 5GB, we recommend using
+                    <a class="link" href="https://www.storj.io/object-mount" target="_blank" rel="noopener noreferrer">Object Mount</a>
+                </p>
+                <p>
+                    for better reliability than browser upload.
+                </p>
+                <template #activator="{ props: activatorProps }">
+                    <v-icon
+                        class="mr-2"
+                        v-bind="activatorProps"
+                        :icon="InfoIcon"
+                        color="warning"
+                    />
+                </template>
+            </v-tooltip>
+
             <v-tooltip :text="uploadStatus" location="left">
                 <template #activator="{ props: activatorProps }">
                     <v-progress-circular
@@ -11,8 +32,8 @@
                         v-bind="activatorProps"
                         :indeterminate="!item.progress"
                         :size="20"
-                        color="secondary"
-                        :model-value="progressStyle"
+                        color="success"
+                        :model-value="item.progress"
                     />
                     <v-icon
                         v-else
@@ -38,30 +59,32 @@
 </template>
 
 <script setup lang="ts">
-import { computed, FunctionalComponent } from 'vue';
+import { type FunctionalComponent, computed  } from 'vue';
 import { VListItem, VIcon, VProgressCircular, VTooltip } from 'vuetify/components';
-import { Ban, CircleX, CircleCheck, Info } from 'lucide-vue-next';
+import { Ban, CircleX, CircleCheck, Info, InfoIcon } from '@lucide/vue';
 
 import {
-    UploadingBrowserObject,
+    type UploadingBrowserObject,
     UploadingStatus,
     useObjectBrowserStore,
 } from '@/store/modules/objectBrowserStore';
-import { useNotify } from '@/utils/hooks';
+import { useNotify } from '@/composables/useNotify';
 import { AnalyticsErrorEventSource } from '@/utils/constants/analyticsEventNames';
+import { useConfigStore } from '@/store/modules/configStore';
 
 const obStore = useObjectBrowserStore();
+const configStore = useConfigStore();
+
 const notify = useNotify();
 
 const props = defineProps<{
     item: UploadingBrowserObject
 }>();
 
-const progressStyle = computed((): number => {
-    if (props.item.progress) {
-        return 360*(props.item.progress/100);
-    }
-    return 0;
+const isBetween5GBand30GB = computed((): boolean => {
+    const gb5 = 5 * 1024 * 1024 * 1024;
+    const gb30 = 30 * 1024 * 1024 * 1024;
+    return props.item.Size > gb5 && props.item.Size < gb30;
 });
 
 const uploadStatus = computed((): string => {
@@ -94,7 +117,7 @@ const iconColor = computed((): string => {
     if (props.item.status === UploadingStatus.Finished) {
         return 'success';
     } else if (props.item.status === UploadingStatus.Failed) {
-        return 'warning';
+        return 'error';
     } else if (props.item.status === UploadingStatus.Cancelled) {
         return 'error';
     } else {
@@ -113,3 +136,9 @@ function cancelUpload(): void {
     }
 }
 </script>
+
+<style scoped lang="scss">
+:deep(.v-list-item__content) {
+    overflow: hidden !important;
+}
+</style>

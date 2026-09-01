@@ -1,7 +1,7 @@
 // Copyright (C) 2020 Storj Labs, Inc.
 // See LICENSE for copying information.
 
-//go:build windows && service
+//go:build windows
 
 package main
 
@@ -37,7 +37,7 @@ func cmdRestart(cmd *cobra.Command, args []string) (err error) {
 		// NB: don't include old version number for updater binary backup
 		backupPath = prependExtension(runCfg.BinaryLocation, "old")
 	} else {
-		backupPath = prependExtension(runCfg.BinaryLocation, "old."+currentVersion.String())
+		backupPath = prependExtension(runCfg.BinaryLocation, "old."+currentVersion.VString())
 	}
 
 	// check if new binary exists
@@ -45,11 +45,15 @@ func cmdRestart(cmd *cobra.Command, args []string) (err error) {
 		return errs.Wrap(err)
 	}
 
-	_, err = restartService(ctx, "", runCfg.ServiceName, runCfg.BinaryLocation, newVersionPath, backupPath)
+	_, err = swapBinariesAndRestart(ctx, runCfg.Standalone, "", runCfg.ServiceName, runCfg.BinaryLocation, newVersionPath, backupPath)
 	return err
 }
 
-func restartService(ctx context.Context, restartMethod, service, binaryLocation, newVersionPath, backupPath string) (exit bool, err error) {
+func swapBinariesAndRestart(ctx context.Context, standalone bool, restartMethod, service, binaryLocation, newVersionPath, backupPath string) (exit bool, err error) {
+	if standalone {
+		return false, swapBinaries(ctx, binaryLocation, newVersionPath, backupPath)
+	}
+
 	srvc, err := openService(service)
 	if err != nil {
 		return false, errs.Combine(errs.Wrap(err), os.Remove(newVersionPath))

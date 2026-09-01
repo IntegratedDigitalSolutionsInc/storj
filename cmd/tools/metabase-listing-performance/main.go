@@ -65,7 +65,6 @@ var (
 	databaseConn   = flag.String("database", os.Getenv("STORJ_TEST_COCKROACH"), "database to use for testing")
 	benchmarkCount = flag.Int("benchmark", 6, "how many times to repeat a single query for benchmarking")
 	filter         = flag.String("filter", "", "run only tests that match this regular expression")
-	skipIterator   = flag.Bool("skip-iterator", false, "skip iterator benchmark")
 	skipList       = flag.Bool("skip-list", false, "skip list objects benchmark")
 
 	cpuprofile = flag.String("cpuprofile", "", "profile cpu")
@@ -151,14 +150,8 @@ func Info(ctx context.Context, log *zap.Logger) error {
 
 // Setup (re)creates the data based on scenarios specified above.
 func Setup(ctx context.Context, log *zap.Logger, db *metabase.DB) error {
-	err1 := db.DestroyTables(ctx)
-	log.Info("destroyed tables", zap.Error(err1))
-
-	err3 := db.TestMigrateToLatest(ctx)
-	log.Info("recreate tables", zap.Error(err3))
-	if err3 != nil {
-		return err3
-	}
+	err1 := db.TestingDeleteAll(ctx)
+	log.Info("delete all", zap.Error(err1))
 
 	for _, scenario := range scenarios {
 		log.Info("setting up scenario "+scenario.Name, zap.Int("objects", scenario.Setup.Expected()))
@@ -181,7 +174,7 @@ func Setup(ctx context.Context, log *zap.Logger, db *metabase.DB) error {
 // Benchmark runs benchmarks with the configured scenarios.
 func Benchmark(ctx context.Context, log *zap.Logger, db *metabase.DB) (err error) {
 	prefix := "bench-" + time.Now().Format("2006-01-02_15-04-05")
-	var listFile, iterateFile *os.File
+	var listFile *os.File
 
 	if !*skipList {
 		var err error
@@ -190,15 +183,6 @@ func Benchmark(ctx context.Context, log *zap.Logger, db *metabase.DB) (err error
 			return errs.Wrap(err)
 		}
 		defer func() { _ = listFile.Close() }()
-	}
-
-	if !*skipIterator {
-		var err error
-		iterateFile, err = os.Create(prefix + ".Iterate.log")
-		if err != nil {
-			return errs.Wrap(err)
-		}
-		defer func() { _ = iterateFile.Close() }()
 	}
 
 	var rx *regexp.Regexp
@@ -235,14 +219,6 @@ func Benchmark(ctx context.Context, log *zap.Logger, db *metabase.DB) (err error
 							}
 							_ = listFile.Sync()
 						}
-						if !*skipIterator {
-							err := benchmarkIterator(ctx, slog, db, testName, opts, iterateFile)
-							err = ignoreTimeoutOrCancel(err)
-							if err != nil {
-								return errs.Wrap(err)
-							}
-							_ = iterateFile.Sync()
-						}
 
 						if ctx.Err() != nil {
 							return errs.Wrap(ctx.Err())
@@ -258,7 +234,7 @@ func Benchmark(ctx context.Context, log *zap.Logger, db *metabase.DB) (err error
 // isCanceledOrTimeout returns true, when the error is a cancellation.
 func isCanceledOrTimeout(err error) bool {
 	return errs.IsFunc(err, func(err error) bool {
-		return err == context.Canceled || err == context.DeadlineExceeded //nolint:errorlint,goerr113
+		return err == context.Canceled || err == context.DeadlineExceeded //nolint:errorlint,err113
 	})
 }
 
@@ -316,50 +292,6 @@ func benchmarkListObjects(ctx context.Context, log *zap.Logger, db *metabase.DB,
 		}
 	}
 
-	return nil
-}
-
-func benchmarkIterator(ctx context.Context, log *zap.Logger, db *metabase.DB, testName string, opts metabase.ListObjects, out io.Writer) error {
-	if opts.Pending || opts.AllVersions {
-		// not supported
-		return nil
-	}
-
-	totalTime := time.Duration(0)
-
-	for range repeat(*benchmarkCount) {
-		startClock := time.Now()
-		start := hrtime.Now()
-		result, err := db.ListObjectsWithIterator(ctx, opts)
-		finish := hrtime.Now()
-		finishClock := time.Now()
-
-		duration := finish - start
-		if duration < 0 { // hrtime seems to not handle tsc wrapping nicely
-			duration = finishClock.Sub(startClock)
-		}
-		totalTime += duration
-
-		if err != nil {
-			return errs.Wrap(err)
-		}
-		log.Info("Iterator",
-			zap.Duration("time", duration),
-			zap.Int("result", len(result.Objects)),
-			zap.Bool("pending", opts.Pending),
-			zap.Bool("recursive", opts.Recursive),
-			zap.Bool("all", opts.AllVersions),
-			zap.Int("limit", opts.Limit),
-		)
-
-		line := fmt.Sprintf("Benchmark%v\t1\t%v ns/op", testName, duration.Nanoseconds())
-		fmt.Println(line)
-		_, _ = fmt.Fprintln(out, line)
-
-		if totalTime > maxTimePerBenchmark {
-			break
-		}
-	}
 	return nil
 }
 

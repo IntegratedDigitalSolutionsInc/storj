@@ -108,7 +108,7 @@ func TestDownloadWithSomeNodesOffline(t *testing.T) {
 		}
 
 		// confirm that we marked the correct number of storage nodes as offline
-		allNodes, err := satellite.Overlay.Service.GetParticipatingNodes(ctx)
+		allNodes, err := satellite.Overlay.Service.GetAllParticipatingNodes(ctx)
 		require.NoError(t, err)
 		online := make([]nodeselection.SelectedNode, 0, len(allNodes))
 		for _, node := range allNodes {
@@ -329,7 +329,7 @@ func TestUploadRSOveride(t *testing.T) {
 		{
 			buckets := planet.Satellites[0].API.Buckets.Service
 
-			err := client.CreateBucket(ctx, planet.Satellites[0], "placement1")
+			err := client.TestingCreateBucket(ctx, planet.Satellites[0], "placement1")
 			require.NoError(t, err)
 
 			bucket, err := buckets.GetBucket(ctx, []byte("placement1"), client.Projects[0].ID)
@@ -363,10 +363,6 @@ func TestUplinkAPIKeyVersionObjectLock(t *testing.T) {
 	testplanet.Run(t, testplanet.Config{
 		SatelliteCount: 1, StorageNodeCount: 0, UplinkCount: 1,
 		Reconfigure: testplanet.Reconfigure{
-			Satellite: func(log *zap.Logger, index int, config *satellite.Config) {
-				config.Metainfo.ObjectLockEnabled = true
-				config.Metainfo.UseBucketLevelObjectVersioning = true
-			},
 			Uplink: func(log *zap.Logger, index int, config *testplanet.UplinkConfig) {
 				config.APIKeyVersion = macaroon.APIKeyVersionObjectLock
 			},

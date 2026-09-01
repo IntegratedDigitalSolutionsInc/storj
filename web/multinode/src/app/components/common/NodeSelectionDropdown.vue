@@ -5,37 +5,28 @@
     <v-dropdown :options="nodes" />
 </template>
 
-<script lang="ts">
-import { Component, Vue } from 'vue-property-decorator';
+<script setup lang="ts">
+import { computed } from 'vue';
 
 import { Node } from '@/nodes';
+import { Option } from '@/app/types/common';
+import { useNodesStore } from '@/app/store/nodesStore';
 
-import VDropdown, { Option } from '@/app/components/common/VDropdown.vue';
+import VDropdown from '@/app/components/common/VDropdown.vue';
 
-// @vue/component
-@Component({
-    components: { VDropdown },
-})
-export default class NodeSelectionDropdown extends Vue {
-    /**
-     * List of nodes from store.
-     */
-    public get nodes(): Option[] {
-        const nodes: Node[] = this.$store.state.nodes.nodes;
+const nodesStore = useNodesStore();
 
-        const options: Option[] = nodes.map(
-            (node: Node) => new Option(node.displayedName, () => this.onNodeClick(node.id)),
-        );
+const nodes = computed<Option[]>(() => {
+    const nodeList: Node[] = nodesStore.state.nodes;
 
-        return [new Option('All Nodes', () => this.onNodeClick()), ...options];
-    }
+    const options: Option[] = nodeList.map(
+        (node: Node) => new Option(node.displayedName, () => onNodeClick(node.id)),
+    );
 
-    /**
-     * Callback for node click.
-     * @param nodeId - node id to select
-     */
-    public async onNodeClick(nodeId = ''): Promise<void> {
-        await this.$store.dispatch('nodes/selectNode', nodeId);
-    }
+    return [new Option('All Nodes', () => onNodeClick()), ...options];
+});
+
+async function onNodeClick(nodeId = ''): Promise<void> {
+    await nodesStore.selectNode(nodeId);
 }
 </script>

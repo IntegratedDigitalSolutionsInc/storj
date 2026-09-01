@@ -2,30 +2,67 @@
 // See LICENSE for copying information.
 
 <template>
-    <div id="payment-element">
-        <!-- A Stripe Element will be inserted here. -->
+    <v-progress-linear rounded indeterminate :active="isLoading" />
+    <div ref="paymentContainer">
+        <!-- A Stripe Payment Element will be inserted here. -->
+    </div>
+    <div v-if="collectBillingAddress" ref="addressContainer" class="mt-4">
+        <!-- A Stripe Address Element will be inserted here. -->
     </div>
 </template>
 
 <script setup lang="ts">
-import { onMounted, ref, watch } from 'vue';
+import { onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import { loadStripe } from '@stripe/stripe-js/pure';
-import { Stripe, StripeElements, StripePaymentElement, StripeElementsOptionsMode } from '@stripe/stripe-js';
+import type {
+    Stripe,
+    StripeAddressElement,
+    StripeAddressElementChangeEvent,
+    StripeElements,
+    StripeElementsOptionsMode,
+    StripePaymentElement,
+} from '@stripe/stripe-js';
 import { useTheme } from 'vuetify';
+import { VProgressLinear } from 'vuetify/components';
 
 import { AnalyticsErrorEventSource } from '@/utils/constants/analyticsEventNames';
-import { useNotify } from '@/utils/hooks';
+import { useNotify } from '@/composables/useNotify';
 import { useConfigStore } from '@/store/modules/configStore';
+import { useBillingStore } from '@/store/modules/billingStore';
 
 const configStore = useConfigStore();
+const billingStore = useBillingStore();
 
 const notify = useNotify();
 const theme = useTheme();
+
+const isLoading = ref(true);
+const isUnmounted = ref(false);
+
+const paymentContainer = ref<HTMLElement>();
+const addressContainer = ref<HTMLElement>();
+
+const props = withDefaults(defineProps<{
+    // When true, a Stripe Address Element (mode: 'billing') is mounted in the
+    // same Elements instance as the Payment Element.
+    collectBillingAddress?: boolean;
+}>(), {
+    collectBillingAddress: false,
+});
+
+const emit = defineEmits<{
+    ready: [];
+    billingCountryChange: [code: string | undefined];
+}>();
 
 /**
  * Stripe elements is used to create 'Add Card' form.
  */
 const paymentElement = ref<StripePaymentElement>();
+/**
+ * Stripe Address Element used to collect the billing address (when enabled).
+ */
+const addressElement = ref<StripeAddressElement>();
 /**
  * Stripe library.
  */
@@ -39,73 +76,105 @@ async function initStripe(): Promise<void> {
     const stripePublicKey = configStore.state.config.stripePublicKey;
 
     try {
-        stripe.value = await loadStripe(stripePublicKey);
+        const options: StripeElementsOptionsMode = {
+            currency:'usd',
+            appearance: {
+                theme: theme.global.current.value.dark ? 'night' : 'stripe',
+                labels: 'floating',
+            },
+            // @ts-expect-error clientSecret can be assigned a string but is defined as undefined in the type.
+            clientSecret: await billingStore.getCardSetupSecret(),
+        };
+
+        if (!stripe.value) {
+            // load stripe library
+            stripe.value = await loadStripe(stripePublicKey);
+            if (!stripe.value) throw new Error('Unable to initialize stripe');
+        }
+
+        if (isUnmounted.value || !paymentContainer.value) return;
+
+        // initialize stripe elements
+        elements.value = stripe.value?.elements(options);
+        if (!elements.value) throw new Error('Unable to instantiate elements');
+
+        // create payment element
+        paymentElement.value?.off('ready');
+        paymentElement.value?.unmount();
+        paymentElement.value?.destroy();
+        paymentElement.value = props.collectBillingAddress
+            ? elements.value.create('payment', { fields: { billingDetails: { name: 'never', address: 'never' } } })
+            : elements.value.create('payment');
+        if (!paymentElement.value) throw new Error('Unable to create card element');
+
+        paymentElement.value?.mount(paymentContainer.value);
+        paymentElement.value?.on('ready', () => {
+            isLoading.value = false;
+            emit('ready');
+        });
+
+        if (props.collectBillingAddress && addressContainer.value) {
+            addressElement.value?.off('change');
+            addressElement.value?.unmount();
+            addressElement.value?.destroy();
+            addressElement.value = elements.value.create('address', { mode: 'billing' });
+            addressElement.value.on('change', (event: StripeAddressElementChangeEvent) => {
+                emit('billingCountryChange', event.value.address?.country ?? undefined);
+            });
+            addressElement.value.mount(addressContainer.value);
+        }
     } catch (error) {
+        isLoading.value = false;
         notify.error(error.message, AnalyticsErrorEventSource.BILLING_STRIPE_CARD_INPUT);
         return;
     }
-
-    if (!stripe.value) {
-        notify.error('Unable to initialize stripe', AnalyticsErrorEventSource.BILLING_STRIPE_CARD_INPUT);
-        return;
-    }
-
-    const options: StripeElementsOptionsMode = {
-        mode: 'setup',
-        currency: 'usd',
-        paymentMethodCreation: 'manual',
-        paymentMethodTypes: ['card'],
-        appearance: {
-            theme: theme.global.current.value.dark ? 'night' : 'stripe',
-            labels: 'floating',
-        },
-    };
-    elements.value = stripe.value?.elements(options);
-
-    if (!elements.value) {
-        notify.error('Unable to instantiate elements', AnalyticsErrorEventSource.BILLING_STRIPE_CARD_INPUT);
-        return;
-    }
-
-    paymentElement.value = elements.value.create('payment');
-    if (!paymentElement.value) {
-        notify.error('Unable to create card element', AnalyticsErrorEventSource.BILLING_STRIPE_CARD_INPUT);
-        return;
-    }
-
-    paymentElement.value?.mount('#payment-element');
 }
 
 /**
  * Fires stripe event after all inputs are filled.
  * This method is called from the parent component.
  *
+ * When billing address collection is enabled, Stripe validates the Address Element
+ * during elements.submit() and attaches the address to the payment method on
+ * confirmSetup.
+ *
  * @returns {string} Payment method id.
  * @throws {Error}
  */
 async function onSubmit(): Promise<string> {
-
     if (!(stripe.value && elements.value && paymentElement.value)) {
         throw new Error('Stripe is not initialized');
     }
+    const stripeValue = stripe.value;
+    const elementsValue = elements.value;
 
-    // Trigger form validation
+    // Trigger form validation (includes the billing Address Element when collected).
     const res = await elements.value.submit();
     if (res.error) {
         throw new Error(res.error.message ?? 'There is an issue with the card');
     }
 
-    // Create the PaymentMethod using the details collected by the Payment Element
-    const { error, paymentMethod } = await stripe.value.createPaymentMethod({
-        elements: elements.value,
+    const { error, setupIntent } = await stripeValue.confirmSetup({
+        elements: elementsValue,
+        redirect: 'if_required',
+        confirmParams: {
+            expand: ['payment_method'],
+        },
     });
-    if (error) {
-        throw new Error(error.message ?? 'There is an issue with the card');
+
+    if (error || !setupIntent.payment_method || setupIntent.status !== 'succeeded') {
+        throw new Error(error?.message ?? 'There is an issue with the card');
     }
 
+    const paymentMethod = setupIntent.payment_method;
+
+    if (typeof paymentMethod === 'string') {
+        return paymentMethod;
+    }
     if (paymentMethod.card?.funding === 'prepaid') {
         throw new Error('Prepaid cards are not supported');
     }
+
     return paymentMethod.id;
 }
 
@@ -125,7 +194,20 @@ onMounted(() => {
     initStripe();
 });
 
+onBeforeUnmount(() => {
+    isUnmounted.value = true;
+    paymentElement.value?.off('ready');
+    paymentElement.value?.unmount();
+    paymentElement.value?.destroy();
+    paymentElement.value = undefined;
+    addressElement.value?.off('change');
+    addressElement.value?.unmount();
+    addressElement.value?.destroy();
+    addressElement.value = undefined;
+});
+
 defineExpose({
     onSubmit,
+    initStripe,
 });
 </script>

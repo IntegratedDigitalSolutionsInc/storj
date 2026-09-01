@@ -329,7 +329,14 @@ func Schema() map[string]*dbschema.Schema {
 							Name:       "uplink_cert_id",
 							Type:       "INTEGER",
 							IsNullable: false,
-							Reference:  &dbschema.Reference{Table: "certificate", Column: "cert_id", OnDelete: "", OnUpdate: ""},
+						},
+					},
+					ForeignKeys: []*dbschema.ForeignKey{
+						{
+							Name:           "fk_0",
+							LocalColumns:   []string{"uplink_cert_id"},
+							ForeignTable:   "certificate",
+							ForeignColumns: []string{"cert_id"},
 						},
 					},
 				},
@@ -365,7 +372,14 @@ func Schema() map[string]*dbschema.Schema {
 							Name:       "uplink_cert_id",
 							Type:       "INTEGER",
 							IsNullable: false,
-							Reference:  &dbschema.Reference{Table: "certificate", Column: "cert_id", OnDelete: "", OnUpdate: ""},
+						},
+					},
+					ForeignKeys: []*dbschema.ForeignKey{
+						{
+							Name:           "fk_0",
+							LocalColumns:   []string{"uplink_cert_id"},
+							ForeignTable:   "certificate",
+							ForeignColumns: []string{"cert_id"},
 						},
 					},
 				},
@@ -473,12 +487,19 @@ func Schema() map[string]*dbschema.Schema {
 							Name:       "uplink_cert_id",
 							Type:       "INTEGER",
 							IsNullable: false,
-							Reference:  &dbschema.Reference{Table: "certificate", Column: "cert_id", OnDelete: "", OnUpdate: ""},
 						},
 						{
 							Name:       "uplink_piece_hash",
 							Type:       "BLOB",
 							IsNullable: false,
+						},
+					},
+					ForeignKeys: []*dbschema.ForeignKey{
+						{
+							Name:           "fk_0",
+							LocalColumns:   []string{"uplink_cert_id"},
+							ForeignTable:   "certificate",
+							ForeignColumns: []string{"cert_id"},
 						},
 					},
 				},
@@ -652,12 +673,19 @@ func Schema() map[string]*dbschema.Schema {
 							Name:       "satellite_id",
 							Type:       "BLOB",
 							IsNullable: false,
-							Reference:  &dbschema.Reference{Table: "satellites", Column: "node_id", OnDelete: "", OnUpdate: ""},
 						},
 						{
 							Name:       "starting_disk_usage",
 							Type:       "INTEGER",
 							IsNullable: false,
+						},
+					},
+					ForeignKeys: []*dbschema.ForeignKey{
+						{
+							Name:           "fk_0",
+							LocalColumns:   []string{"satellite_id"},
+							ForeignTable:   "satellites",
+							ForeignColumns: []string{"node_id"},
 						},
 					},
 				},
@@ -713,7 +741,7 @@ func Schema() map[string]*dbschema.Schema {
 			Tables: []*dbschema.Table{
 				{
 					Name:       "storage_usage",
-					PrimaryKey: []string{"satellite_id", "timestamp"},
+					PrimaryKey: []string{"timestamp", "satellite_id"},
 					Columns: []*dbschema.Column{
 						{
 							Name:       "at_rest_total",
@@ -744,7 +772,7 @@ func Schema() map[string]*dbschema.Schema {
 			Tables: []*dbschema.Table{
 				{
 					Name:       "used_space_per_prefix",
-					PrimaryKey: []string{"piece_prefix", "satellite_id"},
+					PrimaryKey: []string{"satellite_id", "piece_prefix"},
 					Columns: []*dbschema.Column{
 						{
 							Name:       "last_updated",

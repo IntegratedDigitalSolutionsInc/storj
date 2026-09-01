@@ -62,12 +62,12 @@ func (r *MetabaseSearchRepository) UpdateMetadata(ctx context.Context, loc metab
 	}
 
 	// Update metadata
-	obj := metabase.UpdateObjectLastCommittedMetadata{
+	obj := metabase.UpdateObjectLastCommittedClearMetadata{
 		ObjectLocation: loc,
 		ClearMetadata:  newMetadata,
 		StreamID:       current.StreamID,
 	}
-	err = r.db.UpdateObjectLastCommittedMetadata(ctx, obj)
+	err = r.db.UpdateObjectLastCommittedClearMetadata(ctx, obj)
 	if err != nil {
 		return fmt.Errorf("%w: %v", ErrInternalError, err)
 	}

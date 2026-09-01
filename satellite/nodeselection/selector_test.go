@@ -4,8 +4,10 @@
 package nodeselection_test
 
 import (
+	"context"
 	"fmt"
 	"math"
+	"slices"
 	"strconv"
 	"sync/atomic"
 	"testing"
@@ -50,7 +52,7 @@ func TestSelectByID(t *testing.T) {
 	}
 
 	nodes := []*nodeselection.SelectedNode{subnetA1, subnetA2, subnetB1}
-	selector := nodeselection.RandomSelector()(nodes, nil)
+	selector := nodeselection.RandomSelector()(ctx, nodes, nil)
 
 	const (
 		reqCount       = 2
@@ -61,7 +63,7 @@ func TestSelectByID(t *testing.T) {
 
 	// perform many node selections that selects 2 nodes
 	for i := 0; i < executionCount; i++ {
-		selectedNodes, err := selector(storj.NodeID{}, reqCount, nil, nil)
+		selectedNodes, err := selector(ctx, storj.NodeID{}, reqCount, nil, nil)
 		require.NoError(t, err)
 		require.Len(t, selectedNodes, reqCount)
 		for _, node := range selectedNodes {
@@ -113,7 +115,7 @@ func TestSelectBySubnet(t *testing.T) {
 	nodes := []*nodeselection.SelectedNode{subnetA1, subnetA2, subnetB1}
 	attribute, err := nodeselection.CreateNodeAttribute("last_net")
 	require.NoError(t, err)
-	selector := nodeselection.AttributeGroupSelector(attribute)(nodes, nil)
+	selector := nodeselection.AttributeGroupSelector(attribute)(ctx, nodes, nil)
 
 	const (
 		reqCount       = 2
@@ -124,7 +126,7 @@ func TestSelectBySubnet(t *testing.T) {
 
 	// perform many node selections that selects 2 nodes
 	for i := 0; i < executionCount; i++ {
-		selectedNodes, err := selector(storj.NodeID{}, reqCount, nil, nil)
+		selectedNodes, err := selector(ctx, storj.NodeID{}, reqCount, nil, nil)
 		require.NoError(t, err)
 		require.Len(t, selectedNodes, reqCount)
 		for _, node := range selectedNodes {
@@ -188,7 +190,7 @@ func TestSelectBySubnetOneAtATime(t *testing.T) {
 	nodes := []*nodeselection.SelectedNode{subnetA1, subnetA2, subnetB1}
 	attribute, err := nodeselection.CreateNodeAttribute("last_net")
 	require.NoError(t, err)
-	selector := nodeselection.AttributeGroupSelector(attribute)(nodes, nil)
+	selector := nodeselection.AttributeGroupSelector(attribute)(ctx, nodes, nil)
 
 	const (
 		reqCount       = 1
@@ -199,7 +201,7 @@ func TestSelectBySubnetOneAtATime(t *testing.T) {
 
 	// perform many node selections that selects 1 node
 	for i := 0; i < executionCount; i++ {
-		selectedNodes, err := selector(storj.NodeID{}, reqCount, nil, nil)
+		selectedNodes, err := selector(ctx, storj.NodeID{}, reqCount, nil, nil)
 		require.NoError(t, err)
 		require.Len(t, selectedNodes, reqCount)
 		for _, node := range selectedNodes {
@@ -257,16 +259,16 @@ func TestSelectFiltered(t *testing.T) {
 
 	nodes := []*nodeselection.SelectedNode{subnetA1, subnetA2, subnetB1}
 
-	selector := nodeselection.RandomSelector()(nodes, nil)
-	selected, err := selector(storj.NodeID{}, 3, nil, nil)
+	selector := nodeselection.RandomSelector()(ctx, nodes, nil)
+	selected, err := selector(ctx, storj.NodeID{}, 3, nil, nil)
 	require.NoError(t, err)
 	assert.Len(t, selected, 3)
-	selected, err = selector(storj.NodeID{}, 3, nil, nil)
+	selected, err = selector(ctx, storj.NodeID{}, 3, nil, nil)
 	require.NoError(t, err)
 	assert.Len(t, selected, 3)
 
-	selector = nodeselection.RandomSelector()(nodes, nodeselection.NodeFilters{}.WithExcludedIDs([]storj.NodeID{firstID, secondID}))
-	selected, err = selector(storj.NodeID{}, 3, nil, nil)
+	selector = nodeselection.RandomSelector()(ctx, nodes, nodeselection.NodeFilters{}.WithExcludedIDs([]storj.NodeID{firstID, secondID}))
+	selected, err = selector(ctx, storj.NodeID{}, 3, nil, nil)
 	require.NoError(t, err)
 	assert.Len(t, selected, 1)
 }
@@ -293,15 +295,18 @@ func TestSelectFilteredMulti(t *testing.T) {
 	filter := nodeselection.NodeFilters{}.WithCountryFilter(location.NewSet(location.Germany))
 	attribute, err := nodeselection.CreateNodeAttribute("last_net")
 	require.NoError(t, err)
-	selector := nodeselection.AttributeGroupSelector(attribute)(nodes, filter)
+	selector := nodeselection.AttributeGroupSelector(attribute)(ctx, nodes, filter)
 	for i := 0; i < 100; i++ {
-		selected, err := selector(storj.NodeID{}, 4, nil, nil)
+		selected, err := selector(ctx, storj.NodeID{}, 4, nil, nil)
 		require.NoError(t, err)
 		assert.Len(t, selected, 4)
 	}
 }
 
 func TestFilterSelector(t *testing.T) {
+	ctx := testcontext.New(t)
+	defer ctx.Cleanup()
+
 	list := nodeselection.AllowedNodesFilter([]storj.NodeID{
 		testidentity.MustPregeneratedIdentity(1, storj.LatestIDVersion()).ID,
 		testidentity.MustPregeneratedIdentity(2, storj.LatestIDVersion()).ID,
@@ -318,9 +323,9 @@ func TestFilterSelector(t *testing.T) {
 		})
 	}
 
-	initialized := selector(nodes, nil)
+	initialized := selector(ctx, nodes, nil)
 	for i := 0; i < 100; i++ {
-		selected, err := initialized(storj.NodeID{}, 3, []storj.NodeID{}, nil)
+		selected, err := initialized(ctx, storj.NodeID{}, 3, []storj.NodeID{}, nil)
 		require.NoError(t, err)
 		for _, s := range selected {
 			for _, w := range list {
@@ -355,12 +360,12 @@ func TestBalancedSelector(t *testing.T) {
 	}
 
 	ctx := testcontext.New(t)
-	selector := nodeselection.BalancedGroupBasedSelector(attribute, nil)(nodes, nil)
+	selector := nodeselection.BalancedGroupBasedSelector(attribute, nil)(ctx, nodes, nil)
 
 	var badSelection atomic.Int64
 	for i := 0; i < 1000; i++ {
 		ctx.Go(func() error {
-			selectedNodes, err := selector(storj.NodeID{}, 10, nil, nil)
+			selectedNodes, err := selector(ctx, storj.NodeID{}, 10, nil, nil)
 			if err != nil {
 				t.Log("Selection is failed", err.Error())
 				badSelection.Add(1)
@@ -394,6 +399,9 @@ func TestBalancedSelector(t *testing.T) {
 }
 
 func TestBalancedSelectorWithExisting(t *testing.T) {
+	ctx := testcontext.New(t)
+	defer ctx.Cleanup()
+
 	attribute, err := nodeselection.CreateNodeAttribute("tag:owner")
 	require.NoError(t, err)
 
@@ -401,7 +409,7 @@ func TestBalancedSelectorWithExisting(t *testing.T) {
 	var nodes []*nodeselection.SelectedNode
 
 	var excluded []storj.NodeID
-	var alreadySelected []*nodeselection.SelectedNode
+	var alreadySelected []storj.NodeID
 
 	idIndex := 0
 	for owner, count := range ownerCounts {
@@ -420,16 +428,16 @@ func TestBalancedSelectorWithExisting(t *testing.T) {
 				excluded = append(excluded, nodes[len(nodes)-1].ID)
 			}
 			if owner == "B" && len(alreadySelected) < 9 {
-				alreadySelected = append(alreadySelected, nodes[len(nodes)-1])
+				alreadySelected = append(alreadySelected, nodes[len(nodes)-1].ID)
 			}
 		}
 	}
 
-	selector := nodeselection.BalancedGroupBasedSelector(attribute, nil)(nodes, nil)
+	selector := nodeselection.BalancedGroupBasedSelector(attribute, nil)(ctx, nodes, nil)
 
 	histogram := map[string]int{}
 	for i := 0; i < 1000; i++ {
-		selectedNodes, err := selector(storj.NodeID{}, 7, excluded, alreadySelected)
+		selectedNodes, err := selector(ctx, storj.NodeID{}, 7, excluded, alreadySelected)
 		require.NoError(t, err)
 
 		require.Len(t, selectedNodes, 7)
@@ -455,6 +463,9 @@ func TestBalancedSelectorWithExisting(t *testing.T) {
 }
 
 func TestUnvettedSelector(t *testing.T) {
+	ctx := testcontext.New(t)
+	defer ctx.Cleanup()
+
 	var nodes []*nodeselection.SelectedNode
 	for i := 0; i < 20; i++ {
 		node := &nodeselection.SelectedNode{
@@ -469,10 +480,10 @@ func TestUnvettedSelector(t *testing.T) {
 
 	t.Run("0 new nodes", func(t *testing.T) {
 		selectorInit := nodeselection.UnvettedSelector(1.0, nodeselection.RandomSelector())
-		selector := selectorInit(nodes[:10], nil)
+		selector := selectorInit(ctx, nodes[:10], nil)
 
 		for i := 0; i < 100; i++ {
-			selected, err := selector(storj.NodeID{}, 10, nil, nil)
+			selected, err := selector(ctx, storj.NodeID{}, 10, nil, nil)
 			require.NoError(t, err)
 			require.Len(t, selected, 10)
 			require.Equal(t, 0, countUnvetted(selected))
@@ -481,10 +492,10 @@ func TestUnvettedSelector(t *testing.T) {
 
 	t.Run("25% of 5", func(t *testing.T) {
 		selectorInit := nodeselection.UnvettedSelector(0.25, nodeselection.RandomSelector())
-		selector := selectorInit(nodes, nil)
+		selector := selectorInit(ctx, nodes, nil)
 
 		for i := 0; i < 100; i++ {
-			selected, err := selector(storj.NodeID{}, 5, nil, nil)
+			selected, err := selector(ctx, storj.NodeID{}, 5, nil, nil)
 			require.NoError(t, err)
 			require.Len(t, selected, 5)
 			require.Equal(t, 1, countUnvetted(selected))
@@ -493,10 +504,10 @@ func TestUnvettedSelector(t *testing.T) {
 
 	t.Run("15% of 5", func(t *testing.T) {
 		selectorInit := nodeselection.UnvettedSelector(0.15, nodeselection.RandomSelector())
-		selector := selectorInit(nodes, nil)
+		selector := selectorInit(ctx, nodes, nil)
 
 		for i := 0; i < 100; i++ {
-			selected, err := selector(storj.NodeID{}, 5, nil, nil)
+			selected, err := selector(ctx, storj.NodeID{}, 5, nil, nil)
 			require.NoError(t, err)
 			// The faction result in less than 1 node, so it randonly decide if 0 or 1 vetted node is
 			// selected.
@@ -506,12 +517,12 @@ func TestUnvettedSelector(t *testing.T) {
 
 	t.Run("0.01% of 5", func(t *testing.T) {
 		selectorInit := nodeselection.UnvettedSelector(0.0001, nodeselection.RandomSelector())
-		selector := selectorInit(nodes, nil)
+		selector := selectorInit(ctx, nodes, nil)
 
 		for i := 0; i < 100; i++ {
-			selected, err := selector(storj.NodeID{}, 5, nil, nil)
+			selected, err := selector(ctx, storj.NodeID{}, 5, nil, nil)
 			require.NoError(t, err)
-			// The faction result in less than 1 node, so it randonly decide if 0 or 1 vetted node is
+			// The faction result in less than 1 node, so it randomly decide if 0 or 1 vetted node is
 			// selected.
 			require.InDelta(t, 0, countUnvetted(selected), 1)
 		}
@@ -519,10 +530,10 @@ func TestUnvettedSelector(t *testing.T) {
 
 	t.Run("0% of 5", func(t *testing.T) {
 		selectorInit := nodeselection.UnvettedSelector(0, nodeselection.RandomSelector())
-		selector := selectorInit(nodes, nil)
+		selector := selectorInit(ctx, nodes, nil)
 
 		for i := 0; i < 100; i++ {
-			selected, err := selector(storj.NodeID{}, 5, nil, nil)
+			selected, err := selector(ctx, storj.NodeID{}, 5, nil, nil)
 			require.NoError(t, err)
 			require.Zero(t, countUnvetted(selected))
 		}
@@ -530,10 +541,10 @@ func TestUnvettedSelector(t *testing.T) {
 
 	t.Run("negative % of 5", func(t *testing.T) {
 		selectorInit := nodeselection.UnvettedSelector(-1, nodeselection.RandomSelector())
-		selector := selectorInit(nodes, nil)
+		selector := selectorInit(ctx, nodes, nil)
 
 		for i := 0; i < 100; i++ {
-			selected, err := selector(storj.NodeID{}, 5, nil, nil)
+			selected, err := selector(ctx, storj.NodeID{}, 5, nil, nil)
 			require.NoError(t, err)
 			require.Zero(t, countUnvetted(selected))
 		}
@@ -541,17 +552,49 @@ func TestUnvettedSelector(t *testing.T) {
 
 	t.Run("NaN % of 5", func(t *testing.T) {
 		selectorInit := nodeselection.UnvettedSelector(math.NaN(), nodeselection.RandomSelector())
-		selector := selectorInit(nodes, nil)
+		selector := selectorInit(ctx, nodes, nil)
 
 		for i := 0; i < 100; i++ {
-			selected, err := selector(storj.NodeID{}, 5, nil, nil)
+			selected, err := selector(ctx, storj.NodeID{}, 5, nil, nil)
 			require.NoError(t, err)
 			require.Zero(t, countUnvetted(selected))
 		}
 	})
 }
 
+func TestUnvettedSelectorFraction(t *testing.T) {
+	ctx := testcontext.New(t)
+	defer ctx.Cleanup()
+
+	var nodes []*nodeselection.SelectedNode
+	for i := 0; i < 100; i++ {
+		node := &nodeselection.SelectedNode{
+			ID: testrand.NodeID(),
+		}
+		if i >= 5 {
+			node.Vetted = true
+		}
+
+		nodes = append(nodes, node)
+	}
+
+	// now we have 5% vetted nodes. When we define 10% vetted fraction,it should be used as upper limit, but 5% should be used instead of overusage.
+
+	selectorInit := nodeselection.UnvettedSelector(0.1, nodeselection.RandomSelector())
+	selector := selectorInit(ctx, nodes, nil)
+
+	for i := 0; i < 100; i++ {
+		selected, err := selector(ctx, storj.NodeID{}, 50, nil, nil)
+		require.NoError(t, err)
+		require.Len(t, selected, 50)
+		require.Equal(t, 2, countUnvetted(selected))
+	}
+
+}
 func TestChoiceOfTwo(t *testing.T) {
+	ctx := testcontext.New(t)
+	defer ctx.Cleanup()
+
 	tracker := &mockTracker{
 		trustedUplink: testrand.NodeID(),
 	}
@@ -568,11 +611,11 @@ func TestChoiceOfTwo(t *testing.T) {
 		nodes = append(nodes, node)
 	}
 
-	selector := nodeselection.ChoiceOfTwo(tracker, nodeselection.RandomSelector())
-	initializedSelector := selector(nodes, nil)
+	selector := nodeselection.ChoiceOfTwo(nodeselection.Compare(tracker), nodeselection.RandomSelector())
+	initializedSelector := selector(ctx, nodes, nil)
 
 	for i := 0; i < 100; i++ {
-		selectedNodes, err := initializedSelector(tracker.trustedUplink, 10, nil, nil)
+		selectedNodes, err := initializedSelector(ctx, tracker.trustedUplink, 10, nil, nil)
 		require.NoError(t, err)
 		require.Len(t, selectedNodes, 10)
 		slowNodes := countSlowNodes(selectedNodes)
@@ -584,7 +627,7 @@ func TestChoiceOfTwo(t *testing.T) {
 
 	suboptimal := 0
 	for i := 0; i < 1000; i++ {
-		selectedNodes, err := initializedSelector(storj.NodeID{}, 10, nil, nil)
+		selectedNodes, err := initializedSelector(ctx, storj.NodeID{}, 10, nil, nil)
 		require.NoError(t, err)
 		require.Len(t, selectedNodes, 10)
 
@@ -601,6 +644,9 @@ func TestChoiceOfTwo(t *testing.T) {
 }
 
 func TestChoiceOfN(t *testing.T) {
+	ctx := testcontext.New(t)
+	defer ctx.Cleanup()
+
 	tracker := &mockTracker{
 		trustedUplink: testrand.NodeID(),
 	}
@@ -617,11 +663,11 @@ func TestChoiceOfN(t *testing.T) {
 		nodes = append(nodes, node)
 	}
 
-	selector := nodeselection.ChoiceOfN(tracker, 3, nodeselection.RandomSelector())
-	initializedSelector := selector(nodes, nil)
+	selector := nodeselection.ChoiceOfN(nodeselection.Compare(tracker), 3, nodeselection.RandomSelector())
+	initializedSelector := selector(ctx, nodes, nil)
 
 	for i := 0; i < 100; i++ {
-		selectedNodes, err := initializedSelector(tracker.trustedUplink, 10, nil, nil)
+		selectedNodes, err := initializedSelector(ctx, tracker.trustedUplink, 10, nil, nil)
 		require.NoError(t, err)
 		require.Len(t, selectedNodes, 10)
 		slowNodes := countSlowNodes(selectedNodes)
@@ -633,7 +679,7 @@ func TestChoiceOfN(t *testing.T) {
 
 	suboptimal := 0
 	for i := 0; i < 1000; i++ {
-		selectedNodes, err := initializedSelector(storj.NodeID{}, 10, nil, nil)
+		selectedNodes, err := initializedSelector(ctx, storj.NodeID{}, 10, nil, nil)
 		require.NoError(t, err)
 		require.Len(t, selectedNodes, 10)
 
@@ -650,6 +696,9 @@ func TestChoiceOfN(t *testing.T) {
 }
 
 func TestFilterBest(t *testing.T) {
+	ctx := testcontext.New(t)
+	defer ctx.Cleanup()
+
 	tracker := &mockTracker{
 		trustedUplink: storj.NodeID{},
 	}
@@ -669,9 +718,9 @@ func TestFilterBest(t *testing.T) {
 	t.Run("keep best 40%", func(t *testing.T) {
 		selectorInit := nodeselection.FilterBest(tracker, "40%", "", nodeselection.RandomSelector())
 		for i := 0; i < 2; i++ {
-			nodeSelector := selectorInit(nodes, nil)
+			nodeSelector := selectorInit(ctx, nodes, nil)
 			for i := 0; i < 100; i++ {
-				selected, err := nodeSelector(storj.NodeID{}, 8, nil, nil)
+				selected, err := nodeSelector(ctx, storj.NodeID{}, 8, nil, nil)
 				require.NoError(t, err)
 				require.Len(t, selected, 8)
 				require.Equal(t, 0, countSlowNodes(selected))
@@ -681,9 +730,9 @@ func TestFilterBest(t *testing.T) {
 
 	t.Run("keep best 8", func(t *testing.T) {
 		selectorInit := nodeselection.FilterBest(tracker, "8", "", nodeselection.RandomSelector())
-		nodeSelector := selectorInit(nodes, nil)
+		nodeSelector := selectorInit(ctx, nodes, nil)
 		for i := 0; i < 10; i++ {
-			selected, err := nodeSelector(storj.NodeID{}, 2, nil, nil)
+			selected, err := nodeSelector(ctx, storj.NodeID{}, 2, nil, nil)
 			require.NoError(t, err)
 			require.Len(t, selected, 2)
 			require.Equal(t, 0, countSlowNodes(selected))
@@ -692,9 +741,9 @@ func TestFilterBest(t *testing.T) {
 
 	t.Run("cut off worst 30", func(t *testing.T) {
 		selectorInit := nodeselection.FilterBest(tracker, "-30", "", nodeselection.RandomSelector())
-		nodeSelector := selectorInit(nodes, nil)
+		nodeSelector := selectorInit(ctx, nodes, nil)
 		for i := 0; i < 10; i++ {
-			selected, err := nodeSelector(storj.NodeID{}, 10, nil, nil)
+			selected, err := nodeSelector(ctx, storj.NodeID{}, 10, nil, nil)
 			require.NoError(t, err)
 			require.Len(t, selected, 0)
 			require.Equal(t, 0, countSlowNodes(selected))
@@ -703,6 +752,9 @@ func TestFilterBest(t *testing.T) {
 }
 
 func TestFilterBestOfN(t *testing.T) {
+	ctx := testcontext.New(t)
+	defer ctx.Cleanup()
+
 	tracker := &mockTracker{
 		trustedUplink: storj.NodeID{},
 	}
@@ -721,9 +773,9 @@ func TestFilterBestOfN(t *testing.T) {
 
 	t.Run("fastest 10 out of 20", func(t *testing.T) {
 		selectorInit := nodeselection.BestOfN(tracker, 2.0, nodeselection.RandomSelector())
-		nodeSelector := selectorInit(nodes, nil)
+		nodeSelector := selectorInit(ctx, nodes, nil)
 		for i := 0; i < 100; i++ {
-			selected, err := nodeSelector(storj.NodeID{}, 10, nil, nil)
+			selected, err := nodeSelector(ctx, storj.NodeID{}, 10, nil, nil)
 			require.NoError(t, err)
 			require.Len(t, selected, 10)
 			require.Equal(t, 0, countSlowNodes(selected))
@@ -732,9 +784,9 @@ func TestFilterBestOfN(t *testing.T) {
 
 	t.Run("fastest 10 out of 5", func(t *testing.T) {
 		selectorInit := nodeselection.BestOfN(tracker, 0.5, nodeselection.RandomSelector())
-		nodeSelector := selectorInit(nodes, nil)
+		nodeSelector := selectorInit(ctx, nodes, nil)
 		for i := 0; i < 100; i++ {
-			selected, err := nodeSelector(storj.NodeID{}, 10, nil, nil)
+			selected, err := nodeSelector(ctx, storj.NodeID{}, 10, nil, nil)
 			require.NoError(t, err)
 			require.Len(t, selected, 5)
 		}
@@ -864,7 +916,7 @@ func TestIfWithEqSelector(t *testing.T) {
 	require.NoError(t, err)
 
 	selector := nodeselection.BalancedGroupBasedSelector(nodeselection.IfSelector(
-		nodeselection.EqualSelector(surgeTag, "true"), lastIpPortAttribute, lastNetAttribute), nil)(nodes, nil)
+		nodeselection.EqualSelector(surgeTag, "true"), lastIpPortAttribute, lastNetAttribute), nil)(ctx, nodes, nil)
 
 	const (
 		reqCount       = 3
@@ -875,7 +927,7 @@ func TestIfWithEqSelector(t *testing.T) {
 
 	// perform many node selections that selects 3 nodes
 	for i := 0; i < executionCount; i++ {
-		selectedNodes, err := selector(storj.NodeID{}, reqCount, nil, nil)
+		selectedNodes, err := selector(ctx, storj.NodeID{}, reqCount, nil, nil)
 		require.NoError(t, err)
 		require.Len(t, selectedNodes, reqCount)
 		for _, node := range selectedNodes {
@@ -908,10 +960,12 @@ func TestIfWithEqSelector(t *testing.T) {
 }
 
 func TestDualSelector(t *testing.T) {
+	ctx := testcontext.New(t)
+	defer ctx.Cleanup()
 
-	slowFilter, err := nodeselection.NewAttributeFilter("email", "slow")
+	slowFilter, err := nodeselection.NewAttributeFilter("email", "==", "slow")
 	require.NoError(t, err)
-	fastFilter, err := nodeselection.NewAttributeFilter("email", "fast")
+	fastFilter, err := nodeselection.NewAttributeFilter("email", "==", "fast")
 	require.NoError(t, err)
 
 	t.Run("3 from slow, 7 from remaining", func(t *testing.T) {
@@ -922,9 +976,9 @@ func TestDualSelector(t *testing.T) {
 			nodeselection.FilteredSelector(slowFilter, nodeselection.RandomSelector()),
 			nodeselection.FilteredSelector(fastFilter, nodeselection.RandomSelector()),
 		)
-		nodeSelector := selectorInit(nodes, nil)
+		nodeSelector := selectorInit(ctx, nodes, nil)
 		for i := 0; i < 100; i++ {
-			selected, err := nodeSelector(storj.NodeID{}, 10, nil, nil)
+			selected, err := nodeSelector(ctx, storj.NodeID{}, 10, nil, nil)
 			require.NoError(t, err)
 			require.Len(t, selected, 10)
 			require.Equal(t, 3, countSlowNodes(selected))
@@ -939,9 +993,9 @@ func TestDualSelector(t *testing.T) {
 			nodeselection.FilteredSelector(slowFilter, nodeselection.RandomSelector()),
 			nodeselection.FilteredSelector(fastFilter, nodeselection.RandomSelector()),
 		)
-		nodeSelector := selectorInit(nodes, nil)
+		nodeSelector := selectorInit(ctx, nodes, nil)
 		for i := 0; i < 100; i++ {
-			selected, err := nodeSelector(storj.NodeID{}, 10, nil, nil)
+			selected, err := nodeSelector(ctx, storj.NodeID{}, 10, nil, nil)
 			require.NoError(t, err)
 			require.Len(t, selected, 10)
 			require.Equal(t, 0, countSlowNodes(selected))
@@ -956,9 +1010,9 @@ func TestDualSelector(t *testing.T) {
 			nodeselection.FilteredSelector(slowFilter, nodeselection.RandomSelector()),
 			nodeselection.FilteredSelector(fastFilter, nodeselection.RandomSelector()),
 		)
-		nodeSelector := selectorInit(nodes, nil)
+		nodeSelector := selectorInit(ctx, nodes, nil)
 		for i := 0; i < 100; i++ {
-			selected, err := nodeSelector(storj.NodeID{}, 10, nil, nil)
+			selected, err := nodeSelector(ctx, storj.NodeID{}, 10, nil, nil)
 			require.NoError(t, err)
 			require.Len(t, selected, 3)
 			require.Equal(t, 3, countSlowNodes(selected))
@@ -973,11 +1027,11 @@ func TestDualSelector(t *testing.T) {
 			nodeselection.FilteredSelector(slowFilter, nodeselection.RandomSelector()),
 			nodeselection.FilteredSelector(fastFilter, nodeselection.RandomSelector()),
 		)
-		nodeSelector := selectorInit(nodes, nil)
+		nodeSelector := selectorInit(ctx, nodes, nil)
 		slowCounts := 0
 		allCounts := 0
 		for i := 0; i < 1000; i++ {
-			selected, err := nodeSelector(storj.NodeID{}, 10, nil, nil)
+			selected, err := nodeSelector(ctx, storj.NodeID{}, 10, nil, nil)
 			require.NoError(t, err)
 			slowNodeCount := countSlowNodes(selected)
 			slowCounts += slowNodeCount
@@ -1119,6 +1173,9 @@ func TestLastBut(t *testing.T) {
 }
 
 func TestChoiceOfNSelection(t *testing.T) {
+	ctx := testcontext.New(t)
+	defer ctx.Cleanup()
+
 	// pre-generate 4 selections
 	var selections [][]*nodeselection.SelectedNode
 	for i := 0; i < 4; i++ {
@@ -1137,15 +1194,15 @@ func TestChoiceOfNSelection(t *testing.T) {
 	}
 
 	ix := -1
-	predictableSelector := func(nodes []*nodeselection.SelectedNode, filter nodeselection.NodeFilter) nodeselection.NodeSelector {
-		return func(requester storj.NodeID, n int, excluded []storj.NodeID, alreadySelected []*nodeselection.SelectedNode) ([]*nodeselection.SelectedNode, error) {
+	predictableSelector := func(ctx context.Context, nodes []*nodeselection.SelectedNode, filter nodeselection.NodeFilter) nodeselection.NodeSelector {
+		return func(ctx context.Context, requester storj.NodeID, n int, excluded []storj.NodeID, alreadySelected []storj.NodeID) ([]*nodeselection.SelectedNode, error) {
 			ix++
 			return selections[ix], nil
 		}
 	}
 	selector := nodeselection.ChoiceOfNSelection(3, predictableSelector, nodeselection.LastBut(nodeselection.Desc(nodeselection.PieceCount(10)), 0))
-	initializedSelector := selector(nil, nil)
-	selection, err := initializedSelector(storj.NodeID{}, 10, nil, nil)
+	initializedSelector := selector(ctx, nil, nil)
+	selection, err := initializedSelector(ctx, storj.NodeID{}, 10, nil, nil)
 	require.NoError(t, err)
 
 	require.Len(t, selection, 10)
@@ -1165,9 +1222,9 @@ func TestMin(t *testing.T) {
 	tracker.slowNodes = append(tracker.slowNodes, node2)
 
 	env := map[interface{}]interface{}{
-		"min":     nodeselection.Min,
 		"tracker": tracker,
 	}
+	nodeselection.AddArithmetic(env)
 	test := func(expression string, node storj.NodeID, expected float64) {
 		evaluated, err := mito.Eval(expression, env)
 		require.NoError(t, err)
@@ -1187,6 +1244,9 @@ func TestMin(t *testing.T) {
 }
 
 func TestWeightedSelector(t *testing.T) {
+	ctx := testcontext.New(t)
+	defer ctx.Cleanup()
+
 	var nodes []*nodeselection.SelectedNode
 	idIndex := 0
 
@@ -1207,15 +1267,15 @@ func TestWeightedSelector(t *testing.T) {
 
 	// 3x more chance to be selected --> selecting 10 nodes --> very high chance, for being selected (at least once)
 	nodes[0].Tags[0].Value = []byte("500")
-	val, err := nodeselection.CreateNodeValue("tag:1111111111111111111111111111111112m1s9K/weight")
+	val, err := nodeselection.CreateNodeValue("tag:1111111111111111111111111111111112m1s9K/weight?100")
 	require.NoError(t, err)
 
-	selector := nodeselection.WeightedSelector(val, 100, nil)(nodes, nil)
+	selector := nodeselection.WeightedSelector(val, nil)(ctx, nodes, nil)
 
 	histogram := map[storj.NodeID]int{}
 
 	for i := 0; i < 10000; i++ {
-		selectedNodes, err := selector(storj.NodeID{}, 10, nil, nil)
+		selectedNodes, err := selector(ctx, storj.NodeID{}, 10, nil, nil)
 		require.NoError(t, err)
 		require.Len(t, selectedNodes, 10)
 
@@ -1224,7 +1284,548 @@ func TestWeightedSelector(t *testing.T) {
 		}
 	}
 
+	selector = nodeselection.WeightedSelector(val, nodeselection.NodeFilterFunc(func(node *nodeselection.SelectedNode) bool {
+		return false
+	}))(ctx, nodes, nil)
+	selectedNodes, err := selector(ctx, storj.NodeID{}, 10, nil, nil)
+	require.NoError(t, err)
+	require.Len(t, selectedNodes, 0)
+
 	// specific node selected at least 3 times more
 	require.Greater(t, float64(histogram[nodes[0].ID])/float64(histogram[nodes[1].ID]), float64(3))
 
+}
+
+func TestReduce(t *testing.T) {
+	ctx := testcontext.New(t)
+	defer ctx.Cleanup()
+
+	t.Run("no constraints", func(t *testing.T) {
+		nodes := []*nodeselection.SelectedNode{
+			{ID: testrand.NodeID(), LastNet: "192.168.1.0/24"},
+			{ID: testrand.NodeID(), LastNet: "192.168.2.0/24"},
+		}
+
+		selectorInit := nodeselection.Reduce(nodeselection.RandomSelector(), nil)
+		selector := selectorInit(ctx, nodes, nil)
+
+		selected, err := selector(ctx, storj.NodeID{}, 2, nil, nil)
+		require.NoError(t, err)
+		require.Greater(t, len(selected), 0)
+	})
+
+	t.Run("single constraint - functional test", func(t *testing.T) {
+		// Create nodes with different subnets to test AtLeast constraint
+		nodes := []*nodeselection.SelectedNode{
+			{ID: testrand.NodeID(), LastNet: "192.168.1.0/24"},
+			{ID: testrand.NodeID(), LastNet: "192.168.2.0/24"},
+			{ID: testrand.NodeID(), LastNet: "192.168.3.0/24"},
+			{ID: testrand.NodeID(), LastNet: "192.168.4.0/24"},
+			{ID: testrand.NodeID(), LastNet: "192.168.5.0/24"},
+		}
+
+		attr, err := nodeselection.CreateNodeAttribute("last_net")
+		require.NoError(t, err)
+
+		selectorInit := nodeselection.Reduce(
+			nodeselection.RandomSelector(),
+			nil,
+			nodeselection.AtLeast(attr, 2), // Include nodes until we have 2 different groups
+		)
+		selector := selectorInit(ctx, nodes, nil)
+
+		selected, err := selector(ctx, storj.NodeID{}, 5, nil, nil)
+		require.NoError(t, err)
+		require.Len(t, selected, 2, "Should include exactly 2 nodes (when we have 2 different groups, needMore becomes false)")
+	})
+
+	t.Run("multiple constraints", func(t *testing.T) {
+		// Create nodes with different attributes
+		nodes := []*nodeselection.SelectedNode{
+			{ID: testrand.NodeID(), LastNet: "192.168.1.0/24", CountryCode: location.Germany},
+			{ID: testrand.NodeID(), LastNet: "192.168.1.0/24", CountryCode: location.Germany},
+			{ID: testrand.NodeID(), LastNet: "192.168.2.0/24", CountryCode: location.Austria},
+			{ID: testrand.NodeID(), LastNet: "192.168.2.0/24", CountryCode: location.Austria},
+		}
+
+		subnetAttr, err := nodeselection.CreateNodeAttribute("last_net")
+		require.NoError(t, err)
+		countryAttr, err := nodeselection.CreateNodeAttribute("country")
+		require.NoError(t, err)
+
+		// Two constraints: need at most 1 per subnet AND at most 1 per country
+		selectorInit := nodeselection.Reduce(
+			nodeselection.RandomSelector(),
+			nil,
+			nodeselection.AtLeast(subnetAttr, 1),  // Include while subnet count <= 1
+			nodeselection.AtLeast(countryAttr, 1), // Include while country count <= 1
+		)
+		selector := selectorInit(ctx, nodes, nil)
+
+		selected, err := selector(ctx, storj.NodeID{}, 4, nil, nil)
+		require.NoError(t, err)
+
+		require.Len(t, selected, 1)
+	})
+
+	t.Run("with node filter", func(t *testing.T) {
+		nodes := []*nodeselection.SelectedNode{
+			{ID: testrand.NodeID(), LastNet: "192.168.1.0/24", CountryCode: location.Germany},
+			{ID: testrand.NodeID(), LastNet: "192.168.2.0/24", CountryCode: location.Austria},
+			{ID: testrand.NodeID(), LastNet: "192.168.3.0/24", CountryCode: location.Germany},
+		}
+
+		// Filter that only allows German nodes
+		filter := nodeselection.NodeFilterFunc(func(node *nodeselection.SelectedNode) bool {
+			return node.CountryCode == location.Germany
+		})
+
+		selectorInit := nodeselection.Reduce(nodeselection.RandomSelector(), nil)
+		selector := selectorInit(ctx, nodes, filter)
+
+		selected, err := selector(ctx, storj.NodeID{}, 3, nil, nil)
+		require.NoError(t, err)
+
+		require.Len(t, selected, 1)
+		require.NotEqual(t, selected[0].CountryCode, location.Austria, "Should only select German nodes")
+	})
+
+	t.Run("with constraint and filter", func(t *testing.T) {
+		nodes := []*nodeselection.SelectedNode{
+			{ID: testrand.NodeID(), LastNet: "192.168.1.0/24", CountryCode: location.Germany},
+			{ID: testrand.NodeID(), LastNet: "192.168.2.0/24", CountryCode: location.Austria},
+			{ID: testrand.NodeID(), LastNet: "192.168.1.0/24", CountryCode: location.Germany},
+		}
+
+		filter := nodeselection.NodeFilterFunc(func(node *nodeselection.SelectedNode) bool {
+			return node.CountryCode == location.Germany
+		})
+
+		subnetAttr, err := nodeselection.CreateNodeAttribute("last_net")
+		require.NoError(t, err)
+
+		selectorInit := nodeselection.Reduce(
+			nodeselection.RandomSelector(),
+			nil,
+			nodeselection.AtLeast(subnetAttr, 1), // Include while count <= 1 per subnet
+		)
+		selector := selectorInit(ctx, nodes, filter)
+
+		selected, err := selector(ctx, storj.NodeID{}, 3, nil, nil)
+		require.NoError(t, err)
+
+		require.Len(t, selected, 1)
+
+		for _, node := range selected {
+			require.Equal(t, location.Germany, node.CountryCode)
+		}
+	})
+
+	t.Run("does not mutate input slice", func(t *testing.T) {
+		// Regression test: Reduce sorts when sortOrder is non-nil; the input
+		// slice is shared across placement inits and exposed via
+		// UploadSelectionCache.GetAllNodes, so it must not be reordered.
+		nodes := []*nodeselection.SelectedNode{
+			{ID: testrand.NodeID(), FreeDisk: 1000000},
+			{ID: testrand.NodeID(), FreeDisk: 8000000},
+			{ID: testrand.NodeID(), FreeDisk: 3000000},
+			{ID: testrand.NodeID(), FreeDisk: 5000000},
+			{ID: testrand.NodeID(), FreeDisk: 2000000},
+		}
+		original := slices.Clone(nodes)
+
+		freeDiskValue, err := nodeselection.CreateNodeValue("free_disk")
+		require.NoError(t, err)
+
+		sortOrder := nodeselection.Compare(nodeselection.Desc(nodeselection.ScoreNodeFunc(func(uplink storj.NodeID, node *nodeselection.SelectedNode) float64 {
+			return freeDiskValue(*node)
+		})))
+
+		selectorInit := nodeselection.Reduce(nodeselection.RandomSelector(), sortOrder)
+		selector := selectorInit(ctx, nodes, nil)
+		_, err = selector(ctx, storj.NodeID{}, 5, nil, nil)
+		require.NoError(t, err)
+
+		require.Equal(t, original, nodes, "Reduce must not reorder its input slice")
+	})
+}
+
+func TestReduceConfigExpression(t *testing.T) {
+	ctx := testcontext.New(t)
+	defer ctx.Cleanup()
+
+	// Test that parses the config expression but documents the issue
+	t.Run("config expression parsing", func(t *testing.T) {
+		var nodes []*nodeselection.SelectedNode
+		for i := 0; i < 15; i++ {
+			nodes = append(nodes, &nodeselection.SelectedNode{
+				ID: testidentity.MustPregeneratedIdentity(i, storj.LatestIDVersion()).ID,
+				Tags: nodeselection.NodeTags{
+					{
+						Name:  "server_name",
+						Value: []byte("server" + string(rune('A'+i/5))), // 3 servers: A, B, C (5 nodes each)
+					},
+				},
+			})
+		}
+
+		environment := nodeselection.NewPlacementConfigEnvironment(nil, nil)
+
+		// This expression should parse without error
+		selectorInit, err := nodeselection.SelectorFromString(
+			`reduce(random(), node_value("free_disk") * -1, atleast(node_attribute("tag:server_name"), 10))`,
+			environment,
+		)
+		require.NoError(t, err, "Expression should parse successfully")
+
+		selector := selectorInit(ctx, nodes, nil)
+		selected, err := selector(ctx, storj.NodeID{}, 10, nil, nil)
+		require.NoError(t, err, "Selector should execute without error")
+
+		require.Len(t, selected, 10)
+	})
+
+	t.Run("equivalent working expression", func(t *testing.T) {
+		// Show how to write a working version using a custom needMore function
+		var nodes []*nodeselection.SelectedNode
+		for i := 0; i < 15; i++ {
+			nodes = append(nodes, &nodeselection.SelectedNode{
+				ID: testidentity.MustPregeneratedIdentity(i, storj.LatestIDVersion()).ID,
+				Tags: nodeselection.NodeTags{
+					{
+						Name:  "server_name",
+						Value: []byte("server" + string(rune('A'+i/5))),
+					},
+				},
+			})
+		}
+
+		attr, err := nodeselection.CreateNodeAttribute("tag:server_name")
+		require.NoError(t, err)
+
+		selectorInit := nodeselection.Reduce(
+			nodeselection.RandomSelector(),
+			nil,
+			nodeselection.AtLeast(attr, 3), // Include until we have 3 different server groups
+		)
+		selector := selectorInit(ctx, nodes, nil)
+
+		selected, err := selector(ctx, storj.NodeID{}, 15, nil, nil)
+		require.NoError(t, err)
+
+		// Should include nodes until we have 3 different servers (at least 11 nodes: 5 serverA + 5 serverB + 1 serverC)
+		require.GreaterOrEqual(t, len(selected), 11, "Should include nodes until we have 3 different server groups")
+
+		// Verify we have nodes from 3 different servers
+		serverCounts := make(map[string]int)
+		for _, node := range selected {
+			serverName := ""
+			for _, tag := range node.Tags {
+				if tag.Name == "server_name" {
+					serverName = string(tag.Value)
+					break
+				}
+			}
+			if serverName != "" {
+				serverCounts[serverName]++
+			}
+		}
+
+		require.Len(t, serverCounts, 3, "Should have nodes from 3 different servers")
+		require.Contains(t, serverCounts, "serverA", "Should include serverA")
+		require.Contains(t, serverCounts, "serverB", "Should include serverB")
+		require.Contains(t, serverCounts, "serverC", "Should include serverC")
+	})
+}
+
+func TestReduceSortOrder(t *testing.T) {
+	ctx := testcontext.New(t)
+	defer ctx.Cleanup()
+
+	t.Run("sort order with node_value free_disk", func(t *testing.T) {
+		// Create nodes with different free disk values and different subnets
+		// This will test that the sort order determines which nodes are processed first
+		nodes := []*nodeselection.SelectedNode{
+			{ID: testrand.NodeID(), FreeDisk: 1000000, LastNet: "192.168.1.0/24"}, // 1MB
+			{ID: testrand.NodeID(), FreeDisk: 5000000, LastNet: "192.168.2.0/24"}, // 5MB
+			{ID: testrand.NodeID(), FreeDisk: 2000000, LastNet: "192.168.3.0/24"}, // 2MB
+			{ID: testrand.NodeID(), FreeDisk: 8000000, LastNet: "192.168.4.0/24"}, // 8MB
+			{ID: testrand.NodeID(), FreeDisk: 3000000, LastNet: "192.168.5.0/24"}, // 3MB
+		}
+
+		// Create a sort order based on free_disk (descending - higher free disk first)
+		freeDiskValue, err := nodeselection.CreateNodeValue("free_disk")
+		require.NoError(t, err)
+
+		sortOrder := nodeselection.Compare(nodeselection.Desc(nodeselection.ScoreNodeFunc(func(uplink storj.NodeID, node *nodeselection.SelectedNode) float64 {
+			return freeDiskValue(*node)
+		})))
+
+		subnetAttr, err := nodeselection.CreateNodeAttribute("last_net")
+		require.NoError(t, err)
+
+		// Use Reduce with the sort order - should process nodes in descending order of free disk
+		// Since nodes have different subnets, AtLeast(3) will select until 3 different subnets are found
+		selectorInit := nodeselection.Reduce(
+			nodeselection.RandomSelector(),
+			sortOrder,
+			nodeselection.AtLeast(subnetAttr, 3), // Include until 3 different subnets
+		)
+		selector := selectorInit(ctx, nodes, nil)
+
+		selected, err := selector(ctx, storj.NodeID{}, 10, nil, nil)
+		require.NoError(t, err)
+
+		// Should select exactly 3 nodes (due to the AtLeast constraint)
+		require.Len(t, selected, 3)
+
+		// Verify that the 3 nodes with highest free disk are selected
+		// Sort the selected nodes by FreeDisk descending to verify order
+		selectedFreeDisk := make([]int64, len(selected))
+		for i, node := range selected {
+			selectedFreeDisk[i] = node.FreeDisk
+		}
+
+		// The top 3 should be 8MB, 5MB, 3MB in some order
+		require.Contains(t, selectedFreeDisk, int64(8000000), "Should include node with 8MB")
+		require.Contains(t, selectedFreeDisk, int64(5000000), "Should include node with 5MB")
+		require.Contains(t, selectedFreeDisk, int64(3000000), "Should include node with 3MB")
+
+		// Should not include the lower values
+		require.NotContains(t, selectedFreeDisk, int64(1000000), "Should not include node with 1MB")
+		require.NotContains(t, selectedFreeDisk, int64(2000000), "Should not include node with 2MB")
+	})
+
+	t.Run("sort order affects selection with different subnets", func(t *testing.T) {
+		// Create nodes where sort order matters for selection across different subnets
+		nodes := []*nodeselection.SelectedNode{
+			{ID: testrand.NodeID(), FreeDisk: 1000000, LastNet: "192.168.1.0/24"}, // 1MB - subnet1 (lower priority)
+			{ID: testrand.NodeID(), FreeDisk: 8000000, LastNet: "192.168.1.0/24"}, // 8MB - subnet1 (should be selected first)
+			{ID: testrand.NodeID(), FreeDisk: 3000000, LastNet: "192.168.1.0/24"}, // 3MB - subnet1
+			{ID: testrand.NodeID(), FreeDisk: 2000000, LastNet: "192.168.2.0/24"}, // 2MB - subnet2 (lower priority)
+			{ID: testrand.NodeID(), FreeDisk: 5000000, LastNet: "192.168.2.0/24"}, // 5MB - subnet2 (should be selected first)
+		}
+
+		freeDiskValue, err := nodeselection.CreateNodeValue("free_disk")
+		require.NoError(t, err)
+
+		// Sort by free_disk descending (highest first)
+		sortOrder := nodeselection.Compare(nodeselection.Desc(nodeselection.ScoreNodeFunc(func(uplink storj.NodeID, node *nodeselection.SelectedNode) float64 {
+			return freeDiskValue(*node)
+		})))
+
+		// Custom needMore function that stops after we've seen at least one node from each of the two subnets
+		var seenSubnets map[string]bool
+		needMoreFunc := func() func(node *nodeselection.SelectedNode) bool {
+			seenSubnets = make(map[string]bool)
+			return func(node *nodeselection.SelectedNode) bool {
+				subnet := node.LastNet
+				seenSubnets[subnet] = true
+				// Continue while we haven't seen both subnets yet
+				return len(seenSubnets) < 2
+			}
+		}
+
+		// Use Reduce with constraint that ensures we get at least one node from each subnet
+		selectorInit := nodeselection.Reduce(
+			nodeselection.RandomSelector(),
+			sortOrder,
+			needMoreFunc, // Custom logic for cross-subnet selection
+		)
+		selector := selectorInit(ctx, nodes, nil)
+
+		selected, err := selector(ctx, storj.NodeID{}, 10, nil, nil)
+		require.NoError(t, err)
+
+		// Should select 2 nodes (one from each subnet, the highest FreeDisk from each)
+		require.Len(t, selected, 2)
+
+		// Verify that the nodes with highest free disk from each subnet are selected
+		subnetToFreeDisk := make(map[string]int64)
+		for _, node := range selected {
+			subnetToFreeDisk[node.LastNet] = node.FreeDisk
+		}
+
+		// Should have selected the 8MB node from subnet 1 and 5MB node from subnet 2
+		// because the sort order processes nodes by descending free disk
+		require.Equal(t, int64(8000000), subnetToFreeDisk["192.168.1.0/24"], "Should select node with highest free disk from subnet 1")
+		require.Equal(t, int64(5000000), subnetToFreeDisk["192.168.2.0/24"], "Should select node with highest free disk from subnet 2")
+	})
+}
+
+func TestDailyPeriods(t *testing.T) {
+	require.Equal(t, int64(1), nodeselection.DailyPeriodsForHour(1, []int64{1, 2}))
+	require.Equal(t, int64(1), nodeselection.DailyPeriodsForHour(11, []int64{1, 2}))
+	require.Equal(t, int64(2), nodeselection.DailyPeriodsForHour(12, []int64{1, 2}))
+	require.Equal(t, int64(2), nodeselection.DailyPeriodsForHour(23, []int64{1, 2}))
+
+	require.Equal(t, int64(4), nodeselection.DailyPeriodsForHour(23, []int64{1, 2, 3, 4}))
+}
+
+func TestMultiSelector(t *testing.T) {
+	ctx := testcontext.New(t)
+	defer ctx.Cleanup()
+
+	t.Run("combines multiple selectors", func(t *testing.T) {
+		var nodes []*nodeselection.SelectedNode
+		for i := 0; i < 20; i++ {
+			nodes = append(nodes, &nodeselection.SelectedNode{
+				ID:         testrand.NodeID(),
+				LastNet:    fmt.Sprintf("192.168.%d.0/24", i/5),
+				LastIPPort: fmt.Sprintf("192.168.%d.%d:8080", i/5, i%5+1),
+			})
+		}
+
+		// Create multi-selector that combines random selector with itself
+		selectorInit := nodeselection.MultiSelector(
+			nodeselection.RandomSelector(),
+			nodeselection.RandomSelector(),
+		)
+		selector := selectorInit(ctx, nodes, nil)
+
+		// Request 10 nodes, each selector should get 5
+		selected, err := selector(ctx, storj.NodeID{}, 10, nil, nil)
+		require.NoError(t, err)
+		require.Len(t, selected, 10)
+
+		// Note: MultiSelector doesn't prevent duplicates between selectors,
+		// so we just verify we got the expected number of nodes
+		require.LessOrEqual(t, len(selected), 20) // Can't exceed available nodes
+	})
+
+	t.Run("distributes nodes evenly among selectors", func(t *testing.T) {
+		var nodes []*nodeselection.SelectedNode
+		for i := 0; i < 30; i++ {
+			nodes = append(nodes, &nodeselection.SelectedNode{
+				ID: testrand.NodeID(),
+			})
+		}
+
+		// Create multi-selector with 3 random selectors
+		selectorInit := nodeselection.MultiSelector(
+			nodeselection.RandomSelector(),
+			nodeselection.RandomSelector(),
+			nodeselection.RandomSelector(),
+		)
+		selector := selectorInit(ctx, nodes, nil)
+
+		// Request 15 nodes, each selector should get 5
+		selected, err := selector(ctx, storj.NodeID{}, 15, nil, nil)
+		require.NoError(t, err)
+		require.Len(t, selected, 15)
+	})
+
+	t.Run("handles empty selectors", func(t *testing.T) {
+		var nodes []*nodeselection.SelectedNode
+		for i := 0; i < 10; i++ {
+			nodes = append(nodes, &nodeselection.SelectedNode{
+				ID: testrand.NodeID(),
+			})
+		}
+
+		selectorInit := nodeselection.MultiSelector()
+		selector := selectorInit(ctx, nodes, nil)
+
+		selected, err := selector(ctx, storj.NodeID{}, 5, nil, nil)
+		require.NoError(t, err)
+		require.Len(t, selected, 0)
+	})
+
+	t.Run("handles single selector", func(t *testing.T) {
+		var nodes []*nodeselection.SelectedNode
+		for i := 0; i < 10; i++ {
+			nodes = append(nodes, &nodeselection.SelectedNode{
+				ID: testrand.NodeID(),
+			})
+		}
+
+		selectorInit := nodeselection.MultiSelector(
+			nodeselection.RandomSelector(),
+		)
+		selector := selectorInit(ctx, nodes, nil)
+
+		selected, err := selector(ctx, storj.NodeID{}, 5, nil, nil)
+		require.NoError(t, err)
+		require.Len(t, selected, 5)
+	})
+
+	t.Run("basic functionality with insufficient nodes", func(t *testing.T) {
+		var nodes []*nodeselection.SelectedNode
+		for i := 0; i < 4; i++ {
+			nodes = append(nodes, &nodeselection.SelectedNode{
+				ID: testrand.NodeID(),
+			})
+		}
+
+		// Create multi-selector with 2 random selectors
+		selectorInit := nodeselection.MultiSelector(
+			nodeselection.RandomSelector(),
+			nodeselection.RandomSelector(),
+		)
+		selector := selectorInit(ctx, nodes, nil)
+
+		// Request 10 nodes total, each selector gets 5
+		// With only 4 nodes available, each selector can return at most 4 nodes
+		selected, err := selector(ctx, storj.NodeID{}, 10, nil, nil)
+		require.NoError(t, err)
+		// Could get duplicates between selectors, so length could vary
+		require.GreaterOrEqual(t, len(selected), 0)
+		require.LessOrEqual(t, len(selected), 8) // At most 4 nodes from each selector
+	})
+}
+
+func TestFixedSelector(t *testing.T) {
+	ctx := testcontext.New(t)
+	defer ctx.Cleanup()
+
+	t.Run("overrides requested count with fixed count", func(t *testing.T) {
+		var nodes []*nodeselection.SelectedNode
+		for i := 0; i < 20; i++ {
+			nodes = append(nodes, &nodeselection.SelectedNode{
+				ID: testrand.NodeID(),
+			})
+		}
+
+		// Create fixed selector that always selects 7 nodes
+		selectorInit := nodeselection.FixedSelector(7, nodeselection.RandomSelector())
+		selector := selectorInit(ctx, nodes, nil)
+
+		// Request 10 nodes but should only get 7
+		selected, err := selector(ctx, storj.NodeID{}, 10, nil, nil)
+		require.NoError(t, err)
+		require.Len(t, selected, 7)
+
+		// Request 3 nodes but should still get 7
+		selected, err = selector(ctx, storj.NodeID{}, 3, nil, nil)
+		require.NoError(t, err)
+		require.Len(t, selected, 7)
+	})
+
+	t.Run("delegates to wrapped selector correctly", func(t *testing.T) {
+		var nodes []*nodeselection.SelectedNode
+		for i := 0; i < 20; i++ {
+			nodes = append(nodes, &nodeselection.SelectedNode{
+				ID:      testrand.NodeID(),
+				LastNet: fmt.Sprintf("192.168.%d.0/24", i),
+			})
+		}
+
+		// Use attribute group selector as delegate to verify delegation
+		attribute, err := nodeselection.CreateNodeAttribute("last_net")
+		require.NoError(t, err)
+
+		selectorInit := nodeselection.FixedSelector(5, nodeselection.AttributeGroupSelector(attribute))
+		selector := selectorInit(ctx, nodes, nil)
+
+		selected, err := selector(ctx, storj.NodeID{}, 10, nil, nil)
+		require.NoError(t, err)
+		require.Len(t, selected, 5)
+
+		// Verify the delegate's behavior is preserved (different subnets)
+		subnets := make(map[string]bool)
+		for _, node := range selected {
+			subnets[node.LastNet] = true
+		}
+		require.Equal(t, 5, len(subnets), "Each selected node should be from different subnet")
+	})
 }

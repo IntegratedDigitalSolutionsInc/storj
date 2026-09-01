@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/http"
 	"runtime/pprof"
 
 	"github.com/spacemonkeygo/monkit/v3"
@@ -34,15 +35,21 @@ import (
 	"storj.io/storj/satellite/buckets"
 	"storj.io/storj/satellite/console"
 	"storj.io/storj/satellite/console/consoleauth"
+	"storj.io/storj/satellite/console/consoleauth/csrf"
 	"storj.io/storj/satellite/console/consoleauth/sso"
+	"storj.io/storj/satellite/console/consoleservice"
 	"storj.io/storj/satellite/console/consoleweb"
+	"storj.io/storj/satellite/console/restapikeys"
 	"storj.io/storj/satellite/console/restkeys"
 	"storj.io/storj/satellite/console/userinfo"
+	"storj.io/storj/satellite/console/valdi"
+	"storj.io/storj/satellite/console/valdi/valdiclient"
 	"storj.io/storj/satellite/emission"
+	"storj.io/storj/satellite/entitlements"
 	"storj.io/storj/satellite/kms"
 	"storj.io/storj/satellite/mailservice"
+	"storj.io/storj/satellite/mailservice/hubspotmails"
 	"storj.io/storj/satellite/metabase"
-	"storj.io/storj/satellite/metainfo"
 	"storj.io/storj/satellite/nodeselection"
 	"storj.io/storj/satellite/oidc"
 	"storj.io/storj/satellite/orders"
@@ -50,6 +57,7 @@ import (
 	"storj.io/storj/satellite/payments"
 	"storj.io/storj/satellite/payments/storjscan"
 	"storj.io/storj/satellite/payments/stripe"
+	"storj.io/storj/satellite/webhook"
 )
 
 // ConsoleAPI is the satellite console API process.
@@ -102,7 +110,8 @@ type ConsoleAPI struct {
 	}
 
 	Mail struct {
-		Service *mailservice.Service
+		Service        *mailservice.Service
+		HubspotService *hubspotmails.Service
 	}
 
 	Payments struct {
@@ -116,15 +125,23 @@ type ConsoleAPI struct {
 		StripeClient  stripe.Client
 	}
 
-	REST struct {
-		Keys *restkeys.Service
+	Console struct {
+		Listener       net.Listener
+		Service        *console.Service
+		ConsoleService *consoleservice.Service // this is a duplicate of Service, but should replace it in the future.
+		RestKeys       restapikeys.Service
+		Endpoint       *consoleweb.Server
+		AuthTokens     *consoleauth.Service
+		Webhook        *webhook.Service
 	}
 
-	Console struct {
-		Listener   net.Listener
-		Service    *console.Service
-		Endpoint   *consoleweb.Server
-		AuthTokens *consoleauth.Service
+	Entitlements struct {
+		Service *entitlements.Service
+	}
+
+	Valdi struct {
+		Service *valdi.Service
+		Client  *valdiclient.Client
 	}
 
 	OIDC struct {
@@ -151,11 +168,13 @@ type ConsoleAPI struct {
 		Service *sso.Service
 	}
 
+	CSRF struct {
+		Service *csrf.Service
+	}
+
 	HealthCheck struct {
 		Server *healthcheck.Server
 	}
-
-	SuccessTrackers *metainfo.SuccessTrackers
 }
 
 // NewConsoleAPI creates a new satellite console API process.
@@ -174,7 +193,7 @@ func NewConsoleAPI(log *zap.Logger, full *identity.FullIdentity, db DB,
 	}
 
 	{ // setup buckets service
-		peer.Buckets.Service = buckets.NewService(db.Buckets(), metabaseDB)
+		peer.Buckets.Service = buckets.NewService(db.Buckets(), metabaseDB, db.Attribution())
 	}
 
 	{ // setup debug
@@ -200,10 +219,10 @@ func NewConsoleAPI(log *zap.Logger, full *identity.FullIdentity, db DB,
 
 	{
 		peer.Log.Info("Version info",
-			zap.Stringer("Version", versionInfo.Version.Version),
-			zap.String("Commit Hash", versionInfo.CommitHash),
-			zap.Stringer("Build Timestamp", versionInfo.Timestamp),
-			zap.Bool("Release Build", versionInfo.Release),
+			zap.String("version", versionInfo.Version.VString()),
+			zap.String("commit_hash", versionInfo.CommitHash),
+			zap.Stringer("build_timestamp", versionInfo.Timestamp),
+			zap.Bool("release_build", versionInfo.Release),
 		)
 
 		peer.Version.Service = checker.NewService(log.Named("version"), config.Version, versionInfo, "Satellite")
@@ -240,23 +259,11 @@ func NewConsoleAPI(log *zap.Logger, full *identity.FullIdentity, db DB,
 			Run: func(ctx context.Context) error {
 				// Don't change the format of this comment, it is used to figure out the node id.
 				peer.Log.Info(fmt.Sprintf("Node %s started", peer.Identity.ID))
-				peer.Log.Info(fmt.Sprintf("Public server started on %s", peer.Addr()))
-				peer.Log.Info(fmt.Sprintf("Private server started on %s", peer.PrivateAddr()))
+				peer.Log.Info("Public server started on " + peer.Addr())
+				peer.Log.Info("Private server started on " + peer.PrivateAddr())
 				return peer.Server.Run(ctx)
 			},
 			Close: peer.Server.Close,
-		})
-	}
-
-	{ // setup mailservice
-		peer.Mail.Service, err = setupMailService(peer.Log, *config)
-		if err != nil {
-			return nil, errs.Combine(err, peer.Close())
-		}
-
-		peer.Services.Add(lifecycle.Item{
-			Name:  "mail:service",
-			Close: peer.Mail.Service.Close,
 		})
 	}
 
@@ -282,7 +289,7 @@ func NewConsoleAPI(log *zap.Logger, full *identity.FullIdentity, db DB,
 		peer.OIDC.Service = oidc.NewService(db.OIDC())
 	}
 
-	placement, err := config.Placement.Parse(config.Overlay.Node.CreateDefaultPlacement, nodeselection.NewPlacementConfigEnvironment(peer.SuccessTrackers))
+	placement, err := config.Placement.Parse(config.Overlay.Node.CreateDefaultPlacement, nodeselection.NewPlacementConfigEnvironment(nil, nil))
 	if err != nil {
 		return nil, err
 	}
@@ -316,8 +323,10 @@ func NewConsoleAPI(log *zap.Logger, full *identity.FullIdentity, db DB,
 			satelliteSignee,
 			peer.Orders.DB,
 			peer.DB.NodeAPIVersion(),
-			config.Orders.OrdersSemaphoreSize,
 			peer.Orders.Service,
+			config.Orders,
+			peer.Overlay.Service,
+			peer.DB.Console().Projects(),
 		)
 
 		if err := pb.DRPCRegisterOrders(peer.Server.DRPC(), peer.Orders.Endpoint); err != nil {
@@ -326,12 +335,31 @@ func NewConsoleAPI(log *zap.Logger, full *identity.FullIdentity, db DB,
 	}
 
 	{ // setup analytics service
-		peer.Analytics.Service = analytics.NewService(peer.Log.Named("analytics:service"), config.Analytics, config.Console.SatelliteName)
+		peer.Analytics.Service = analytics.NewService(peer.Log.Named("analytics:service"), config.Analytics, config.Console.SatelliteName, config.Console.ExternalAddress)
 
 		peer.Services.Add(lifecycle.Item{
 			Name:  "analytics:service",
 			Run:   peer.Analytics.Service.Run,
 			Close: peer.Analytics.Service.Close,
+		})
+	}
+
+	{ // setup legacy and hubspot mail services
+		peer.Mail.Service, err = setupMailService(peer.Log, config.Mail, config.Console)
+		if err != nil {
+			return nil, errs.Combine(err, peer.Close())
+		}
+
+		peer.Services.Add(lifecycle.Item{
+			Name:  "mail:service",
+			Close: peer.Mail.Service.Close,
+		})
+
+		peer.Mail.HubspotService = hubspotmails.NewService(peer.Log.Named("mail:hubspotservice"), peer.Analytics.Service, config.HubspotMails)
+
+		peer.Services.Add(lifecycle.Item{
+			Name:  "hubspotmails:service",
+			Close: peer.Mail.HubspotService.Close,
 		})
 	}
 
@@ -354,17 +382,6 @@ func NewConsoleAPI(log *zap.Logger, full *identity.FullIdentity, db DB,
 		}
 	}
 
-	{ // setup sso
-		if config.SSO.Enabled {
-			peer.SSO.Service = sso.NewService(config.Console.ExternalAddress, config.SSO)
-
-			peer.Services.Add(lifecycle.Item{
-				Name: "sso:service",
-				Run:  peer.SSO.Service.Initialize,
-			})
-		}
-	}
-
 	{ // setup userinfo.
 		if config.Userinfo.Enabled {
 			peer.Userinfo.Endpoint, err = userinfo.NewEndpoint(
@@ -373,6 +390,7 @@ func NewConsoleAPI(log *zap.Logger, full *identity.FullIdentity, db DB,
 				peer.DB.Console().APIKeys(),
 				peer.DB.Console().Projects(),
 				config.Userinfo,
+				userinfo.ConsoleConfig{BillingFeaturesEnabled: config.Console.BillingFeaturesEnabled},
 			)
 			if err != nil {
 				return nil, errs.Combine(err, peer.Close())
@@ -389,6 +407,13 @@ func NewConsoleAPI(log *zap.Logger, full *identity.FullIdentity, db DB,
 		} else {
 			peer.Log.Named("userinfo:endpoint").Info("disabled")
 		}
+	}
+
+	{ // setup entitlements
+		peer.Entitlements.Service = entitlements.NewService(
+			peer.Log.Named("entitlements:service"),
+			db.Console().Entitlements(),
+		)
 	}
 
 	emissionService := emission.NewService(config.Emission)
@@ -421,23 +446,50 @@ func NewConsoleAPI(log *zap.Logger, full *identity.FullIdentity, db DB,
 			return nil, errs.Combine(err, peer.Close())
 		}
 
+		productPrices, err := pc.Products.ToModels()
+		if err != nil {
+			return nil, errs.Combine(err, peer.Close())
+		}
+
+		minimumChargeDate, err := pc.MinimumCharge.GetEffectiveDate()
+		if err != nil {
+			return nil, errs.Combine(err, peer.Close())
+		}
+
 		peer.Payments.StripeService, err = stripe.NewService(
 			peer.Log.Named("payments.stripe:service"),
 			stripeClient,
+			stripe.ServiceDependencies{
+				DB:                   peer.DB.StripeCoinPayments(),
+				WalletsDB:            peer.DB.Wallets(),
+				BillingDB:            peer.DB.Billing(),
+				ProjectsDB:           peer.DB.Console().Projects(),
+				UsersDB:              peer.DB.Console().Users(),
+				FreezeEventsDB:       peer.DB.Console().AccountFreezeEvents(),
+				UsageDB:              peer.DB.ProjectAccounting(),
+				RetentionRemainderDB: peer.DB.RetentionRemainderCharges(),
+				Analytics:            peer.Analytics.Service,
+				Emission:             emissionService,
+				Entitlements:         peer.Entitlements.Service,
+			},
+			stripe.ServiceConfig{
+				DeleteAccountEnabled:       config.Console.SelfServeAccountDeleteEnabled,
+				DeleteProjectCostThreshold: pc.DeleteProjectCostThreshold,
+				EntitlementsEnabled:        config.Entitlements.Enabled,
+			},
 			pc.StripeCoinPayments,
-			peer.DB.StripeCoinPayments(),
-			peer.DB.Wallets(),
-			peer.DB.Billing(),
-			peer.DB.Console().Projects(),
-			peer.DB.Console().Users(),
-			peer.DB.ProjectAccounting(),
-			prices,
-			priceOverrides,
-			pc.PackagePlans.Packages,
-			pc.BonusRate,
-			peer.Analytics.Service,
-			emissionService,
-			config.Console.SelfServeAccountDeleteEnabled,
+			stripe.PricingConfig{
+				UsagePrices:               prices,
+				UsagePriceOverrides:       priceOverrides,
+				ProductPriceMap:           productPrices,
+				PlacementProductMap:       pc.PlacementPriceOverrides.ToMap(),
+				PackagePlans:              pc.PackagePlans.Packages,
+				BonusRate:                 pc.BonusRate,
+				MinimumChargeAmount:       pc.MinimumCharge.Amount,
+				MinimumChargeDate:         minimumChargeDate,
+				LegacyMinimumChargeAmount: pc.MinimumCharge.LegacyAmount,
+				LegacyPricingUserAgents:   pc.LegacyPricingUserAgents,
+			},
 		)
 
 		if err != nil {
@@ -462,13 +514,9 @@ func NewConsoleAPI(log *zap.Logger, full *identity.FullIdentity, db DB,
 		peer.Payments.DepositWallets = peer.Payments.StorjscanService
 	}
 
-	{ // setup account management api keys
-		peer.REST.Keys = restkeys.NewService(peer.DB.OIDC().OAuthTokens(), config.RESTKeys)
-	}
-
 	{ // setup console
+		config.Console.ProjectLimitNotificationsEnabled = config.Metainfo.LimitEmailNotificationsEnabled && config.ProjectLimitEvents.Enabled
 		consoleConfig := config.Console
-		consoleConfig.SsoEnabled = config.SSO.Enabled
 		peer.Console.Listener, err = net.Listen("tcp", consoleConfig.Address)
 		if err != nil {
 			return nil, errs.Combine(err, peer.Close())
@@ -477,11 +525,26 @@ func NewConsoleAPI(log *zap.Logger, full *identity.FullIdentity, db DB,
 			return nil, errs.New("Auth token secret required")
 		}
 
-		peer.Console.AuthTokens = consoleauth.NewService(config.ConsoleAuth, &consoleauth.Hmac{Secret: []byte(consoleConfig.AuthTokenSecret)})
+		signer := &consoleauth.Hmac{Secret: []byte(consoleConfig.AuthTokenSecret)}
+		peer.Console.AuthTokens = consoleauth.NewService(config.ConsoleAuth, signer)
 
 		externalAddress := consoleConfig.ExternalAddress
 		if externalAddress == "" {
 			externalAddress = "http://" + peer.Console.Listener.Addr().String()
+		}
+
+		if config.SSO.Enabled {
+			// setup sso
+			peer.SSO.Service = sso.NewService(
+				externalAddress,
+				peer.Console.AuthTokens,
+				config.SSO,
+			)
+
+			peer.Services.Add(lifecycle.Item{
+				Name: "sso:service",
+				Run:  peer.SSO.Service.Initialize,
+			})
 		}
 
 		accountFreezeService := console.NewAccountFreezeService(
@@ -490,34 +553,108 @@ func NewConsoleAPI(log *zap.Logger, full *identity.FullIdentity, db DB,
 			consoleConfig.AccountFreeze,
 		)
 
+		if config.Console.CloudGpusEnabled {
+			peer.Valdi.Client, err = valdiclient.New(peer.Log.Named("valdi:client"), http.DefaultClient, config.Valdi.Config)
+			if err != nil {
+				return nil, errs.Combine(err, peer.Close())
+			}
+
+			peer.Valdi.Service, err = valdi.NewService(peer.Log.Named("valdi:service"), config.Valdi, peer.Valdi.Client)
+			if err != nil {
+				return nil, errs.Combine(err, peer.Close())
+			}
+		}
+
+		minimumChargeDate, err := config.Payments.MinimumCharge.GetEffectiveDate()
+		if err != nil {
+			return nil, errs.Combine(err, peer.Close())
+		}
+
+		loginURL, err := config.Console.LoginURL()
+		if err != nil {
+			return nil, errs.Combine(err, peer.Close())
+		}
+
+		supportURL := config.Console.SupportURL()
+
+		productModels, err := config.Payments.Products.ToModels()
+		if err != nil {
+			return nil, errs.Combine(err, peer.Close())
+		}
+
+		peer.Console.Webhook = webhook.New(peer.Log.Named("webhook"), config.Webhook)
+		peer.Services.Add(lifecycle.Item{
+			Name:  "webhook:service",
+			Close: peer.Console.Webhook.Close,
+		})
+
 		peer.Console.Service, err = console.NewService(
 			peer.Log.Named("console:service"),
 			peer.DB.Console(),
-			peer.REST.Keys,
+			peer.DB.Console().RestApiKeys(),
+			restkeys.NewService(peer.DB.OIDC().OAuthTokens(), config.Console.RestAPIKeys.DefaultExpiration),
 			peer.DB.ProjectAccounting(),
 			peer.Accounting.ProjectUsage,
 			peer.Buckets.Service,
+			peer.DB.Attribution(),
 			peer.Payments.Accounts,
 			peer.Payments.DepositWallets,
 			peer.DB.Billing(),
 			peer.Analytics.Service,
 			peer.Console.AuthTokens,
 			peer.Mail.Service,
+			peer.Mail.HubspotService,
 			accountFreezeService,
 			emissionService,
 			peer.KeyManagement.Service,
+			peer.SSO.Service,
 			externalAddress,
+			peer.URL().String(),
 			consoleConfig.SatelliteName,
+			consoleConfig.SingleWhiteLabel,
 			config.Metainfo.ProjectLimits.MaxBuckets,
 			config.SSO.Enabled,
 			placement,
-			console.ObjectLockAndVersioningConfig{
-				ObjectLockEnabled:                      config.Metainfo.ObjectLockEnabled,
-				UseBucketLevelObjectVersioning:         config.Metainfo.UseBucketLevelObjectVersioning,
-				UseBucketLevelObjectVersioningProjects: config.Metainfo.UseBucketLevelObjectVersioningProjects,
+			peer.Valdi.Service,
+			peer.Console.Webhook,
+			config.Payments.MinimumCharge.Amount,
+			minimumChargeDate,
+			config.Payments.PackagePlans.Packages,
+			config.Entitlements,
+			peer.Entitlements.Service,
+			config.Payments.PlacementPriceOverrides.ToMap(),
+			productModels,
+			config.Payments.LegacyPricingUserAgents,
+			config.Payments.LegacyPlacementPriceOverrides.ToMap(),
+			consoleConfig.Config,
+			config.Payments.StripeCoinPayments.SkuEnabled,
+			loginURL, supportURL,
+		)
+		if err != nil {
+			return nil, errs.Combine(err, peer.Close())
+		}
+
+		peer.Console.ConsoleService, err = consoleservice.NewService(
+			peer.Log.Named("console:service"),
+			consoleservice.ServiceDependencies{
+				ConsoleDB:            peer.DB.Console(),
+				AccountFreezeService: accountFreezeService,
 			},
 			consoleConfig.Config,
 		)
+		if err != nil {
+			return nil, errs.Combine(err, peer.Close())
+		}
+
+		peer.Console.RestKeys = peer.Console.Service
+		peer.CSRF.Service = csrf.NewService(signer)
+
+		prices, err := config.Payments.UsagePrice.ToModel()
+		if err != nil {
+			return nil, errs.Combine(err, peer.Close())
+		}
+
+		priceSummaries, err := consoleweb.CreateProductPriceSummaries(config.Payments.Products)
 		if err != nil {
 			return nil, errs.Combine(err, peer.Close())
 		}
@@ -526,21 +663,27 @@ func NewConsoleAPI(log *zap.Logger, full *identity.FullIdentity, db DB,
 			peer.Log.Named("console:endpoint"),
 			consoleConfig,
 			peer.Console.Service,
+			peer.Console.ConsoleService,
 			peer.OIDC.Service,
 			peer.Mail.Service,
+			peer.Mail.HubspotService,
 			peer.Analytics.Service,
 			peer.ABTesting.Service,
 			accountFreezeService,
 			peer.SSO.Service,
+			peer.CSRF.Service,
 			peer.Console.Listener,
 			config.Payments.StripeCoinPayments.StripePublicKey,
-			config.Payments.Storjscan.Confirmations, peer.URL(), console.ObjectLockAndVersioningConfig{
-				ObjectLockEnabled:                      config.Metainfo.ObjectLockEnabled,
-				UseBucketLevelObjectVersioning:         config.Metainfo.UseBucketLevelObjectVersioning,
-				UseBucketLevelObjectVersioningProjects: config.Metainfo.UseBucketLevelObjectVersioningProjects,
-			},
+			config.Payments.Storjscan.Confirmations,
+			peer.URL(),
 			config.Analytics,
-			config.Payments.PackagePlans,
+			config.Payments.MinimumCharge,
+			prices,
+			priceSummaries,
+			config.Payments.LegacyPricingUserAgents,
+			config.Entitlements.Enabled,
+			config.SSO.Enabled,
+			config.AccountFreeze.OptOutFreezeOptedOutOnly,
 		)
 
 		peer.Servers.Add(lifecycle.Item{

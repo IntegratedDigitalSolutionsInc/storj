@@ -3,7 +3,7 @@
 
 <template>
     <div class="title-area">
-        <div v-clipboard="nodeId" class="title-area__node-id-container">
+        <div class="title-area__node-id-container" @click="copyNodeId">
             <b class="title-area__node-id-container__title">Node ID</b>
             <div class="title-area__node-id-container__right-area">
                 <p class="title-area__node-id-container__id">{{ nodeId }}</p>
@@ -89,15 +89,14 @@
     </div>
 </template>
 
-<script lang="ts">
-import { Component, Vue } from 'vue-property-decorator';
+<script setup lang="ts">
+import { computed, onMounted, ref } from 'vue';
 
-import { StatusOnline, QUIC_STATUS } from '@/app/store/modules/node';
+import { StatusOnline, QUIC_STATUS, useNodeStore } from '@/app/store/modules/nodeStore';
 import { Duration, millisecondsInSecond, minutesInHour, secondsInHour, secondsInMinute } from '@/app/utils/duration';
+import CopyIcon from '@/../static/images/Copy.svg';
 
 import VInfo from '@/app/components/VInfo.vue';
-
-import CopyIcon from '@/../static/images/Copy.svg';
 
 /**
  * NodeInfo class holds info for NodeInfo entity.
@@ -128,88 +127,98 @@ class NodeInfo {
     }
 }
 
-// @vue/component
-@Component ({
-    components: {
-        VInfo,
-        CopyIcon,
-    },
-})
-export default class SNOContentTitle extends Vue {
-    private timeNow: Date = new Date();
+const nodeStore = useNodeStore();
 
-    public mounted(): void {
-        window.setInterval(() => {
-            this.timeNow = new Date();
-        }, 1000);
+const monthNames = ['January', 'February', 'March', 'April', 'May', 'June',
+    'July', 'August', 'September', 'October', 'November', 'December'];
+
+const timeNow = ref<Date>(new Date());
+
+const nodeId = computed<string>(() => {
+    return nodeStore.state.info.id;
+});
+
+const info = computed<NodeInfo>(() => {
+    const nodeInfo = nodeStore.state.info;
+
+    return new NodeInfo(nodeInfo.id, nodeInfo.status, nodeInfo.version, nodeInfo.allowedVersion, nodeInfo.wallet,
+        nodeInfo.isLastVersion, nodeInfo.quicStatus, nodeInfo.configuredPort);
+});
+
+const online = computed<boolean>(() => {
+    return nodeStore.state.info.status === StatusOnline;
+});
+
+const quicStatusOk = computed<string>(() => {
+    return QUIC_STATUS.StatusOk;
+});
+
+const quicStatusRefreshing = computed<string>(() => {
+    return QUIC_STATUS.StatusRefreshing;
+});
+
+const quicStatusMisconfigured = computed<string>(() => {
+    return QUIC_STATUS.StatusMisconfigured;
+});
+
+const uptime = computed<string>(() => {
+    return timePassed(nodeStore.state.info.startedAt);
+});
+
+const lastPinged = computed<string>(() => {
+    return timePassed(nodeStore.state.info.lastPinged);
+});
+
+const lastQuicPingedAt = computed<string>(() => {
+    return timePassed(nodeStore.state.info.lastQuicPingedAt);
+});
+
+const currentMonth = computed<string>(() => {
+    const date = new Date();
+
+    return monthNames[date.getMonth()];
+});
+
+function timePassed(date: Date): string {
+    const difference = Duration.difference(timeNow.value, date);
+
+    if (Math.floor(difference / millisecondsInSecond) > secondsInHour) {
+        const hours: string = Math.floor(difference / millisecondsInSecond / secondsInHour) + 'h';
+        const minutes: string = Math.floor((difference / millisecondsInSecond % secondsInHour) / minutesInHour) + 'm';
+
+        return `${hours} ${minutes}`;
     }
 
-    public get nodeId(): string {
-        return this.$store.state.node.info.id;
-    }
-
-    public get info(): NodeInfo {
-        const nodeInfo = this.$store.state.node.info;
-
-        return new NodeInfo(nodeInfo.id, nodeInfo.status, nodeInfo.version, nodeInfo.allowedVersion, nodeInfo.wallet,
-            nodeInfo.isLastVersion, nodeInfo.quicStatus, nodeInfo.configuredPort);
-    }
-
-    public get online(): boolean {
-        return this.$store.state.node.info.status === StatusOnline;
-    }
-
-    public get quicStatusOk(): string {
-        return QUIC_STATUS.StatusOk;
-    }
-
-    public get quicStatusRefreshing(): string {
-        return QUIC_STATUS.StatusRefreshing;
-    }
-
-    public get quicStatusMisconfigured(): string {
-        return QUIC_STATUS.StatusMisconfigured;
-    }
-
-    public get uptime(): string {
-        return this.timePassed(this.$store.state.node.info.startedAt);
-    }
-
-    public get lastPinged(): string {
-        return this.timePassed(this.$store.state.node.info.lastPinged);
-    }
-
-    public get lastQuicPingedAt(): string {
-        return this.timePassed(this.$store.state.node.info.lastQuicPingedAt);
-    }
-
-    public get currentMonth(): string {
-        const monthNames = ['January', 'February', 'March', 'April', 'May', 'June',
-            'July', 'August', 'September', 'October', 'November', 'December',
-        ];
-        const date = new Date();
-
-        return monthNames[date.getMonth()];
-    }
-
-    private timePassed(date: Date): string {
-        const difference = Duration.difference(this.timeNow, date);
-
-        if (Math.floor(difference / millisecondsInSecond) > secondsInHour) {
-            const hours: string = Math.floor(difference / millisecondsInSecond / secondsInHour) + 'h';
-            const minutes: string = Math.floor((difference / millisecondsInSecond % secondsInHour) / minutesInHour) + 'm';
-
-            return `${hours} ${minutes}`;
-        }
-
-        return `${Math.floor(difference / millisecondsInSecond / secondsInMinute)}m`;
-    }
+    return `${Math.floor(difference / millisecondsInSecond / secondsInMinute)}m`;
 }
+
+function copyNodeId(): void {
+    navigator.clipboard.writeText(nodeId.value);
+}
+
+onMounted(() => {
+    window.setInterval(() => {
+        timeNow.value = new Date();
+    }, 1000);
+});
 </script>
 
 <style scoped lang="scss">
-    .svg ::v-deep path {
+    .svg :deep(path) {
         fill: var(--node-id-copy-icon-color);
+    }
+
+    :deep(.info__message-box) {
+        bottom: 90%;
+        padding: 20px 20px 40px;
+    }
+
+    :deep(.info__message-box__text) {
+        align-items: flex-start;
+    }
+
+    :deep(.info__message-box__text__regular-text) {
+        margin-bottom: 5px;
     }
 
     .title-area {
@@ -248,7 +257,7 @@ export default class SNOContentTitle extends Vue {
                 border-color: var(--node-id-border-hover-color);
                 color: var(--node-id-hover-text-color);
 
-                .svg ::v-deep path {
+                .svg :deep(path) {
                     fill: var(--node-id-border-hover-color) !important;
                 }
             }
@@ -303,22 +312,7 @@ export default class SNOContentTitle extends Vue {
         color: #ce0000;
     }
 
-    ::v-deep .info__message-box {
-        background-image: var(--info-image-arrow-left-path);
-        bottom: 100%;
-        left: 220%;
-        padding: 20px 20px 25px;
-
-        &__text {
-            align-items: flex-start;
-
-            &__regular-text {
-                margin-bottom: 5px;
-            }
-        }
-    }
-
-    @media screen and (max-width: 780px) {
+    @media screen and (width <= 780px) {
 
         .title-area {
 
@@ -336,7 +330,7 @@ export default class SNOContentTitle extends Vue {
         }
     }
 
-    @media screen and (max-width: 600px) {
+    @media screen and (width <= 600px) {
 
         .title-area {
 
@@ -357,7 +351,7 @@ export default class SNOContentTitle extends Vue {
         }
     }
 
-    @media screen and (max-width: 600px) {
+    @media screen and (width <= 600px) {
 
         .title-area {
 

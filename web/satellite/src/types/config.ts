@@ -1,7 +1,7 @@
 // Copyright (C) 2023 Storj Labs, Inc.
 // See LICENSE for copying information.
 
-import { FrontendConfig } from '@/types/config.gen';
+import type { FrontendConfig } from '@/types/config.gen';
 export * from '@/types/config.gen';
 
 /**
@@ -14,4 +14,127 @@ export interface FrontendConfigApi {
      * @throws Error
      */
     get(): Promise<FrontendConfig>;
+
+    /**
+     * Returns branding config based on the tenant.
+     *
+     * @throws Error
+     */
+    getBranding(): Promise<BrandingConfig>;
+
+    /**
+     * Returns UI config of some kind for a partner.
+     *
+     * @param kind
+     * @param partner
+     */
+    getPartnerUIConfig(kind: string, partner: string): Promise<unknown>;
+}
+
+export const defaultBrandingName = 'Storj';
+
+/**
+  * Creates a default Storj branding configuration.
+  * This is used as a fallback when custom branding is not available.
+  */
+export function createDefaultBranding(): BrandingConfig {
+    return new BrandingConfig(
+        defaultBrandingName,
+        new Map([
+            [LogoKey.FullLight, '/static/static/images/logo.svg'],
+            [LogoKey.FullDark, '/static/static/images/logo-dark.svg'],
+        ]),
+        new Map([
+            [FaviconKey.Small, '/static/static/images/favicons/favicon-16x16.png'],
+            [FaviconKey.Large, '/static/static/images/favicons/favicon-32x32.png'],
+            [FaviconKey.AppleTouch, '/static/static/images/favicons/apple-touch-icon.png'],
+        ]),
+        new Map([
+            [ColorKey.PrimaryLight, '#0052FF'],
+            [ColorKey.PrimaryDark, '#0052FF'],
+            [ColorKey.OnPrimaryLight, '#FFFFFF'],
+            [ColorKey.OnPrimaryDark, '#FFFFFF'],
+            [ColorKey.SecondaryLight, '#091C45'],
+            [ColorKey.SecondaryDark, '#537CFF'],
+            [ColorKey.OnSecondaryLight, '#FFFFFF'],
+            [ColorKey.OnSecondaryDark, '#FFFFFF'],
+            [ColorKey.BackgroundLight, '#fcfcfd'],
+            [ColorKey.BackgroundDark, '#000a20'],
+            [ColorKey.SurfaceLight, '#FFFFFF'],
+            [ColorKey.SurfaceDark, '#000b21'],
+            [ColorKey.OnSurfaceLight, '#000000'],
+            [ColorKey.OnSurfaceDark, '#FFFFFF'],
+            [ColorKey.SuccessLight, '#00B661'],
+            [ColorKey.SuccessDark, '#00E366'],
+            [ColorKey.InfoLight, '#0059D0'],
+            [ColorKey.InfoDark, '#2196f3'],
+            [ColorKey.WarningLight, '#FF7F00'],
+            [ColorKey.WarningDark, '#FF8A00'],
+        ]),
+    );
+}
+
+export class BrandingConfig {
+    public constructor(
+        public name: string = '',
+        public logoUrls: Map<string, string> = new Map(),
+        public faviconUrls: Map<string, string> = new Map(),
+        public colors: Map<string, string> = new Map(),
+        public supportUrl: string = '',
+        public docsUrl: string = '',
+        public homepageUrl: string = '',
+        public getInTouchUrl: string = '',
+        public gatewayUrl: string = '',
+        public privacyPolicyUrl: string = '',
+        public termsOfServiceUrl: string = '',
+        public freeTrialsEnabled: boolean = true,
+    ) {}
+
+    public getColor(key: ColorKey): string | undefined {
+        return this.colors.get(key);
+    }
+
+    public getLogo(key: LogoKey): string | undefined {
+        return this.logoUrls.get(key);
+    }
+
+    public getFavicon(key: FaviconKey): string | undefined {
+        return this.faviconUrls.get(key);
+    }
+}
+
+export enum LogoKey {
+    FullLight = 'full-light',
+    FullDark = 'full-dark',
+    SmallLight = 'small-light',
+    SmallDark = 'small-dark',
+}
+
+export enum FaviconKey {
+    Small = '16x16',
+    Large = '32x32',
+    AppleTouch = 'apple-touch',
+}
+
+export enum ColorKey {
+    PrimaryLight = 'primary-light',
+    PrimaryDark = 'primary-dark',
+    OnPrimaryLight = 'on-primary-light',
+    OnPrimaryDark = 'on-primary-dark',
+    SecondaryLight = 'secondary-light',
+    SecondaryDark = 'secondary-dark',
+    OnSecondaryLight = 'on-secondary-light',
+    OnSecondaryDark = 'on-secondary-dark',
+    BackgroundLight = 'background-light',
+    BackgroundDark = 'background-dark',
+    SurfaceLight = 'surface-light',
+    SurfaceDark = 'surface-dark',
+    OnSurfaceLight = 'on-surface-light',
+    OnSurfaceDark = 'on-surface-dark',
+    SuccessLight = 'success-light',
+    SuccessDark = 'success-dark',
+    InfoLight = 'info-light',
+    InfoDark = 'info-dark',
+    WarningLight = 'warning-light',
+    WarningDark = 'warning-dark',
 }

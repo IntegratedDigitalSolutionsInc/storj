@@ -5,6 +5,7 @@ package nodeselection
 
 import (
 	"bytes"
+	"context"
 	"os"
 	"strconv"
 	"strings"
@@ -25,6 +26,8 @@ type Placement struct {
 	Name string
 	// binding condition for filtering out nodes
 	NodeFilter NodeFilter
+	// binding condition for filtering out nodes, but only during uploads. Repair won't move nodes based on this.
+	UploadFilter NodeFilter
 	// Selector is the method how the nodes are selected from the full node space (eg. pick a subnet first, and pick a node from the subnet)
 	Selector NodeSelectorInit
 	// checked by repair job, applied to the full selection. Out of placement items will be replaced by new, selected by the Selector.
@@ -34,6 +37,13 @@ type Placement struct {
 	// choice of 2).
 	DownloadSelector DownloadSelector
 
+	// CohortRequirements, if set, specify how the uplink will determine if
+	// enough pieces with the right rules have been uploaded.
+	CohortRequirements *CohortRequirements
+	// CohortNames, if set, specifies how to calculate cohort names from a given
+	// SelectedNode, for return in the AddressedOrderLimits.
+	CohortNames map[string]CohortName
+
 	// EC defines erasure coding parameter overrides.
 	EC ECParameters `yaml:"ec"`
 }
@@ -41,9 +51,76 @@ type Placement struct {
 // ECParameters can be used to override certain part of the RS parameters.
 type ECParameters struct {
 	Minimum int
-	Success int
+	Success func(k int) int
 	Total   int
-	Repair  int
+	Repair  func(k int) int
+}
+
+// UnmarshalYAML handles YAML unmarshaling for ECParameters.
+func (e *ECParameters) UnmarshalYAML(unmarshal func(interface{}) error) (err error) {
+	// First try to unmarshal as a struct with mixed repair value (int or string)
+	type ECParametersYAML struct {
+		Minimum int `yaml:"minimum"`
+		Success any `yaml:"success"`
+		Total   int `yaml:"total"`
+		Repair  any `yaml:"repair"`
+	}
+
+	var params ECParametersYAML
+	if err := unmarshal(&params); err != nil {
+		return err
+	}
+
+	e.Minimum = params.Minimum
+	e.Total = params.Total
+
+	if params.Success != nil {
+		e.Success, err = parseRedundancyValue(params.Minimum, params.Success)
+		if err != nil {
+			return err
+		}
+	}
+	if params.Repair != nil {
+		e.Repair, err = parseRedundancyValue(params.Minimum, params.Repair)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func parseRedundancyValue(minimum int, value any) (func(k int) int, error) {
+	switch val := value.(type) {
+	case int:
+		// Static repair value
+		if val > 0 {
+			staticVal := val
+			return func(k int) int {
+				if k == minimum {
+					return staticVal
+				}
+				// if the repair is static, but defined for a different k, don't use it.
+				// it's possible that repair will try to get repair threshold for different k
+				return 0
+			}, nil
+		}
+	case string:
+		// Dynamic repair value (e.g., "+5" means k+5)
+		if strings.HasPrefix(val, "+") {
+			offsetStr := val[1:]
+			offset, err := strconv.Atoi(offsetStr)
+			if err != nil {
+				return nil, errs.New("invalid EC parameter offset value '%s': %v", val, err)
+			}
+			return func(k int) int {
+				return k + offset
+			}, nil
+		} else {
+			return nil, errs.New("unsupported EC parameter string format '%s', expected format like '+5'", val)
+		}
+	}
+	return nil, errs.New("EC fields must be int or string, got %T", value)
 }
 
 // Match implements NodeFilter.
@@ -51,7 +128,13 @@ func (p Placement) Match(node *SelectedNode) bool {
 	return p.NodeFilter.Match(node)
 }
 
+// MatchForUpload implements NodeFilter. It checks not just the global filter but also the filter for uploads.
+func (p Placement) MatchForUpload(node *SelectedNode) bool {
+	return p.NodeFilter.Match(node) && p.UploadFilter.Match(node)
+}
+
 // GetAnnotation implements NodeFilterWithAnnotation.
+//
 // Deprecated: use Name instead.
 func (p Placement) GetAnnotation(name string) string {
 	if name == Location && p.Name != "" {
@@ -70,32 +153,12 @@ var _ NodeFilter = Placement{}
 var _ NodeFilterWithAnnotation = Placement{}
 
 // NodeSelectorInit initializes a stateful NodeSelector when node cache is refreshed.
-type NodeSelectorInit func([]*SelectedNode, NodeFilter) NodeSelector
+type NodeSelectorInit func(context.Context, []*SelectedNode, NodeFilter) NodeSelector
 
 // NodeSelector pick random nodes based on a specific algorithm.
 // Nodes from excluded should never be used. Same is true for alreadySelected, but it may also trigger other restrictions
 // (for example, when a last_net is already selected, all the nodes from the same net should be excluded as well.
-type NodeSelector func(requester storj.NodeID, n int, excluded []storj.NodeID, alreadySelected []*SelectedNode) ([]*SelectedNode, error)
-
-// DownloadSelector will take a map of possible nodes to choose for a download.
-// It returns a new map of nodes to consider for selecting for the download.
-// It is always true that 0 <= len(result) <= len(possibleNodes), and every
-// element in result will have come from possibleNodes. 'needed' is a hint to
-// the selector of how many nodes are needed for return ideally, so many
-// selectors will try to return at least 'needed' nodes.
-type DownloadSelector func(requester storj.NodeID, possibleNodes map[storj.NodeID]*SelectedNode, needed int) (map[storj.NodeID]*SelectedNode, error)
-
-// ExcludeAllDownloadSelector is a DownloadSelector that always returns an
-// empty map.
-var ExcludeAllDownloadSelector DownloadSelector = func(storj.NodeID, map[storj.NodeID]*SelectedNode, int) (map[storj.NodeID]*SelectedNode, error) {
-	return map[storj.NodeID]*SelectedNode{}, nil
-}
-
-// DefaultDownloadSelector is a DownloadSelector that returns the set of
-// possibleNodes unchanged.
-var DefaultDownloadSelector DownloadSelector = func(_ storj.NodeID, possibleNodes map[storj.NodeID]*SelectedNode, _ int) (map[storj.NodeID]*SelectedNode, error) {
-	return possibleNodes, nil
-}
+type NodeSelector func(ctx context.Context, requester storj.NodeID, n int, excluded []storj.NodeID, alreadySelected []storj.NodeID) ([]*SelectedNode, error)
 
 // ErrPlacement is used for placement definition related parsing errors.
 var ErrPlacement = errs.Class("placement")
@@ -129,11 +192,9 @@ func (c *ConfigurablePlacementRule) Type() string {
 
 // Parse creates the PlacementDefinitions from the string rules.
 // defaultPlacement is used to create the placement if no placement has been set.
-func (c ConfigurablePlacementRule) Parse(defaultPlacement func() (Placement, error), environment *PlacementConfigEnvironment) (PlacementDefinitions, error) {
+func (c ConfigurablePlacementRule) Parse(defaultPlacement func() (Placement, error), environment PlacementConfigEnvironment) (PlacementDefinitions, error) {
 	if environment == nil {
-		environment = &PlacementConfigEnvironment{
-			tracker: NoopTracker{},
-		}
+		environment = NewPlacementConfigEnvironment(nil, nil)
 	}
 	if c.PlacementRules == "" {
 		dp, err := defaultPlacement()
@@ -204,23 +265,23 @@ func NewPlacementDefinitions(placements ...Placement) PlacementDefinitions {
 
 // AddLegacyStaticRules initializes all the placement rules defined earlier in static golang code.
 func (d PlacementDefinitions) AddLegacyStaticRules() {
-	d[storj.EEA] = Placement{
+	d[storj.EEA] = Placement{ //lint:ignore SA1019 intentionally using legacy placement constant
 		NodeFilter:       NodeFilters{NewCountryFilter(location.NewSet(EeaCountriesWithoutEu...).With(EuCountries...))},
 		DownloadSelector: DefaultDownloadSelector,
 	}
-	d[storj.EU] = Placement{
+	d[storj.EU] = Placement{ //lint:ignore SA1019 intentionally using legacy placement constant
 		NodeFilter:       NodeFilters{NewCountryFilter(location.NewSet(EuCountries...))},
 		DownloadSelector: DefaultDownloadSelector,
 	}
-	d[storj.US] = Placement{
+	d[storj.US] = Placement{ //lint:ignore SA1019 intentionally using legacy placement constant
 		NodeFilter:       NodeFilters{NewCountryFilter(location.NewSet(location.UnitedStates))},
 		DownloadSelector: DefaultDownloadSelector,
 	}
-	d[storj.DE] = Placement{
+	d[storj.DE] = Placement{ //lint:ignore SA1019 intentionally using legacy placement constant
 		NodeFilter:       NodeFilters{NewCountryFilter(location.NewSet(location.Germany))},
 		DownloadSelector: DefaultDownloadSelector,
 	}
-	d[storj.NR] = Placement{
+	d[storj.NR] = Placement{ //lint:ignore SA1019 intentionally using legacy placement constant
 		NodeFilter:       NodeFilters{NewCountryFilter(location.NewFullSet().Without(location.Russia, location.Belarus, location.None))},
 		DownloadSelector: DefaultDownloadSelector,
 	}
@@ -248,6 +309,7 @@ func (d PlacementDefinitions) AddPlacementRule(id storj.PlacementConstraint, fil
 type stringNotMatch string
 
 // AddPlacementFromString parses placement definition form string representations from id:definition;id:definition;...
+//
 // Deprecated: we will switch to the YAML based configuration.
 func (d PlacementDefinitions) AddPlacementFromString(definitions string) error {
 	env := map[any]any{
@@ -367,6 +429,7 @@ func (d PlacementDefinitions) AddPlacementFromString(definitions string) error {
 		}
 
 		placement.Name = GetAnnotation(placement.NodeFilter, Location)
+		placement.ID = storj.PlacementConstraint(id)
 
 		d[storj.PlacementConstraint(id)] = placement
 	}

@@ -55,8 +55,12 @@ type Auditor struct {
 		Server   *debug.Server
 	}
 
-	Mail       *mailservice.Service
-	Overlay    *overlay.Service
+	Mail    *mailservice.Service
+	Overlay struct {
+		Service                *overlay.Service
+		UploadSelectionCache   *overlay.UploadSelectionCache
+		DownloadSelectionCache *overlay.DownloadSelectionCache
+	}
 	Reputation *reputation.Service
 	Orders     struct {
 		Service *orders.Service
@@ -114,10 +118,10 @@ func NewAuditor(log *zap.Logger, full *identity.FullIdentity,
 
 	{ // setup version control
 		peer.Log.Info("Version info",
-			zap.Stringer("Version", versionInfo.Version.Version),
-			zap.String("Commit Hash", versionInfo.CommitHash),
-			zap.Stringer("Build Timestamp", versionInfo.Timestamp),
-			zap.Bool("Release Build", versionInfo.Release),
+			zap.String("version", versionInfo.Version.VString()),
+			zap.String("commit_hash", versionInfo.CommitHash),
+			zap.Stringer("build_timestamp", versionInfo.Timestamp),
+			zap.Bool("release_build", versionInfo.Release),
 		)
 		peer.Version.Service = version_checker.NewService(log.Named("version"), config.Version, versionInfo, "Satellite")
 		peer.Version.Chore = version_checker.NewChore(peer.Version.Service, config.Version.CheckInterval)
@@ -146,14 +150,29 @@ func NewAuditor(log *zap.Logger, full *identity.FullIdentity,
 
 	{ // setup overlay
 		var err error
-		peer.Overlay, err = overlay.NewService(log.Named("overlay"), overlayCache, nodeEvents, placement, config.Console.ExternalAddress, config.Console.SatelliteName, config.Overlay)
+		peer.Overlay.UploadSelectionCache, err = overlay.NewUploadSelectionCacheFromConfig(log.Named("overlay"), overlayCache, config.Overlay, placement)
+		if err != nil {
+			return nil, errs.Combine(err, peer.Close())
+		}
+		peer.Overlay.DownloadSelectionCache, err = overlay.NewDownloadSelectionCacheFromConfig(log.Named("overlay"), overlayCache, config.Overlay, placement)
+		if err != nil {
+			return nil, errs.Combine(err, peer.Close())
+		}
+		peer.Overlay.Service, err = overlay.NewService(log.Named("overlay"), overlayCache, nodeEvents, peer.Overlay.UploadSelectionCache, peer.Overlay.DownloadSelectionCache, placement, config.Console.ExternalAddress, config.Console.SatelliteName, config.Overlay, config.NodeEvents)
 		if err != nil {
 			return nil, errs.Combine(err, peer.Close())
 		}
 		peer.Services.Add(lifecycle.Item{
 			Name:  "overlay",
-			Run:   peer.Overlay.Run,
-			Close: peer.Overlay.Close,
+			Close: peer.Overlay.Service.Close,
+		})
+		peer.Services.Add(lifecycle.Item{
+			Name: "upload-selection-cache",
+			Run:  peer.Overlay.UploadSelectionCache.Run,
+		})
+		peer.Services.Add(lifecycle.Item{
+			Name: "download-selection-cache",
+			Run:  peer.Overlay.DownloadSelectionCache.Run,
 		})
 	}
 
@@ -167,7 +186,7 @@ func NewAuditor(log *zap.Logger, full *identity.FullIdentity,
 			reputationdb = cachingDB
 		}
 		peer.Reputation = reputation.NewService(log.Named("reputation:service"),
-			peer.Overlay,
+			peer.Overlay.Service,
 			reputationdb,
 			config.Reputation,
 		)
@@ -188,7 +207,7 @@ func NewAuditor(log *zap.Logger, full *identity.FullIdentity,
 		peer.Orders.Service, err = orders.NewService(
 			log.Named("orders"),
 			signing.SignerFromFullIdentity(peer.Identity),
-			peer.Overlay,
+			peer.Overlay.Service,
 			// orders service needs DB only for handling
 			// PUT and GET actions which are not used by
 			// auditor so we can set noop implementation.
@@ -215,7 +234,7 @@ func NewAuditor(log *zap.Logger, full *identity.FullIdentity,
 		peer.Audit.Verifier = audit.NewVerifier(log.Named("audit:verifier"),
 			metabaseDB,
 			dialer,
-			peer.Overlay,
+			peer.Overlay.Service,
 			containmentDB,
 			peer.Orders.Service,
 			peer.Identity,
@@ -229,11 +248,10 @@ func NewAuditor(log *zap.Logger, full *identity.FullIdentity,
 		peer.Audit.Reporter = audit.NewReporter(
 			log.Named("reporter"),
 			peer.Reputation,
-			peer.Overlay,
+			peer.Overlay.Service,
 			metabaseDB,
 			containmentDB,
-			config.Audit.MaxRetriesStatDB,
-			int32(config.Audit.MaxReverifyCount))
+			config.Audit)
 
 		peer.Audit.Worker = audit.NewWorker(log.Named("audit:verify-worker"),
 			verifyQueue,

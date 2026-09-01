@@ -28,6 +28,54 @@ const maxExemplars = 3
 // HistogramByPlacement contains multiple Histogram for each Placement.
 type HistogramByPlacement []Histogram // placement -> Histogram
 
+// HealthStat stores the number of segments for each piece count (healthy / retrievable pairs).
+type HealthStat struct {
+	Placement         storj.PlacementConstraint
+	HealthyPieces     int // k-normalized number of healthy pieces
+	RetrievablePieces int // k-normalized number of retrievable pieces
+	SegmentCount      int
+	Exemplar          string
+}
+
+// HealthMatrix stores the number of segments for each k+healthy / k+ retrievable pieces.
+type HealthMatrix struct {
+	Stat []HealthStat
+}
+
+// Increment updates the health matrix counter for the given parameters.
+func (h *HealthMatrix) Increment(placement storj.PlacementConstraint, healthyPieces int, retrievablePieces int, increment int, segmentExemplar string) {
+	for ix := range h.Stat {
+		if h.Stat[ix].Placement == placement && h.Stat[ix].HealthyPieces == healthyPieces && h.Stat[ix].RetrievablePieces == retrievablePieces {
+			h.Stat[ix].SegmentCount += increment
+			return
+		}
+	}
+	h.Stat = append(h.Stat, HealthStat{
+		Placement:         placement,
+		HealthyPieces:     healthyPieces,
+		RetrievablePieces: retrievablePieces,
+		Exemplar:          segmentExemplar,
+		SegmentCount:      increment,
+	})
+}
+
+// Merge merges the health matrix with another health matrix.
+func (h *HealthMatrix) Merge(matrix *HealthMatrix) {
+	for _, stat := range matrix.Stat {
+		h.Increment(stat.Placement, stat.HealthyPieces, stat.RetrievablePieces, stat.SegmentCount, stat.Exemplar)
+	}
+}
+
+// Find returns the number of segments for the given placement, healthyPieces and retrievablePieces.
+func (h *HealthMatrix) Find(placement storj.PlacementConstraint, healthyPieces, retrievablePieces int) int {
+	for _, stat := range h.Stat {
+		if stat.Placement == placement && stat.HealthyPieces == healthyPieces && stat.RetrievablePieces == retrievablePieces {
+			return stat.SegmentCount
+		}
+	}
+	return 0
+}
+
 // Reset will reset all the included Histograms.
 func (p *HistogramByPlacement) Reset() {
 	for _, h := range *p {
@@ -134,7 +182,7 @@ type NodeClassifier func(node *nodeselection.SelectedNode) string
 
 // ReportConfig configures durability report.
 type ReportConfig struct {
-	Enabled bool `help:"whether to enable durability report (rangedloop observer)" default:"true"`
+	Enabled bool `help:"whether to enable durability report (rangedloop observer)" default:"true" testDefault:"false"`
 }
 
 // Report  is a calculator (rangloop.Observer) which checks the availability of pieces without certain nodes.
@@ -147,13 +195,16 @@ type ReportConfig struct {
 //	in this case this reporter will return 38 for the class "country:DE" (assuming all the other segments are more lucky).
 type Report struct {
 	// histogram shows the piece distribution -> by default, 1 -> with removing the biggest owner from each piece, 2-> with removing the second biggest owner from each piece, etc.
-	healthStat         []HistogramByPlacement
+	healthStat []HistogramByPlacement
+	// healthMatrix stores the number of segments for each k+healthy / k+ retrievable pieces.
+	healthMatrix *HealthMatrix
+
 	classifier         NodeClassifier
-	aliasMap           *metabase.NodeAliasMap
 	nodes              []nodeselection.SelectedNode
 	db                 overlay.DB
 	metabaseDB         *metabase.DB
 	reporter           func(n time.Time, class string, missingProviders int, ix int, placement storj.PlacementConstraint, stat Bucket, classResolver func(id ClassID) string)
+	matrixReporter     func(n time.Time, placement storj.PlacementConstraint, healthy int, retrievable int, segmentCount int, segmentExemplar string)
 	asOfSystemInterval time.Duration
 
 	// map between classes (like "country:hu" and integer IDs)
@@ -162,15 +213,15 @@ type Report struct {
 	// contains the available classes for each node alias.
 	classified []ClassID
 
-	maxPieceCount int
-	Class         string
-	nodeGetter    NodeGetter
+	Class      string
+	nodeGetter NodeGetter
 }
 
 // NewDurability creates the new instance.
-func NewDurability(db overlay.DB, metabaseDB *metabase.DB, nodeGetter NodeGetter, class string, classifier NodeClassifier, maxPieceCount int, asOfSystemInterval time.Duration) *Report {
+func NewDurability(db overlay.DB, metabaseDB *metabase.DB, nodeGetter NodeGetter, class string, classifier NodeClassifier, asOfSystemInterval time.Duration) *Report {
 	return &Report{
 		healthStat:         make([]HistogramByPlacement, 3),
+		healthMatrix:       &HealthMatrix{},
 		nodeGetter:         nodeGetter,
 		Class:              class,
 		db:                 db,
@@ -179,22 +230,22 @@ func NewDurability(db overlay.DB, metabaseDB *metabase.DB, nodeGetter NodeGetter
 		asOfSystemInterval: asOfSystemInterval,
 		nodes:              []nodeselection.SelectedNode{},
 		reporter:           reportToEventkit,
-		maxPieceCount:      maxPieceCount,
+		matrixReporter:     matrixReportToEventkit,
 	}
 }
 
 // Start implements rangedloop.Observer.
 func (c *Report) Start(ctx context.Context, startTime time.Time) (err error) {
-	c.nodes, err = c.db.GetParticipatingNodes(ctx, -12*time.Hour, c.asOfSystemInterval)
+	c.nodes, err = c.db.GetAllParticipatingNodes(ctx, -12*time.Hour, c.asOfSystemInterval)
 	if err != nil {
 		return errs.Wrap(err)
 	}
-	c.aliasMap, err = c.metabaseDB.LatestNodesAliasMap(ctx)
+	aliasMap, err := c.metabaseDB.LatestNodesAliasMap(ctx)
 	if err != nil {
 		return errs.Wrap(err)
 	}
 	c.resetStat()
-	c.classifyNodeAliases()
+	c.classifyNodeAliases(aliasMap)
 	return nil
 }
 
@@ -202,18 +253,19 @@ func (c *Report) resetStat() {
 	for _, h := range c.healthStat {
 		h.Reset()
 	}
+	c.healthMatrix = &HealthMatrix{}
 }
 
-func (c *Report) classifyNodeAliases() {
+func (c *Report) classifyNodeAliases(aliasMap *metabase.NodeAliasMap) {
 	classes := make(map[string]ClassID)
 	c.className = make(map[ClassID]string)
 
 	classes["unclassified"] = 0
 	c.className[0] = "unclassified"
 
-	c.classified = make([]ClassID, c.aliasMap.Max()+1)
+	c.classified = make([]ClassID, aliasMap.Max()+1)
 	for _, node := range c.nodes {
-		alias, ok := c.aliasMap.Alias(node.ID)
+		alias, ok := aliasMap.Alias(node.ID)
 		if !ok {
 			continue
 		}
@@ -236,6 +288,7 @@ func (c *Report) Fork(ctx context.Context) (rangedloop.Partial, error) {
 		healthStat:             make([]HistogramByPlacement, 3),
 		controlledByClassCache: make([]int32, len(c.className)),
 		classified:             c.classified,
+		healthMatrix:           &HealthMatrix{},
 	}
 	return d, nil
 }
@@ -253,6 +306,7 @@ func (c *Report) Join(ctx context.Context, partial rangedloop.Partial) (err erro
 			c.healthStat[ix][placement].Merge(hs)
 		}
 	}
+	c.healthMatrix.Merge(fork.healthMatrix)
 	return nil
 }
 
@@ -272,6 +326,9 @@ func (c *Report) Finish(ctx context.Context) error {
 				c.reporter(reportTime, c.Class, group, ix*-1, storj.PlacementConstraint(placement), *stat, c.resolveClass)
 			}
 		}
+	}
+	for _, stat := range c.healthMatrix.Stat {
+		c.matrixReporter(reportTime, stat.Placement, stat.HealthyPieces, stat.RetrievablePieces, stat.SegmentCount, stat.Exemplar)
 	}
 	return nil
 }
@@ -293,6 +350,7 @@ type ClassID int32
 type ObserverFork struct {
 	controlledByClassCache []int32
 	healthStat             []HistogramByPlacement
+	healthMatrix           *HealthMatrix
 
 	nodesCache NodeGetter
 
@@ -341,8 +399,9 @@ func (c *ObserverFork) Process(ctx context.Context, segments []rangedloop.Segmen
 			continue
 		}
 
-		piecesCheck := repair.ClassifySegmentPieces(s.Pieces, selectedNodes, nil, false, false, c.placements[s.Placement])
+		piecesCheck := repair.ClassifySegmentPieces(s.Pieces, selectedNodes, nil, true, true, c.placements[s.Placement])
 
+		c.healthMatrix.Increment(s.Placement, piecesCheck.Healthy.Count()-int(s.Redundancy.RequiredShares), piecesCheck.Retrievable.Count()-int(s.Redundancy.RequiredShares), 1, fmt.Sprintf("%s/%d", s.StreamID, s.Position.Encode()))
 		counters := ClassGroupCounters{}
 		healthyPieceCount := 0
 		for _, piece := range s.AliasPieces {
@@ -405,6 +464,17 @@ func reportToEventkit(n time.Time, class string, missingProviders int, ix int, p
 		eventkit.Int64("placement", int64(placement)),
 		eventkit.String("segment_exemplars", strings.Join(stat.SegmentExemplars, ",")),
 		eventkit.String("class_exemplars", strings.Join(classExemplars, ",")),
+		eventkit.Timestamp("report_time", n),
+	)
+}
+
+func matrixReportToEventkit(n time.Time, placement storj.PlacementConstraint, healthy int, retrievable int, count int, exemplar string) {
+	ek.Event("durability_matrix",
+		eventkit.Int64("placement", int64(placement)),
+		eventkit.Int64("healthy_pieces", int64(healthy)),
+		eventkit.Int64("retrievable_pieces", int64(retrievable)),
+		eventkit.Int64("count", int64(count)),
+		eventkit.String("segment_exemplars", exemplar),
 		eventkit.Timestamp("report_time", n),
 	)
 }

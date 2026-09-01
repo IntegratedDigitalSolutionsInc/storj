@@ -19,6 +19,7 @@ import (
 	"storj.io/common/peertls/extensions"
 	"storj.io/common/peertls/tlsopts"
 	"storj.io/common/rpc"
+	"storj.io/common/rpc/rpcpool"
 	"storj.io/common/signing"
 	"storj.io/common/storj"
 	"storj.io/common/version"
@@ -57,7 +58,11 @@ type Repairer struct {
 		Server   *debug.Server
 	}
 
-	Overlay    *overlay.Service
+	Overlay struct {
+		Service                *overlay.Service
+		UploadSelectionCache   *overlay.UploadSelectionCache
+		DownloadSelectionCache *overlay.DownloadSelectionCache
+	}
 	Reputation *reputation.Service
 	Orders     struct {
 		Service *orders.Service
@@ -69,6 +74,7 @@ type Repairer struct {
 
 	EcRepairer      *repairer.ECRepairer
 	SegmentRepairer *repairer.SegmentRepairer
+	Queue           queue.RepairQueue
 	Repairer        *repairer.Service
 }
 
@@ -113,10 +119,10 @@ func NewRepairer(log *zap.Logger, full *identity.FullIdentity,
 
 	{
 		peer.Log.Info("Version info",
-			zap.Stringer("Version", versionInfo.Version.Version),
-			zap.String("Commit Hash", versionInfo.CommitHash),
-			zap.Stringer("Build Timestamp", versionInfo.Timestamp),
-			zap.Bool("Release Build", versionInfo.Release),
+			zap.Stringer("version", versionInfo.Version),
+			zap.String("commit_hash", versionInfo.CommitHash),
+			zap.Stringer("build_timestamp", versionInfo.Timestamp),
+			zap.Bool("release_build", versionInfo.Release),
 		)
 		peer.Version.Service = version_checker.NewService(log.Named("version"), config.Version, versionInfo, "Satellite")
 		peer.Version.Chore = version_checker.NewChore(peer.Version.Service, config.Version.CheckInterval)
@@ -136,6 +142,16 @@ func NewRepairer(log *zap.Logger, full *identity.FullIdentity,
 		}
 
 		peer.Dialer = rpc.NewDefaultDialer(tlsOptions)
+		if config.Repairer.ConnectionPool.Capacity > 0 {
+			peer.Dialer.Pool = rpcpool.New(rpcpool.Options{
+				Capacity:       config.Repairer.ConnectionPool.Capacity,
+				KeyCapacity:    config.Repairer.ConnectionPool.KeyCapacity,
+				IdleExpiration: config.Repairer.ConnectionPool.IdleExpiration,
+				MaxLifetime:    config.Repairer.ConnectionPool.MaxLifetime,
+				Name:           "repairer",
+			})
+		}
+
 		peer.Dialer.DialTimeout = config.Repairer.DialTimeout
 	}
 
@@ -145,14 +161,29 @@ func NewRepairer(log *zap.Logger, full *identity.FullIdentity,
 			return nil, err
 		}
 
-		peer.Overlay, err = overlay.NewService(log.Named("overlay"), overlayCache, nodeEvents, placement, config.Console.ExternalAddress, config.Console.SatelliteName, config.Overlay)
+		peer.Overlay.UploadSelectionCache, err = overlay.NewUploadSelectionCacheFromConfig(log.Named("overlay"), overlayCache, config.Overlay, placement)
+		if err != nil {
+			return nil, errs.Combine(err, peer.Close())
+		}
+		peer.Overlay.DownloadSelectionCache, err = overlay.NewDownloadSelectionCacheFromConfig(log.Named("overlay"), overlayCache, config.Overlay, placement)
+		if err != nil {
+			return nil, errs.Combine(err, peer.Close())
+		}
+		peer.Overlay.Service, err = overlay.NewService(log.Named("overlay"), overlayCache, nodeEvents, peer.Overlay.UploadSelectionCache, peer.Overlay.DownloadSelectionCache, placement, config.Console.ExternalAddress, config.Console.SatelliteName, config.Overlay, config.NodeEvents)
 		if err != nil {
 			return nil, errs.Combine(err, peer.Close())
 		}
 		peer.Services.Add(lifecycle.Item{
 			Name:  "overlay",
-			Run:   peer.Overlay.Run,
-			Close: peer.Overlay.Close,
+			Close: peer.Overlay.Service.Close,
+		})
+		peer.Services.Add(lifecycle.Item{
+			Name: "upload-selection-cache",
+			Run:  peer.Overlay.UploadSelectionCache.Run,
+		})
+		peer.Services.Add(lifecycle.Item{
+			Name: "download-selection-cache",
+			Run:  peer.Overlay.DownloadSelectionCache.Run,
 		})
 	}
 
@@ -166,7 +197,7 @@ func NewRepairer(log *zap.Logger, full *identity.FullIdentity,
 			reputationdb = cachingDB
 		}
 		peer.Reputation = reputation.NewService(log.Named("reputation:service"),
-			peer.Overlay,
+			peer.Overlay.Service,
 			reputationdb,
 			config.Reputation,
 		)
@@ -186,7 +217,7 @@ func NewRepairer(log *zap.Logger, full *identity.FullIdentity,
 		peer.Orders.Service, err = orders.NewService(
 			log.Named("orders"),
 			signing.SignerFromFullIdentity(peer.Identity),
-			peer.Overlay,
+			peer.Overlay.Service,
 			// orders service needs DB only for handling
 			// PUT and GET actions which are not used by
 			// repairer so we can set noop implementation.
@@ -203,11 +234,10 @@ func NewRepairer(log *zap.Logger, full *identity.FullIdentity,
 		peer.Audit.Reporter = audit.NewReporter(
 			log.Named("reporter"),
 			peer.Reputation,
-			peer.Overlay,
+			peer.Overlay.Service,
 			metabaseDB,
 			containmentDB,
-			config.Audit.MaxRetriesStatDB,
-			int32(config.Audit.MaxReverifyCount))
+			config.Audit)
 	}
 
 	{ // setup repairer
@@ -223,17 +253,19 @@ func NewRepairer(log *zap.Logger, full *identity.FullIdentity,
 			config.Repairer.DownloadTimeout,
 			config.Repairer.InMemoryRepair,
 			config.Repairer.InMemoryUpload,
+			config.Repairer.DownloadLongTail,
+			config.Repairer.DownloadChunkSize,
 		)
 
 		if len(config.Repairer.RepairExcludedCountryCodes) == 0 {
 			config.Repairer.RepairExcludedCountryCodes = config.Overlay.RepairExcludedCountryCodes
 		}
 
-		peer.SegmentRepairer = repairer.NewSegmentRepairer(
+		peer.SegmentRepairer, err = repairer.NewSegmentRepairer(
 			log.Named("segment-repair"),
 			metabaseDB,
 			peer.Orders.Service,
-			peer.Overlay,
+			peer.Overlay.Service,
 			peer.Audit.Reporter,
 			peer.EcRepairer,
 			placement,
@@ -241,6 +273,16 @@ func NewRepairer(log *zap.Logger, full *identity.FullIdentity,
 			config.Checker.RepairTargetOverrides,
 			config.Repairer,
 		)
+		if err != nil {
+			return nil, err
+		}
+		peer.Services.Add(lifecycle.Item{
+			Name:  "segment-repair",
+			Run:   peer.SegmentRepairer.Run,
+			Close: peer.Repairer.Close,
+		})
+
+		peer.Queue = repairQueue
 		peer.Repairer = repairer.NewService(log.Named("repairer"), repairQueue, &config.Repairer, peer.SegmentRepairer)
 
 		peer.Services.Add(lifecycle.Item{

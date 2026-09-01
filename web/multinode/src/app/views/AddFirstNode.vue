@@ -2,9 +2,7 @@
 // See LICENSE for copying information.
 
 <template>
-    <div
-        class="add-first-node"
-    >
+    <div class="add-first-node">
         <div class="add-first-node__left-area">
             <svg class="logo" width="70" height="70" viewBox="0 0 46 29" xmlns="http://www.w3.org/2000/svg">
                 <g id="Page-1" stroke="none" stroke-width="1" fill="none" fill-rule="evenodd">
@@ -20,21 +18,28 @@
                 label="Node ID"
                 placeholder="Enter Node ID"
                 :error="idError"
-                @setData="setNodeId"
+                @set-data="setNodeId"
+            />
+            <headered-input
+                class="add-first-node__left-area__input"
+                label="Node Name"
+                placeholder="Enter Node Name"
+                :error="nameError"
+                @set-data="setNodeName"
             />
             <headered-input
                 class="add-first-node__left-area__input"
                 label="Public IP Address"
                 placeholder="Enter Public IP Address and Port"
                 :error="publicIPError"
-                @setData="setPublicIP"
+                @set-data="setPublicIP"
             />
             <headered-input
                 class="add-first-node__left-area__input"
                 label="API Key"
                 placeholder="Enter API Key"
                 :error="apiKeyError"
-                @setData="setApiKey"
+                @set-data="setApiKey"
             />
             <v-button class="add-first-node__left-area__button" label="Add Node" width="120px" :on-press="onCreate" />
         </div>
@@ -45,98 +50,94 @@
     </div>
 </template>
 
-<script lang="ts">
-import { Component, Vue } from 'vue-property-decorator';
+<script setup lang="ts">
+import { ref } from 'vue';
+import { useRouter } from 'vue-router';
 
 import { Config as RouterConfig } from '@/app/router';
 import { CreateNodeFields } from '@/nodes';
+import { useNodesStore } from '@/app/store/nodesStore';
 
 import HeaderedInput from '@/app/components/common/HeaderedInput.vue';
 import VButton from '@/app/components/common/VButton.vue';
 import ThemeSelector from '@/app/components/common/ThemeSelector.vue';
 
-// @vue/component
-@Component({
-    components: {
-        HeaderedInput,
-        VButton,
-        ThemeSelector,
-    },
-})
-export default class AddFirstNode extends Vue {
-    private nodeToAdd: CreateNodeFields = new CreateNodeFields();
+const router = useRouter();
 
-    private isLoading = false;
-    // errors
-    private idError = '';
-    private publicIPError = '';
-    private apiKeyError = '';
+const nodesStore = useNodesStore();
 
-    /**
-     * Sets node id field from value string.
-     */
-    public setNodeId(value: string): void {
-        this.nodeToAdd.id = value.trim();
-        this.idError = '';
+const nodeToAdd = ref<CreateNodeFields>(new CreateNodeFields());
+const isLoading = ref<boolean>(false);
+const idError = ref<string>('');
+const publicIPError = ref<string>('');
+const apiKeyError = ref<string>('');
+const nameError = ref<string>('');
+
+function setNodeId(value: string): void {
+    nodeToAdd.value.id = value.trim();
+    idError.value = '';
+}
+
+function setPublicIP(value: string): void {
+    nodeToAdd.value.publicAddress = value.trim();
+    publicIPError.value = '';
+}
+
+function setApiKey(value: string): void {
+    nodeToAdd.value.apiSecret = value.trim();
+    apiKeyError.value = '';
+}
+
+function setNodeName(value: string): void {
+    nodeToAdd.value.name = value.trim();
+    nameError.value = '';
+}
+
+function validateFields(): boolean {
+    let hasNoErrors = true;
+
+    if (!nodeToAdd.value.id) {
+        idError.value = 'This field is required. Please enter a valid node ID';
+        hasNoErrors = false;
     }
 
-    /**
-     * Sets node public ip field from value string.
-     */
-    public setPublicIP(value: string): void {
-        this.nodeToAdd.publicAddress = value.trim();
-        this.publicIPError = '';
+    if (!nodeToAdd.value.name) {
+        nameError.value = 'This field is required. Please enter a valid node Name';
+        hasNoErrors = false;
     }
 
-    /**
-     * Sets API key field from value string.
-     */
-    public setApiKey(value: string): void {
-        this.nodeToAdd.apiSecret = value.trim();
-        this.apiKeyError = '';
+    if (!nodeToAdd.value.publicAddress) {
+        publicIPError.value = 'This field is required. Please enter a valid node Public Address';
+        hasNoErrors = false;
     }
 
-    public async onCreate(): Promise<void> {
-        if (this.isLoading) { return; }
-
-        this.isLoading = true;
-
-        if (!this.validateFields()) {
-            this.isLoading = false;
-
-            return;
-        }
-
-        try {
-            await this.$store.dispatch('nodes/add', this.nodeToAdd);
-        } catch (error) {
-            console.error(error);
-            this.isLoading = false;
-        }
-
-        await this.$router.push(RouterConfig.MyNodes.path);
+    if (!nodeToAdd.value.apiSecret) {
+        apiKeyError.value = 'This field is required. Please enter a valid API Key';
+        hasNoErrors = false;
     }
 
-    private validateFields(): boolean {
-        let hasNoErrors = true;
+    return hasNoErrors;
+}
 
-        if (!this.nodeToAdd.id) {
-            this.idError = 'This field is required. Please enter a valid node ID';
-            hasNoErrors = false;
-        }
+async function onCreate(): Promise<void> {
+    if (isLoading.value) return;
 
-        if (!this.nodeToAdd.publicAddress) {
-            this.publicIPError = 'This field is required. Please enter a valid node Public Address';
-            hasNoErrors = false;
-        }
+    isLoading.value = true;
 
-        if (!this.nodeToAdd.apiSecret) {
-            this.apiKeyError = 'This field is required. Please enter a valid API Key';
-            hasNoErrors = false;
-        }
+    if (!validateFields()) {
+        isLoading.value = false;
 
-        return hasNoErrors;
+        return;
     }
+
+    try {
+        await nodesStore.add(nodeToAdd.value);
+    } catch (error) {
+        console.error(error);
+        isLoading.value = false;
+    }
+
+    await router.push(RouterConfig.MyNodes.path);
 }
 </script>
 

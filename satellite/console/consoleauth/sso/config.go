@@ -14,9 +14,60 @@ import (
 
 // Config is a configuration struct for SSO.
 type Config struct {
-	Enabled               bool                  `help:"whether SSO is enabled." default:"false"`
-	OidcProviderInfos     OidcProviderInfos     `help:"semicolon-separated provider:client-id,client-secret,provider-url." default:""`
-	EmailProviderMappings EmailProviderMappings `help:"semicolon-separated provider:email-regex as provided in oidc-provider-infos." default:""`
+	Enabled                        bool                  `help:"whether SSO is enabled." default:"false"`
+	OidcProviderInfos              OidcProviderInfos     `help:"semicolon-separated provider:client-id,client-secret,provider-url." default:""`
+	EmailProviderMappings          EmailProviderMappings `help:"semicolon-separated provider:email-regex as provided in oidc-provider-infos." default:""`
+	GeneralProviders               GeneralProviders      `help:"semicolon-separated provider names for general SSO (opt-in, no email mapping). Must exist in oidc-provider-infos." default:""`
+	PrimaryAuthProvider            string                `help:"name of the SSO provider used as the primary auth (replaces login page). Must exist in general-providers and oidc-provider-infos." default:""`
+	AccountURL                     string                `help:"account management URL for the primary auth provider." default:""`
+	GeneralLinkVerificationEnabled bool                  `help:"require satellite email verification before linking existing users via general SSO." default:"false"`
+	AllowUnverifiedGeneralSSO      bool                  `help:"allow users to link existing accounts via general SSO without verifying their email." default:"false"`
+	MockSso                        bool                  `help:"whether to mock SSO for testing purposes. This should never be true in production." default:"false" hidden:"true"`
+	MockEmail                      string                `help:"mock email for successful SSO auth for testing purposes." default:"" hidden:"true"`
+	Webhook                        WebhookConfig
+}
+
+// WebhookConfig holds configuration for the primary auth provider webhook endpoint.
+type WebhookConfig struct {
+	Enabled         bool   `help:"whether the primary auth provider's webhook endpoint is enabled." default:"false"`
+	Username        string `help:"username for Basic Auth webhook validation." default:""`
+	Password        string `help:"password for Basic Auth webhook validation." default:""`
+	SigningSecret   string `help:"HMAC signing secret for webhook signature verification." default:""`
+	SignatureHeader string `help:"HTTP header name carrying the webhook signature JWT." default:"X-FusionAuth-Signature-JWT"`
+}
+
+// Ensure that GeneralProviders implements pflag.Value.
+var _ pflag.Value = (*GeneralProviders)(nil)
+
+// GeneralProviders is a list of provider names allowed for general SSO.
+type GeneralProviders struct {
+	Values []string
+}
+
+// Type returns the type of the pflag.Value.
+func (*GeneralProviders) Type() string { return "sso.general-providers" }
+
+func (gp *GeneralProviders) String() string {
+	return strings.Join(gp.Values, ";")
+}
+
+// Set general providers from a semicolon-separated string.
+func (gp *GeneralProviders) Set(s string) error {
+	seen := make(map[string]struct{})
+	var providers []string
+	for _, v := range strings.Split(s, ";") {
+		p := strings.TrimSpace(v)
+		if p == "" {
+			continue
+		}
+		if _, ok := seen[p]; ok {
+			return Error.New("provider duplicate found. Provider must be unique: %s", p)
+		}
+		seen[p] = struct{}{}
+		providers = append(providers, p)
+	}
+	gp.Values = providers
+	return nil
 }
 
 // Ensure that OidcProviderInfos implements pflag.Value.
@@ -35,7 +86,7 @@ type OidcProviderInfos struct {
 }
 
 // Type returns the type of the pflag.Value.
-func (OidcProviderInfos) Type() string { return "sso.infos" }
+func (*OidcProviderInfos) Type() string { return "sso.infos" }
 
 func (si *OidcProviderInfos) String() string {
 	var s strings.Builder
@@ -44,7 +95,7 @@ func (si *OidcProviderInfos) String() string {
 		if i > 0 {
 			s.WriteString(";")
 		}
-		_, _ = fmt.Fprintf(&s, "%s:%s,%s,%s", k, v.ClientID, v.ClientSecret, v.ProviderURL.String())
+		_, _ = fmt.Fprintf(&s, "%s:%s,%s,%s", k, v.ClientID, "<redacted>", v.ProviderURL.String())
 		i++
 	}
 	return s.String()
@@ -101,7 +152,7 @@ type EmailProviderMappings struct {
 }
 
 // Type returns the type of the pflag.Value.
-func (EmailProviderMappings) Type() string { return "sso.email-provider-mappings" }
+func (*EmailProviderMappings) Type() string { return "sso.email-provider-mappings" }
 
 func (epm *EmailProviderMappings) String() string {
 	var s strings.Builder
@@ -138,9 +189,9 @@ func (epm *EmailProviderMappings) Set(s string) error {
 		}
 
 		regexStr := strings.TrimSpace(info[1])
-		emailSuffix := regexp.MustCompile(regexStr)
-		if emailSuffix == nil {
-			return Error.New("invalid email suffix regex: %s", regexStr)
+		emailSuffix, err := regexp.Compile(regexStr)
+		if err != nil {
+			return Error.New("invalid email suffix regex %q: %v", regexStr, err)
 		}
 
 		mappingsMap[provider] = *emailSuffix

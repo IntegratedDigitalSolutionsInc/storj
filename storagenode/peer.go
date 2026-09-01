@@ -42,6 +42,7 @@ import (
 	"storj.io/storj/storagenode/contact"
 	"storj.io/storj/storagenode/forgetsatellite"
 	"storj.io/storj/storagenode/gracefulexit"
+	"storj.io/storj/storagenode/hashstore"
 	"storj.io/storj/storagenode/healthcheck"
 	"storj.io/storj/storagenode/inspector"
 	"storj.io/storj/storagenode/internalpb"
@@ -53,15 +54,18 @@ import (
 	"storj.io/storj/storagenode/orders"
 	"storj.io/storj/storagenode/payouts"
 	"storj.io/storj/storagenode/payouts/estimatedpayouts"
+	"storj.io/storj/storagenode/piecemigrate"
 	"storj.io/storj/storagenode/pieces"
 	"storj.io/storj/storagenode/pieces/lazyfilewalker"
 	"storj.io/storj/storagenode/piecestore"
+	"storj.io/storj/storagenode/piecestore/signaturecheck"
 	"storj.io/storj/storagenode/piecestore/usedserials"
 	"storj.io/storj/storagenode/preflight"
 	"storj.io/storj/storagenode/pricing"
 	"storj.io/storj/storagenode/reputation"
 	"storj.io/storj/storagenode/retain"
 	"storj.io/storj/storagenode/satellites"
+	"storj.io/storj/storagenode/satstore"
 	"storj.io/storj/storagenode/storagenodedb"
 	"storj.io/storj/storagenode/storageusage"
 	"storj.io/storj/storagenode/trust"
@@ -119,10 +123,13 @@ type Config struct {
 	Contact   contact.Config
 	Operator  operator.Config
 
+	Hashstore hashstore.Config
+
 	// TODO: flatten storage config and only keep the new one
-	Storage   piecestore.OldConfig
-	Storage2  piecestore.Config
-	Collector collector.Config
+	Storage           piecestore.OldConfig
+	Storage2          piecestore.Config
+	Storage2Migration piecemigrate.Config
+	Collector         collector.Config
 
 	Filestore filestore.Config
 
@@ -131,6 +138,8 @@ type Config struct {
 	Retain retain.Config
 
 	Nodestats nodestats.Config
+
+	Reputation reputation.Config
 
 	Console consoleserver.Config
 
@@ -193,7 +202,7 @@ func isAddressValid(addrstring string) error {
 	if addr == "" {
 		return nil
 	}
-	resolvedhosts, err := net.LookupHost(addr)
+	resolvedhosts, err := (&net.Resolver{}).LookupHost(context.Background(), addr)
 	if err != nil || len(resolvedhosts) == 0 {
 		return errs.New("lookup %q failed: %+v", addr, err)
 	}
@@ -243,11 +252,12 @@ type Peer struct {
 	}
 
 	Contact struct {
-		Service   *contact.Service
-		Chore     *contact.Chore
-		Endpoint  *contact.Endpoint
-		PingStats *contact.PingStats
-		QUICStats *contact.QUICStats
+		Service       *contact.Service
+		Chore         *contact.Chore
+		Endpoint      *contact.Endpoint
+		PingStats     *contact.PingStats
+		QUICStats     *contact.QUICStats
+		AmnestyClient *contact.AmnestyClient
 	}
 
 	Estimation struct {
@@ -256,22 +266,32 @@ type Peer struct {
 
 	Storage2 struct {
 		// TODO: lift things outside of it to organize better
-		Trust          *trust.Pool
+		Trust              *trust.Pool
+		SpaceReport        monitor.SpaceReport
+		OldPieceBackend    *piecestore.OldPieceBackend
+		HashStoreBackend   *piecestore.HashStoreBackend
+		MigrationState     *satstore.SatelliteStore
+		MigrationChore     *piecemigrate.Chore
+		MigratingBackend   *piecestore.MigratingBackend
+		PieceBackend       *piecestore.TestingBackend
+		Endpoint           *piecestore.Endpoint
+		Inspector          *inspector.Endpoint
+		Monitor            *monitor.Service
+		Orders             *orders.Service
+		RestoreTimeManager *retain.RestoreTimeManager
+		BloomFilterManager *retain.BloomFilterManager
+	}
+
+	StorageOld struct {
 		Store          *pieces.Store
 		TrashChore     *pieces.TrashChore
 		BlobsCache     *pieces.BlobsUsageCache
 		CacheService   *pieces.CacheService
 		RetainService  *retain.Service
-		PieceDeleter   *pieces.Deleter
-		Endpoint       *piecestore.Endpoint
-		Inspector      *inspector.Endpoint
-		Monitor        *monitor.Service
-		Orders         *orders.Service
 		FileWalker     *pieces.FileWalker
 		LazyFileWalker *lazyfilewalker.Supervisor
+		Collector      *collector.Service
 	}
-
-	Collector *collector.Service
 
 	NodeStats struct {
 		Service *nodestats.Service
@@ -312,7 +332,10 @@ type Peer struct {
 		Cache   *bandwidth.Cache
 	}
 
-	Reputation *reputation.Service
+	Reputation struct {
+		Service *reputation.Service
+		Chore   *reputation.Chore
+	}
 
 	Multinode struct {
 		Storage   *multinode.StorageEndpoint
@@ -344,10 +367,10 @@ func New(log *zap.Logger, full *identity.FullIdentity, db DB, revocationDB exten
 	{ // version setup
 		if !versionInfo.IsZero() {
 			peer.Log.Debug("Version info",
-				zap.Stringer("Version", versionInfo.Version.Version),
-				zap.String("Commit Hash", versionInfo.CommitHash),
-				zap.Stringer("Build Timestamp", versionInfo.Timestamp),
-				zap.Bool("Release Build", versionInfo.Release),
+				zap.String("version", versionInfo.Version.VString()),
+				zap.String("commit_hash", versionInfo.CommitHash),
+				zap.Stringer("build_timestamp", versionInfo.Timestamp),
+				zap.Bool("release_build", versionInfo.Release),
 			)
 		}
 
@@ -397,8 +420,8 @@ func New(log *zap.Logger, full *identity.FullIdentity, db DB, revocationDB exten
 			Run: func(ctx context.Context) error {
 				// Don't change the format of this comment, it is used to figure out the node id.
 				peer.Log.Info(fmt.Sprintf("Node %s started", peer.Identity.ID))
-				peer.Log.Info(fmt.Sprintf("Public server started on %s", peer.Addr()))
-				peer.Log.Info(fmt.Sprintf("Private server started on %s", peer.PrivateAddr()))
+				peer.Log.Info("Public server started on " + peer.Addr())
+				peer.Log.Info("Private server started on " + peer.PrivateAddr())
 				return peer.Server.Run(ctx)
 			},
 			Close: peer.Server.Close,
@@ -453,6 +476,11 @@ func New(log *zap.Logger, full *identity.FullIdentity, db DB, revocationDB exten
 		peer.Preflight.LocalTime = preflight.NewLocalTime(process.NamedLog(peer.Log, "preflight:localtime"), config.Preflight, peer.Storage2.Trust, peer.Dialer)
 	}
 
+	logsPath, tablePath := config.Hashstore.Directories(config.Storage.Path)
+	metaDir := filepath.Join(logsPath, "meta")
+
+	peer.Storage2.MigrationState = satstore.NewSatelliteStore(metaDir, "migrate")
+
 	{ // setup contact service
 		c := config.Contact
 		if c.ExternalAddress == "" {
@@ -479,7 +507,11 @@ func New(log *zap.Logger, full *identity.FullIdentity, db DB, revocationDB exten
 			NoiseKeyAttestation: noiseKeyAttestation,
 			DebounceLimit:       peer.Server.DebounceLimit(),
 			FastOpen:            peer.Server.FastOpen(),
+			HashstoreMemtbl:     config.Hashstore.TableDefaultKind.Kind == hashstore.TableKind_MemTbl,
 		}
+
+		self.HashstoreWriteToNew = ReportHashstoreWriteToNew(peer.Log, peer.Storage2.MigrationState)
+
 		peer.Contact.PingStats = new(contact.PingStats)
 		peer.Contact.QUICStats = contact.NewQUICStats(peer.Server.IsQUICEnabled())
 
@@ -490,7 +522,9 @@ func New(log *zap.Logger, full *identity.FullIdentity, db DB, revocationDB exten
 
 		peer.Contact.Service = contact.NewService(process.NamedLog(peer.Log, "contact:service"), peer.Dialer, self, peer.Storage2.Trust, peer.Contact.QUICStats, tags)
 
-		peer.Contact.Chore = contact.NewChore(process.NamedLog(peer.Log, "contact:chore"), config.Contact.Interval, peer.Contact.Service)
+		peer.Contact.AmnestyClient = contact.NewAmnestyClient(process.NamedLog(peer.Log, "contact:amnesty"), peer.Dialer, peer.Storage2.Trust)
+
+		peer.Contact.Chore = contact.NewChore(process.NamedLog(peer.Log, "contact:chore"), config.Contact.Interval, config.Contact.CheckInTimeout, peer.Contact.Service)
 		peer.Services.Add(lifecycle.Item{
 			Name:  "contact:chore",
 			Run:   peer.Contact.Chore.Run,
@@ -516,14 +550,14 @@ func New(log *zap.Logger, full *identity.FullIdentity, db DB, revocationDB exten
 	}
 
 	{ // setup storage
-		peer.Storage2.BlobsCache = pieces.NewBlobsUsageCache(process.NamedLog(log, "blobscache"), peer.DB.Pieces())
+		peer.StorageOld.BlobsCache = pieces.NewBlobsUsageCache(process.NamedLog(log, "blobscache"), peer.DB.Pieces())
 
-		blobStore := peer.DB.Pieces()
+		oldBlobStore := peer.DB.Pieces()
 		if !config.Storage2.Monitor.DedicatedDisk {
-			blobStore = peer.Storage2.BlobsCache
+			oldBlobStore = peer.StorageOld.BlobsCache
 		}
 
-		peer.Storage2.FileWalker = pieces.NewFileWalker(process.NamedLog(log, "filewalker"), blobStore, peer.DB.V0PieceInfo(), peer.DB.GCFilewalkerProgress(), peer.DB.UsedSpacePerPrefix())
+		peer.StorageOld.FileWalker = pieces.NewFileWalker(process.NamedLog(log, "filewalker"), oldBlobStore, peer.DB.V0PieceInfo(), peer.DB.GCFilewalkerProgress(), peer.DB.UsedSpacePerPrefix())
 
 		if config.Pieces.EnableLazyFilewalker {
 			executable, err := os.Executable()
@@ -531,102 +565,108 @@ func New(log *zap.Logger, full *identity.FullIdentity, db DB, revocationDB exten
 				return nil, errs.Combine(err, peer.Close())
 			}
 
-			peer.Storage2.LazyFileWalker = lazyfilewalker.NewSupervisor(process.NamedLog(peer.Log, "lazyfilewalker"), db.Config().LazyFilewalkerConfig(), executable)
+			peer.StorageOld.LazyFileWalker = lazyfilewalker.NewSupervisor(process.NamedLog(peer.Log, "lazyfilewalker"), db.Config().LazyFilewalkerConfig(), executable)
 		}
 
-		var pieceExpiration pieces.PieceExpirationDB
-		if config.Pieces.EnableFlatExpirationStore {
-			flatFileStorePath := config.Pieces.FlatExpirationStorePath
-			if abs := filepath.IsAbs(flatFileStorePath); !abs {
-				if config.Storage2.DatabaseDir != "" {
-					flatFileStorePath = filepath.Join(config.Storage2.DatabaseDir, flatFileStorePath)
-				} else {
-					flatFileStorePath = filepath.Join(config.Storage.Path, flatFileStorePath)
-				}
-			}
-
-			var chainedStore pieces.PieceExpirationDB
-			if config.Pieces.FlatExpirationIncludeSQLite {
-				chainedStore = peer.DB.PieceExpirationDB()
-			}
-			pieceExpirationStore, err := pieces.NewPieceExpirationStore(process.NamedLog(peer.Log, "pieceexpiration"), chainedStore, pieces.PieceExpirationConfig{
-				DataDir:               flatFileStorePath,
-				ConcurrentFileHandles: config.Pieces.FlatExpirationStoreFileHandles,
-				MaxBufferTime:         config.Pieces.FlatExpirationStoreMaxBufferTime,
-			})
-			if err != nil {
-				return nil, errs.Combine(err, peer.Close())
-			}
-			peer.Services.Add(lifecycle.Item{
-				Name:  "pieceexpirationstore",
-				Close: pieceExpirationStore.Close,
-			})
-			pieceExpiration = pieceExpirationStore
-		} else {
-			pieceExpiration = peer.DB.PieceExpirationDB()
+		oldPieceExpiration, err := getPieceExpirationStore(process.NamedLog(log, "pieceexpiration"), db.PieceExpirationDB(), config.Storage, config.Storage2, config.Pieces)
+		if err != nil {
+			return nil, errs.Combine(err, peer.Close())
 		}
 
-		peer.Storage2.Store = pieces.NewStore(process.NamedLog(peer.Log, "pieces"),
-			peer.Storage2.FileWalker,
-			peer.Storage2.LazyFileWalker,
-			blobStore,
+		peer.StorageOld.Store = pieces.NewStore(process.NamedLog(peer.Log, "pieces"),
+			peer.StorageOld.FileWalker,
+			peer.StorageOld.LazyFileWalker,
+			oldBlobStore,
 			peer.DB.V0PieceInfo(),
-			pieceExpiration,
+			oldPieceExpiration,
 			config.Pieces,
 		)
 
-		peer.Storage2.PieceDeleter = pieces.NewDeleter(process.NamedLog(log, "piecedeleter"), peer.Storage2.Store, config.Storage2.DeleteWorkers, config.Storage2.DeleteQueueSize)
-		peer.Services.Add(lifecycle.Item{
-			Name:  "PieceDeleter",
-			Run:   peer.Storage2.PieceDeleter.Run,
-			Close: peer.Storage2.PieceDeleter.Close,
-		})
-
-		peer.Storage2.TrashChore = pieces.NewTrashChore(
+		peer.StorageOld.TrashChore = pieces.NewTrashChore(
 			process.NamedLog(log, "pieces:trash"),
 			config.Pieces.TrashChoreInterval, // choreInterval: how often to run the chore
 			trashExpiryInterval,              // trashExpiryInterval: when items in the trash should be deleted
 			peer.Storage2.Trust,
-			peer.Storage2.Store,
+			peer.StorageOld.Store,
 		)
 		peer.Services.Add(lifecycle.Item{
 			Name:  "pieces:trash",
-			Run:   peer.Storage2.TrashChore.Run,
-			Close: peer.Storage2.TrashChore.Close,
+			Run:   peer.StorageOld.TrashChore.Run,
+			Close: peer.StorageOld.TrashChore.Close,
 		})
 
-		var spaceReport monitor.SpaceReport
-		if config.Storage2.Monitor.DedicatedDisk {
-			spaceReport = monitor.NewDedicatedDisk(log, peer.Storage2.Store, config.Storage2.Monitor.MinimumDiskSpace.Int64(), config.Storage2.Monitor.ReservedBytes.Int64())
-		} else {
-			spaceReport = monitor.NewSharedDisk(log, peer.Storage2.Store, config.Storage2.Monitor.MinimumDiskSpace.Int64(), config.Storage.AllocatedDiskSpace.Int64())
+		peer.Storage2.RestoreTimeManager = retain.NewRestoreTimeManager(metaDir)
+		peer.Storage2.BloomFilterManager, err = retain.NewBloomFilterManager(
+			metaDir,
+			config.Retain.MaxTimeSkew,
+		)
+		if err != nil {
+			peer.Log.Info("error encountered loading bloom filters", zap.Error(err))
+		}
 
-			// enable cache service only when using shared disk
-			peer.Storage2.CacheService = pieces.NewService(
+		peer.Storage2.HashStoreBackend, err = piecestore.NewHashStoreBackend(
+			context.Background(),
+			config.Hashstore,
+			logsPath,
+			tablePath,
+			peer.Storage2.BloomFilterManager,
+			peer.Storage2.RestoreTimeManager,
+			process.NamedLog(peer.Log, "hashstore"),
+			peer.Contact.AmnestyClient,
+		)
+		if err != nil {
+			return nil, errs.Combine(err, peer.Close())
+		}
+		peer.Services.Add(lifecycle.Item{
+			Name:  "hashstore",
+			Close: peer.Storage2.HashStoreBackend.Close,
+		})
+		mon.Chain(peer.Storage2.HashStoreBackend)
+
+		if config.Storage2.Monitor.DedicatedDisk {
+			peer.Storage2.SpaceReport, err = monitor.NewDedicatedDisk(context.TODO(), log, config.Storage.Path, config.Storage2.Monitor.MinimumDiskSpace.Int64(), config.Storage2.Monitor.ReservedBytes.Int64())
+			if err != nil {
+				return nil, errs.Combine(err, peer.Close())
+			}
+		} else {
+			// enable cache service only when using shared disk; seed it from the DB
+			// before NewSharedDisk so PreFlightCheck sees accurate blobstore usage.
+			peer.StorageOld.CacheService = pieces.NewService(
 				process.NamedLog(log, "piecestore:cache"),
-				peer.Storage2.BlobsCache,
-				peer.Storage2.Store,
+				peer.StorageOld.BlobsCache,
+				peer.StorageOld.Store,
 				peer.DB.PieceSpaceUsedDB(),
 				config.Storage2.CacheSyncInterval,
 				config.Storage2.PieceScanOnStartup,
 			)
+			if err := peer.StorageOld.CacheService.Init(context.TODO()); err != nil {
+				// Non-fatal: new nodes have no persisted data yet (zeros are correct).
+				// Existing nodes should succeed; if Init fails, PreFlightCheck may
+				// conservatively reduce allocatedDiskSpace on this restart.
+				log.Warn("could not pre-initialize blobstore space cache from DB", zap.Error(err))
+			}
+
+			peer.Storage2.SpaceReport, err = monitor.NewSharedDisk(context.TODO(), log, NewPieceStoreSpaceUsageAdapter(peer.StorageOld.Store), peer.Storage2.HashStoreBackend, config.Storage2.Monitor.MinimumDiskSpace.Int64(), config.Storage.AllocatedDiskSpace.Int64())
+			if err != nil {
+				return nil, errs.Combine(err, peer.Close())
+			}
+
 			peer.Services.Add(lifecycle.Item{
 				Name:  "piecestore:cache",
-				Run:   peer.Storage2.CacheService.Run,
-				Close: peer.Storage2.CacheService.Close,
+				Run:   peer.StorageOld.CacheService.Run,
+				Close: peer.StorageOld.CacheService.Close,
 			})
 			peer.Debug.Server.Panel.Add(
-				debug.Cycle("Piecestore Cache", peer.Storage2.CacheService.Loop))
+				debug.Cycle("Piecestore Cache", peer.StorageOld.CacheService.Loop))
 		}
 
 		peer.Storage2.Monitor = monitor.NewService(
 			process.NamedLog(log, "piecestore:monitor"),
-			peer.Storage2.Store,
+			peer.StorageOld.Store,
 			peer.Contact.Service,
-			// TODO: use config.Storage.Monitor.Interval, but for some reason is not set
-			config.Storage.KBucketRefreshInterval,
-			spaceReport,
+			peer.Storage2.SpaceReport,
 			config.Storage2.Monitor,
+			config.Contact.CheckInTimeout,
 		)
 		peer.Services.Add(lifecycle.Item{
 			Name:  "piecestore:monitor",
@@ -636,16 +676,16 @@ func New(log *zap.Logger, full *identity.FullIdentity, db DB, revocationDB exten
 		peer.Debug.Server.Panel.Add(
 			debug.Cycle("Piecestore Monitor", peer.Storage2.Monitor.Loop))
 
-		peer.Storage2.RetainService = retain.NewService(
+		peer.StorageOld.RetainService = retain.NewService(
 			process.NamedLog(peer.Log, "retain"),
-			peer.Storage2.Store,
+			peer.StorageOld.Store,
 			config.Retain,
 		)
 
 		peer.Services.Add(lifecycle.Item{
 			Name:  "retain",
-			Run:   peer.Storage2.RetainService.Run,
-			Close: peer.Storage2.RetainService.Close,
+			Run:   peer.StorageOld.RetainService.Run,
+			Close: peer.StorageOld.RetainService.Close,
 		})
 
 		peer.UsedSerials = usedserials.NewTable(config.Storage2.MaxUsedSerialsSize)
@@ -663,19 +703,62 @@ func New(log *zap.Logger, full *identity.FullIdentity, db DB, revocationDB exten
 			Close: peer.OrdersStore.Close,
 		})
 
+		peer.Storage2.OldPieceBackend = piecestore.NewOldPieceBackend(
+			peer.StorageOld.Store,
+			peer.StorageOld.TrashChore,
+			peer.Storage2.Monitor,
+		)
+
+		peer.Storage2.MigrationChore = piecemigrate.NewChore(
+			process.NamedLog(peer.Log, "piecemigrate:chore"),
+			config.Storage2Migration,
+			satstore.NewSatelliteStore(metaDir, "migrate_chore"),
+			peer.StorageOld.Store,
+			peer.Storage2.HashStoreBackend,
+			peer.Contact.Service,
+			filepath.Join(config.Storage.Path, "blobs"),
+		)
+		mon.Chain(peer.Storage2.MigrationChore)
+
+		peer.Services.Add(lifecycle.Item{
+			Name:  "piecemigrate:chore",
+			Run:   peer.Storage2.MigrationChore.Run,
+			Close: peer.Storage2.MigrationChore.Close,
+		})
+		peer.Debug.Server.Panel.Add(
+			debug.Cycle("Piecemigrate Migration Chore", peer.Storage2.MigrationChore.Loop))
+
+		peer.Storage2.MigratingBackend = piecestore.NewMigratingBackend(
+			peer.Log,
+			peer.Storage2.OldPieceBackend,
+			peer.Storage2.HashStoreBackend,
+			peer.Storage2.MigrationState,
+			peer.Storage2.MigrationChore,
+			peer.Contact.Service,
+			config.Storage2Migration.SuppressCentralMigration,
+		)
+		mon.Chain(peer.Storage2.MigratingBackend)
+		peer.Storage2.MigrationChore.SetWriteStateChecker(peer.Storage2.MigratingBackend)
+
+		peer.Storage2.PieceBackend = piecestore.NewTestingBackend(
+			peer.Storage2.MigratingBackend,
+		)
+
 		peer.Storage2.Endpoint, err = piecestore.NewEndpoint(
 			process.NamedLog(peer.Log, "piecestore"),
 			peer.Identity,
 			peer.Storage2.Trust,
 			peer.Storage2.Monitor,
-			peer.Storage2.RetainService,
+			[]piecestore.QueueRetain{
+				peer.StorageOld.RetainService,
+				peer.Storage2.BloomFilterManager,
+			},
 			peer.Contact.PingStats,
-			peer.Storage2.Store,
-			peer.Storage2.TrashChore,
-			peer.Storage2.PieceDeleter,
+			peer.Storage2.PieceBackend,
 			peer.OrdersStore,
 			peer.Bandwidth.Cache,
 			peer.UsedSerials,
+			&signaturecheck.Full{},
 			config.Storage2,
 		)
 		if err != nil {
@@ -704,7 +787,6 @@ func New(log *zap.Logger, full *identity.FullIdentity, db DB, revocationDB exten
 			process.NamedLog(log, "orders"),
 			dialer,
 			peer.OrdersStore,
-			peer.DB.Orders(),
 			peer.Storage2.Trust,
 			config.Storage2.Orders,
 		)
@@ -739,12 +821,29 @@ func New(log *zap.Logger, full *identity.FullIdentity, db DB, revocationDB exten
 	}
 
 	{ // setup reputation service.
-		peer.Reputation = reputation.NewService(
+		peer.Reputation.Service = reputation.NewService(
 			process.NamedLog(peer.Log, "reputation:service"),
 			peer.DB.Reputation(),
+			peer.Dialer,
+			peer.Storage2.Trust,
 			peer.Identity.ID,
 			peer.Notifications.Service,
 		)
+
+		peer.Reputation.Chore = reputation.NewChore(
+			process.NamedLog(peer.Log, "reputation:chore"),
+			peer.Reputation.Service,
+			config.Reputation,
+		)
+
+		peer.Services.Add(lifecycle.Item{
+			Name:  "reputation:chore",
+			Run:   peer.Reputation.Chore.Run,
+			Close: peer.Reputation.Chore.Close,
+		})
+
+		peer.Debug.Server.Panel.Add(
+			debug.Cycle("Reputation Chore", peer.Reputation.Chore.Loop))
 	}
 
 	{ // setup node stats service
@@ -758,14 +857,12 @@ func New(log *zap.Logger, full *identity.FullIdentity, db DB, revocationDB exten
 			process.NamedLog(peer.Log, "nodestats:cache"),
 			config.Nodestats,
 			nodestats.CacheStorage{
-				Reputation:   peer.DB.Reputation(),
 				StorageUsage: peer.DB.StorageUsage(),
 				Payout:       peer.DB.Payout(),
 				Pricing:      peer.DB.Pricing(),
 			},
 			peer.NodeStats.Service,
 			peer.Payout.Endpoint,
-			peer.Reputation,
 			peer.Storage2.Trust,
 		)
 		peer.Services.Add(lifecycle.Item{
@@ -773,8 +870,6 @@ func New(log *zap.Logger, full *identity.FullIdentity, db DB, revocationDB exten
 			Run:   peer.NodeStats.Cache.Run,
 			Close: peer.NodeStats.Cache.Close,
 		})
-		peer.Debug.Server.Panel.Add(
-			debug.Cycle("Node Stats Cache Reputation", peer.NodeStats.Cache.Reputation))
 		peer.Debug.Server.Panel.Add(
 			debug.Cycle("Node Stats Cache Storage", peer.NodeStats.Cache.Storage))
 	}
@@ -795,9 +890,7 @@ func New(log *zap.Logger, full *identity.FullIdentity, db DB, revocationDB exten
 		peer.Console.Service, err = console.NewService(
 			process.NamedLog(peer.Log, "console:service"),
 			peer.Bandwidth.Cache,
-			peer.Storage2.Store,
 			peer.Version.Service,
-			config.Storage.AllocatedDiskSpace,
 			config.Operator.Wallet,
 			versionInfo,
 			peer.Storage2.Trust,
@@ -808,10 +901,10 @@ func New(log *zap.Logger, full *identity.FullIdentity, db DB, revocationDB exten
 			peer.Contact.PingStats,
 			peer.Contact.Service,
 			peer.Estimation.Service,
-			peer.Storage2.BlobsCache,
 			config.Operator.WalletFeatures,
 			port,
 			peer.Contact.QUICStats,
+			peer.Storage2.SpaceReport,
 		)
 		if err != nil {
 			return nil, errs.Combine(err, peer.Close())
@@ -850,7 +943,7 @@ func New(log *zap.Logger, full *identity.FullIdentity, db DB, revocationDB exten
 	{ // setup storage inspector
 		peer.Storage2.Inspector = inspector.NewEndpoint(
 			process.NamedLog(peer.Log, "pieces:inspector"),
-			peer.Storage2.Store,
+			peer.Storage2.SpaceReport,
 			peer.Contact.Service,
 			peer.Contact.PingStats,
 			peer.Bandwidth.Cache,
@@ -866,7 +959,7 @@ func New(log *zap.Logger, full *identity.FullIdentity, db DB, revocationDB exten
 	{ // setup graceful exit service
 		peer.GracefulExit.Service = gracefulexit.NewService(
 			process.NamedLog(peer.Log, "gracefulexit:service"),
-			peer.Storage2.Store,
+			peer.StorageOld.Store, // TODO: update graceful exit to know about hashstore
 			peer.Storage2.Trust,
 			peer.DB.Satellites(),
 			peer.Dialer,
@@ -878,7 +971,7 @@ func New(log *zap.Logger, full *identity.FullIdentity, db DB, revocationDB exten
 			peer.Storage2.Trust,
 			peer.DB.Satellites(),
 			peer.Dialer,
-			peer.Storage2.BlobsCache,
+			peer.StorageOld.BlobsCache, // TODO: update graceful exit to know about hashstore
 		)
 		if err := internalpb.DRPCRegisterNodeGracefulExit(peer.Server.PrivateDRPC(), peer.GracefulExit.Endpoint); err != nil {
 			return nil, errs.Combine(err, peer.Close())
@@ -892,7 +985,7 @@ func New(log *zap.Logger, full *identity.FullIdentity, db DB, revocationDB exten
 		)
 		peer.GracefulExit.BlobsCleaner = gracefulexit.NewBlobsCleaner(
 			process.NamedLog(peer.Log, "gracefulexit:blobscleaner"),
-			peer.Storage2.Store,
+			peer.StorageOld.Store, // TODO: update graceful exit to know about hashstore
 			peer.Storage2.Trust,
 			peer.DB.Satellites(),
 		)
@@ -922,12 +1015,13 @@ func New(log *zap.Logger, full *identity.FullIdentity, db DB, revocationDB exten
 
 		peer.ForgetSatellite.Cleaner = forgetsatellite.NewCleaner(
 			process.NamedLog(peer.Log, "forgetsatellite:cleaner"),
-			peer.Storage2.Store,
+			peer.StorageOld.Store,
 			peer.Storage2.Trust,
-			peer.Storage2.BlobsCache,
+			peer.StorageOld.BlobsCache,
 			peer.DB.Satellites(),
 			peer.DB.Reputation(),
 			peer.DB.V0PieceInfo(),
+			peer.Storage2.HashStoreBackend,
 		)
 
 		peer.ForgetSatellite.Chore = forgetsatellite.NewChore(
@@ -945,14 +1039,18 @@ func New(log *zap.Logger, full *identity.FullIdentity, db DB, revocationDB exten
 			debug.Cycle("Forget Satellite", peer.ForgetSatellite.Chore.Loop))
 	}
 
-	peer.Collector = collector.NewService(process.NamedLog(peer.Log, "collector"), peer.Storage2.Store, peer.UsedSerials, config.Collector)
+	peer.StorageOld.Collector = collector.NewService(
+		process.NamedLog(peer.Log, "collector"),
+		peer.StorageOld.Store,
+		peer.UsedSerials,
+		config.Collector)
 	peer.Services.Add(lifecycle.Item{
 		Name:  "collector",
-		Run:   peer.Collector.Run,
-		Close: peer.Collector.Close,
+		Run:   peer.StorageOld.Collector.Run,
+		Close: peer.StorageOld.Collector.Close,
 	})
 	peer.Debug.Server.Panel.Add(
-		debug.Cycle("Collector", peer.Collector.Loop))
+		debug.Cycle("Collector", peer.StorageOld.Collector.Loop))
 
 	{ // setup multinode endpoints
 		// TODO: add to peer?
@@ -1051,3 +1149,32 @@ func (peer *Peer) URL() storj.NodeURL { return storj.NodeURL{ID: peer.ID(), Addr
 
 // PrivateAddr returns the private address.
 func (peer *Peer) PrivateAddr() string { return peer.Server.PrivateAddr().String() }
+
+func getPieceExpirationStore(log *zap.Logger, expDB pieces.PieceExpirationDB, oldCfg piecestore.OldConfig, storeCfg piecestore.Config, cfg pieces.Config) (pieces.PieceExpirationDB, error) {
+	if !cfg.EnableFlatExpirationStore {
+		return expDB, nil
+	}
+
+	flatFileStorePath := cfg.FlatExpirationStorePath
+	if abs := filepath.IsAbs(flatFileStorePath); !abs {
+		if storeCfg.DatabaseDir != "" {
+			flatFileStorePath = filepath.Join(storeCfg.DatabaseDir, flatFileStorePath)
+		} else {
+			flatFileStorePath = filepath.Join(oldCfg.Path, flatFileStorePath)
+		}
+	}
+	flatExpStore, err := pieces.NewPieceExpirationStore(log, pieces.PieceExpirationConfig{
+		DataDir:               flatFileStorePath,
+		ConcurrentFileHandles: cfg.FlatExpirationStoreFileHandles,
+		MaxBufferTime:         cfg.FlatExpirationStoreMaxBufferTime,
+	})
+
+	if err != nil {
+		return nil, err
+	}
+
+	if !cfg.FlatExpirationIncludeSQLite {
+		return flatExpStore, nil
+	}
+	return pieces.NewCombinedExpirationStore(log, expDB, flatExpStore), nil
+}

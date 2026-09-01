@@ -13,10 +13,12 @@ import (
 	"sync/atomic"
 
 	"github.com/spacemonkeygo/monkit/v3"
+	"github.com/zeebo/mwc"
 	"golang.org/x/exp/maps"
 
 	"storj.io/common/storj"
 	"storj.io/storj/satellite/nodeselection"
+	"storj.io/storj/satellite/trust"
 )
 
 // SuccessTracker describes a type that is told about successes of nodes and
@@ -32,6 +34,9 @@ type SuccessTracker interface {
 	// node.
 	Get(node *nodeselection.SelectedNode) float64
 
+	// Range iterates over all nodes and calls the function with the actual value.
+	Range(fn func(storj.NodeID, float64))
+
 	// BumpGeneration should be called periodically to clear out stale
 	// information.
 	BumpGeneration()
@@ -42,12 +47,23 @@ type SuccessTracker interface {
 // GetNewSuccessTracker returns a function that creates a new SuccessTracker
 // based on the kind. The bool return value is false if the kind is unknown.
 func GetNewSuccessTracker(kind string) (func() SuccessTracker, bool) {
-
 	switch {
 	case kind == "bitshift":
-		return func() SuccessTracker { return newBitshiftSuccessTracker() }, true
+		return func() SuccessTracker { return newBitshiftSuccessTracker(0) }, true
 	case kind == "congestion":
 		return func() SuccessTracker { return newCongestionSuccessTracker() }, true
+	case kind == "lag":
+		return func() SuccessTracker { return newLagSuccessTracker() }, true
+	case strings.HasPrefix(kind, "bitshift-noise-"):
+		noiseStr := strings.TrimPrefix(kind, "bitshift-noise-")
+		noise, err := strconv.Atoi(noiseStr)
+		if err != nil {
+			panic("bitshift-noise size should be an integer, not " + noiseStr)
+		}
+
+		return func() SuccessTracker {
+			return newBitshiftSuccessTracker(noise)
+		}, true
 	case strings.HasPrefix(kind, "bitshift"):
 		lengthDef := strings.TrimPrefix(kind, "bitshift")
 		length, err := strconv.Atoi(lengthDef)
@@ -61,62 +77,182 @@ func GetNewSuccessTracker(kind string) (func() SuccessTracker, bool) {
 			}
 		}, true
 	case kind == "percent":
-		return func() SuccessTracker { return new(percentSuccessTracker) }, true
+		return NewPercentSuccessTracker, true
 	default:
 		return nil, false
 	}
 }
 
-// SuccessTrackers manages global and uplink level trackers.
-type SuccessTrackers struct {
-	trackers map[storj.NodeID]SuccessTracker
-	global   SuccessTracker
+// Trackers manages global, per-uplink success trackers, and shared
+// failure and retry trackers. It encapsulates the logic for deciding which
+// trackers to update when a node is observed succeeding or failing during
+// an upload.
+type Trackers struct {
+	dedicated      map[storj.NodeID]SuccessTracker
+	global         SuccessTracker
+	failure        SuccessTracker
+	retry          SuccessTracker
+	trustedUplinks *trust.TrustedPeersList
+	config         Config
 }
 
-// NewSuccessTrackers creates a new success tracker.
-func NewSuccessTrackers(approvedUplinks []storj.NodeID, newTracker func() SuccessTracker) *SuccessTrackers {
-	global := newTracker()
-	trackers := make(map[storj.NodeID]SuccessTracker, len(approvedUplinks))
+// NewTrackers creates a new Trackers, managing the global, per-uplink,
+// failure, and retry trackers together.
+func NewTrackers(
+	cfg Config,
+	approvedUplinks []storj.NodeID,
+	newTracker func(id storj.NodeID) SuccessTracker,
+	failure SuccessTracker,
+	retry SuccessTracker,
+	trustedUplinks *trust.TrustedPeersList,
+) *Trackers {
+	global := newTracker(storj.NodeID{})
+	dedicated := make(map[storj.NodeID]SuccessTracker, len(approvedUplinks))
 	for _, uplink := range approvedUplinks {
-		trackers[uplink] = newTracker()
+		dedicated[uplink] = newTracker(uplink)
 	}
-
-	return &SuccessTrackers{
-		trackers: trackers,
-		global:   global,
+	return &Trackers{
+		dedicated:      dedicated,
+		global:         global,
+		failure:        failure,
+		retry:          retry,
+		trustedUplinks: trustedUplinks,
+		config:         cfg,
 	}
 }
 
-// BumpGeneration will bump all the managed trackers.
-func (t *SuccessTrackers) BumpGeneration() {
-	for _, tracker := range t.trackers {
+// BumpGeneration bumps the generation of all dedicated trackers and the
+// global tracker.
+func (t *Trackers) BumpGeneration() {
+	for _, tracker := range t.dedicated {
 		tracker.BumpGeneration()
 	}
 	t.global.BumpGeneration()
 }
 
+// BumpFailureGeneration bumps the generation of the failure tracker.
+func (t *Trackers) BumpFailureGeneration() {
+	t.failure.BumpGeneration()
+}
+
+// BumpRetryGeneration bumps the generation of the retry tracker.
+func (t *Trackers) BumpRetryGeneration() {
+	t.retry.BumpGeneration()
+}
+
 // GetTracker returns the tracker for the specific uplink. Returns with the
 // global tracker, if uplink is not whitelisted.
-func (t *SuccessTrackers) GetTracker(uplink storj.NodeID) SuccessTracker {
-	if tracker, ok := t.trackers[uplink]; ok {
+func (t *Trackers) GetTracker(uplink storj.NodeID) SuccessTracker {
+	if tracker, ok := t.dedicated[uplink]; ok {
 		return tracker
 	}
 	return t.global
 }
 
-// Get returns a function that can be used to get an estimate of how good a node
-// is for a given uplink.
-func (t *SuccessTrackers) Get(uplink storj.NodeID) func(node *nodeselection.SelectedNode) float64 {
+// GetDedicatedTracker returns the tracker for the specific uplink. Returns
+// nil if the uplink is not whitelisted.
+func (t *Trackers) GetDedicatedTracker(uplink storj.NodeID) SuccessTracker {
+	if tracker, ok := t.dedicated[uplink]; ok {
+		return tracker
+	}
+	return nil
+}
+
+// GetGlobalTracker returns the global tracker.
+func (t *Trackers) GetGlobalTracker() SuccessTracker {
+	return t.global
+}
+
+// GetFailureTracker returns the failure tracker.
+func (t *Trackers) GetFailureTracker() SuccessTracker {
+	return t.failure
+}
+
+// GetRetryTracker returns the retry tracker.
+func (t *Trackers) GetRetryTracker() SuccessTracker {
+	return t.retry
+}
+
+// Get returns a function that can be used to get an estimate of how good a
+// node is for a given uplink.
+func (t *Trackers) Get(uplink storj.NodeID) func(node *nodeselection.SelectedNode) float64 {
 	return t.GetTracker(uplink).Get
 }
 
-// Stats reports monkit statistics for all of the trackers.
-func (t *SuccessTrackers) Stats(cb func(monkit.SeriesKey, string, float64)) {
-	ids := maps.Keys(t.trackers)
+// NodeCommitted records that a node successfully stored a piece as part of
+// a committed segment.
+func (t *Trackers) NodeCommitted(uplink, node storj.NodeID) {
+	t.record(uplink, node, true)
+	t.retry.Increment(node, true)
+}
+
+// NodeCancelled records that a node was part of the initial order limits for
+// a segment but did not end up in the committed set (long-tail cancellation
+// or missing upload).
+func (t *Trackers) NodeCancelled(uplink, node storj.NodeID) {
+	t.record(uplink, node, false)
+}
+
+// NodeRetried records that a node's piece upload is being retried with a
+// different node, so the original node is considered to have failed.
+func (t *Trackers) NodeRetried(uplink, node storj.NodeID) {
+	t.record(uplink, node, false)
+	t.retry.Increment(node, false)
+}
+
+// record implements the shared logic for NodeCommitted, NodeCancelled and
+// NodeRetried: it increments the dedicated tracker if one exists for the
+// uplink, the global tracker when configured or when no dedicated tracker is
+// available, and the failure tracker when the uplink is trusted.
+func (t *Trackers) record(uplink, node storj.NodeID, success bool) {
+	dedicated, hasDedicated := t.dedicated[uplink]
+	if hasDedicated {
+		dedicated.Increment(node, success)
+	}
+	if t.config.AlwaysUpdateGlobalTracker || !hasDedicated {
+		t.global.Increment(node, success)
+	}
+	if t.trustedUplinks != nil && t.trustedUplinks.IsTrusted(uplink) {
+		t.failure.Increment(node, success)
+	}
+}
+
+// RangeAll implements MonitoredTrackers by iterating over all dedicated,
+// global, and failure trackers, emitting (seriesKey, nodeID, value) triples.
+func (t *Trackers) RangeAll(fn func(key monkit.SeriesKey, nodeID storj.NodeID, value float64)) {
+	ids := maps.Keys(t.dedicated)
+	sort.Slice(ids, func(i, j int) bool { return ids[i].Less(ids[j]) })
+
+	successKey := monkit.NewSeriesKey("success_tracker")
+	for _, id := range ids {
+		key := successKey.WithTag("uplink", id.String())
+		t.dedicated[id].Range(func(nodeID storj.NodeID, v float64) {
+			fn(key, nodeID, v)
+		})
+	}
+	globalKey := successKey.WithTag("uplink", storj.NodeID{}.String())
+	t.global.Range(func(nodeID storj.NodeID, v float64) {
+		fn(globalKey, nodeID, v)
+	})
+	failureKey := monkit.NewSeriesKey("failure_tracker")
+	t.failure.Range(func(nodeID storj.NodeID, v float64) {
+		fn(failureKey, nodeID, v)
+	})
+	retryKey := monkit.NewSeriesKey("retry_tracker")
+	t.retry.Range(func(nodeID storj.NodeID, v float64) {
+		fn(retryKey, nodeID, v)
+	})
+}
+
+// Stats reports monkit statistics for all of the per-uplink and global
+// trackers. The failure tracker is reported separately by the monkit chain
+// wired up at construction.
+func (t *Trackers) Stats(cb func(monkit.SeriesKey, string, float64)) {
+	ids := maps.Keys(t.dedicated)
 	sort.Slice(ids, func(i, j int) bool { return ids[i].Less(ids[j]) })
 
 	for _, id := range ids {
-		t.trackers[id].Stats(func(key monkit.SeriesKey, field string, val float64) {
+		t.dedicated[id].Stats(func(key monkit.SeriesKey, field string, val float64) {
 			cb(key.WithTag("uplink_id", id.String()), field, val)
 		})
 	}
@@ -129,14 +265,37 @@ func (t *SuccessTrackers) Stats(cb func(monkit.SeriesKey, string, float64)) {
 // percent success tracker
 //
 
-const nodeSuccessGenerations = 4
+const nodeSuccessGenerations = 8
 
 type nodeCounterArray [nodeSuccessGenerations]atomic.Uint64
 
 type percentSuccessTracker struct {
-	mu   sync.Mutex
-	gen  atomic.Uint64
-	data sync.Map // storj.NodeID -> *nodeCounterArray
+	mu           sync.Mutex
+	gen          atomic.Uint64
+	data         sync.Map // storj.NodeID -> *nodeCounterArray
+	chanceToSkip float32
+}
+
+// NewPercentSuccessTracker creates a new percent-based success tracker.
+func NewPercentSuccessTracker() SuccessTracker {
+	return new(percentSuccessTracker)
+}
+
+// NewStochasticPercentSuccessTracker creates a new percent-based success tracker with a stochastic chance of bumping a node's generation.
+func NewStochasticPercentSuccessTracker(chanceToSkip float32) SuccessTracker {
+	return &percentSuccessTracker{chanceToSkip: chanceToSkip}
+}
+
+// Range implements SuccessTracker.
+func (t *percentSuccessTracker) Range(fn func(storj.NodeID, float64)) {
+	t.data.Range(func(k, v interface{}) bool {
+		nodeID, ok := k.(storj.NodeID)
+		value, ok2 := v.(*nodeCounterArray)
+		if ok && ok2 {
+			fn(nodeID, readCounters(value))
+		}
+		return true
+	})
 }
 
 func (t *percentSuccessTracker) Increment(node storj.NodeID, success bool) {
@@ -187,7 +346,9 @@ func (t *percentSuccessTracker) BumpGeneration() {
 	gen := (t.gen.Add(1) + 1) % nodeSuccessGenerations
 	t.data.Range(func(_, ctrsI any) bool {
 		ctrs, _ := ctrsI.(*nodeCounterArray)
-		ctrs[gen].Store(0)
+		if t.chanceToSkip == 0 || mwc.Float32() >= t.chanceToSkip {
+			ctrs[gen].Store(0)
+		}
 		return true
 	})
 }
@@ -208,7 +369,12 @@ func (t *percentSuccessTracker) Stats(cb func(monkit.SeriesKey, string, float64)
 // different success trackers
 //
 
-func newBitshiftSuccessTracker() *parameterizedSuccessTracker {
+func newBitshiftSuccessTracker(noise int) *parameterizedSuccessTracker {
+	addNoise := func() float64 { return 0 }
+	if noise > 0 {
+		addNoise = func() float64 { return float64(mwc.Intn(noise)) }
+	}
+
 	return &parameterizedSuccessTracker{
 		name: "bitshift",
 		increment: func(ctr *atomic.Uint64, success bool) {
@@ -226,7 +392,7 @@ func newBitshiftSuccessTracker() *parameterizedSuccessTracker {
 			}
 		},
 		defaultVal: ^uint64(0),
-		score:      func(v uint64) float64 { return float64(bits.OnesCount64(v)) },
+		score:      func(v uint64) float64 { return float64(bits.OnesCount64(v)) + addNoise() },
 	}
 }
 
@@ -247,6 +413,44 @@ func newCongestionSuccessTracker() *parameterizedSuccessTracker {
 		},
 		defaultVal: 0,
 		score:      func(v uint64) float64 { return float64(v) },
+	}
+}
+
+func newLagSuccessTracker() *parameterizedSuccessTracker {
+	return &parameterizedSuccessTracker{
+		name: "lag",
+		increment: func(ctr *atomic.Uint64, success bool) {
+
+			for {
+				old := ctr.Load()
+				lag, score := uint32(old>>32), uint32(old)
+
+				if lag < score {
+					lag = score
+				}
+
+				if success {
+					var carry uint32
+					score, carry = bits.Add32(lag, score, 0)
+					score /= 2
+					score++
+					if carry > 0 {
+						lag = math.MaxUint32 / 2
+						score = math.MaxUint32 / 2
+					}
+				} else {
+					const rate = 64 // roughly 46 failures to drop lag by 2x
+					lag = uint32(uint64(lag) * (rate - 1) / rate)
+					score /= 2
+				}
+
+				if ctr.CompareAndSwap(old, uint64(lag)<<32|uint64(score)) {
+					return
+				}
+			}
+		},
+		defaultVal: 0,
+		score:      func(v uint64) float64 { return float64(uint32(v)) },
 	}
 }
 
@@ -283,6 +487,18 @@ func (t *parameterizedSuccessTracker) Get(node *nodeselection.SelectedNode) floa
 	return t.score(ctr.Load())
 }
 
+// Range implements SuccessTracker.
+func (t *parameterizedSuccessTracker) Range(fn func(storj.NodeID, float64)) {
+	t.data.Range(func(k, v interface{}) bool {
+		nodeID, ok := k.(storj.NodeID)
+		ctr, ok2 := v.(*atomic.Uint64)
+		if ok && ok2 {
+			fn(nodeID, t.score(ctr.Load()))
+		}
+		return true
+	})
+}
+
 func (t *parameterizedSuccessTracker) BumpGeneration() {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -299,7 +515,10 @@ func (t *parameterizedSuccessTracker) Stats(cb func(monkit.SeriesKey, string, fl
 
 	t.data.Range(func(_, ctrI any) bool {
 		ctr, _ := ctrI.(*atomic.Uint64)
-		dist.Insert(t.score(ctr.Load()))
+		val := t.score(ctr.Load())
+		if !math.IsNaN(val) {
+			dist.Insert(val)
+		}
 		return true
 	})
 
@@ -377,6 +596,18 @@ func (t *bigBitshiftSuccessTracker) Get(node *nodeselection.SelectedNode) float6
 	}
 	ctr, _ := ctrI.(*bigBitList)
 	return ctr.get()
+}
+
+// Range implements SuccessTracker.
+func (t *bigBitshiftSuccessTracker) Range(fn func(storj.NodeID, float64)) {
+	t.data.Range(func(k, v interface{}) bool {
+		nodeID, ok := k.(storj.NodeID)
+		ctr, ok2 := v.(*bigBitList)
+		if ok && ok2 {
+			fn(nodeID, ctr.get())
+		}
+		return true
+	})
 }
 
 // BumpGeneration implements SuccessTracker.

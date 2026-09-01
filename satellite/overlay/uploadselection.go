@@ -5,10 +5,13 @@ package overlay
 
 import (
 	"context"
+	"fmt"
 	"time"
 
+	"github.com/spacemonkeygo/monkit/v3"
 	"go.uber.org/zap"
 
+	"storj.io/common/storj"
 	"storj.io/common/sync2"
 	"storj.io/storj/satellite/nodeselection"
 )
@@ -27,6 +30,12 @@ type UploadSelectionCacheConfig struct {
 	Staleness time.Duration `help:"how stale the node selection cache can be" releaseDefault:"3m" devDefault:"5m" testDefault:"3m"`
 }
 
+// uploadSelectionCacheState holds the cached state for upload selection.
+type uploadSelectionCacheState struct {
+	state nodeselection.State
+	nodes []*nodeselection.SelectedNode
+}
+
 // UploadSelectionCache keeps a list of all the storage nodes that are qualified to store data
 // We organize the nodes by if they are reputable or a new node on the network.
 // The cache will sync with the nodes table in the database and get refreshed once the staleness time has past.
@@ -35,7 +44,7 @@ type UploadSelectionCache struct {
 	db              UploadSelectionDB
 	selectionConfig NodeSelectionConfig
 
-	cache sync2.ReadCacheOf[nodeselection.State]
+	cache sync2.ReadCacheOf[uploadSelectionCacheState]
 
 	defaultFilters nodeselection.NodeFilters
 	placements     nodeselection.PlacementDefinitions
@@ -69,20 +78,64 @@ func (cache *UploadSelectionCache) Refresh(ctx context.Context) (err error) {
 // refresh calls out to the database and refreshes the cache with the most up-to-date
 // data from the nodes table, then sets time that the last refresh occurred so we know when
 // to refresh again in the future.
-func (cache *UploadSelectionCache) read(ctx context.Context) (_ nodeselection.State, err error) {
+func (cache *UploadSelectionCache) read(ctx context.Context) (_ uploadSelectionCacheState, err error) {
 	defer mon.Task()(&ctx)(&err)
 
 	reputableNodes, newNodes, err := cache.db.SelectAllStorageNodesUpload(ctx, cache.selectionConfig)
 	if err != nil {
-		return nil, Error.Wrap(err)
+		return uploadSelectionCacheState{}, Error.Wrap(err)
 	}
 
-	mon.IntVal("refresh_cache_size_reputable").Observe(int64(len(reputableNodes)))
-	mon.IntVal("refresh_cache_size_new").Observe(int64(len(newNodes)))
-
 	var allNodes = append(append([]*nodeselection.SelectedNode{}, reputableNodes...), newNodes...)
-	state := nodeselection.NewState(allNodes, cache.placements)
-	return state, nil
+	reportMetrics(allNodes, cache.placements)
+	state := nodeselection.InitState(ctx, allNodes, cache.placements)
+	return uploadSelectionCacheState{
+		state: state,
+		nodes: allNodes,
+	}, nil
+}
+
+// PlacementMetrics is a struct that holds the metrics for a specific placement.
+// This is a workaround, as all other IntVal/FloatVal/etc registers too many unnecessary fields.
+type PlacementMetrics struct {
+	UploadCount    float64
+	Count          float64
+	UploadFreeDisk float64
+}
+
+func reportMetrics(nodes []*nodeselection.SelectedNode, placements nodeselection.PlacementDefinitions) {
+	reputable := 0
+	count := map[storj.PlacementConstraint]int64{}
+	uploadCount := map[storj.PlacementConstraint]int64{}
+	uploadFreeDisk := map[storj.PlacementConstraint]int64{}
+	for _, node := range nodes {
+		if node.Vetted {
+			reputable++
+		}
+		for _, placement := range placements {
+			if placement.NodeFilter == nil || placement.NodeFilter.Match(node) {
+				count[placement.ID]++
+				if placement.UploadFilter == nil || placement.UploadFilter.Match(node) {
+					uploadCount[placement.ID]++
+					uploadFreeDisk[placement.ID] += node.FreeDisk
+				}
+			}
+		}
+	}
+
+	mon.IntVal("refresh_cache_size_reputable").Observe(int64(reputable))
+	mon.IntVal("refresh_cache_size_new").Observe(int64(len(nodes) - reputable))
+
+	for _, placement := range placements {
+		mon.StructVal("placement",
+			monkit.NewSeriesTag("name", placement.Name),
+			monkit.NewSeriesTag("id", fmt.Sprintf("%d", placement.ID))).
+			Observe(PlacementMetrics{
+				UploadCount:    float64(uploadCount[placement.ID]),
+				Count:          float64(count[placement.ID]),
+				UploadFreeDisk: float64(uploadFreeDisk[placement.ID]),
+			})
+	}
 }
 
 // GetNodes selects nodes from the cache that will be used to upload a file.
@@ -91,14 +144,27 @@ func (cache *UploadSelectionCache) read(ctx context.Context) (_ nodeselection.St
 func (cache *UploadSelectionCache) GetNodes(ctx context.Context, req FindStorageNodesRequest) (_ []*nodeselection.SelectedNode, err error) {
 	defer mon.Task()(&ctx)(&err)
 
-	state, err := cache.cache.Get(ctx, time.Now())
+	cached, err := cache.cache.Get(ctx, time.Now())
 	if err != nil {
 		return nil, Error.Wrap(err)
 	}
 
-	nodes, err := state.Select(req.Requester, req.Placement, req.RequestedCount, req.ExcludedIDs, req.AlreadySelected)
+	nodes, err := cached.state.Select(ctx, req.Requester, req.Placement, req.RequestedCount, req.ExcludedIDs, req.AlreadySelected)
 	if nodeselection.ErrNotEnoughNodes.Has(err) {
 		err = ErrNotEnoughNodes.Wrap(err)
 	}
 	return nodes, err
+}
+
+// GetAllNodes returns all cached upload-eligible nodes.
+// These are nodes that are online, not suspended, not exiting, and meet minimum requirements.
+func (cache *UploadSelectionCache) GetAllNodes(ctx context.Context) (_ []*nodeselection.SelectedNode, err error) {
+	defer mon.Task()(&ctx)(&err)
+
+	cached, err := cache.cache.Get(ctx, time.Now())
+	if err != nil {
+		return nil, Error.Wrap(err)
+	}
+
+	return cached.nodes, nil
 }

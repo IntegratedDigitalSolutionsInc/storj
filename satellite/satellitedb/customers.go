@@ -56,7 +56,7 @@ func (customers *customers) ListMissingCustomers(ctx context.Context) (_ []strip
 		return nil, err
 	}
 	defer func() {
-		err = errs.Combine(err, rows.Close())
+		err = errs.Combine(err, rows.Err(), rows.Close())
 	}()
 
 	var users []stripe.MissingCustomer
@@ -87,22 +87,6 @@ func (customers *customers) GetCustomerID(ctx context.Context, userID uuid.UUID)
 	}
 
 	return idRow.CustomerId, nil
-}
-
-// GetStripeIDs returns stripe customer and billing ids.
-func (customers *customers) GetStripeIDs(ctx context.Context, userID uuid.UUID) (billingID *string, customerID string, err error) {
-	defer mon.Task()(&ctx, userID)(&err)
-
-	idRow, err := customers.db.Get_StripeCustomer_CustomerId_StripeCustomer_BillingCustomerId_By_UserId(ctx, dbx.StripeCustomer_UserId(userID[:]))
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, "", stripe.ErrNoCustomer
-		}
-
-		return nil, "", err
-	}
-
-	return idRow.BillingCustomerId, idRow.CustomerId, nil
 }
 
 // GetUserID return userID given stripe customer id.
@@ -194,7 +178,7 @@ func (customers *customers) UpdatePackage(ctx context.Context, userID uuid.UUID,
 	return fromDBXCustomer(dbxCustomer)
 }
 
-// UpdatePackage updates the customer's package plan and purchase time.
+// GetPackageInfo returns the package plan and time of purchase for a user.
 func (customers *customers) GetPackageInfo(ctx context.Context, userID uuid.UUID) (_ *string, _ *time.Time, err error) {
 	defer mon.Task()(&ctx)(&err)
 
@@ -219,25 +203,4 @@ func fromDBXCustomer(dbxCustomer *dbx.StripeCustomer) (*stripe.Customer, error) 
 		PackagePlan:        dbxCustomer.PackagePlan,
 		PackagePurchasedAt: dbxCustomer.PurchasedPackageAt,
 	}, nil
-}
-
-// UpdateBillingCustomerID updates the customer's billing customer id.
-func (customers *customers) UpdateBillingCustomerID(ctx context.Context, userID uuid.UUID, billingCustomerID *string) (c *stripe.Customer, err error) {
-	defer mon.Task()(&ctx)(&err)
-
-	updateFields := dbx.StripeCustomer_Update_Fields{
-		BillingCustomerId: dbx.StripeCustomer_BillingCustomerId_Null(),
-	}
-	if billingCustomerID != nil {
-		updateFields.BillingCustomerId = dbx.StripeCustomer_BillingCustomerId(*billingCustomerID)
-	}
-
-	dbxCustomer, err := customers.db.Update_StripeCustomer_By_UserId(ctx,
-		dbx.StripeCustomer_UserId(userID[:]),
-		updateFields,
-	)
-	if err != nil {
-		return c, err
-	}
-	return fromDBXCustomer(dbxCustomer)
 }

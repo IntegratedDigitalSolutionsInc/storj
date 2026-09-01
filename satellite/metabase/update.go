@@ -6,16 +6,16 @@ package metabase
 import (
 	"context"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"time"
 
-	"cloud.google.com/go/spanner"
 	"github.com/zeebo/errs"
-	"google.golang.org/api/iterator"
+	"go.uber.org/zap"
 
 	"storj.io/common/storj"
 	"storj.io/common/uuid"
-	"storj.io/storj/shared/dbutil/spannerutil"
+	"storj.io/storj/shared/dbutil/tidbutil"
 )
 
 const (
@@ -49,6 +49,12 @@ type UpdateSegmentPieces struct {
 
 	OldPieces Pieces
 
+	// OldPiecesHash, when set, uses SHA256(remote_alias_pieces) for the CAS condition
+	// instead of exact match on OldPieces. This allows callers that only have a hash
+	// (e.g. from a prior loop scan) to perform an atomic compare-and-swap without
+	// needing the exact old pieces. When set, OldPieces is ignored.
+	OldPiecesHash []byte
+
 	NewRedundancy storj.RedundancyScheme
 	NewPieces     Pieces
 
@@ -64,11 +70,15 @@ func (db *DB) UpdateSegmentPieces(ctx context.Context, opts UpdateSegmentPieces)
 		return ErrInvalidRequest.New("StreamID missing")
 	}
 
-	if err := opts.OldPieces.Verify(); err != nil {
-		if ErrInvalidRequest.Has(err) {
-			return ErrInvalidRequest.New("OldPieces: %v", errors.Unwrap(err))
+	useHashCAS := len(opts.OldPiecesHash) > 0
+
+	if !useHashCAS {
+		if err := opts.OldPieces.Verify(); err != nil {
+			if ErrInvalidRequest.Has(err) {
+				return ErrInvalidRequest.New("OldPieces: %v", errors.Unwrap(err))
+			}
+			return err
 		}
-		return err
 	}
 
 	if opts.NewRedundancy.IsZero() {
@@ -78,7 +88,12 @@ func (db *DB) UpdateSegmentPieces(ctx context.Context, opts UpdateSegmentPieces)
 	// its possible that in this method we will have less pieces
 	// than optimal shares (e.g. after repair)
 	if len(opts.NewPieces) < int(opts.NewRedundancy.RepairShares) {
-		return ErrInvalidRequest.New("number of new pieces is less than new redundancy repair shares value")
+		db.log.Warn("number of new pieces is less than new redundancy repair shares value (segment will return to repair queue)",
+			zap.Int("new_pieces", len(opts.NewPieces)),
+			zap.Int("new_redundancy_repair_shares", int(opts.NewRedundancy.RepairShares)))
+	}
+	if len(opts.NewPieces) < int(opts.NewRedundancy.RequiredShares) {
+		return ErrInvalidRequest.New("number of pieces is less than redundancy required shares")
 	}
 
 	if err := opts.NewPieces.Verify(); err != nil {
@@ -88,9 +103,12 @@ func (db *DB) UpdateSegmentPieces(ctx context.Context, opts UpdateSegmentPieces)
 		return err
 	}
 
-	oldPieces, err := db.aliasCache.EnsurePiecesToAliases(ctx, opts.OldPieces)
-	if err != nil {
-		return Error.New("unable to convert pieces to aliases: %w", err)
+	var oldPieces AliasPieces
+	if !useHashCAS {
+		oldPieces, err = db.aliasCache.EnsurePiecesToAliases(ctx, opts.OldPieces)
+		if err != nil {
+			return Error.New("unable to convert pieces to aliases: %w", err)
+		}
 	}
 
 	newPieces, err := db.aliasCache.EnsurePiecesToAliases(ctx, opts.NewPieces)
@@ -129,26 +147,49 @@ func (db *DB) UpdateSegmentPieces(ctx context.Context, opts UpdateSegmentPieces)
 func (p *PostgresAdapter) UpdateSegmentPieces(ctx context.Context, opts UpdateSegmentPieces, oldPieces, newPieces AliasPieces) (resultPieces AliasPieces, err error) {
 	updateRepairAt := !opts.NewRepairedAt.IsZero()
 
-	err = p.db.QueryRowContext(ctx, `
-		UPDATE segments SET
-			remote_alias_pieces = CASE
-				WHEN remote_alias_pieces = $3 THEN $4
-				ELSE remote_alias_pieces
-			END,
-			redundancy = CASE
-				WHEN remote_alias_pieces = $3 THEN $5
-				ELSE redundancy
-			END,
-			repaired_at = CASE
-				WHEN remote_alias_pieces = $3 AND $7 = true THEN $6
-				ELSE repaired_at
-			END
-		WHERE
-			stream_id     = $1 AND
-			position      = $2
-		RETURNING remote_alias_pieces
-		`, opts.StreamID, opts.Position, oldPieces, newPieces, redundancyScheme{&opts.NewRedundancy}, opts.NewRepairedAt, updateRepairAt).
-		Scan(&resultPieces)
+	if len(opts.OldPiecesHash) > 0 {
+		err = p.db.QueryRowContext(ctx, `
+			UPDATE segments SET
+				remote_alias_pieces = CASE
+					WHEN sha256(remote_alias_pieces) = $3 THEN $4
+					ELSE remote_alias_pieces
+				END,
+				redundancy = CASE
+					WHEN sha256(remote_alias_pieces) = $3 THEN $5
+					ELSE redundancy
+				END,
+				repaired_at = CASE
+					WHEN sha256(remote_alias_pieces) = $3 AND $7 = true THEN $6
+					ELSE repaired_at
+				END
+			WHERE
+				stream_id     = $1 AND
+				position      = $2
+			RETURNING remote_alias_pieces
+			`, opts.StreamID, opts.Position, opts.OldPiecesHash, newPieces, &opts.NewRedundancy, opts.NewRepairedAt, updateRepairAt).
+			Scan(&resultPieces)
+	} else {
+		err = p.db.QueryRowContext(ctx, `
+			UPDATE segments SET
+				remote_alias_pieces = CASE
+					WHEN remote_alias_pieces = $3 THEN $4
+					ELSE remote_alias_pieces
+				END,
+				redundancy = CASE
+					WHEN remote_alias_pieces = $3 THEN $5
+					ELSE redundancy
+				END,
+				repaired_at = CASE
+					WHEN remote_alias_pieces = $3 AND $7 = true THEN $6
+					ELSE repaired_at
+				END
+			WHERE
+				stream_id     = $1 AND
+				position      = $2
+			RETURNING remote_alias_pieces
+			`, opts.StreamID, opts.Position, oldPieces, newPieces, &opts.NewRedundancy, opts.NewRepairedAt, updateRepairAt).
+			Scan(&resultPieces)
+	}
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrSegmentNotFound.New("segment missing")
@@ -159,60 +200,222 @@ func (p *PostgresAdapter) UpdateSegmentPieces(ctx context.Context, opts UpdateSe
 }
 
 // UpdateSegmentPieces updates pieces for specified segment, if pieces matches oldPieces.
-func (s *SpannerAdapter) UpdateSegmentPieces(ctx context.Context, opts UpdateSegmentPieces, oldPieces, newPieces AliasPieces) (resultPieces AliasPieces, err error) {
+func (t *TiDBAdapter) UpdateSegmentPieces(ctx context.Context, opts UpdateSegmentPieces, oldPieces, newPieces AliasPieces) (resultPieces AliasPieces, err error) {
+	defer mon.Task()(&ctx)(&err)
+
 	updateRepairAt := !opts.NewRepairedAt.IsZero()
 
-	_, err = s.client.ReadWriteTransaction(ctx, func(ctx context.Context, tx *spanner.ReadWriteTransaction) error {
-		resultPieces, err = spannerutil.CollectRow(tx.Query(ctx, spanner.Statement{
-			SQL: `
-				UPDATE segments SET
-					remote_alias_pieces = CASE
-						WHEN remote_alias_pieces = @old_pieces THEN @new_pieces
-						ELSE remote_alias_pieces
-					END,
-					redundancy = CASE
-						WHEN remote_alias_pieces = @old_pieces THEN @redundancy
-						ELSE redundancy
-					END,
-					repaired_at = CASE
-						WHEN remote_alias_pieces = @old_pieces AND @update_repaired_at = true THEN @new_repaired_at
-						ELSE repaired_at
-					END
-				WHERE
-					stream_id     = @stream_id AND
-					position      = @position
-				THEN RETURN remote_alias_pieces
-			`,
-			Params: map[string]any{
-				"stream_id":          opts.StreamID,
-				"position":           opts.Position,
-				"old_pieces":         oldPieces,
-				"new_pieces":         newPieces,
-				"redundancy":         redundancyScheme{&opts.NewRedundancy},
-				"new_repaired_at":    opts.NewRepairedAt,
-				"update_repaired_at": updateRepairAt,
+	// Match Postgres: when OldPiecesHash is set, compare SHA256 of the stored
+	// remote_alias_pieces; otherwise compare the bytes directly. SHA2(x,256)
+	// in MySQL/TiDB returns a hex string, so we hex-encode the expected hash
+	// in Go to keep the comparison cheap (no UNHEX per row).
+	cas := "remote_alias_pieces = ?"
+	casArg := any(oldPieces)
+	if len(opts.OldPiecesHash) > 0 {
+		cas = "SHA2(remote_alias_pieces, 256) = ?"
+		casArg = hex.EncodeToString(opts.OldPiecesHash)
+	}
+
+	// Wrap UPDATE + SELECT in one transaction so the SELECT sees this
+	// transaction's own UPDATE, not a concurrent writer's commit landing
+	// between the two statements. In autocommit mode TiDB would commit the
+	// UPDATE on its own, leaving a race window where a racing writer could
+	// flip remote_alias_pieces and cause the caller to report a false
+	// ErrValueChanged for a CAS that actually succeeded. Within a
+	// transaction, MVCC makes the SELECT observe the in-flight UPDATE,
+	// matching the atomic RETURNING semantics of the Postgres adapter.
+	//
+	// CommitWithQuery folds BEGIN, the UPDATE + SELECT multi-statement, and
+	// COMMIT into a single round trip: with multiStatements=true the MySQL
+	// driver pipelines the `;`-separated statements into one COM_QUERY packet.
+	err = tidbutil.WithTx(ctx, t.db, func(ctx context.Context, tx *tidbutil.Tx) (err error) {
+		// reset on retry
+		resultPieces = nil
+
+		return tx.CommitWithQuery(ctx, `
+			UPDATE segments SET
+				remote_alias_pieces = CASE
+					WHEN `+cas+` THEN ?
+					ELSE remote_alias_pieces
+				END,
+				redundancy = CASE
+					WHEN `+cas+` THEN ?
+					ELSE redundancy
+				END,
+				repaired_at = CASE
+					WHEN `+cas+` AND ? = TRUE THEN ?
+					ELSE repaired_at
+				END
+			WHERE (stream_id, position) = (?, ?);
+			SELECT remote_alias_pieces FROM segments WHERE (stream_id, position) = (?, ?)
+		`,
+			[]any{
+				casArg, newPieces, casArg, &opts.NewRedundancy, casArg, updateRepairAt, opts.NewRepairedAt,
+				opts.StreamID, opts.Position,
+				opts.StreamID, opts.Position,
 			},
-		}), func(row *spanner.Row, item *AliasPieces) error {
-			err = row.Columns(item)
-			if err != nil {
-				return Error.New("unable to decode result pieces: %w", err)
-			}
-			return nil
-		})
-
-		if err != nil {
-			if errors.Is(err, iterator.Done) {
-				return ErrSegmentNotFound.New("segment missing")
-			}
-			return Error.New("unable to update segment pieces: %w", err)
-		}
-
-		return nil
+			tidbutil.ScanFirstRow(&resultPieces))
 	})
 	if err != nil {
-		return nil, Error.Wrap(err)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrSegmentNotFound.New("segment missing")
+		}
+		return nil, Error.New("unable to update segment pieces: %w", err)
 	}
 	return resultPieces, nil
+}
+
+// BatchUpdateSegmentPiecesEntry contains the data needed to update one segment's pieces.
+type BatchUpdateSegmentPiecesEntry struct {
+	StreamID      uuid.UUID
+	Position      SegmentPosition
+	OldRepairedAt *time.Time
+	NewPieces     Pieces
+	NewRedundancy storj.RedundancyScheme
+	NewRepairedAt time.Time
+
+	// OldPiecesHash, when set, uses SHA256(remote_alias_pieces) for the CAS condition
+	// instead of OldRepairedAt. When set, OldRepairedAt is ignored.
+	OldPiecesHash []byte
+}
+
+// BatchUpdateSegmentPieces contains arguments necessary for batch updating segment pieces.
+type BatchUpdateSegmentPieces struct {
+	Entries []BatchUpdateSegmentPiecesEntry
+}
+
+// BatchUpdateSegmentPieces updates pieces for multiple segments using a CAS on repaired_at.
+// Returns which entries succeeded (true) and which had a CAS conflict or were missing (false).
+func (db *DB) BatchUpdateSegmentPieces(ctx context.Context, opts BatchUpdateSegmentPieces) (results []bool, err error) {
+	defer mon.Task()(&ctx)(&err)
+
+	if len(opts.Entries) == 0 {
+		return nil, nil
+	}
+
+	aliasEntries := make([]AliasPieces, len(opts.Entries))
+	for i, entry := range opts.Entries {
+		aliasEntries[i], err = db.aliasCache.EnsurePiecesToAliases(ctx, entry.NewPieces)
+		if err != nil {
+			return nil, Error.New("unable to convert pieces to aliases: %w", err)
+		}
+	}
+
+	results = make([]bool, len(opts.Entries))
+	for _, adapter := range db.adapters {
+		adapterResults, adapterErr := adapter.BatchUpdateSegmentPieces(ctx, opts, aliasEntries)
+		if adapterErr != nil {
+			return nil, adapterErr
+		}
+		for i, ok := range adapterResults {
+			if ok {
+				results[i] = true
+			}
+		}
+	}
+
+	mon.Meter("segment_update").Mark(len(opts.Entries))
+
+	return results, nil
+}
+
+// BatchUpdateSegmentPieces updates pieces for multiple segments using a CAS on repaired_at or pieces hash.
+func (p *PostgresAdapter) BatchUpdateSegmentPieces(ctx context.Context, opts BatchUpdateSegmentPieces, newAliasPieces []AliasPieces) (results []bool, err error) {
+	defer mon.Task()(&ctx)(&err)
+
+	results = make([]bool, len(opts.Entries))
+
+	for i, entry := range opts.Entries {
+		var result sql.Result
+		if len(entry.OldPiecesHash) > 0 {
+			result, err = p.db.ExecContext(ctx, `
+				UPDATE segments SET
+					remote_alias_pieces = $4,
+					redundancy = $5,
+					repaired_at = $6
+				WHERE
+					stream_id = $1 AND position = $2
+					AND sha256(remote_alias_pieces) = $3
+			`, entry.StreamID, entry.Position,
+				entry.OldPiecesHash, newAliasPieces[i],
+				&entry.NewRedundancy, entry.NewRepairedAt,
+			)
+		} else {
+			result, err = p.db.ExecContext(ctx, `
+				UPDATE segments SET
+					remote_alias_pieces = $4,
+					redundancy = $5,
+					repaired_at = $6
+				WHERE
+					stream_id = $1 AND position = $2
+					AND repaired_at IS NOT DISTINCT FROM $3
+			`, entry.StreamID, entry.Position,
+				entry.OldRepairedAt, newAliasPieces[i],
+				&entry.NewRedundancy, entry.NewRepairedAt,
+			)
+		}
+		if err != nil {
+			return nil, Error.New("unable to batch update segment pieces: %w", err)
+		}
+		affected, err := result.RowsAffected()
+		if err != nil {
+			return nil, Error.New("unable to get rows affected: %w", err)
+		}
+		results[i] = affected > 0
+	}
+	return results, nil
+}
+
+// BatchUpdateSegmentPieces updates pieces for multiple segments using a CAS on repaired_at or pieces hash.
+func (t *TiDBAdapter) BatchUpdateSegmentPieces(ctx context.Context, opts BatchUpdateSegmentPieces, newAliasPieces []AliasPieces) (results []bool, err error) {
+	defer mon.Task()(&ctx)(&err)
+
+	results = make([]bool, len(opts.Entries))
+
+	// Mirror the Postgres adapter: one UPDATE per entry, switching the CAS
+	// condition based on whether OldPiecesHash was provided. SHA2(x, 256) in
+	// MySQL/TiDB returns a hex string, so we hex-encode the expected hash in
+	// Go to keep the comparison cheap. For the no-hash variant, `<=>` is the
+	// MySQL/TiDB null-safe equivalent of Postgres `IS NOT DISTINCT FROM`.
+	for i, entry := range opts.Entries {
+		var result sql.Result
+		if len(entry.OldPiecesHash) > 0 {
+			result, err = t.db.ExecContext(ctx, `
+				UPDATE segments SET
+					remote_alias_pieces = ?,
+					redundancy = ?,
+					repaired_at = ?
+				WHERE
+					stream_id = ? AND position = ?
+					AND SHA2(remote_alias_pieces, 256) = ?
+			`, newAliasPieces[i], &entry.NewRedundancy, entry.NewRepairedAt,
+				entry.StreamID, entry.Position,
+				hex.EncodeToString(entry.OldPiecesHash),
+			)
+		} else {
+			result, err = t.db.ExecContext(ctx, `
+				UPDATE segments SET
+					remote_alias_pieces = ?,
+					redundancy = ?,
+					repaired_at = ?
+				WHERE
+					stream_id = ? AND position = ?
+					AND repaired_at <=> ?
+			`, newAliasPieces[i], &entry.NewRedundancy, entry.NewRepairedAt,
+				entry.StreamID, entry.Position,
+				entry.OldRepairedAt,
+			)
+		}
+		if err != nil {
+			return nil, Error.New("unable to batch update segment pieces: %w", err)
+		}
+		affected, err := result.RowsAffected()
+		if err != nil {
+			return nil, Error.New("unable to get rows affected: %w", err)
+		}
+		results[i] = affected > 0
+	}
+	return results, nil
 }
 
 // SetObjectExactVersionLegalHold contains arguments necessary for setting
@@ -303,56 +506,54 @@ func (p *PostgresAdapter) SetObjectExactVersionLegalHold(ctx context.Context, op
 }
 
 // SetObjectExactVersionLegalHold sets the legal hold configuration of an exact version of an object.
-func (s *SpannerAdapter) SetObjectExactVersionLegalHold(ctx context.Context, opts SetObjectExactVersionLegalHold) (err error) {
+func (t *TiDBAdapter) SetObjectExactVersionLegalHold(ctx context.Context, opts SetObjectExactVersionLegalHold) (err error) {
 	defer mon.Task()(&ctx)(&err)
 
-	_, err = s.client.ReadWriteTransaction(ctx, func(ctx context.Context, tx *spanner.ReadWriteTransaction) error {
-		result, err := spannerutil.CollectRow(tx.Query(ctx, spanner.Statement{
-			SQL: `
-				SELECT status, expires_at, retention_mode
-				FROM objects
-				WHERE (project_id, bucket_name, object_key, version) = (@project_id, @bucket_name, @object_key, @version)
-			`,
-			Params: map[string]interface{}{
-				"project_id":  opts.ProjectID,
-				"bucket_name": opts.BucketName,
-				"object_key":  opts.ObjectKey,
-				"version":     opts.Version,
-			},
-		}), func(row *spanner.Row, item *preUpdateRetentionInfo) error {
-			return errs.Wrap(row.Columns(
-				&item.Status,
-				&item.ExpiresAt,
-				lockModeWrapper{retentionMode: &item.Retention.Mode},
-			))
-		})
+	// The FOR UPDATE select folds BEGIN into its first statement and
+	// CommitWithExec folds the UPDATE together with COMMIT, so this read then
+	// dependent write costs two round trips instead of four.
+	return tidbutil.WithTx(ctx, t.db, func(ctx context.Context, tx *tidbutil.Tx) error {
+		var (
+			status    ObjectStatus
+			expiresAt *time.Time
+		)
+		err := tx.QueryRowContext(ctx, `
+			SELECT status, expires_at
+			FROM objects
+			WHERE (project_id, bucket_name, object_key, version) = (?, ?, ?, ?)
+			FOR UPDATE`,
+			opts.ProjectID, opts.BucketName, opts.ObjectKey, opts.Version,
+		).Scan(&status, &expiresAt)
 		if err != nil {
-			if errors.Is(err, iterator.Done) {
+			if errors.Is(err, sql.ErrNoRows) {
 				return ErrObjectNotFound.New("")
 			}
-			return errs.New("unable to query object info before setting legal hold: %w", err)
+			return Error.New("unable to query object info before setting legal hold: %w", err)
 		}
 
 		switch {
-		case result.Status.IsDeleteMarker():
+		case status.IsDeleteMarker():
 			return ErrObjectStatus.New(noLockOnDeleteMarkerErrMsg)
-		case !result.Status.IsCommitted():
+		case !status.IsCommitted():
 			return ErrObjectStatus.New(noLockOnUncommittedErrMsg)
-		case result.ExpiresAt != nil:
+		case expiresAt != nil:
 			return ErrObjectExpiration.New(noLockWithExpirationErrMsg)
 		}
 
-		return errs.Wrap(s.setObjectExactVersionLegalHold(ctx, tx, opts, result.Retention.Mode))
-	})
-
-	if err != nil {
-		if ErrObjectNotFound.Has(err) || ErrObjectExpiration.Has(err) || ErrObjectStatus.Has(err) {
-			return errs.Wrap(err)
+		if err = tx.CommitWithExec(ctx, `
+			UPDATE objects SET
+				retention_mode = CASE
+					WHEN ? THEN COALESCE(retention_mode, 0) | `+retentionModeLegalHold+`
+					ELSE retention_mode & ~`+retentionModeLegalHold+`
+				END
+			WHERE
+				(project_id, bucket_name, object_key, version) = (?, ?, ?, ?)`,
+			opts.Enabled, opts.ProjectID, opts.BucketName, opts.ObjectKey, opts.Version,
+		); err != nil {
+			return Error.New("unable to update object legal hold configuration: %w", err)
 		}
-		return Error.Wrap(err)
-	}
-
-	return nil
+		return nil
+	})
 }
 
 // SetObjectLastCommittedLegalHold contains arguments necessary for setting
@@ -444,97 +645,57 @@ func (p *PostgresAdapter) SetObjectLastCommittedLegalHold(ctx context.Context, o
 
 // SetObjectLastCommittedLegalHold sets the legal hold configuration
 // of the most recently committed version of an object.
-func (s *SpannerAdapter) SetObjectLastCommittedLegalHold(ctx context.Context, opts SetObjectLastCommittedLegalHold) (err error) {
+func (t *TiDBAdapter) SetObjectLastCommittedLegalHold(ctx context.Context, opts SetObjectLastCommittedLegalHold) (err error) {
 	defer mon.Task()(&ctx)(&err)
 
-	type info struct {
-		version Version
-		preUpdateRetentionInfo
-	}
-
-	_, err = s.client.ReadWriteTransaction(ctx, func(ctx context.Context, tx *spanner.ReadWriteTransaction) error {
-		result, err := spannerutil.CollectRow(tx.Query(ctx, spanner.Statement{
-			SQL: `
-				SELECT status, version, expires_at, retention_mode
-				FROM objects
-				WHERE
-					(project_id, bucket_name, object_key) = (@project_id, @bucket_name, @object_key)
-					AND status <> ` + statusPending + `
-				ORDER BY version DESC
-				LIMIT 1
-			`,
-			Params: map[string]interface{}{
-				"project_id":  opts.ProjectID,
-				"bucket_name": opts.BucketName,
-				"object_key":  opts.ObjectKey,
-			},
-		}), func(row *spanner.Row, item *info) error {
-			return errs.Wrap(row.Columns(
-				&item.Status,
-				&item.version,
-				&item.ExpiresAt,
-				lockModeWrapper{retentionMode: &item.Retention.Mode},
-			))
-		})
+	// The FOR UPDATE select folds BEGIN into its first statement and
+	// CommitWithExec folds the UPDATE together with COMMIT, so this read then
+	// dependent write costs two round trips instead of four.
+	return tidbutil.WithTx(ctx, t.db, func(ctx context.Context, tx *tidbutil.Tx) error {
+		var (
+			status    ObjectStatus
+			version   Version
+			expiresAt *time.Time
+		)
+		err := tx.QueryRowContext(ctx, `
+			SELECT status, version, expires_at
+			FROM objects
+			WHERE
+				(project_id, bucket_name, object_key) = (?, ?, ?)
+				AND status <> `+statusPending+`
+			ORDER BY version DESC
+			LIMIT 1
+			FOR UPDATE`,
+			opts.ProjectID, opts.BucketName, opts.ObjectKey,
+		).Scan(&status, &version, &expiresAt)
 		if err != nil {
-			if errors.Is(err, iterator.Done) {
+			if errors.Is(err, sql.ErrNoRows) {
 				return ErrObjectNotFound.New("")
 			}
-			return errs.New("unable to query object info before setting legal hold: %w", err)
+			return Error.New("unable to query object info before setting legal hold: %w", err)
 		}
 
 		switch {
-		case result.Status.IsDeleteMarker():
+		case status.IsDeleteMarker():
 			return ErrObjectStatus.New(noLockOnDeleteMarkerErrMsg)
-		case result.ExpiresAt != nil:
+		case expiresAt != nil:
 			return ErrObjectExpiration.New(noLockWithExpirationErrMsg)
 		}
 
-		return errs.Wrap(s.setObjectExactVersionLegalHold(ctx, tx, SetObjectExactVersionLegalHold{
-			ObjectLocation: opts.ObjectLocation,
-			Version:        result.version,
-			Enabled:        opts.Enabled,
-		}, result.Retention.Mode))
-	})
-
-	if err != nil {
-		if ErrObjectNotFound.Has(err) || ErrObjectExpiration.Has(err) || ErrObjectStatus.Has(err) {
-			return errs.Wrap(err)
+		if err = tx.CommitWithExec(ctx, `
+			UPDATE objects SET
+				retention_mode = CASE
+					WHEN ? THEN COALESCE(retention_mode, 0) | `+retentionModeLegalHold+`
+					ELSE retention_mode & ~`+retentionModeLegalHold+`
+				END
+			WHERE
+				(project_id, bucket_name, object_key, version) = (?, ?, ?, ?)`,
+			opts.Enabled, opts.ProjectID, opts.BucketName, opts.ObjectKey, version,
+		); err != nil {
+			return Error.New("unable to update object legal hold configuration: %w", err)
 		}
-		return Error.Wrap(err)
-	}
-
-	return nil
-}
-
-func (s *SpannerAdapter) setObjectExactVersionLegalHold(ctx context.Context, tx *spanner.ReadWriteTransaction, opts SetObjectExactVersionLegalHold, existingRetMode storj.RetentionMode) (err error) {
-	defer mon.Task()(&ctx)(&err)
-
-	affected, err := tx.Update(ctx, spanner.Statement{
-		SQL: `
-				UPDATE objects
-				SET
-					retention_mode = @retention_mode
-				WHERE
-					(project_id, bucket_name, object_key, version) = (@project_id, @bucket_name, @object_key, @version)
-			`,
-		Params: map[string]interface{}{
-			"project_id":     opts.ProjectID,
-			"bucket_name":    opts.BucketName,
-			"object_key":     opts.ObjectKey,
-			"version":        opts.Version,
-			"retention_mode": lockModeWrapper{legalHold: &opts.Enabled, retentionMode: &existingRetMode},
-		},
+		return nil
 	})
-	if err != nil {
-		return errs.New("unable to update object legal hold configuration: %w", err)
-	}
-
-	if affected == 0 {
-		return ErrObjectNotFound.New("")
-	}
-
-	return nil
 }
 
 // SetObjectExactVersionRetention contains arguments necessary for setting
@@ -650,89 +811,57 @@ func (p *PostgresAdapter) SetObjectExactVersionRetention(ctx context.Context, op
 }
 
 // SetObjectExactVersionRetention sets the retention configuration of an exact version of an object.
-func (s *SpannerAdapter) SetObjectExactVersionRetention(ctx context.Context, opts SetObjectExactVersionRetention) (err error) {
+func (t *TiDBAdapter) SetObjectExactVersionRetention(ctx context.Context, opts SetObjectExactVersionRetention) (err error) {
 	defer mon.Task()(&ctx)(&err)
 
-	now := time.Now()
+	now := time.Now().Truncate(time.Microsecond)
 
-	_, err = s.client.ReadWriteTransaction(ctx, func(ctx context.Context, tx *spanner.ReadWriteTransaction) error {
-		result, err := spannerutil.CollectRow(tx.Query(ctx, spanner.Statement{
-			SQL: `
-				SELECT status, expires_at, retention_mode, retain_until
-				FROM objects
-				WHERE (project_id, bucket_name, object_key, version) = (@project_id, @bucket_name, @object_key, @version)
-			`,
-			Params: map[string]interface{}{
-				"project_id":  opts.ProjectID,
-				"bucket_name": opts.BucketName,
-				"object_key":  opts.ObjectKey,
-				"version":     opts.Version,
-			},
-		}), func(row *spanner.Row, item *preUpdateRetentionInfo) error {
-			return errs.Wrap(row.Columns(
-				&item.Status,
-				&item.ExpiresAt,
-				lockModeWrapper{retentionMode: &item.Retention.Mode},
-				timeWrapper{&item.Retention.RetainUntil},
-			))
-		})
+	// The FOR UPDATE select folds BEGIN into its first statement and
+	// CommitWithExec folds the UPDATE together with COMMIT, so this read then
+	// dependent write costs two round trips instead of four.
+	return tidbutil.WithTx(ctx, t.db, func(ctx context.Context, tx *tidbutil.Tx) error {
+		var info preUpdateRetentionInfo
+		err := tx.QueryRowContext(ctx, `
+			SELECT status, expires_at, retention_mode, retain_until
+			FROM objects
+			WHERE (project_id, bucket_name, object_key, version) = (?, ?, ?, ?)
+			FOR UPDATE`,
+			opts.ProjectID, opts.BucketName, opts.ObjectKey, opts.Version,
+		).Scan(
+			&info.Status,
+			&info.ExpiresAt,
+			lockModeWrapper{retentionMode: &info.Retention.Mode},
+			timeWrapper{&info.Retention.RetainUntil},
+		)
 		if err != nil {
-			if errors.Is(err, iterator.Done) {
+			if errors.Is(err, sql.ErrNoRows) {
 				return ErrObjectNotFound.New("")
 			}
-			return errs.New("unable to query object info before setting retention: %w", err)
+			return Error.New("unable to query object info before setting retention: %w", err)
 		}
 
-		if err = result.verify(opts.Retention, opts.BypassGovernance, now); err != nil {
+		if err = info.verify(opts.Retention, opts.BypassGovernance, now); err != nil {
 			return errs.Wrap(err)
 		}
 
-		return errs.Wrap(s.setObjectExactVersionRetention(ctx, tx, opts))
-	})
-
-	if err != nil {
-		if ErrObjectNotFound.Has(err) || ErrObjectExpiration.Has(err) || ErrObjectLock.Has(err) || ErrObjectStatus.Has(err) {
-			return errs.Wrap(err)
-		}
-		return Error.Wrap(err)
-	}
-
-	return nil
-}
-
-func (s *SpannerAdapter) setObjectExactVersionRetention(ctx context.Context, tx *spanner.ReadWriteTransaction, opts SetObjectExactVersionRetention) (err error) {
-	defer mon.Task()(&ctx)(&err)
-
-	affected, err := tx.Update(ctx, spanner.Statement{
-		SQL: `
-			UPDATE objects
-			SET
+		if err = tx.CommitWithExec(ctx, `
+			UPDATE objects SET
 				retention_mode = CASE
-					WHEN @retention_mode != ` + retentionModeNone + ` THEN (COALESCE(retention_mode, ` + retentionModeNone + `) & ~` + retentionModeComplianceAndGovernanceMask + `) | @retention_mode
-					ELSE retention_mode & ~` + retentionModeComplianceAndGovernanceMask + `
+					WHEN ? != `+retentionModeNone+` THEN (COALESCE(retention_mode, `+retentionModeNone+`) & ~`+retentionModeComplianceAndGovernanceMask+`) | ?
+					ELSE retention_mode & ~`+retentionModeComplianceAndGovernanceMask+`
 				END,
-				retain_until   = @retain_until
+				retain_until = ?
 			WHERE
-				(project_id, bucket_name, object_key, version) = (@project_id, @bucket_name, @object_key, @version)
-		`,
-		Params: map[string]interface{}{
-			"project_id":     opts.ProjectID,
-			"bucket_name":    opts.BucketName,
-			"object_key":     opts.ObjectKey,
-			"version":        opts.Version,
-			"retention_mode": lockModeWrapper{retentionMode: &opts.Retention.Mode},
-			"retain_until":   timeWrapper{&opts.Retention.RetainUntil},
-		},
+				(project_id, bucket_name, object_key, version) = (?, ?, ?, ?)`,
+			lockModeWrapper{retentionMode: &opts.Retention.Mode},
+			lockModeWrapper{retentionMode: &opts.Retention.Mode},
+			timeWrapper{&opts.Retention.RetainUntil},
+			opts.ProjectID, opts.BucketName, opts.ObjectKey, opts.Version,
+		); err != nil {
+			return Error.New("unable to update object retention configuration: %w", err)
+		}
+		return nil
 	})
-	if err != nil {
-		return errs.New("unable to update object retention configuration: %w", err)
-	}
-
-	if affected == 0 {
-		return ErrObjectNotFound.New("")
-	}
-
-	return nil
 }
 
 // SetObjectLastCommittedRetention contains arguments necessary for setting
@@ -854,67 +983,65 @@ func (p *PostgresAdapter) SetObjectLastCommittedRetention(ctx context.Context, o
 
 // SetObjectLastCommittedRetention sets the retention configuration
 // of the most recently committed version of an object.
-func (s *SpannerAdapter) SetObjectLastCommittedRetention(ctx context.Context, opts SetObjectLastCommittedRetention) (err error) {
+func (t *TiDBAdapter) SetObjectLastCommittedRetention(ctx context.Context, opts SetObjectLastCommittedRetention) (err error) {
 	defer mon.Task()(&ctx)(&err)
 
-	type info struct {
-		version Version
-		preUpdateRetentionInfo
-	}
+	now := time.Now().Truncate(time.Microsecond)
 
-	now := time.Now()
-
-	_, err = s.client.ReadWriteTransaction(ctx, func(ctx context.Context, tx *spanner.ReadWriteTransaction) error {
-		result, err := spannerutil.CollectRow(tx.Query(ctx, spanner.Statement{
-			SQL: `
-				SELECT status, version, expires_at, retention_mode, retain_until
-				FROM objects
-				WHERE
-					(project_id, bucket_name, object_key) = (@project_id, @bucket_name, @object_key)
-					AND status <> ` + statusPending + `
-				ORDER BY version DESC
-				LIMIT 1
-			`,
-			Params: map[string]interface{}{
-				"project_id":  opts.ProjectID,
-				"bucket_name": opts.BucketName,
-				"object_key":  opts.ObjectKey,
-			},
-		}), func(row *spanner.Row, item *info) error {
-			return errs.Wrap(row.Columns(
-				&item.Status,
-				&item.version,
-				&item.ExpiresAt,
-				lockModeWrapper{retentionMode: &item.Retention.Mode},
-				timeWrapper{&item.Retention.RetainUntil},
-			))
-		})
+	// The FOR UPDATE select folds BEGIN into its first statement and
+	// CommitWithExec folds the UPDATE together with COMMIT, so this read then
+	// dependent write costs two round trips instead of four.
+	return tidbutil.WithTx(ctx, t.db, func(ctx context.Context, tx *tidbutil.Tx) error {
+		var (
+			info    preUpdateRetentionInfo
+			version Version
+		)
+		err := tx.QueryRowContext(ctx, `
+			SELECT status, version, expires_at, retention_mode, retain_until
+			FROM objects
+			WHERE
+				(project_id, bucket_name, object_key) = (?, ?, ?)
+				AND status <> `+statusPending+`
+			ORDER BY version DESC
+			LIMIT 1
+			FOR UPDATE`,
+			opts.ProjectID, opts.BucketName, opts.ObjectKey,
+		).Scan(
+			&info.Status,
+			&version,
+			&info.ExpiresAt,
+			lockModeWrapper{retentionMode: &info.Retention.Mode},
+			timeWrapper{&info.Retention.RetainUntil},
+		)
 		if err != nil {
-			if errors.Is(err, iterator.Done) {
+			if errors.Is(err, sql.ErrNoRows) {
 				return ErrObjectNotFound.New("")
 			}
-			return errs.New("unable to query object info before setting retention: %w", err)
+			return Error.New("unable to query object info before setting retention: %w", err)
 		}
 
-		if err = result.verify(opts.Retention, opts.BypassGovernance, now); err != nil {
+		if err = info.verify(opts.Retention, opts.BypassGovernance, now); err != nil {
 			return errs.Wrap(err)
 		}
 
-		return errs.Wrap(s.setObjectExactVersionRetention(ctx, tx, SetObjectExactVersionRetention{
-			ObjectLocation: opts.ObjectLocation,
-			Version:        result.version,
-			Retention:      opts.Retention,
-		}))
+		if err = tx.CommitWithExec(ctx, `
+			UPDATE objects SET
+				retention_mode = CASE
+					WHEN ? != `+retentionModeNone+` THEN (COALESCE(retention_mode, `+retentionModeNone+`) & ~`+retentionModeComplianceAndGovernanceMask+`) | ?
+					ELSE retention_mode & ~`+retentionModeComplianceAndGovernanceMask+`
+				END,
+				retain_until = ?
+			WHERE
+				(project_id, bucket_name, object_key, version) = (?, ?, ?, ?)`,
+			lockModeWrapper{retentionMode: &opts.Retention.Mode},
+			lockModeWrapper{retentionMode: &opts.Retention.Mode},
+			timeWrapper{&opts.Retention.RetainUntil},
+			opts.ProjectID, opts.BucketName, opts.ObjectKey, version,
+		); err != nil {
+			return Error.New("unable to update object retention configuration: %w", err)
+		}
+		return nil
 	})
-
-	if err != nil {
-		if ErrObjectNotFound.Has(err) || ErrObjectExpiration.Has(err) || ErrObjectLock.Has(err) || ErrObjectStatus.Has(err) {
-			return errs.Wrap(err)
-		}
-		return Error.Wrap(err)
-	}
-
-	return nil
 }
 
 // preUpdateRetentionInfo contains information about an object that is collected

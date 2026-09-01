@@ -2,7 +2,7 @@
 // See LICENSE for copying information.
 
 import { SizeBreakpoints } from '@/private/memory/size';
-import { BandwidthUsed, Stamp } from '@/storagenode/sno/sno';
+import { Stamp } from '@/storagenode/sno/sno';
 
 const shortMonthNames = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sept', 'Oct', 'Nov', 'Dec'];
 
@@ -16,7 +16,8 @@ export class ChartUtils {
      * @returns data - numeric array of normalized data
      */
     public static normalizeChartData(data: number[]): number[] {
-        const maxBytes = Math.ceil(Math.max(...data));
+        const finiteData = data.filter(Number.isFinite);
+        const maxBytes = finiteData.length ? Math.ceil(Math.max(...finiteData)) : 0;
 
         let divider: number = SizeBreakpoints.PB;
         switch (true) {
@@ -34,7 +35,7 @@ export class ChartUtils {
             break;
         }
 
-        return data.map(elem => elem / divider);
+        return data.map(elem => Number.isFinite(elem) ? elem / divider : Number.NaN);
     }
 
     /**
@@ -43,7 +44,8 @@ export class ChartUtils {
      * @returns dataDimension - string of data dimension
      */
     public static getChartDataDimension(data: number[]): string {
-        const maxBytes = Math.ceil(Math.max(...data));
+        const finiteData = data.filter(Number.isFinite);
+        const maxBytes = finiteData.length ? Math.ceil(Math.max(...finiteData)) : 0;
 
         let dataDimension: string;
         switch (true) {
@@ -89,36 +91,40 @@ export class ChartUtils {
     /**
      * Adds missing bandwidth usage for bandwidth chart data for each day of month.
      * @param fetchedData - array of data that is spread over missing bandwidth usage for each day of the month
-     * @returns bandwidthChartData - array of filled data
+     * @param constructor - the class constructor with emptyWithDate static method
+     * @returns chartData - array of filled data
      */
-    public static populateEmptyBandwidth(fetchedData: BandwidthUsed[]): BandwidthUsed[] {
-        const bandwidthChartData: BandwidthUsed[] = new Array(new Date().getUTCDate());
-        const data: BandwidthUsed[] = fetchedData || [];
+    public static populateEmptyBandwidth<T extends { intervalStart: Date }>(
+        fetchedData: T[],
+        constructor: { emptyWithDate(date: number): T },
+    ): T[] {
+        const chartData: T[] = new Array(new Date().getUTCDate());
+        const data: T[] = fetchedData || [];
 
         if (data.length === 0) {
-            return bandwidthChartData;
+            return chartData;
         }
 
         outer:
-        for (let i = 0; i < bandwidthChartData.length; i++) {
+        for (let i = 0; i < chartData.length; i++) {
             const date = i + 1;
 
             for (let j = 0; j < data.length; j++) {
                 if (data[j].intervalStart.getUTCDate() === date) {
-                    bandwidthChartData[i] = data[j];
+                    chartData[i] = data[j];
                     continue outer;
                 }
             }
 
-            bandwidthChartData[i] = BandwidthUsed.emptyWithDate(date);
+            chartData[i] = constructor.emptyWithDate(date);
         }
 
-        if (bandwidthChartData.length === 1) {
-            bandwidthChartData.unshift(BandwidthUsed.emptyWithDate(1));
-            bandwidthChartData[0].intervalStart.setUTCHours(0, 0, 0, 0);
+        if (chartData.length === 1) {
+            chartData.unshift(constructor.emptyWithDate(1));
+            chartData[0].intervalStart.setUTCHours(0, 0, 0, 0);
         }
 
-        return bandwidthChartData;
+        return chartData;
     }
 
     /**
@@ -129,10 +135,6 @@ export class ChartUtils {
     public static populateEmptyStamps(fetchedData: Stamp[]): Stamp[] {
         const storageChartData: Stamp[] = new Array(new Date().getUTCDate());
         const data: Stamp[] = fetchedData || [];
-
-        if (data.length === 0) {
-            return storageChartData;
-        }
 
         outer:
         for (let i = 0; i < storageChartData.length; i++) {

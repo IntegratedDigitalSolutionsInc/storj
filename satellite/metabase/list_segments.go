@@ -9,10 +9,7 @@ import (
 	"errors"
 	"time"
 
-	"cloud.google.com/go/spanner"
-
 	"storj.io/common/uuid"
-	"storj.io/storj/shared/dbutil/spannerutil"
 	"storj.io/storj/shared/tagsql"
 )
 
@@ -63,8 +60,10 @@ func (p *PostgresAdapter) ListSegments(ctx context.Context, opts ListSegments, a
 		rows, rowsErr = p.db.QueryContext(ctx, `
 			SELECT
 				position, created_at, expires_at, root_piece_id,
-				encrypted_key_nonce, encrypted_key, encrypted_size,
-				plain_offset, plain_size, encrypted_etag, redundancy,
+				encrypted_key_nonce, encrypted_key,
+				encrypted_size, plain_offset, plain_size,
+				encrypted_etag, encrypted_checksum,
+				redundancy,
 				inline_data, remote_alias_pieces, placement
 			FROM segments
 			WHERE
@@ -77,8 +76,10 @@ func (p *PostgresAdapter) ListSegments(ctx context.Context, opts ListSegments, a
 		rows, rowsErr = p.db.QueryContext(ctx, `
 			SELECT
 				position, created_at, expires_at, root_piece_id,
-				encrypted_key_nonce, encrypted_key, encrypted_size,
-				plain_offset, plain_size, encrypted_etag, redundancy,
+				encrypted_key_nonce, encrypted_key,
+				encrypted_size, plain_offset, plain_size,
+				encrypted_etag, encrypted_checksum,
+				redundancy,
 				inline_data, remote_alias_pieces, placement
 			FROM segments
 			WHERE
@@ -99,8 +100,8 @@ func (p *PostgresAdapter) ListSegments(ctx context.Context, opts ListSegments, a
 				&segment.CreatedAt, &segment.ExpiresAt,
 				&segment.RootPieceID, &segment.EncryptedKeyNonce, &segment.EncryptedKey,
 				&segment.EncryptedSize, &segment.PlainOffset, &segment.PlainSize,
-				&segment.EncryptedETag,
-				redundancyScheme{&segment.Redundancy},
+				&segment.EncryptedETag, &segment.EncryptedChecksum,
+				&segment.Redundancy,
 				&segment.InlineData, &aliasPieces,
 				&segment.Placement,
 			)
@@ -134,72 +135,60 @@ func (p *PostgresAdapter) ListSegments(ctx context.Context, opts ListSegments, a
 }
 
 // ListSegments lists specified stream segments.
-func (s *SpannerAdapter) ListSegments(ctx context.Context, opts ListSegments, aliasCache *NodeAliasCache) (result ListSegmentsResult, err error) {
-	var stmt spanner.Statement
+func (t *TiDBAdapter) ListSegments(ctx context.Context, opts ListSegments, aliasCache *NodeAliasCache) (result ListSegmentsResult, err error) {
+	var rows tagsql.Rows
+	var rowsErr error
 	if opts.Range == nil {
-		stmt = spanner.Statement{
-			SQL: `
-				SELECT
-					position, created_at, expires_at, root_piece_id,
-					encrypted_key_nonce, encrypted_key, encrypted_size,
-					plain_offset, plain_size, encrypted_etag, redundancy,
-					inline_data, remote_alias_pieces, placement
-				FROM segments
-				WHERE
-					stream_id = @stream_id AND
-					(@position = 0 OR position > @position)
-				ORDER BY stream_id, position ASC
-				LIMIT @limit
-			`,
-			Params: map[string]any{
-				"stream_id": opts.StreamID,
-				"position":  opts.Cursor,
-				"limit":     opts.Limit + 1,
-			},
-		}
+		rows, rowsErr = t.db.QueryContext(ctx, `
+			SELECT
+				position, created_at, expires_at, root_piece_id,
+				encrypted_key_nonce, encrypted_key,
+				encrypted_size, plain_offset, plain_size,
+				encrypted_etag, encrypted_checksum,
+				redundancy,
+				inline_data, remote_alias_pieces, placement
+			FROM segments
+			WHERE
+				stream_id = ? AND
+				(? = 0 OR position > ?)
+			ORDER BY stream_id, position ASC
+			LIMIT ?
+		`, opts.StreamID, opts.Cursor, opts.Cursor, opts.Limit+1)
 	} else {
-		stmt = spanner.Statement{
-			SQL: `
-				SELECT
-					position, created_at, expires_at, root_piece_id,
-					encrypted_key_nonce, encrypted_key, encrypted_size,
-					plain_offset, plain_size, encrypted_etag, redundancy,
-					inline_data, remote_alias_pieces, placement
-				FROM segments
-				WHERE
-					stream_id = @stream_id AND
-					(@position = 0 OR position > @position) AND
-					@plain_start < plain_offset + plain_size AND plain_offset < @plain_limit
-				ORDER BY stream_id, position ASC
-				LIMIT @limit
-			`,
-			Params: map[string]any{
-				"stream_id":   opts.StreamID,
-				"position":    opts.Cursor,
-				"limit":       opts.Limit + 1,
-				"plain_start": opts.Range.PlainStart,
-				"plain_limit": opts.Range.PlainLimit,
-			},
-		}
+		rows, rowsErr = t.db.QueryContext(ctx, `
+			SELECT
+				position, created_at, expires_at, root_piece_id,
+				encrypted_key_nonce, encrypted_key,
+				encrypted_size, plain_offset, plain_size,
+				encrypted_etag, encrypted_checksum,
+				redundancy,
+				inline_data, remote_alias_pieces, placement
+			FROM segments
+			WHERE
+				stream_id = ? AND
+				(? = 0 OR position > ?) AND
+				? < plain_offset + plain_size AND plain_offset < ?
+			ORDER BY stream_id, position ASC
+			LIMIT ?
+		`, opts.StreamID, opts.Cursor, opts.Cursor, opts.Range.PlainStart, opts.Range.PlainLimit, opts.Limit+1)
 	}
 
-	result.Segments, err = spannerutil.CollectRows(s.client.Single().Query(ctx, stmt),
-		func(row *spanner.Row, segment *Segment) error {
-			segment.StreamID = opts.StreamID
-
+	err = withRows(rows, rowsErr)(func(rows tagsql.Rows) error {
+		for rows.Next() {
+			var segment Segment
 			var aliasPieces AliasPieces
-			err = row.Columns(
+			err = rows.Scan(
 				&segment.Position,
 				&segment.CreatedAt, &segment.ExpiresAt,
 				&segment.RootPieceID, &segment.EncryptedKeyNonce, &segment.EncryptedKey,
-				spannerutil.Int(&segment.EncryptedSize), &segment.PlainOffset, spannerutil.Int(&segment.PlainSize),
-				&segment.EncryptedETag,
-				redundancyScheme{&segment.Redundancy},
+				&segment.EncryptedSize, &segment.PlainOffset, &segment.PlainSize,
+				&segment.EncryptedETag, &segment.EncryptedChecksum,
+				&segment.Redundancy,
 				&segment.InlineData, &aliasPieces,
 				&segment.Placement,
 			)
 			if err != nil {
-				return Error.New("failed to read segments: %w", err)
+				return Error.New("failed to scan segments: %w", err)
 			}
 
 			segment.Pieces, err = aliasCache.ConvertAliasesToPieces(ctx, aliasPieces)
@@ -207,11 +196,16 @@ func (s *SpannerAdapter) ListSegments(ctx context.Context, opts ListSegments, al
 				return Error.New("failed to convert aliases to pieces: %w", err)
 			}
 
-			return nil
-		})
-
+			segment.StreamID = opts.StreamID
+			result.Segments = append(result.Segments, segment)
+		}
+		return nil
+	})
 	if err != nil {
-		return ListSegmentsResult{}, Error.New("failed to list segments: %w", err)
+		if errors.Is(err, sql.ErrNoRows) {
+			return ListSegmentsResult{}, nil
+		}
+		return ListSegmentsResult{}, Error.New("unable to fetch object segments: %w", err)
 	}
 
 	if len(result.Segments) > opts.Limit {
@@ -253,6 +247,7 @@ type SegmentPositionInfo struct {
 	PlainOffset       int64
 	CreatedAt         *time.Time // TODO: make it non-nilable after we migrate all existing segments to have creation time
 	EncryptedETag     []byte
+	EncryptedChecksum []byte
 	EncryptedKeyNonce []byte
 	EncryptedKey      []byte
 }
@@ -288,7 +283,8 @@ func (p *PostgresAdapter) ListStreamPositions(ctx context.Context, opts ListStre
 		rows, rowsErr = p.db.QueryContext(ctx, `
 			SELECT
 				position, plain_size, plain_offset, created_at,
-				encrypted_etag, encrypted_key_nonce, encrypted_key
+				encrypted_etag, encrypted_checksum,
+				encrypted_key_nonce, encrypted_key
 			FROM segments
 			WHERE
 				stream_id = $1 AND
@@ -300,7 +296,8 @@ func (p *PostgresAdapter) ListStreamPositions(ctx context.Context, opts ListStre
 		rows, rowsErr = p.db.QueryContext(ctx, `
 			SELECT
 				position, plain_size, plain_offset, created_at,
-				encrypted_etag, encrypted_key_nonce, encrypted_key
+				encrypted_etag, encrypted_checksum,
+				encrypted_key_nonce, encrypted_key
 			FROM segments
 			WHERE
 				stream_id = $1 AND
@@ -316,7 +313,8 @@ func (p *PostgresAdapter) ListStreamPositions(ctx context.Context, opts ListStre
 			var segment SegmentPositionInfo
 			err = rows.Scan(
 				&segment.Position, &segment.PlainSize, &segment.PlainOffset, &segment.CreatedAt,
-				&segment.EncryptedETag, &segment.EncryptedKeyNonce, &segment.EncryptedKey,
+				&segment.EncryptedETag, &segment.EncryptedChecksum,
+				&segment.EncryptedKeyNonce, &segment.EncryptedKey,
 			)
 			if err != nil {
 				return Error.New("failed to scan segments: %w", err)
@@ -341,64 +339,57 @@ func (p *PostgresAdapter) ListStreamPositions(ctx context.Context, opts ListStre
 }
 
 // ListStreamPositions lists specified stream segment positions.
-func (s *SpannerAdapter) ListStreamPositions(ctx context.Context, opts ListStreamPositions) (result ListStreamPositionsResult, err error) {
-	var stmt spanner.Statement
+func (t *TiDBAdapter) ListStreamPositions(ctx context.Context, opts ListStreamPositions) (result ListStreamPositionsResult, err error) {
+	var rows tagsql.Rows
+	var rowsErr error
 	if opts.Range == nil {
-		stmt = spanner.Statement{
-			SQL: `
-				SELECT
-					position, plain_size, plain_offset, created_at,
-					encrypted_etag, encrypted_key_nonce, encrypted_key
-				FROM segments
-				WHERE
-					stream_id = @stream_id AND
-					(@cursor = 0 OR position > @cursor)
-				ORDER BY position ASC
-				LIMIT @limit
-			`,
-			Params: map[string]any{
-				"stream_id": opts.StreamID,
-				"cursor":    opts.Cursor,
-				"limit":     opts.Limit + 1,
-			},
-		}
+		rows, rowsErr = t.db.QueryContext(ctx, `
+			SELECT
+				position, plain_size, plain_offset, created_at,
+				encrypted_etag, encrypted_checksum,
+				encrypted_key_nonce, encrypted_key
+			FROM segments
+			WHERE
+				stream_id = ? AND
+				(? = 0 OR position > ?)
+			ORDER BY position ASC
+			LIMIT ?
+		`, opts.StreamID, opts.Cursor, opts.Cursor, opts.Limit+1)
 	} else {
-		stmt = spanner.Statement{
-			SQL: `
-				SELECT
-					position, plain_size, plain_offset, created_at,
-					encrypted_etag, encrypted_key_nonce, encrypted_key
-				FROM segments
-				WHERE
-					stream_id = @stream_id AND
-					(@cursor = 0 OR position > @cursor) AND
-					@plain_start < plain_offset + plain_size AND plain_offset < @plain_limit
-				ORDER BY position ASC
-				LIMIT @limit
-			`,
-			Params: map[string]any{
-				"stream_id":   opts.StreamID,
-				"cursor":      opts.Cursor,
-				"limit":       opts.Limit + 1,
-				"plain_start": opts.Range.PlainStart,
-				"plain_limit": opts.Range.PlainLimit,
-			},
-		}
+		rows, rowsErr = t.db.QueryContext(ctx, `
+			SELECT
+				position, plain_size, plain_offset, created_at,
+				encrypted_etag, encrypted_checksum,
+				encrypted_key_nonce, encrypted_key
+			FROM segments
+			WHERE
+				stream_id = ? AND
+				(? = 0 OR position > ?) AND
+				? < plain_offset + plain_size AND plain_offset < ?
+			ORDER BY position ASC
+			LIMIT ?
+		`, opts.StreamID, opts.Cursor, opts.Cursor, opts.Range.PlainStart, opts.Range.PlainLimit, opts.Limit+1)
 	}
 
-	result.Segments, err = spannerutil.CollectRows(s.client.Single().Query(ctx, stmt),
-		func(row *spanner.Row, segment *SegmentPositionInfo) error {
-			err = row.Columns(
-				&segment.Position, spannerutil.Int(&segment.PlainSize), &segment.PlainOffset, &segment.CreatedAt,
-				&segment.EncryptedETag, &segment.EncryptedKeyNonce, &segment.EncryptedKey,
+	err = withRows(rows, rowsErr)(func(rows tagsql.Rows) error {
+		for rows.Next() {
+			var segment SegmentPositionInfo
+			err = rows.Scan(
+				&segment.Position, &segment.PlainSize, &segment.PlainOffset, &segment.CreatedAt,
+				&segment.EncryptedETag, &segment.EncryptedChecksum,
+				&segment.EncryptedKeyNonce, &segment.EncryptedKey,
 			)
 			if err != nil {
 				return Error.New("failed to scan segments: %w", err)
 			}
-			return nil
-		})
-
+			result.Segments = append(result.Segments, segment)
+		}
+		return nil
+	})
 	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ListStreamPositionsResult{}, nil
+		}
 		return ListStreamPositionsResult{}, Error.New("unable to fetch object segments: %w", err)
 	}
 

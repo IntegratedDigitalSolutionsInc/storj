@@ -8,9 +8,11 @@ import (
 
 	"github.com/shopspring/decimal"
 	"github.com/zeebo/errs"
+	"go.uber.org/zap"
 
 	"storj.io/common/storj"
 	"storj.io/storj/private/currency"
+	"storj.io/storj/satellite/nodeselection"
 )
 
 var (
@@ -41,6 +43,7 @@ type NodeInfo struct {
 	LastContactSuccess time.Time
 	Disqualified       *time.Time
 	GracefulExit       *time.Time
+	ExitInitiated      *time.Time
 	UsageAtRest        float64
 	UsageGet           int64
 	UsagePut           int64
@@ -51,6 +54,8 @@ type NodeInfo struct {
 	TotalDisposed      currency.MicroUnit
 	TotalPaid          currency.MicroUnit
 	TotalDistributed   currency.MicroUnit
+	// Tags carries the node's self-signed price tags (see tag_rates.go).
+	Tags nodeselection.NodeTags
 }
 
 // Statement is the computed amounts and codes from a node.
@@ -67,6 +72,11 @@ type Statement struct {
 	Owed         currency.MicroUnit
 	Held         currency.MicroUnit
 	Disposed     currency.MicroUnit
+	// VoluntaryDiscount is the gross pre-surge, pre-withholding amount the
+	// node discounted below the configured rates by publishing self-signed
+	// price tags. It is the raw rate delta and is NOT the actual reduction
+	// in Owed once SurgePercent and withholding are applied.
+	VoluntaryDiscount currency.MicroUnit
 }
 
 // PeriodInfo contains configuration about the payment info to generate
@@ -74,6 +84,15 @@ type Statement struct {
 type PeriodInfo struct {
 	// Period is the period.
 	Period Period
+
+	// StartDateOverride, if non-nil, replaces Period.StartDate() when
+	// determining offline status. Used to compute a partial-month statement.
+	StartDateOverride *time.Time
+
+	// EndDateExclusiveOverride, if non-nil, replaces Period.EndDateExclusive()
+	// when determining graceful-exit, disqualification, and withholding tier.
+	// Used to compute a partial-month statement.
+	EndDateExclusiveOverride *time.Time
 
 	// Nodes is usage and other related information for nodes for this period.
 	Nodes []NodeInfo
@@ -97,12 +116,31 @@ type PeriodInfo struct {
 	// SurgePercent is the percent to adjust final amounts owed. For example,
 	// to pay 150%, set to 150. Zero means no surge.
 	SurgePercent int64
+
+	// Log receives warnings about malformed self-signed price tags. If nil, a
+	// no-op logger is used.
+	Log *zap.Logger
+
+	// Cutoff overrides the timestamp used to classify a node's recent
+	// activity for this period. Nodes whose last successful contact predates
+	// Cutoff are flagged Offline (default: the period start date) and their
+	// owed, held and disposed amounts for the whole period are zeroed
+	// alongside the Offline flag below. Nodes still in a graceful exit at
+	// Cutoff are flagged GracefulExiting (default: the period end date). If
+	// zero, the defaults are used.
+	Cutoff time.Time
 }
 
 // GenerateStatements generates all of the Statements for the given PeriodInfo.
 func GenerateStatements(info PeriodInfo) ([]Statement, error) {
 	startDate := info.Period.StartDate()
+	if info.StartDateOverride != nil {
+		startDate = *info.StartDateOverride
+	}
 	endDate := info.Period.EndDateExclusive()
+	if info.EndDateExclusiveOverride != nil {
+		endDate = *info.EndDateExclusiveOverride
+	}
 
 	rates := info.Rates
 	if rates == nil {
@@ -111,6 +149,11 @@ func GenerateStatements(info PeriodInfo) ([]Statement, error) {
 	withheldPercents := info.WithheldPercents
 	if withheldPercents == nil {
 		withheldPercents = DefaultWithheldPercents
+	}
+
+	log := info.Log
+	if log == nil {
+		log = zap.NewNop()
 	}
 
 	surgePercent := decimal.NewFromInt(info.SurgePercent)
@@ -125,24 +168,51 @@ func GenerateStatements(info PeriodInfo) ([]Statement, error) {
 	for _, node := range info.Nodes {
 		var codes []Code
 
+		effective := EffectiveRates(*rates, node.ID, node.Tags, log)
+
 		atRest := decimal.NewFromFloat(node.UsageAtRest).
-			Mul(decimal.Decimal(rates.AtRestGBHours)).
+			Mul(decimal.Decimal(effective.AtRestGBHours)).
 			Div(gb)
 		get := decimal.NewFromInt(node.UsageGet).
-			Mul(decimal.Decimal(rates.GetTB)).
+			Mul(decimal.Decimal(effective.GetTB)).
 			Div(tb)
 		put := decimal.NewFromInt(node.UsagePut).
-			Mul(decimal.Decimal(rates.PutTB)).
+			Mul(decimal.Decimal(effective.PutTB)).
 			Div(tb)
 		getRepair := decimal.NewFromInt(node.UsageGetRepair).
-			Mul(decimal.Decimal(rates.GetRepairTB)).
+			Mul(decimal.Decimal(effective.GetRepairTB)).
 			Div(tb)
 		putRepair := decimal.NewFromInt(node.UsagePutRepair).
-			Mul(decimal.Decimal(rates.PutRepairTB)).
+			Mul(decimal.Decimal(effective.PutRepairTB)).
 			Div(tb)
 		getAudit := decimal.NewFromInt(node.UsageGetAudit).
-			Mul(decimal.Decimal(rates.GetAuditTB)).
+			Mul(decimal.Decimal(effective.GetAuditTB)).
 			Div(tb)
+
+		// voluntaryDiscount is the pre-surge difference between what the node
+		// would have earned at the operator-configured rates and what it earns
+		// at the (possibly node-lowered) effective rates.
+		voluntaryDiscount := decimal.Zero
+		if !effective.Equal(*rates) {
+			atRestConfig := decimal.NewFromFloat(node.UsageAtRest).
+				Mul(decimal.Decimal(rates.AtRestGBHours)).
+				Div(gb)
+			getConfig := decimal.NewFromInt(node.UsageGet).
+				Mul(decimal.Decimal(rates.GetTB)).
+				Div(tb)
+			getRepairConfig := decimal.NewFromInt(node.UsageGetRepair).
+				Mul(decimal.Decimal(rates.GetRepairTB)).
+				Div(tb)
+			getAuditConfig := decimal.NewFromInt(node.UsageGetAudit).
+				Mul(decimal.Decimal(rates.GetAuditTB)).
+				Div(tb)
+			configTotal := decimal.Sum(atRestConfig, getConfig, getRepairConfig, getAuditConfig)
+			actualTotal := decimal.Sum(atRest, get, getRepair, getAudit)
+			voluntaryDiscount = configTotal.Sub(actualTotal)
+			if voluntaryDiscount.Sign() < 0 {
+				voluntaryDiscount = decimal.Zero
+			}
+		}
 
 		total := decimal.Sum(atRest, get, put, getRepair, putRepair, getAudit)
 		if info.SurgePercent > 0 {
@@ -154,7 +224,26 @@ func GenerateStatements(info PeriodInfo) ([]Statement, error) {
 			codes = append(codes, GracefulExit)
 		}
 
-		offline := node.LastContactSuccess.Before(startDate)
+		exitingAt := endDate
+		if !info.Cutoff.IsZero() {
+			exitingAt = info.Cutoff
+		}
+		// A node is flagged GracefulExiting if it had initiated a graceful
+		// exit by exitingAt (exclusive) and had not yet successfully finished
+		// it by then. The nil check also covers failed exits: those never set
+		// GracefulExit (see run/compensation.go, only ExitSuccess sets it),
+		// so a failed exit keeps showing up as GracefulExiting in every
+		// subsequent period until it is manually classified.
+		if node.ExitInitiated != nil && node.ExitInitiated.Before(exitingAt) &&
+			(node.GracefulExit == nil || !node.GracefulExit.Before(exitingAt)) {
+			codes = append(codes, GracefulExiting)
+		}
+
+		offlineDate := startDate
+		if !info.Cutoff.IsZero() {
+			offlineDate = info.Cutoff
+		}
+		offline := node.LastContactSuccess.Before(offlineDate)
 		if offline {
 			codes = append(codes, Offline)
 		}
@@ -192,6 +281,7 @@ func GenerateStatements(info PeriodInfo) ([]Statement, error) {
 			disposed = decimal.Zero
 			held = decimal.Zero
 			owed = decimal.Zero
+			voluntaryDiscount = decimal.Zero
 		}
 
 		// If the node is offline, nothing is owed/held/disposed.
@@ -199,6 +289,7 @@ func GenerateStatements(info PeriodInfo) ([]Statement, error) {
 			disposed = decimal.Zero
 			held = decimal.Zero
 			owed = decimal.Zero
+			voluntaryDiscount = decimal.Zero
 		}
 
 		var overflowErrs errs.Group
@@ -211,18 +302,19 @@ func GenerateStatements(info PeriodInfo) ([]Statement, error) {
 			return m
 		}
 		statement := Statement{
-			NodeID:       node.ID,
-			Codes:        codes,
-			AtRest:       toMicroUnit(atRest),
-			Get:          toMicroUnit(get),
-			Put:          toMicroUnit(put),
-			GetRepair:    toMicroUnit(getRepair),
-			PutRepair:    toMicroUnit(putRepair),
-			GetAudit:     toMicroUnit(getAudit),
-			SurgePercent: info.SurgePercent,
-			Owed:         toMicroUnit(owed),
-			Held:         toMicroUnit(held),
-			Disposed:     toMicroUnit(disposed),
+			NodeID:            node.ID,
+			Codes:             codes,
+			AtRest:            toMicroUnit(atRest),
+			Get:               toMicroUnit(get),
+			Put:               toMicroUnit(put),
+			GetRepair:         toMicroUnit(getRepair),
+			PutRepair:         toMicroUnit(putRepair),
+			GetAudit:          toMicroUnit(getAudit),
+			SurgePercent:      info.SurgePercent,
+			Owed:              toMicroUnit(owed),
+			Held:              toMicroUnit(held),
+			Disposed:          toMicroUnit(disposed),
+			VoluntaryDiscount: toMicroUnit(voluntaryDiscount),
 		}
 
 		if err := overflowErrs.Err(); err != nil {

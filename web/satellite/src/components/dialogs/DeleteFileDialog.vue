@@ -6,6 +6,7 @@
         v-model="model"
         max-width="420px"
         transition="fade-transition"
+        :persistent="false"
     >
         <v-card ref="innerContent">
             <v-card-item class="pa-6">
@@ -22,7 +23,7 @@
                 <v-card-title class="font-weight-bold text-capitalize">Delete {{ fileTypes }}</v-card-title>
                 <template #append>
                     <v-btn
-                        icon="$close"
+                        :icon="X"
                         variant="text"
                         size="small"
                         color="default"
@@ -77,10 +78,10 @@ import {
     VBtn,
     VChip,
 } from 'vuetify/components';
-import { Trash2 } from 'lucide-vue-next';
+import { Trash2, X } from '@lucide/vue';
 
 import { useBucketsStore } from '@/store/modules/bucketsStore';
-import { BrowserObject, useObjectBrowserStore } from '@/store/modules/objectBrowserStore';
+import { type BrowserObject, useObjectBrowserStore  } from '@/store/modules/objectBrowserStore';
 
 const props = defineProps<{
     files: BrowserObject[],

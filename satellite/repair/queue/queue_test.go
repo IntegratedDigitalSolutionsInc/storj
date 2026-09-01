@@ -18,15 +18,12 @@ import (
 	"storj.io/common/testcontext"
 	"storj.io/common/testrand"
 	"storj.io/common/uuid"
-	"storj.io/storj/satellite"
 	"storj.io/storj/satellite/repair/queue"
-	"storj.io/storj/satellite/satellitedb/satellitedbtest"
+	"storj.io/storj/satellite/repair/repairqueuetest"
 )
 
 func TestInsertSelect(t *testing.T) {
-	satellitedbtest.Run(t, func(ctx *testcontext.Context, t *testing.T, db satellite.DB) {
-		q := db.RepairQueue()
-
+	repairqueuetest.Run(t, func(ctx *testcontext.Context, t *testing.T, q queue.RepairQueue) {
 		seg := createInjuredSegment()
 		seg.SegmentHealth = 0.4
 
@@ -35,7 +32,7 @@ func TestInsertSelect(t *testing.T) {
 		require.False(t, alreadyInserted)
 		segments, err := q.Select(ctx, 1, nil, nil)
 		require.NoError(t, err)
-		err = q.Delete(ctx, segments[0])
+		err = q.Release(ctx, segments[0], true)
 		require.NoError(t, err)
 		require.Equal(t, seg.StreamID, segments[0].StreamID)
 		require.Equal(t, seg.Position, segments[0].Position)
@@ -46,9 +43,7 @@ func TestInsertSelect(t *testing.T) {
 }
 
 func TestInsertDuplicate(t *testing.T) {
-	satellitedbtest.Run(t, func(ctx *testcontext.Context, t *testing.T, db satellite.DB) {
-		q := db.RepairQueue()
-
+	repairqueuetest.Run(t, func(ctx *testcontext.Context, t *testing.T, q queue.RepairQueue) {
 		seg := createInjuredSegment()
 		alreadyInserted, err := q.Insert(ctx, seg)
 		require.NoError(t, err)
@@ -60,9 +55,7 @@ func TestInsertDuplicate(t *testing.T) {
 }
 
 func TestInsertBatchOfOne(t *testing.T) {
-	satellitedbtest.Run(t, func(ctx *testcontext.Context, t *testing.T, db satellite.DB) {
-		q := db.RepairQueue()
-
+	repairqueuetest.Run(t, func(ctx *testcontext.Context, t *testing.T, q queue.RepairQueue) {
 		writeSegments := []*queue.InjuredSegment{
 			createInjuredSegment(),
 		}
@@ -86,9 +79,7 @@ func TestInsertBatchOfOne(t *testing.T) {
 }
 
 func TestInsertOverlappingBatches(t *testing.T) {
-	satellitedbtest.Run(t, func(ctx *testcontext.Context, t *testing.T, db satellite.DB) {
-		q := db.RepairQueue()
-
+	repairqueuetest.Run(t, func(ctx *testcontext.Context, t *testing.T, q queue.RepairQueue) {
 		requireDbState := func(expectedSegments []queue.InjuredSegment) {
 			sort := func(segments []queue.InjuredSegment) {
 				sort.Slice(segments, func(i, j int) bool {
@@ -134,9 +125,7 @@ func TestInsertOverlappingBatches(t *testing.T) {
 }
 
 func TestDequeueEmptyQueue(t *testing.T) {
-	satellitedbtest.Run(t, func(ctx *testcontext.Context, t *testing.T, db satellite.DB) {
-		q := db.RepairQueue()
-
+	repairqueuetest.Run(t, func(ctx *testcontext.Context, t *testing.T, q queue.RepairQueue) {
 		_, err := q.Select(ctx, 1, nil, nil)
 		require.Error(t, err)
 		require.True(t, queue.ErrEmpty.Has(err), "error should of class EmptyQueue")
@@ -144,9 +133,7 @@ func TestDequeueEmptyQueue(t *testing.T) {
 }
 
 func TestSequential(t *testing.T) {
-	satellitedbtest.Run(t, func(ctx *testcontext.Context, t *testing.T, db satellite.DB) {
-		q := db.RepairQueue()
-
+	repairqueuetest.Run(t, func(ctx *testcontext.Context, t *testing.T, q queue.RepairQueue) {
 		const N = 20
 		var added []*queue.InjuredSegment
 		for i := 0; i < N; i++ {
@@ -172,7 +159,7 @@ func TestSequential(t *testing.T) {
 			}
 			require.NoError(t, err)
 			require.Len(t, s, 1)
-			err = q.Delete(ctx, s[0])
+			err = q.Release(ctx, s[0], true)
 			require.NoError(t, err)
 
 			got = append(got, &s[0])
@@ -192,8 +179,7 @@ func TestSequential(t *testing.T) {
 }
 
 func TestParallel(t *testing.T) {
-	satellitedbtest.Run(t, func(ctx *testcontext.Context, t *testing.T, db satellite.DB) {
-		q := db.RepairQueue()
+	repairqueuetest.Run(t, func(ctx *testcontext.Context, t *testing.T, q queue.RepairQueue) {
 		const N = 20
 
 		expectedSegments := make([]queue.InjuredSegment, N)
@@ -240,7 +226,7 @@ func TestParallel(t *testing.T) {
 					return errs.New("got %d segments, expected 1: %+v", len(s), s)
 				}
 
-				err = q.Delete(ctx, s[0])
+				err = q.Release(ctx, s[0], true)
 				if err != nil {
 					return err
 				}
@@ -267,9 +253,8 @@ func TestParallel(t *testing.T) {
 }
 
 func TestClean(t *testing.T) {
-	satellitedbtest.Run(t, func(ctx *testcontext.Context, t *testing.T, db satellite.DB) {
-		q := db.RepairQueue()
-
+	repairqueuetest.Run(t, func(ctx *testcontext.Context, t *testing.T, q queue.RepairQueue) {
+		// Create three segments
 		seg1 := &queue.InjuredSegment{
 			StreamID: testrand.UUID(),
 		}
@@ -280,58 +265,52 @@ func TestClean(t *testing.T) {
 			StreamID: testrand.UUID(),
 		}
 
-		timeBeforeInsert1 := time.Now()
+		// Create reference time before insertion
+		timeBeforeInsert := time.Now().Add(-time.Hour)
 
+		// Insert all segments - this will set their UpdatedAt times to now
 		segmentHealth := 1.3
+		seg1.SegmentHealth = segmentHealth
 		_, err := q.Insert(ctx, seg1)
 		require.NoError(t, err)
 
+		seg2.SegmentHealth = segmentHealth
 		_, err = q.Insert(ctx, seg2)
 		require.NoError(t, err)
 
+		seg3.SegmentHealth = segmentHealth
 		_, err = q.Insert(ctx, seg3)
+		require.NoError(t, err)
+
+		// mark seg1 as updated an hour ago
+		_, err = q.TestingSetUpdatedTime(ctx, 0, seg1.StreamID, seg1.Position, timeBeforeInsert)
 		require.NoError(t, err)
 
 		count, err := q.Count(ctx)
 		require.NoError(t, err)
 		require.Equal(t, 3, count)
 
-		d, err := q.Clean(ctx, timeBeforeInsert1)
+		// Clean should not remove any segments when using a time before all segments
+		d, err := q.Clean(ctx, timeBeforeInsert.Add(-time.Hour))
 		require.NoError(t, err)
 		require.Equal(t, int64(0), d)
 
-		count, err = q.Count(ctx)
-		require.NoError(t, err)
-		require.Equal(t, 3, count)
-
-		timeBeforeInsert2 := time.Now()
-
-		// seg1 "becomes healthy", so do not update it
-		// seg2 stays at the same health
-		_, err = q.Insert(ctx, seg2)
-		require.NoError(t, err)
-
-		// seg3 has a lower health
-		seg3.SegmentHealth = segmentHealth - 0.1
-		_, err = q.Insert(ctx, seg3)
-		require.NoError(t, err)
-
-		count, err = q.Count(ctx)
-		require.NoError(t, err)
-		require.Equal(t, 3, count)
-
-		d, err = q.Clean(ctx, timeBeforeInsert2)
+		// Clean should remove 1 segment (seg1) when using timeBeforeInsert
+		d, err = q.Clean(ctx, timeBeforeInsert.Add(time.Minute))
 		require.NoError(t, err)
 		require.Equal(t, int64(1), d)
 
+		// We should have 2 segments left
 		count, err = q.Count(ctx)
 		require.NoError(t, err)
 		require.Equal(t, 2, count)
 
-		d, err = q.Clean(ctx, time.Now())
+		// Clean with current time should remove all segments
+		d, err = q.Clean(ctx, time.Now().Add(time.Minute))
 		require.NoError(t, err)
 		require.Equal(t, int64(2), d)
 
+		// We should have 0 segments left
 		count, err = q.Count(ctx)
 		require.NoError(t, err)
 		require.Equal(t, 0, count)

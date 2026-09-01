@@ -47,9 +47,142 @@ export class Validator {
     }
 
     /**
+     * Checks string to satisfy hostname rules.
+     */
+    public static hostname(hostname: string): boolean {
+        if (hostname.length > 255) return false;
+
+        // require at least one dot and each label 1..63, no leading/trailing hyphen.
+        const rgx = /^(?=.{1,255}$)(?!-)[A-Za-z0-9-]{1,63}(?<!-)(\.(?!-)[A-Za-z0-9-]{1,63}(?<!-))+$/;
+        return rgx.test(hostname);
+    }
+
+    /**
      * Checks if value string is less than or equal to max possible length.
      */
     public static nameLength(value: string, maxLength: number): boolean {
         return value.length <= maxLength;
     }
+
+    /**
+     * Checks string to see if it contains typical phone number characters.
+     */
+    public static phoneNumber(value: string): boolean {
+        const rgx = /^\+?\d{1,15}(?:[\s.-]?\d{1,15})*$/;
+        return rgx.test(value);
+    }
+
+    /**
+     * Checks string to see if it is a valid SSH public key.
+     * Ported from Compute backend (Go) implementation of isPublicKeyValid and readSSHProtoString.
+     * Mirrors logic defined in RFC 4251, 4253, 5656, and 8709.
+     * Original reference: https://pkg.go.dev/golang.org/x/crypto/ssh and internal backend code at func isPublicKeyValid(key string) bool
+     */
+    public static publicSSHKey(key: string): boolean {
+        if (key.length > 8192) return false;
+
+        const parts = key.trim().split(/\s+/, 3);
+        if (parts.length < 2) return false;
+
+        const keyFormat = parts[0];
+        const blobStr = parts[1];
+
+        const blobBytes = base64ToBytes(blobStr);
+        if (!blobBytes) return false;
+
+        let blobFormat: Uint8Array;
+        let rest: Uint8Array;
+        let ok: boolean;
+
+        // eslint-disable-next-line prefer-const
+        [blobFormat, rest, ok] = readSSHProtoString(blobBytes);
+        if (!ok || bytesToString(blobFormat) !== keyFormat) return false;
+
+        switch (keyFormat) {
+        // RFC 4253
+        case 'ssh-rsa':
+            for (let i = 0; i < 2; i++) {
+                [, rest, ok] = readSSHProtoString(rest);
+                if (!ok) return false;
+            }
+            break;
+        case 'ssh-dss':
+            for (let i = 0; i < 4; i++) {
+                [, rest, ok] = readSSHProtoString(rest);
+                if (!ok) return false;
+            }
+            break;
+        // RFC 8709
+        case 'ssh-ed25519': {
+            let pubKey: Uint8Array;
+            [pubKey, rest, ok] = readSSHProtoString(rest);
+            if (!ok || pubKey.length !== 32) return false;
+            break;
+        }
+        // RFC 5656
+        case 'ecdsa-sha2-nistp256':
+        case 'ecdsa-sha2-nistp384':
+        case 'ecdsa-sha2-nistp521': {
+            let curveID: Uint8Array;
+            [curveID, rest, ok] = readSSHProtoString(rest);
+
+            const expectedCurveID = keyFormat.substring(keyFormat.lastIndexOf('-') + 1);
+            if (!ok || bytesToString(curveID) !== expectedCurveID) return false;
+
+            [, rest, ok] = readSSHProtoString(rest);
+            if (!ok) return false;
+            break;
+        }
+        default:
+            return false;
+        }
+
+        return rest.length === 0;
+    }
+}
+
+/**
+ * Decodes base64 into bytes; returns null on failure.
+ * @param b64
+ */
+function base64ToBytes(b64: string): Uint8Array | null {
+    try {
+        const clean = b64.replace(/\s+/g, '');
+        const bin = atob(clean);
+        const out = new Uint8Array(bin.length);
+
+        for (let i = 0; i < bin.length; i++) {
+            out[i] = bin.charCodeAt(i) & 0xff;
+        }
+
+        return out;
+    } catch {
+        return null;
+    }
+}
+
+/**
+ * Read an SSH "string" per RFC 4251 §5: 4-byte big-endian length + bytes.
+ * Returns the byte slice, the unread portion of the slice, and whether the read was successful.
+ * If the read was unsuccessful, an empty slice will be returned.
+ * @param data
+ */
+function readSSHProtoString(data: Uint8Array): [str: Uint8Array, rest: Uint8Array, ok: boolean] {
+    if (data.length < 4) return [new Uint8Array(0), data, false];
+
+    const length = (data[0] << 24 | data[1] << 16 | data[2] << 8 | data[3]) >>> 0;
+    if (length > data.length - 4) return [new Uint8Array(0), data, false];
+
+    const str = data.subarray(4, 4 + length);
+    const rest = data.subarray(4 + length);
+
+    return [str, rest, true];
+}
+
+/**
+ * Decode bytes to string (for ASCII-like protocol fields).
+ * @param bytes
+ */
+function bytesToString(bytes: Uint8Array): string {
+    return new TextDecoder('utf-8', { fatal: false }).decode(bytes);
 }

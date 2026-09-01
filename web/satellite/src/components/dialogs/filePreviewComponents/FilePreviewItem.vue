@@ -58,9 +58,9 @@
 import { computed, ref, watch } from 'vue';
 import { VContainer, VProgressCircular } from 'vuetify/components';
 
-import { BrowserObject, PreviewCache, useObjectBrowserStore } from '@/store/modules/objectBrowserStore';
+import { type BrowserObject, type PreviewCache, useObjectBrowserStore  } from '@/store/modules/objectBrowserStore';
 import { useBucketsStore } from '@/store/modules/bucketsStore';
-import { useNotify } from '@/utils/hooks';
+import { useNotify } from '@/composables/useNotify';
 import { AnalyticsErrorEventSource } from '@/utils/constants/analyticsEventNames';
 import { EXTENSION_PREVIEW_TYPES, PreviewType } from '@/types/browser';
 

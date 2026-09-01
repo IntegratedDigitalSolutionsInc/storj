@@ -28,6 +28,7 @@ import (
 	"storj.io/storj/satellite/nodeselection"
 	"storj.io/storj/satellite/overlay"
 	"storj.io/storj/satellite/repair/checker"
+	"storj.io/storj/satellite/repair/queue"
 )
 
 // RangedLoop is the satellite ranged loop process.
@@ -54,10 +55,13 @@ type RangedLoop struct {
 	}
 
 	Overlay struct {
-		Service *overlay.Service
+		Service                *overlay.Service
+		UploadSelectionCache   *overlay.UploadSelectionCache
+		DownloadSelectionCache *overlay.DownloadSelectionCache
 	}
 
 	Repair struct {
+		Queue    queue.RepairQueue
 		Observer *checker.Observer
 	}
 
@@ -79,7 +83,7 @@ type RangedLoop struct {
 }
 
 // NewRangedLoop creates a new satellite ranged loop process.
-func NewRangedLoop(log *zap.Logger, db DB, metabaseDB *metabase.DB, config *Config, atomicLogLevel *zap.AtomicLevel) (_ *RangedLoop, err error) {
+func NewRangedLoop(log *zap.Logger, db DB, metabaseDB *metabase.DB, repairQueue queue.RepairQueue, config *Config, atomicLogLevel *zap.AtomicLevel) (_ *RangedLoop, err error) {
 	peer := &RangedLoop{
 		Log: log,
 		DB:  db,
@@ -108,7 +112,15 @@ func NewRangedLoop(log *zap.Logger, db DB, metabaseDB *metabase.DB, config *Conf
 	}
 
 	{ // setup audit observer
-		peer.Audit.Observer = audit.NewObserver(log.Named("audit"), db.VerifyQueue(), config.Audit)
+		var nodeSet audit.AuditedNodes
+		if config.Audit.NodeFilter != "" {
+			filter, err := nodeselection.FilterFromString(config.Audit.NodeFilter, nil)
+			if err != nil {
+				return nil, err
+			}
+			nodeSet = audit.NewFilteredNodes(filter, db.OverlayCache(), metabaseDB)
+		}
+		peer.Audit.Observer = audit.NewObserver(log.Named("audit"), nodeSet, db.VerifyQueue(), config.Audit)
 	}
 
 	{ // setup metrics observer
@@ -119,7 +131,7 @@ func NewRangedLoop(log *zap.Logger, db DB, metabaseDB *metabase.DB, config *Conf
 		peer.Accounting.NodeTallyObserver = nodetally.NewObserver(
 			log.Named("accounting:nodetally"),
 			db.StoragenodeAccounting(),
-			metabaseDB)
+			metabaseDB, config.NodeTally)
 	}
 
 	{ // setup piece tracker observer
@@ -137,32 +149,41 @@ func NewRangedLoop(log *zap.Logger, db DB, metabaseDB *metabase.DB, config *Conf
 			return nil, err
 		}
 
-		peer.Overlay.Service, err = overlay.NewService(peer.Log.Named("overlay"), peer.DB.OverlayCache(), peer.DB.NodeEvents(), placement, config.Console.ExternalAddress, config.Console.SatelliteName, config.Overlay)
+		peer.Overlay.UploadSelectionCache, err = overlay.NewUploadSelectionCacheFromConfig(peer.Log.Named("overlay"), peer.DB.OverlayCache(), config.Overlay, placement)
+		if err != nil {
+			return nil, errs.Combine(err, peer.Close())
+		}
+		peer.Overlay.DownloadSelectionCache, err = overlay.NewDownloadSelectionCacheFromConfig(peer.Log.Named("overlay"), peer.DB.OverlayCache(), config.Overlay, placement)
+		if err != nil {
+			return nil, errs.Combine(err, peer.Close())
+		}
+		peer.Overlay.Service, err = overlay.NewService(peer.Log.Named("overlay"), peer.DB.OverlayCache(), peer.DB.NodeEvents(), peer.Overlay.UploadSelectionCache, peer.Overlay.DownloadSelectionCache, placement, config.Console.ExternalAddress, config.Console.SatelliteName, config.Overlay, config.NodeEvents)
 		if err != nil {
 			return nil, errs.Combine(err, peer.Close())
 		}
 		peer.Services.Add(lifecycle.Item{
 			Name:  "overlay",
-			Run:   peer.Overlay.Service.Run,
 			Close: peer.Overlay.Service.Close,
+		})
+		peer.Services.Add(lifecycle.Item{
+			Name: "upload-selection-cache",
+			Run:  peer.Overlay.UploadSelectionCache.Run,
+		})
+		peer.Services.Add(lifecycle.Item{
+			Name: "download-selection-cache",
+			Run:  peer.Overlay.DownloadSelectionCache.Run,
 		})
 	}
 
 	{ // setup
-		classes := map[string]func(node *nodeselection.SelectedNode) string{
-			"email": func(node *nodeselection.SelectedNode) string {
-				return node.Email
-			},
-			"wallet": func(node *nodeselection.SelectedNode) string {
-				return node.Wallet
-			},
-			"net": func(node *nodeselection.SelectedNode) string {
-				return node.LastNet
-			},
+		classes, err := config.Durability.CreateNodeClassifiers()
+		if err != nil {
+			return nil, err
 		}
+
 		for class, f := range classes {
-			cache := checker.NewReliabilityCache(peer.Overlay.Service, config.Checker.ReliabilityCacheStaleness)
-			peer.DurabilityReport.Observer = append(peer.DurabilityReport.Observer, durability.NewDurability(db.OverlayCache(), metabaseDB, cache, class, f, config.Metainfo.RS.Repair-config.Metainfo.RS.Min, config.RangedLoop.AsOfSystemInterval))
+			cache := checker.NewReliabilityCache(peer.Overlay.Service, config.Checker.ReliabilityCacheStaleness, config.Checker.OnlineWindow)
+			peer.DurabilityReport.Observer = append(peer.DurabilityReport.Observer, durability.NewDurability(db.OverlayCache(), metabaseDB, cache, class, f, config.RangedLoop.AsOfSystemInterval))
 		}
 	}
 
@@ -176,12 +197,26 @@ func NewRangedLoop(log *zap.Logger, db DB, metabaseDB *metabase.DB, config *Conf
 			config.Checker.RepairExcludedCountryCodes = config.Overlay.RepairExcludedCountryCodes
 		}
 
+		peer.Repair.Queue = repairQueue
+
+		reliabilityCache := checker.NewReliabilityCache(peer.Overlay.Service, config.Checker.ReliabilityCacheStaleness, config.Checker.OnlineWindow)
+		var health checker.Health
+		switch config.Checker.HealthScore {
+		case "probability":
+			health = checker.NewProbabilityHealth(config.Checker.NodeFailureRate, reliabilityCache)
+		case "normalized":
+			health = checker.NewNormalizedHealth()
+		default:
+			panic("invalid health score: " + config.Checker.HealthScore)
+		}
+
 		peer.Repair.Observer = checker.NewObserver(
 			peer.Log.Named("repair:checker"),
-			peer.DB.RepairQueue(),
+			peer.Repair.Queue,
 			peer.Overlay.Service,
 			placement,
 			config.Checker,
+			health,
 		)
 	}
 
@@ -222,7 +257,10 @@ func NewRangedLoop(log *zap.Logger, db DB, metabaseDB *metabase.DB, config *Conf
 			observers = append(observers, rangedloop.NewSequenceObserver(sequenceObservers...))
 		}
 
-		segments := rangedloop.NewMetabaseRangeSplitter(metabaseDB, config.RangedLoop.AsOfSystemInterval, config.RangedLoop.SpannerStaleInterval, config.RangedLoop.BatchSize)
+		// This splitter reads live. A fixed read timestamp only makes sense for a
+		// single scan (gc-bf run-once mode); the ranged loop chore would re-read
+		// the same, increasingly stale snapshot on every iteration.
+		segments := rangedloop.NewMetabaseRangeSplitter(log.Named("rangedloop-metabase-range-splitter"), metabaseDB, config.RangedLoop)
 		peer.RangedLoop.Service = rangedloop.NewService(log.Named("rangedloop"), config.RangedLoop, segments, observers)
 
 		peer.Services.Add(lifecycle.Item{

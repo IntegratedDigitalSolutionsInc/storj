@@ -4,13 +4,14 @@
 package consoleapi_test
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
+	stripeLib "github.com/stripe/stripe-go/v81"
 	"go.uber.org/zap"
 
 	"storj.io/common/testcontext"
@@ -25,7 +26,7 @@ func TestPurchasePackage(t *testing.T) {
 	partner := "partner1"
 
 	testplanet.Run(t, testplanet.Config{
-		SatelliteCount: 1, StorageNodeCount: 0, UplinkCount: 1,
+		SatelliteCount: 1, UplinkCount: 1,
 		Reconfigure: testplanet.Reconfigure{
 			Satellite: func(log *zap.Logger, index int, config *satellite.Config) {
 				config.Console.OpenRegistrationEnabled = true
@@ -38,7 +39,27 @@ func TestPurchasePackage(t *testing.T) {
 		},
 	}, func(t *testing.T, ctx *testcontext.Context, planet *testplanet.Planet) {
 		sat := planet.Satellites[0]
-		validCardToken := "testValidCardToken"
+		stripeClient := sat.API.Payments.StripeClient
+
+		_, err := stripeClient.PaymentMethods().New(&stripeLib.PaymentMethodParams{
+			Params: stripeLib.Params{Context: ctx},
+			Type:   stripeLib.String(string(stripeLib.PaymentMethodTypeCard)),
+			Card: &stripeLib.PaymentMethodCardParams{
+				Token: stripeLib.String(stripe.TestPaymentMethodsAttachFailure),
+			},
+		})
+		require.NoError(t, err)
+
+		pm, err := stripeClient.PaymentMethods().New(&stripeLib.PaymentMethodParams{
+			Params: stripeLib.Params{Context: ctx},
+			Type:   stripeLib.String(string(stripeLib.PaymentMethodTypeCard)),
+			Card: &stripeLib.PaymentMethodCardParams{
+				Token: stripeLib.String("test"),
+			},
+		})
+		require.NoError(t, err)
+
+		validCardToken := pm.ID
 
 		tests := []struct {
 			name, cardToken, partner string
@@ -50,7 +71,7 @@ func TestPurchasePackage(t *testing.T) {
 				http.StatusNotFound,
 			},
 			{
-				"Add credit card fails", stripe.TestPaymentMethodsNewFailure, partner,
+				"Add credit card fails", stripe.TestPaymentMethodsAttachFailure, partner,
 				http.StatusInternalServerError,
 			},
 			{
@@ -76,7 +97,13 @@ func TestPurchasePackage(t *testing.T) {
 				}, 1)
 				require.NoError(t, err)
 
-				_, status, err := doRequestWithAuth(ctx, t, sat, user, http.MethodPost, "payments/purchase-package", strings.NewReader(tt.cardToken))
+				payload, err := json.Marshal(payments.PurchaseParams{
+					AddCardParams: payments.AddCardParams{Token: tt.cardToken},
+					Intent:        payments.PurchasePackageIntent,
+				})
+				require.NoError(t, err)
+
+				_, status, err := doRequestWithAuth(ctx, sat, user, http.MethodPost, "payments/purchase", bytes.NewBuffer(payload))
 				require.NoError(t, err)
 				require.Equal(t, tt.expectedStatus, status)
 			})
@@ -117,7 +144,7 @@ func TestPackageAvailable(t *testing.T) {
 				}, 1)
 				require.NoError(t, err)
 
-				body, status, err := doRequestWithAuth(ctx, t, sat, user, http.MethodGet, "payments/package-available", nil)
+				body, status, err := doRequestWithAuth(ctx, sat, user, http.MethodGet, "payments/package-available", nil)
 				require.NoError(t, err)
 
 				require.Equal(t, http.StatusOK, status)

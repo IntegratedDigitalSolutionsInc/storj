@@ -18,13 +18,13 @@
                         height="40"
                         rounded="lg"
                     >
-                        <component :is="SquareAsterisk" :size="18" />
+                        <component :is="Lock" :size="18" />
                     </v-sheet>
                 </template>
                 <v-card-title class="font-weight-bold">Change Password</v-card-title>
                 <template #append>
                     <v-btn
-                        icon="$close"
+                        :icon="X"
                         variant="text"
                         size="small"
                         color="default"
@@ -52,17 +52,32 @@
                             required
                             autofocus
                         />
-                        <v-text-field
-                            v-model="newPassword"
-                            variant="outlined"
-                            type="password"
-                            :rules="newRules"
-                            label="New password"
-                            placeholder="Enter a new password"
-                            class="mb-2"
-                            :hide-details="false"
-                            required
-                        />
+                        <v-tooltip
+                            v-model="showPasswordStrength"
+                            width="500px"
+                            location="bottom"
+                            :open-on-hover="false"
+                        >
+                            <template #activator="{ props }">
+                                <v-text-field
+                                    v-model="newPassword"
+                                    v-bind="props"
+                                    variant="outlined"
+                                    type="password"
+                                    :rules="newRules"
+                                    label="New password"
+                                    placeholder="Enter a new password"
+                                    class="mb-2"
+                                    :hide-details="false"
+                                    required
+                                    @update:focused="showPasswordStrength = !showPasswordStrength"
+                                />
+                            </template>
+                            <password-strength
+                                :email="userEmail"
+                                :password="newPassword"
+                            />
+                        </v-tooltip>
                         <v-text-field
                             variant="outlined"
                             type="password"
@@ -109,7 +124,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref } from 'vue';
+import { computed, onBeforeMount, ref, watch } from 'vue';
 import {
     VDialog,
     VCard,
@@ -122,29 +137,48 @@ import {
     VBtn,
     VForm,
     VTextField,
+    VTooltip,
     VSheet,
 } from 'vuetify/components';
-import { SquareAsterisk } from 'lucide-vue-next';
+import { Lock, X } from '@lucide/vue';
 
-import { RequiredRule } from '@/types/common';
+import { type ValidationRule, GoodPasswordRule, RequiredRule  } from '@/types/common';
 import { useLoading } from '@/composables/useLoading';
 import { useConfigStore } from '@/store/modules/configStore';
 import { AuthHttpApi } from '@/api/auth';
 import { useAnalyticsStore } from '@/store/modules/analyticsStore';
 import { AnalyticsErrorEventSource, AnalyticsEvent } from '@/utils/constants/analyticsEventNames';
-import { useNotify } from '@/utils/hooks';
+import { useNotify } from '@/composables/useNotify';
+import { useUsersStore } from '@/store/modules/usersStore';
+
+import PasswordStrength from '@/components/PasswordStrength.vue';
 
 const auth: AuthHttpApi = new AuthHttpApi();
+
+const configStore = useConfigStore();
+const usersStore = useUsersStore();
+
+const badPasswords = computed<Set<string>>(() => usersStore.state.badPasswords);
+const liveCheckBadPassword = computed<boolean>(() => configStore.state.config.liveCheckBadPasswords);
+
 const oldRules = [
     RequiredRule,
 ];
-const newRules = [
-    RequiredRule,
-    (value: string) => (value && value.length >= config.passwordMinimumLength || `Invalid password. Use ${config.passwordMinimumLength} or more characters`),
-    (value: string) => (value && value.length <= config.passwordMaximumLength || `Invalid password. Use ${config.passwordMaximumLength} or fewer characters`),
-];
+
+const newRules = computed<ValidationRule<string>[]>(() => {
+    const rules = [
+        RequiredRule,
+        (value: string) => value.length < config.passwordMinimumLength || value.length > config.passwordMaximumLength
+            ? `Password must be between ${config.passwordMinimumLength} and ${config.passwordMaximumLength} characters`
+            : true,
+    ];
+    if (liveCheckBadPassword.value) rules.push(GoodPasswordRule);
+
+    return rules;
+});
+
 const repeatRules = [
-    ...newRules,
+    ...newRules.value,
     (value: string) => (value && value === newPassword.value || 'Passwords are not the same.'),
 ];
 
@@ -152,12 +186,16 @@ const analyticsStore = useAnalyticsStore();
 const { config } = useConfigStore().state;
 const { isLoading, withLoading } = useLoading();
 const notify = useNotify();
+const userStore = useUsersStore();
 
 const model = defineModel<boolean>({ required: true });
 
 const formValid = ref<boolean>(false);
+const showPasswordStrength = ref(false);
 const oldPassword = ref<string>('');
 const newPassword = ref<string>('');
+
+const userEmail = computed<string>(() => userStore.state.user?.email ?? '');
 
 /**
  * Handles change password request.
@@ -167,7 +205,7 @@ async function onChangePassword(): Promise<void> {
 
     await withLoading(async () => {
         try {
-            await auth.changePassword(oldPassword.value, newPassword.value);
+            await auth.changePassword(oldPassword.value, newPassword.value, config.csrfToken);
 
             notify.success('Password successfully changed!');
             analyticsStore.eventTriggered(AnalyticsEvent.PASSWORD_CHANGED);
@@ -179,4 +217,24 @@ async function onChangePassword(): Promise<void> {
         model.value = false;
     });
 }
+
+onBeforeMount(() => {
+    if (liveCheckBadPassword.value && badPasswords.value.size === 0) {
+        usersStore.getBadPasswords().catch(() => {});
+    }
+});
+
+watch(model, val => {
+    if (!val) {
+        oldPassword.value = '';
+        newPassword.value = '';
+        formValid.value = false;
+    }
+});
 </script>
+
+<style scoped lang="scss">
+:deep(.v-overlay__content) {
+    padding: 0 !important;
+}
+</style>

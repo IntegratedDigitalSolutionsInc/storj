@@ -10,7 +10,7 @@
                     v-model="expiration"
                     column
                     mandatory
-                    selected-class="text-info font-weight-bold"
+                    selected-class="font-weight-bold"
                     variant="outlined"
                     class="mt-2"
                 >
@@ -68,7 +68,7 @@
                     </v-chip>
                 </v-chip-group>
                 <v-alert class="mt-2" variant="tonal" width="auto">
-                    <p class="text-subtitle-2">{{ endDate ? endDate.toLocaleString() : 'No end date' }}</p>
+                    <p class="text-title-small">{{ endDate ? endDate.toLocaleString() : 'No end date' }}</p>
                 </v-alert>
             </v-col>
         </v-row>
@@ -76,6 +76,7 @@
         <v-overlay v-model="isDatePicker" persistent class="align-center justify-center">
             <v-date-picker
                 v-model="datePickerModel"
+                :allowed-dates="allowDate"
                 show-adjacent-months
                 @update:model-value="onDatePickerSubmit"
             >
@@ -100,7 +101,7 @@ import {
 } from 'vuetify/components';
 
 import { AnalyticsErrorEventSource } from '@/utils/constants/analyticsEventNames';
-import { useNotify } from '@/utils/hooks';
+import { useNotify } from '@/composables/useNotify';
 
 enum Expiration {
     No = 'No Expiration',
@@ -136,6 +137,18 @@ function getNowOffset(days = 0, months = 0, years = 0): Date {
         now.getDate() + days,
         11, 59, 59,
     );
+}
+
+function allowDate(date: unknown): boolean {
+    if (!date) return false;
+    const d = new Date(date as string);
+    if (isNaN(d.getTime())) return false;
+
+    d.setHours(0, 0, 0, 0);
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+
+    return d > today;
 }
 
 /**

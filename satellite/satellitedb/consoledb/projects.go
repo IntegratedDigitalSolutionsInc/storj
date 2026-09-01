@@ -31,6 +31,8 @@ var ek = eventkit.Package()
 type projects struct {
 	db   dbx.DriverMethods
 	impl dbutil.Implementation
+
+	nowFn func() time.Time
 }
 
 // GetAll is a method for querying all projects from the database.
@@ -57,6 +59,18 @@ func (projects *projects) GetOwn(ctx context.Context, userID uuid.UUID) (_ []con
 	return projectsFromDbxSlice(ctx, projectsDbx)
 }
 
+// GetOwnActive is a method for querying all active projects created by current user from the database.
+func (projects *projects) GetOwnActive(ctx context.Context, userID uuid.UUID) (_ []console.Project, err error) {
+	defer mon.Task()(&ctx)(&err)
+
+	projectsDbx, err := projects.db.All_Project_By_OwnerId_And_Status_OrderBy_Asc_CreatedAt(ctx, dbx.Project_OwnerId(userID[:]), dbx.Project_Status(int(console.ProjectActive)))
+	if err != nil {
+		return nil, err
+	}
+
+	return projectsFromDbxSlice(ctx, projectsDbx)
+}
+
 // GetCreatedBefore retrieves all projects created before provided date.
 func (projects *projects) GetCreatedBefore(ctx context.Context, before time.Time) (_ []console.Project, err error) {
 	defer mon.Task()(&ctx)(&err)
@@ -73,31 +87,53 @@ func (projects *projects) GetCreatedBefore(ctx context.Context, before time.Time
 func (projects *projects) GetByUserID(ctx context.Context, userID uuid.UUID) (_ []console.Project, err error) {
 	defer mon.Task()(&ctx)(&err)
 
-	rows, err := projects.db.QueryContext(ctx, projects.db.Rebind(`
+	return projects.getByUserID(ctx, userID, false)
+}
+
+// GetActiveByUserID is a method for querying active projects from the database by userID.
+func (projects *projects) GetActiveByUserID(ctx context.Context, userID uuid.UUID) (_ []console.Project, err error) {
+	defer mon.Task()(&ctx)(&err)
+
+	return projects.getByUserID(ctx, userID, true)
+}
+
+func (projects *projects) getByUserID(ctx context.Context, userID uuid.UUID, noDisabled bool) (_ []console.Project, err error) {
+	query := `
 		SELECT
 			projects.id,
 			projects.public_id,
 			projects.name,
 			projects.description,
 			projects.owner_id,
+			projects.status,
 			projects.rate_limit,
 			projects.max_buckets,
+			projects.passphrase_enc,
 			projects.created_at,
 			COALESCE(projects.default_placement, 0),
 			COALESCE(projects.default_versioning, 0),
-			(SELECT COUNT(*) FROM project_members WHERE project_id = projects.id) AS member_count
+			(SELECT COUNT(*) FROM project_members WHERE project_id = projects.id) AS member_count,
+			projects.notification_flags
 		FROM projects
 		JOIN project_members ON projects.id = project_members.project_id
 		WHERE project_members.member_id = ?
-		ORDER BY name ASC
-	`), userID)
+	`
+	args := []interface{}{userID}
+	if noDisabled {
+		query += " AND projects.status = ?"
+		args = append(args, int64(console.ProjectActive))
+	}
+
+	query += " ORDER BY name ASC"
+
+	rows, err := projects.db.QueryContext(ctx, projects.db.Rebind(query), args...)
 	if err != nil {
 		return nil, err
 	}
 	defer func() { err = errs.Combine(err, rows.Close()) }()
 
 	nextProject := &console.Project{}
-	var rateLimit, maxBuckets sql.NullInt32
+	var rateLimit, maxBuckets, status, notificationFlags sql.NullInt32
 	projectsToSend := make([]console.Project, 0)
 	for rows.Next() {
 		err = rows.Scan(
@@ -106,12 +142,15 @@ func (projects *projects) GetByUserID(ctx context.Context, userID uuid.UUID) (_ 
 			&nextProject.Name,
 			&nextProject.Description,
 			&nextProject.OwnerID,
+			&status,
 			&rateLimit,
 			&maxBuckets,
+			&nextProject.PassphraseEnc,
 			&nextProject.CreatedAt,
 			&nextProject.DefaultPlacement,
 			&nextProject.DefaultVersioning,
 			&nextProject.MemberCount,
+			&notificationFlags,
 		)
 		if err != nil {
 			return nil, err
@@ -123,6 +162,14 @@ func (projects *projects) GetByUserID(ctx context.Context, userID uuid.UUID) (_ 
 		if maxBuckets.Valid {
 			nextProject.MaxBuckets = new(int)
 			*nextProject.MaxBuckets = int(maxBuckets.Int32)
+		}
+		if status.Valid {
+			nextProject.Status = new(console.ProjectStatus)
+			*nextProject.Status = console.ProjectStatus(status.Int32)
+		}
+		if notificationFlags.Valid {
+			nextProject.NotificationFlags = new(int)
+			*nextProject.NotificationFlags = int(notificationFlags.Int32)
 		}
 		projectsToSend = append(projectsToSend, *nextProject)
 	}
@@ -186,6 +233,30 @@ func (projects *projects) GetByPublicID(ctx context.Context, publicID uuid.UUID)
 	}
 
 	return ProjectFromDBX(ctx, project)
+}
+
+// GetByPublicOrPrivateID is a method for querying project from the database by either publicID or id.
+func (projects *projects) GetByPublicOrPrivateID(ctx context.Context, id uuid.UUID) (_ *console.Project, err error) {
+	defer mon.Task()(&ctx)(&err)
+
+	project, err := projects.db.Get_Project_By__Id_Or_PublicId(ctx, dbx.Project_Id(id[:]), dbx.Project_PublicId(id[:]))
+	if err != nil {
+		return nil, err
+	}
+
+	return ProjectFromDBX(ctx, project)
+}
+
+// GetPublicID returns the public project ID for a given project ID.
+func (projects *projects) GetPublicID(ctx context.Context, id uuid.UUID) (_ uuid.UUID, err error) {
+	defer mon.Task()(&ctx)(&err)
+
+	publicID, err := projects.db.Get_Project_PublicId_By_Id(ctx, dbx.Project_Id(id[:]))
+	if err != nil {
+		return uuid.UUID{}, err
+	}
+
+	return uuid.FromBytes(publicID.PublicId)
 }
 
 // Insert is a method for inserting project into the database.
@@ -313,8 +384,13 @@ func (projects *projects) Update(ctx context.Context, project *console.Project) 
 	if project.DefaultVersioning > 0 {
 		updateFields.DefaultVersioning = dbx.Project_DefaultVersioning(int(project.DefaultVersioning))
 	}
-
-	updateFields.PromptedForVersioningBeta = dbx.Project_PromptedForVersioningBeta(project.PromptedForVersioningBeta)
+	if project.Status != nil {
+		updateFields.Status = dbx.Project_Status(int(*project.Status))
+		updateFields.StatusUpdatedAt = dbx.Project_StatusUpdatedAt(projects.nowFn())
+	}
+	if project.NotificationFlags != nil {
+		updateFields.NotificationFlags = dbx.Project_NotificationFlags(*project.NotificationFlags)
+	}
 
 	_, err = projects.db.Update_Project_By_Id(ctx,
 		dbx.Project_Id(project.ID[:]),
@@ -496,6 +572,20 @@ func (projects *projects) UpdateUserAgent(ctx context.Context, id uuid.UUID, use
 	return err
 }
 
+// UpdateStatus is a method for updating projects status.
+func (projects *projects) UpdateStatus(ctx context.Context, id uuid.UUID, status console.ProjectStatus) (err error) {
+	defer mon.Task()(&ctx)(&err)
+
+	_, err = projects.db.Update_Project_By_Id(ctx,
+		dbx.Project_Id(id[:]),
+		dbx.Project_Update_Fields{
+			Status:          dbx.Project_Status(int(status)),
+			StatusUpdatedAt: dbx.Project_StatusUpdatedAt(projects.nowFn()),
+		})
+
+	return err
+}
+
 // UpdateDefaultPlacement is a method to update the project's default placement for new segments.
 func (projects *projects) UpdateDefaultPlacement(
 	ctx context.Context,
@@ -570,31 +660,98 @@ func (projects *projects) List(
 	return page, nil
 }
 
+// ListPendingDeletionBefore returns a list of project and owner IDs that are pending deletion and were marked before the specified time.
+func (projects *projects) ListPendingDeletionBefore(
+	ctx context.Context,
+	offset int64,
+	limit int,
+	before time.Time,
+) (page console.ProjectIdOwnerIdPage, err error) {
+	defer mon.Task()(&ctx)(&err)
+
+	dbxProjects, err := projects.db.Limited_Project_Id_Project_PublicId_Project_OwnerId_By_Status_And_StatusUpdatedAt_Less_OrderBy_Asc_StatusUpdatedAt_Asc_Id(ctx,
+		dbx.Project_Status(int(console.ProjectPendingDeletion)),
+		dbx.Project_StatusUpdatedAt(before.UTC()),
+		limit+1,
+		offset,
+	)
+	if err != nil {
+		return console.ProjectIdOwnerIdPage{}, err
+	}
+
+	if len(dbxProjects) == limit+1 {
+		page.Next = true
+		page.NextOffset = offset + int64(limit)
+
+		dbxProjects = dbxProjects[:len(dbxProjects)-1]
+	}
+	page.Limit = limit
+	page.Offset = offset
+
+	ids := make([]console.ProjectIdOwnerId, 0, len(dbxProjects))
+	for _, p := range dbxProjects {
+		id, err := uuid.FromBytes(p.Id)
+		if err != nil {
+			return console.ProjectIdOwnerIdPage{}, errs.Wrap(err)
+		}
+		pubId, err := uuid.FromBytes(p.PublicId)
+		if err != nil {
+			return console.ProjectIdOwnerIdPage{}, errs.Wrap(err)
+		}
+		ownerID, err := uuid.FromBytes(p.OwnerId)
+		if err != nil {
+			return console.ProjectIdOwnerIdPage{}, errs.Wrap(err)
+		}
+		ids = append(ids, console.ProjectIdOwnerId{ProjectID: id, ProjectPublicID: pubId, OwnerID: ownerID})
+	}
+
+	page.Ids = ids
+	return page, nil
+}
+
 // ListByOwnerID is a method for querying all projects from the database by ownerID. It also includes the number of members for each project.
-// cursor.Limit is set to 50 if it exceeds 50.
-func (projects *projects) ListByOwnerID(
+func (projects *projects) ListByOwnerID(ctx context.Context, ownerID uuid.UUID, cursor console.ProjectsCursor) (_ console.ProjectsPage, err error) {
+	defer mon.Task()(&ctx)(&err)
+
+	return projects.listByOwnerID(ctx, ownerID, cursor, false)
+}
+
+// ListActiveByOwnerID is a method for querying only active projects from the database by ownerID. It also includes the number of members for each project.
+func (projects *projects) ListActiveByOwnerID(ctx context.Context, ownerID uuid.UUID, cursor console.ProjectsCursor) (_ console.ProjectsPage, err error) {
+	defer mon.Task()(&ctx)(&err)
+
+	return projects.listByOwnerID(ctx, ownerID, cursor, true)
+}
+
+func (projects *projects) listByOwnerID(
 	ctx context.Context,
 	ownerID uuid.UUID,
 	cursor console.ProjectsCursor,
+	noDisabled bool,
 ) (_ console.ProjectsPage, err error) {
-	defer mon.Task()(&ctx)(&err)
-
-	if cursor.Limit > 50 {
-		cursor.Limit = 50
-	}
 	if cursor.Page == 0 {
 		return console.ProjectsPage{}, errs.New("page can not be 0")
 	}
 
 	page := console.ProjectsPage{
-		CurrentPage: cursor.Page,
-		Limit:       cursor.Limit,
-		Offset:      int64((cursor.Page - 1) * cursor.Limit),
+		PageInfo: console.PageInfo{
+			CurrentPage: cursor.Page,
+			Limit:       cursor.Limit,
+			Offset:      int64((cursor.Page - 1) * cursor.Limit),
+		},
 	}
 
-	countRow := projects.db.QueryRowContext(ctx, projects.db.Rebind(`
+	countQuery := `
 		SELECT COUNT(*) FROM projects WHERE owner_id = ?
-	`), ownerID)
+	`
+
+	countArgs := []interface{}{ownerID}
+	if noDisabled {
+		countQuery += " AND status != ?"
+		countArgs = append(countArgs, int64(console.ProjectDisabled))
+	}
+
+	countRow := projects.db.QueryRowContext(ctx, projects.db.Rebind(countQuery), countArgs...)
 	err = countRow.Scan(&page.TotalCount)
 	if err != nil {
 		return console.ProjectsPage{}, err
@@ -611,6 +768,7 @@ func (projects *projects) ListByOwnerID(
 			name,
 			description,
 			owner_id,
+			status,
 			rate_limit,
 			max_buckets,
 			created_at,
@@ -619,24 +777,27 @@ func (projects *projects) ListByOwnerID(
 			(SELECT COUNT(*) FROM project_members WHERE project_id = projects.id) AS member_count
 		FROM projects
 		WHERE owner_id = ?
-		ORDER BY name ASC
 	`
+
+	args := []interface{}{ownerID}
+	if noDisabled {
+		baseQuery += " AND status != ?"
+		args = append(args, int64(console.ProjectDisabled))
+	}
+
+	baseQuery += " ORDER BY name ASC"
+
 	limit := page.Limit + 1 // add 1 to limit to see if there is another page
 
 	var rows tagsql.Rows
 	switch projects.impl {
 	case dbutil.Postgres, dbutil.Cockroach:
-		rows, err = projects.db.QueryContext(ctx, projects.db.Rebind(
-			baseQuery+`
+		args = append(args, page.Offset, limit)
+
+		rows, err = projects.db.QueryContext(ctx, projects.db.Rebind(baseQuery+`
 			OFFSET ? ROWS
 			LIMIT ?
-		`), ownerID, page.Offset, limit) // add 1 to limit to see if there is another page
-	case dbutil.Spanner:
-		rows, err = projects.db.QueryContext(ctx, projects.db.Rebind(
-			baseQuery+`
-			LIMIT ?
-			OFFSET ?
-		`), ownerID, limit, page.Offset) // add 1 to limit to see if there is another page
+		`), args...)
 	default:
 		return console.ProjectsPage{}, errs.New("unsupported database dialect: %s", projects.impl)
 	}
@@ -656,7 +817,7 @@ func (projects *projects) ListByOwnerID(
 			page.NextOffset = page.Offset + int64(page.Limit)
 			break
 		}
-		var rateLimit, maxBuckets sql.NullInt32
+		var rateLimit, maxBuckets, status sql.NullInt32
 		nextProject := &console.Project{}
 		err = rows.Scan(
 			&nextProject.ID,
@@ -664,6 +825,7 @@ func (projects *projects) ListByOwnerID(
 			&nextProject.Name,
 			&nextProject.Description,
 			&nextProject.OwnerID,
+			&status,
 			&rateLimit,
 			&maxBuckets,
 			&nextProject.CreatedAt,
@@ -681,6 +843,10 @@ func (projects *projects) ListByOwnerID(
 		if maxBuckets.Valid {
 			nextProject.MaxBuckets = new(int)
 			*nextProject.MaxBuckets = int(maxBuckets.Int32)
+		}
+		if status.Valid {
+			nextProject.Status = new(console.ProjectStatus)
+			*nextProject.Status = console.ProjectStatus(status.Int32)
 		}
 		projectsToSend = append(projectsToSend, *nextProject)
 	}
@@ -728,6 +894,8 @@ func ProjectFromDBX(ctx context.Context, project *dbx.Project) (_ *console.Proje
 	return &console.Project{
 		ID:                          id,
 		PublicID:                    publicID,
+		Status:                      (*console.ProjectStatus)(project.Status),
+		StatusUpdatedAt:             project.StatusUpdatedAt,
 		Name:                        project.Name,
 		Description:                 project.Description,
 		UserAgent:                   userAgent,
@@ -753,10 +921,10 @@ func ProjectFromDBX(ctx context.Context, project *dbx.Project) (_ *console.Proje
 		SegmentLimit:                project.SegmentLimit,
 		DefaultPlacement:            placement,
 		DefaultVersioning:           console.DefaultVersioning(project.DefaultVersioning),
-		PromptedForVersioningBeta:   project.PromptedForVersioningBeta,
 		PathEncryption:              &project.PathEncryption,
 		PassphraseEnc:               project.PassphraseEnc,
 		PassphraseEncKeyID:          project.PassphraseEncKeyId,
+		NotificationFlags:           project.NotificationFlags,
 	}, nil
 }
 
@@ -813,4 +981,14 @@ func (projects *projects) UpdateUsageLimits(ctx context.Context, id uuid.UUID, l
 		},
 	)
 	return err
+}
+
+// GetNowFn returns the current time function.
+func (projects *projects) GetNowFn() func() time.Time {
+	return projects.nowFn
+}
+
+// TestSetNowFn is a method to set the now function for testing purposes.
+func (projects *projects) TestSetNowFn(nowFn func() time.Time) {
+	projects.nowFn = nowFn
 }

@@ -101,7 +101,7 @@ type DB struct {
 
 	deprecatedInfoDB       *deprecatedInfoDB
 	v0PieceInfoDB          *v0PieceInfoDB
-	bandwidthDB            *bandwidthDB
+	bandwidthDB            *BandwidthDB
 	ordersDB               *ordersDB
 	pieceExpirationDB      *pieceExpirationDB
 	pieceSpaceUsedDB       *pieceSpaceUsedDB
@@ -138,7 +138,7 @@ func OpenNew(ctx context.Context, log *zap.Logger, config Config) (*DB, error) {
 
 	deprecatedInfoDB := &deprecatedInfoDB{}
 	v0PieceInfoDB := &v0PieceInfoDB{}
-	bandwidthDB := &bandwidthDB{}
+	bandwidthDB := &BandwidthDB{}
 	ordersDB := &ordersDB{}
 	pieceExpirationDB := &pieceExpirationDB{}
 	pieceSpaceUsedDB := &pieceSpaceUsedDB{}
@@ -237,7 +237,7 @@ func OpenExisting(ctx context.Context, log *zap.Logger, config Config) (*DB, err
 
 	deprecatedInfoDB := &deprecatedInfoDB{}
 	v0PieceInfoDB := &v0PieceInfoDB{}
-	bandwidthDB := &bandwidthDB{}
+	bandwidthDB := &BandwidthDB{}
 	ordersDB := &ordersDB{}
 	pieceExpirationDB := &pieceExpirationDB{}
 	pieceSpaceUsedDB := &pieceSpaceUsedDB{}
@@ -334,7 +334,7 @@ func (db *DB) openDatabases(ctx context.Context) error {
 	}
 
 	for _, dbName := range dbs {
-		err := db.openExistingDatabase(ctx, dbName)
+		err := db.openExistingDatabase(ctx, dbName, true)
 		if err != nil {
 			return errs.Combine(err, db.closeDatabases())
 		}
@@ -348,7 +348,7 @@ func (db *DB) rawDatabaseFromName(dbName string) tagsql.DB {
 }
 
 // openExistingDatabase opens existing database at the specified path.
-func (db *DB) openExistingDatabase(ctx context.Context, dbName string) error {
+func (db *DB) openExistingDatabase(ctx context.Context, dbName string, withStat bool) error {
 	path := db.filepathFromDBName(dbName)
 	if _, err := os.Stat(path); err != nil {
 		if os.IsNotExist(err) {
@@ -359,12 +359,12 @@ func (db *DB) openExistingDatabase(ctx context.Context, dbName string) error {
 		return ErrDatabase.New("%s couldn't be read (%q): %w", dbName, path, err)
 	}
 
-	return db.openDatabase(ctx, dbName)
+	return db.openDatabaseWithStat(ctx, dbName, withStat)
 }
 
 // openDatabase opens or creates a database at the specified path.
 func (db *DB) openDatabase(ctx context.Context, dbName string) error {
-	return db.openDatabaseWithStat(ctx, dbName, true)
+	return db.openDatabaseWithStat(ctx, dbName, false)
 }
 
 // openDatabase opens or creates a database at the specified path.
@@ -382,16 +382,20 @@ func (db *DB) openDatabaseWithStat(ctx context.Context, dbName string, registerS
 
 	wal := "&_journal=WAL"
 	if db.config.TestingDisableWAL {
-		wal = "&_journal=MEMORY"
+		wal = "&_journal=MEMORY&_txlock=immediate"
 	}
 
-	sqlDB, err := tagsql.Open(ctx, driver, "file:"+path+"?_busy_timeout=10000"+wal)
+	sqlDB, err := tagsql.Open(ctx, driver, "file:"+path+"?_busy_timeout=10000"+wal, nil)
 	if err != nil {
 		return ErrDatabase.New("%s opening file %q failed: %w", dbName, path, err)
 	}
 
 	mDB := db.SQLDBs[dbName]
 	mDB.Configure(sqlDB)
+
+	if db.config.TestingDisableWAL {
+		sqlDB.SetMaxOpenConns(1)
+	}
 
 	if registerStat {
 		dbutil.Configure(ctx, sqlDB, dbName, mon)
@@ -500,7 +504,7 @@ func (db *DB) preflight(ctx context.Context, dbName string, dbContainer DBContai
 	if err != nil {
 		return ErrPreflight.New("database: %q: failed selecting test value: %w", dbName, err)
 	}
-	defer func() { err = errs.Combine(err, rows.Close()) }()
+	defer func() { err = errs.Combine(err, rows.Err(), rows.Close()) }()
 	if !rows.Next() {
 		return ErrPreflight.New("database %q: no rows in test_table", dbName)
 	}
@@ -689,7 +693,7 @@ func (db *DB) migrateToDB(ctx context.Context, dbName string, tablesToKeep ...st
 		return ErrDatabase.Wrap(err)
 	}
 
-	err = db.openExistingDatabase(ctx, dbName)
+	err = db.openExistingDatabase(ctx, dbName, false)
 	if err != nil {
 		return ErrDatabase.Wrap(err)
 	}
@@ -1456,7 +1460,7 @@ func (db *DB) Migration(ctx context.Context) *migrate.Migration {
 				Action: migrate.Func(func(ctx context.Context, _ *zap.Logger, rdb tagsql.DB, rtx tagsql.Tx) (err error) {
 					// We just need a value for joined_at until the node checks in with the
 					// satellites and gets the real value.
-					_, err = rtx.Exec(ctx, `UPDATE reputation SET joined_at = ? WHERE joined_at ISNULL`, time.Unix(0, 0).UTC())
+					_, err = rtx.ExecContext(ctx, `UPDATE reputation SET joined_at = ? WHERE joined_at ISNULL`, time.Unix(0, 0).UTC())
 					if err != nil {
 						return errs.Wrap(err)
 					}
@@ -1464,7 +1468,7 @@ func (db *DB) Migration(ctx context.Context) *migrate.Migration {
 					// in order to add the not null constraint, we have to do a
 					// generalized ALTER TABLE procedure.
 					// see https://www.sqlite.org/lang_altertable.html
-					_, err = rtx.Exec(ctx, `
+					_, err = rtx.ExecContext(ctx, `
 						CREATE TABLE reputation_new (
 							satellite_id BLOB NOT NULL,
 							uptime_success_count INTEGER NOT NULL,
@@ -1515,23 +1519,23 @@ func (db *DB) Migration(ctx context.Context) *migrate.Migration {
 				Description: "Add unknown_audit_reputation_alpha and unknown_audit_reputation_beta fields to reputation db",
 				Version:     39,
 				Action: migrate.Func(func(ctx context.Context, _ *zap.Logger, rdb tagsql.DB, rtx tagsql.Tx) (err error) {
-					_, err = rtx.Exec(ctx, `ALTER TABLE reputation ADD COLUMN audit_unknown_reputation_alpha REAL`)
+					_, err = rtx.ExecContext(ctx, `ALTER TABLE reputation ADD COLUMN audit_unknown_reputation_alpha REAL`)
 					if err != nil {
 						return errs.Wrap(err)
 					}
 
-					_, err = rtx.Exec(ctx, `ALTER TABLE reputation ADD COLUMN audit_unknown_reputation_beta REAL`)
+					_, err = rtx.ExecContext(ctx, `ALTER TABLE reputation ADD COLUMN audit_unknown_reputation_beta REAL`)
 					if err != nil {
 						return errs.Wrap(err)
 					}
 
-					_, err = rtx.Exec(ctx, `UPDATE reputation SET audit_unknown_reputation_alpha = ?, audit_unknown_reputation_beta = ?`,
+					_, err = rtx.ExecContext(ctx, `UPDATE reputation SET audit_unknown_reputation_alpha = ?, audit_unknown_reputation_beta = ?`,
 						1.0, 1.0)
 					if err != nil {
 						return errs.Wrap(err)
 					}
 
-					_, err = rtx.Exec(ctx, `
+					_, err = rtx.ExecContext(ctx, `
 						CREATE TABLE reputation_new (
 							satellite_id BLOB NOT NULL,
 							uptime_success_count INTEGER NOT NULL,
@@ -1586,18 +1590,18 @@ func (db *DB) Migration(ctx context.Context) *migrate.Migration {
 				Description: "Add unknown_audit_reputation_score field to reputation db",
 				Version:     40,
 				Action: migrate.Func(func(ctx context.Context, _ *zap.Logger, rdb tagsql.DB, rtx tagsql.Tx) (err error) {
-					_, err = rtx.Exec(ctx, `ALTER TABLE reputation ADD COLUMN audit_unknown_reputation_score REAL`)
+					_, err = rtx.ExecContext(ctx, `ALTER TABLE reputation ADD COLUMN audit_unknown_reputation_score REAL`)
 					if err != nil {
 						return errs.Wrap(err)
 					}
 
-					_, err = rtx.Exec(ctx, `UPDATE reputation SET audit_unknown_reputation_score = ?`,
+					_, err = rtx.ExecContext(ctx, `UPDATE reputation SET audit_unknown_reputation_score = ?`,
 						1.0)
 					if err != nil {
 						return errs.Wrap(err)
 					}
 
-					_, err = rtx.Exec(ctx, `
+					_, err = rtx.ExecContext(ctx, `
 						CREATE TABLE reputation_new (
 							satellite_id BLOB NOT NULL,
 							uptime_success_count INTEGER NOT NULL,
@@ -1654,7 +1658,7 @@ func (db *DB) Migration(ctx context.Context) *migrate.Migration {
 				Description: "Make satellite_id foreign key in satellite_exit_progress table",
 				Version:     41,
 				Action: migrate.Func(func(ctx context.Context, _ *zap.Logger, rdb tagsql.DB, rtx tagsql.Tx) (err error) {
-					_, err = rtx.Exec(ctx, `
+					_, err = rtx.ExecContext(ctx, `
 						CREATE TABLE satellite_exit_progress_new (
 							satellite_id BLOB NOT NULL,
 							initiated_at TIMESTAMP,
@@ -1690,7 +1694,7 @@ func (db *DB) Migration(ctx context.Context) *migrate.Migration {
 				Description: "Drop used serials table",
 				Version:     42,
 				Action: migrate.Func(func(ctx context.Context, _ *zap.Logger, rdb tagsql.DB, rtx tagsql.Tx) (err error) {
-					_, err = rtx.Exec(ctx, `
+					_, err = rtx.ExecContext(ctx, `
 						DROP TABLE used_serial_;
 					`)
 					if err != nil {
@@ -1722,33 +1726,33 @@ func (db *DB) Migration(ctx context.Context) *migrate.Migration {
 				Description: "Add online_score and offline_suspended fields to reputation db, rename disqualified and suspended to disqualified_at and suspended_at",
 				Version:     44,
 				Action: migrate.Func(func(ctx context.Context, _ *zap.Logger, rdb tagsql.DB, rtx tagsql.Tx) (err error) {
-					_, err = rtx.Exec(ctx, `ALTER TABLE reputation ADD COLUMN online_score REAL`)
+					_, err = rtx.ExecContext(ctx, `ALTER TABLE reputation ADD COLUMN online_score REAL`)
 					if err != nil {
 						return errs.Wrap(err)
 					}
 
-					_, err = rtx.Exec(ctx, `ALTER TABLE reputation ADD COLUMN offline_suspended_at TIMESTAMP`)
+					_, err = rtx.ExecContext(ctx, `ALTER TABLE reputation ADD COLUMN offline_suspended_at TIMESTAMP`)
 					if err != nil {
 						return errs.Wrap(err)
 					}
 
-					_, err = rtx.Exec(ctx, `ALTER TABLE reputation RENAME COLUMN disqualified TO disqualified_at`)
+					_, err = rtx.ExecContext(ctx, `ALTER TABLE reputation RENAME COLUMN disqualified TO disqualified_at`)
 					if err != nil {
 						return errs.Wrap(err)
 					}
 
-					_, err = rtx.Exec(ctx, `ALTER TABLE reputation RENAME COLUMN suspended TO suspended_at`)
+					_, err = rtx.ExecContext(ctx, `ALTER TABLE reputation RENAME COLUMN suspended TO suspended_at`)
 					if err != nil {
 						return errs.Wrap(err)
 					}
 
-					_, err = rtx.Exec(ctx, `UPDATE reputation SET online_score = ?`,
+					_, err = rtx.ExecContext(ctx, `UPDATE reputation SET online_score = ?`,
 						1.0)
 					if err != nil {
 						return errs.Wrap(err)
 					}
 
-					_, err = rtx.Exec(ctx, `
+					_, err = rtx.ExecContext(ctx, `
 						CREATE TABLE reputation_new (
 							satellite_id BLOB NOT NULL,
 							uptime_success_count INTEGER NOT NULL,
@@ -1809,12 +1813,12 @@ func (db *DB) Migration(ctx context.Context) *migrate.Migration {
 				Description: "Add offline_under_review_at field to reputation db",
 				Version:     45,
 				Action: migrate.Func(func(ctx context.Context, _ *zap.Logger, rdb tagsql.DB, rtx tagsql.Tx) (err error) {
-					_, err = rtx.Exec(ctx, `ALTER TABLE reputation ADD COLUMN offline_under_review_at TIMESTAMP`)
+					_, err = rtx.ExecContext(ctx, `ALTER TABLE reputation ADD COLUMN offline_under_review_at TIMESTAMP`)
 					if err != nil {
 						return errs.Wrap(err)
 					}
 
-					_, err = rtx.Exec(ctx, `
+					_, err = rtx.ExecContext(ctx, `
 						CREATE TABLE reputation_new (
 							satellite_id BLOB NOT NULL,
 							uptime_success_count INTEGER NOT NULL,
@@ -1904,7 +1908,7 @@ func (db *DB) Migration(ctx context.Context) *migrate.Migration {
 				Description: "drop uptime columns",
 				Version:     48,
 				Action: migrate.Func(func(ctx context.Context, _ *zap.Logger, rdb tagsql.DB, rtx tagsql.Tx) (err error) {
-					_, err = rtx.Exec(ctx, `
+					_, err = rtx.ExecContext(ctx, `
 						CREATE TABLE reputation_new (
 							satellite_id BLOB NOT NULL,
 							audit_success_count INTEGER NOT NULL,
@@ -1967,12 +1971,12 @@ func (db *DB) Migration(ctx context.Context) *migrate.Migration {
 				Description: "Make distributed field in paystubs table not null",
 				Version:     50,
 				Action: migrate.Func(func(ctx context.Context, _ *zap.Logger, rdb tagsql.DB, rtx tagsql.Tx) (err error) {
-					_, err = rtx.Exec(ctx, `UPDATE paystubs SET distributed = ? WHERE distributed ISNULL`, 0)
+					_, err = rtx.ExecContext(ctx, `UPDATE paystubs SET distributed = ? WHERE distributed ISNULL`, 0)
 					if err != nil {
 						return errs.Wrap(err)
 					}
 
-					_, err = rtx.Exec(ctx, `
+					_, err = rtx.ExecContext(ctx, `
 						CREATE TABLE paystubs_new (
 							period text NOT NULL,
 							satellite_id bytea NOT NULL,
@@ -2062,7 +2066,7 @@ func (db *DB) Migration(ctx context.Context) *migrate.Migration {
 				Description: "Add interval_end_time field to storage_usage db, backfill interval_end_time with interval_start, rename interval_start to timestamp",
 				Version:     54,
 				Action: migrate.Func(func(ctx context.Context, _ *zap.Logger, rdb tagsql.DB, rtx tagsql.Tx) error {
-					_, err := rtx.Exec(ctx, `
+					_, err := rtx.ExecContext(ctx, `
 						CREATE TABLE storage_usage_new (
 							timestamp TIMESTAMP NOT NULL,
 							satellite_id BLOB NOT NULL,

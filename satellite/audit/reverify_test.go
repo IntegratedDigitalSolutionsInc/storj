@@ -23,8 +23,6 @@ import (
 	"storj.io/storj/satellite"
 	"storj.io/storj/satellite/audit"
 	"storj.io/storj/satellite/metabase"
-	"storj.io/storj/storagenode"
-	"storj.io/storj/storagenode/blobstore/testblobs"
 )
 
 func TestReverifySuccess(t *testing.T) {
@@ -56,7 +54,7 @@ func TestReverifySuccess(t *testing.T) {
 		queueSegment, err := queue.Next(ctx)
 		require.NoError(t, err)
 
-		segment, err := satellite.Metabase.DB.GetSegmentByPosition(ctx, metabase.GetSegmentByPosition{
+		segment, err := satellite.Metabase.DB.GetSegmentByPositionForAudit(ctx, metabase.GetSegmentByPosition{
 			StreamID: queueSegment.StreamID,
 			Position: queueSegment.Position,
 		})
@@ -119,7 +117,7 @@ func TestReverifyFailMissingShare(t *testing.T) {
 		queueSegment, err := queue.Next(ctx)
 		require.NoError(t, err)
 
-		segment, err := satellite.Metabase.DB.GetSegmentByPosition(ctx, metabase.GetSegmentByPosition{
+		segment, err := satellite.Metabase.DB.GetSegmentByPositionForAudit(ctx, metabase.GetSegmentByPosition{
 			StreamID: queueSegment.StreamID,
 			Position: queueSegment.Position,
 		})
@@ -144,8 +142,7 @@ func TestReverifyFailMissingShare(t *testing.T) {
 		// delete the piece from the first node
 		pieceID := rootPieceID.Derive(piece.StorageNode, int32(piece.Number))
 		node := planet.FindNode(piece.StorageNode)
-		err = node.Storage2.Store.Delete(ctx, satellite.ID(), pieceID)
-		require.NoError(t, err)
+		node.Storage2.PieceBackend.TestingDeletePiece(satellite.ID(), pieceID)
 
 		outcome, reputation := audits.Reverifier.ReverifyPiece(ctx, zaptest.NewLogger(t), pending)
 		require.Equal(t, audit.OutcomeFailure, outcome)
@@ -190,7 +187,7 @@ func TestReverifyOffline(t *testing.T) {
 		queueSegment, err := queue.Next(ctx)
 		require.NoError(t, err)
 
-		segment, err := satellite.Metabase.DB.GetSegmentByPosition(ctx, metabase.GetSegmentByPosition{
+		segment, err := satellite.Metabase.DB.GetSegmentByPositionForAudit(ctx, metabase.GetSegmentByPosition{
 			StreamID: queueSegment.StreamID,
 			Position: queueSegment.Position,
 		})
@@ -255,7 +252,7 @@ func TestReverifyOfflineDialTimeout(t *testing.T) {
 		queueSegment, err := queue.Next(ctx)
 		require.NoError(t, err)
 
-		segment, err := satellite.Metabase.DB.GetSegmentByPosition(ctx, metabase.GetSegmentByPosition{
+		segment, err := satellite.Metabase.DB.GetSegmentByPositionForAudit(ctx, metabase.GetSegmentByPosition{
 			StreamID: queueSegment.StreamID,
 			Position: queueSegment.Position,
 		})
@@ -351,7 +348,7 @@ func TestReverifyDeletedSegment(t *testing.T) {
 		queueSegment, err := queue.Next(ctx)
 		require.NoError(t, err)
 
-		segment, err := satellite.Metabase.DB.GetSegmentByPosition(ctx, metabase.GetSegmentByPosition{
+		segment, err := satellite.Metabase.DB.GetSegmentByPositionForAudit(ctx, metabase.GetSegmentByPosition{
 			StreamID: queueSegment.StreamID,
 			Position: queueSegment.Position,
 		})
@@ -388,7 +385,9 @@ func TestReverifyDeletedSegment(t *testing.T) {
 	})
 }
 
-func cloneAndDropPiece(ctx context.Context, metabaseDB *metabase.DB, segment *metabase.Segment, pieceNum int) error {
+func cloneAndDropPiece(
+	ctx context.Context, metabaseDB *metabase.DB, segment *metabase.SegmentForAudit, pieceNum int,
+) error {
 	newPieces := make([]metabase.Piece, len(segment.Pieces))
 	copy(newPieces, segment.Pieces)
 	return metabaseDB.UpdateSegmentPieces(ctx, metabase.UpdateSegmentPieces{
@@ -430,7 +429,7 @@ func TestReverifyModifiedSegment(t *testing.T) {
 		queueSegment, err := queue.Next(ctx)
 		require.NoError(t, err)
 
-		segment, err := satellite.Metabase.DB.GetSegmentByPosition(ctx, metabase.GetSegmentByPosition{
+		segment, err := satellite.Metabase.DB.GetSegmentByPositionForAudit(ctx, metabase.GetSegmentByPosition{
 			StreamID: queueSegment.StreamID,
 			Position: queueSegment.Position,
 		})
@@ -508,7 +507,7 @@ func TestReverifyReplacedSegment(t *testing.T) {
 		queueSegment, err := queue.Next(ctx)
 		require.NoError(t, err)
 
-		segment, err := satellite.Metabase.DB.GetSegmentByPosition(ctx, metabase.GetSegmentByPosition{
+		segment, err := satellite.Metabase.DB.GetSegmentByPositionForAudit(ctx, metabase.GetSegmentByPosition{
 			StreamID: queueSegment.StreamID,
 			Position: queueSegment.Position,
 		})
@@ -570,7 +569,7 @@ func TestReverifyExpired(t *testing.T) {
 		queueSegment, err := queue.Next(ctx)
 		require.NoError(t, err)
 
-		segment, err := satellite.Metabase.DB.GetSegmentByPosition(ctx, metabase.GetSegmentByPosition{
+		segment, err := satellite.Metabase.DB.GetSegmentByPositionForAudit(ctx, metabase.GetSegmentByPosition{
 			StreamID: queueSegment.StreamID,
 			Position: queueSegment.Position,
 		})
@@ -612,9 +611,6 @@ func TestReverifySlowDownload(t *testing.T) {
 	testWithRangedLoop(t, testplanet.Config{
 		SatelliteCount: 1, StorageNodeCount: 4, UplinkCount: 1,
 		Reconfigure: testplanet.Reconfigure{
-			StorageNodeDB: func(index int, db storagenode.DB, log *zap.Logger) (storagenode.DB, error) {
-				return testblobs.NewSlowDB(log.Named("slowdb"), db), nil
-			},
 			Satellite: testplanet.Combine(
 				func(log *zap.Logger, index int, config *satellite.Config) {
 					// These config values are chosen to force the slow node to time out without timing out on the three normal nodes
@@ -643,7 +639,7 @@ func TestReverifySlowDownload(t *testing.T) {
 		queueSegment, err := queue.Next(ctx)
 		require.NoError(t, err)
 
-		segment, err := satellite.Metabase.DB.GetSegmentByPosition(ctx, metabase.GetSegmentByPosition{
+		segment, err := satellite.Metabase.DB.GetSegmentByPositionForAudit(ctx, metabase.GetSegmentByPosition{
 			StreamID: queueSegment.StreamID,
 			Position: queueSegment.Position,
 		})
@@ -663,11 +659,9 @@ func TestReverifySlowDownload(t *testing.T) {
 		err = audits.Reporter.ReportReverificationNeeded(ctx, pending)
 		require.NoError(t, err)
 
-		node := planet.FindNode(slowNode)
-		slowNodeDB := node.DB.(*testblobs.SlowDB)
 		// make downloads on storage node slower than the timeout on the satellite for downloading shares
-		delay := 10 * auditTimeout
-		slowNodeDB.SetLatency(delay)
+		node := planet.FindNode(slowNode)
+		node.Storage2.PieceBackend.TestingSetLatency(10 * auditTimeout)
 
 		outcome, reputation := audits.Reverifier.ReverifyPiece(ctx, zaptest.NewLogger(t), pending)
 		require.Equal(t, audit.OutcomeTimedOut, outcome)
@@ -687,9 +681,6 @@ func TestReverifyUnknownError(t *testing.T) {
 	testWithRangedLoop(t, testplanet.Config{
 		SatelliteCount: 1, StorageNodeCount: 4, UplinkCount: 1,
 		Reconfigure: testplanet.Reconfigure{
-			StorageNodeDB: func(index int, db storagenode.DB, log *zap.Logger) (storagenode.DB, error) {
-				return testblobs.NewBadDB(log.Named("baddb"), db), nil
-			},
 			Satellite: testplanet.ReconfigureRS(2, 2, 4, 4),
 		},
 	}, func(t *testing.T, ctx *testcontext.Context, planet *testplanet.Planet, pauseQueueing pauseQueueingFunc, runQueueingOnce runQueueingOnceFunc) {
@@ -711,7 +702,7 @@ func TestReverifyUnknownError(t *testing.T) {
 		queueSegment, err := queue.Next(ctx)
 		require.NoError(t, err)
 
-		segment, err := satellite.Metabase.DB.GetSegmentByPosition(ctx, metabase.GetSegmentByPosition{
+		segment, err := satellite.Metabase.DB.GetSegmentByPositionForAudit(ctx, metabase.GetSegmentByPosition{
 			StreamID: queueSegment.StreamID,
 			Position: queueSegment.Position,
 		})
@@ -732,9 +723,7 @@ func TestReverifyUnknownError(t *testing.T) {
 		require.NoError(t, err)
 
 		node := planet.FindNode(badNode)
-		badNodeDB := node.DB.(*testblobs.BadDB)
-		// return an error when the satellite requests a share
-		badNodeDB.SetError(errs.New("unknown error"))
+		node.Storage2.PieceBackend.TestingSetError(errs.New("unknown error"))
 
 		outcome, reputation := audits.Reverifier.ReverifyPiece(ctx, zaptest.NewLogger(t), pending)
 		require.Equal(t, audit.OutcomeUnknownError, outcome)
@@ -753,9 +742,6 @@ func TestMaxReverifyCount(t *testing.T) {
 	testWithRangedLoop(t, testplanet.Config{
 		SatelliteCount: 1, StorageNodeCount: 4, UplinkCount: 1,
 		Reconfigure: testplanet.Reconfigure{
-			StorageNodeDB: func(index int, db storagenode.DB, log *zap.Logger) (storagenode.DB, error) {
-				return testblobs.NewSlowDB(log.Named("slowdb"), db), nil
-			},
 			Satellite: testplanet.Combine(
 				func(log *zap.Logger, index int, config *satellite.Config) {
 					// These config values are chosen to force the slow node to time out without timing out on the three normal nodes
@@ -787,7 +773,7 @@ func TestMaxReverifyCount(t *testing.T) {
 		queueSegment, err := queue.Next(ctx)
 		require.NoError(t, err)
 
-		segment, err := satellite.Metabase.DB.GetSegmentByPosition(ctx, metabase.GetSegmentByPosition{
+		segment, err := satellite.Metabase.DB.GetSegmentByPositionForAudit(ctx, metabase.GetSegmentByPosition{
 			StreamID: queueSegment.StreamID,
 			Position: queueSegment.Position,
 		})
@@ -807,11 +793,9 @@ func TestMaxReverifyCount(t *testing.T) {
 		err = audits.Reporter.ReportReverificationNeeded(ctx, pending)
 		require.NoError(t, err)
 
-		node := planet.FindNode(slowNode)
-		slowNodeDB := node.DB.(*testblobs.SlowDB)
 		// make downloads on storage node slower than the timeout on the satellite for downloading shares
-		delay := 10 * auditTimeout
-		slowNodeDB.SetLatency(delay)
+		node := planet.FindNode(slowNode)
+		node.Storage2.PieceBackend.TestingSetLatency(10 * auditTimeout)
 
 		oldRep, err := satellite.Reputation.Service.Get(ctx, slowNode)
 		require.NoError(t, err)
@@ -853,15 +837,16 @@ func TestMaxReverifyCount(t *testing.T) {
 
 func TestTimeDelayBeforeReverifies(t *testing.T) {
 	const (
-		auditTimeout     = time.Second
+		// auditTimeout must comfortably exceed a cold hashstore open (~1s under CI
+		// load): this test audits the whole segment, so if an innocent node's first
+		// read blows the download budget it gets contained too, queuing a second
+		// reverify job and breaking the "which node comes back" assertions below.
+		auditTimeout     = 5 * time.Second
 		reverifyInterval = time.Second / 4
 	)
 	testWithRangedLoop(t, testplanet.Config{
 		SatelliteCount: 1, StorageNodeCount: 4, UplinkCount: 1,
 		Reconfigure: testplanet.Reconfigure{
-			StorageNodeDB: func(index int, db storagenode.DB, log *zap.Logger) (storagenode.DB, error) {
-				return testblobs.NewSlowDB(log.Named("slowdb"), db), nil
-			},
 			Satellite: testplanet.Combine(
 				func(log *zap.Logger, index int, config *satellite.Config) {
 					// These config values are chosen to force the slow node to time out without timing out on the three normal nodes
@@ -893,7 +878,7 @@ func TestTimeDelayBeforeReverifies(t *testing.T) {
 		queueSegment, err := queue.Next(ctx)
 		require.NoError(t, err)
 
-		segment, err := satellite.Metabase.DB.GetSegmentByPosition(ctx, metabase.GetSegmentByPosition{
+		segment, err := satellite.Metabase.DB.GetSegmentByPositionForAudit(ctx, metabase.GetSegmentByPosition{
 			StreamID: queueSegment.StreamID,
 			Position: queueSegment.Position,
 		})
@@ -901,7 +886,7 @@ func TestTimeDelayBeforeReverifies(t *testing.T) {
 
 		slowPiece := segment.Pieces[0]
 		slowNode := planet.FindNode(slowPiece.StorageNode)
-		slowNode.DB.(*testblobs.SlowDB).SetLatency(10 * auditTimeout)
+		slowNode.Storage2.PieceBackend.TestingSetLatency(10 * auditTimeout)
 
 		report, err := audits.Verifier.Verify(ctx, audit.Segment{
 			StreamID: segment.StreamID,

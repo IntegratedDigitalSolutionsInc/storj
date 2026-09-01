@@ -5,13 +5,18 @@ package satellitedb_test
 
 import (
 	"testing"
+	"time"
 
+	"github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp/cmpopts"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"storj.io/common/storj"
 	"storj.io/common/testcontext"
 	"storj.io/common/testrand"
 	"storj.io/storj/satellite"
+	"storj.io/storj/satellite/attribution"
 	"storj.io/storj/satellite/buckets"
 	"storj.io/storj/satellite/console"
 	"storj.io/storj/satellite/satellitedb/satellitedbtest"
@@ -287,5 +292,640 @@ func TestCreateBucketWithObjectLock(t *testing.T) {
 				requireNotExists(t, bucketName)
 			})
 		}
+	})
+}
+
+func TestBucketTagging(t *testing.T) {
+	satellitedbtest.Run(t, func(ctx *testcontext.Context, t *testing.T, db satellite.DB) {
+		bucketsDB := db.Buckets()
+		projectID := testrand.UUID()
+		bucketName := testrand.BucketName()
+
+		_, err := db.Console().Projects().Insert(ctx, &console.Project{ID: projectID})
+		require.NoError(t, err)
+
+		tags, err := bucketsDB.GetBucketTagging(ctx, []byte(bucketName), projectID)
+		require.ErrorIs(t, err, buckets.ErrBucketNotFound.Instance())
+		require.Nil(t, tags)
+
+		err = bucketsDB.SetBucketTagging(ctx, []byte(bucketName), projectID, []buckets.Tag{})
+		require.ErrorIs(t, err, buckets.ErrBucketNotFound.Instance())
+
+		_, err = bucketsDB.CreateBucket(ctx, buckets.Bucket{
+			ID:        testrand.UUID(),
+			Name:      bucketName,
+			ProjectID: projectID,
+		})
+		require.NoError(t, err)
+
+		tags, err = bucketsDB.GetBucketTagging(ctx, []byte(bucketName), projectID)
+		require.NoError(t, err)
+		require.Empty(t, tags)
+
+		var expectedTags []buckets.Tag
+		for i := 0; i < 16; i++ {
+			expectedTags = append(expectedTags, buckets.Tag{
+				Key:   string(testrand.RandAlphaNumeric(16)),
+				Value: string(testrand.RandAlphaNumeric(16)),
+			})
+		}
+		// Ensure that there are no issues encoding/decoding tags with empty keys or values.
+		expectedTags = append(expectedTags, buckets.Tag{})
+
+		require.NoError(t, bucketsDB.SetBucketTagging(ctx, []byte(bucketName), projectID, expectedTags))
+		tags, err = bucketsDB.GetBucketTagging(ctx, []byte(bucketName), projectID)
+		require.NoError(t, err)
+		require.Equal(t, expectedTags, tags)
+
+		require.NoError(t, bucketsDB.SetBucketTagging(ctx, []byte(bucketName), projectID, []buckets.Tag{}))
+		tags, err = bucketsDB.GetBucketTagging(ctx, []byte(bucketName), projectID)
+		require.NoError(t, err)
+		require.Empty(t, tags)
+	})
+}
+
+func TestBucketNotificationConfig_UpdateAndGet(t *testing.T) {
+	satellitedbtest.Run(t, func(ctx *testcontext.Context, t *testing.T, db satellite.DB) {
+		projectID := testrand.UUID()
+		bucketName := testrand.BucketName()
+
+		// Create project and bucket first
+		_, err := db.Console().Projects().Insert(ctx, &console.Project{ID: projectID})
+		require.NoError(t, err)
+
+		_, err = db.Buckets().CreateBucket(ctx, buckets.Bucket{
+			ID:        testrand.UUID(),
+			Name:      bucketName,
+			ProjectID: projectID,
+		})
+		require.NoError(t, err)
+
+		// Test 1: Get non-existent configuration should return nil
+		config, err := db.Buckets().GetBucketNotificationConfig(ctx, []byte(bucketName), projectID)
+		require.NoError(t, err)
+		require.Nil(t, config)
+
+		// Test 2: Insert new configuration
+		newConfig := buckets.NotificationConfig{
+			ConfigID:     "test-config-1",
+			TopicName:    "projects/test-project/topics/test-topic",
+			Events:       []string{"s3:ObjectCreated:Put", "s3:ObjectRemoved:Delete"},
+			FilterPrefix: []byte("logs/"),
+			FilterSuffix: []byte(".txt"),
+		}
+
+		err = db.Buckets().UpdateBucketNotificationConfig(ctx, []byte(bucketName), projectID, newConfig)
+		require.NoError(t, err)
+
+		// Test 3: Get inserted configuration
+		newRetrieved, err := db.Buckets().GetBucketNotificationConfig(ctx, []byte(bucketName), projectID)
+		require.NoError(t, err)
+		require.NotNil(t, newRetrieved)
+		assert.Equal(t, newConfig.ConfigID, newRetrieved.ConfigID)
+		assert.Equal(t, newConfig.TopicName, newRetrieved.TopicName)
+		assert.Equal(t, newConfig.Events, newRetrieved.Events)
+		assert.Equal(t, newConfig.FilterPrefix, newRetrieved.FilterPrefix)
+		assert.Equal(t, newConfig.FilterSuffix, newRetrieved.FilterSuffix)
+		assert.WithinDuration(t, time.Now(), newRetrieved.CreatedAt, time.Minute)
+		assert.WithinDuration(t, time.Now(), newRetrieved.UpdatedAt, time.Minute)
+
+		// Test 4: Update existing configuration (UPSERT)
+		updatedConfig := buckets.NotificationConfig{
+			ConfigID:     "test-config-2",
+			TopicName:    "projects/test-project/topics/updated-topic",
+			Events:       []string{"s3:ObjectCreated:*"},
+			FilterPrefix: []byte("data/"),
+			FilterSuffix: []byte(".json"),
+		}
+
+		err = db.Buckets().UpdateBucketNotificationConfig(ctx, []byte(bucketName), projectID, updatedConfig)
+		require.NoError(t, err)
+
+		// Test 5: Verify update
+		updatedRetrieved, err := db.Buckets().GetBucketNotificationConfig(ctx, []byte(bucketName), projectID)
+		require.NoError(t, err)
+		require.NotNil(t, updatedRetrieved)
+		assert.Equal(t, updatedConfig.ConfigID, updatedRetrieved.ConfigID)
+		assert.Equal(t, updatedConfig.TopicName, updatedRetrieved.TopicName)
+		assert.Equal(t, updatedConfig.Events, updatedRetrieved.Events)
+		assert.Equal(t, updatedConfig.FilterPrefix, updatedRetrieved.FilterPrefix)
+		assert.Equal(t, updatedConfig.FilterSuffix, updatedRetrieved.FilterSuffix)
+		assert.Equal(t, newRetrieved.CreatedAt, updatedRetrieved.CreatedAt)
+		assert.WithinDuration(t, time.Now(), updatedRetrieved.UpdatedAt, time.Minute)
+		assert.Greater(t, updatedRetrieved.UpdatedAt, updatedRetrieved.CreatedAt)
+	})
+}
+
+func TestBucketNotificationConfig_AutoGeneratedConfigID(t *testing.T) {
+	satellitedbtest.Run(t, func(ctx *testcontext.Context, t *testing.T, db satellite.DB) {
+		projectID := testrand.UUID()
+		bucketName := testrand.BucketName()
+
+		// Create project and bucket
+		_, err := db.Console().Projects().Insert(ctx, &console.Project{ID: projectID})
+		require.NoError(t, err)
+
+		_, err = db.Buckets().CreateBucket(ctx, buckets.Bucket{
+			ID:        testrand.UUID(),
+			Name:      bucketName,
+			ProjectID: projectID,
+		})
+		require.NoError(t, err)
+
+		// Test 1: Insert configuration without config_id (should auto-generate)
+		newConfig := buckets.NotificationConfig{
+			ConfigID:  "", // Empty - should be auto-generated by database
+			TopicName: "projects/test-project/topics/test-topic",
+			Events:    []string{"s3:ObjectCreated:Put"},
+		}
+
+		err = db.Buckets().UpdateBucketNotificationConfig(ctx, []byte(bucketName), projectID, newConfig)
+		require.NoError(t, err)
+
+		// Verify config_id was auto-generated
+		retrieved, err := db.Buckets().GetBucketNotificationConfig(ctx, []byte(bucketName), projectID)
+		require.NoError(t, err)
+		require.NotNil(t, retrieved)
+		assert.NotEmpty(t, retrieved.ConfigID, "config_id should be auto-generated")
+
+		// Test 2: Update with empty config_id should preserve the existing config_id
+		updatedConfig := buckets.NotificationConfig{
+			ConfigID:  "", // Empty - should preserve existing config_id
+			TopicName: "projects/test-project/topics/updated-topic",
+			Events:    []string{"s3:ObjectCreated:*", "s3:ObjectRemoved:*"},
+		}
+
+		err = db.Buckets().UpdateBucketNotificationConfig(ctx, []byte(bucketName), projectID, updatedConfig)
+		require.NoError(t, err)
+
+		// Verify config_id was preserved and other fields were updated
+		updatedRetrieved, err := db.Buckets().GetBucketNotificationConfig(ctx, []byte(bucketName), projectID)
+		require.NoError(t, err)
+		require.NotNil(t, updatedRetrieved)
+		assert.Equal(t, retrieved.ConfigID, updatedRetrieved.ConfigID, "config_id should be preserved when updating with empty config_id")
+		assert.Equal(t, updatedConfig.TopicName, updatedRetrieved.TopicName)
+		assert.Equal(t, updatedConfig.Events, updatedRetrieved.Events)
+	})
+}
+
+func TestBucketNotificationConfig_Delete(t *testing.T) {
+	satellitedbtest.Run(t, func(ctx *testcontext.Context, t *testing.T, db satellite.DB) {
+		projectID := testrand.UUID()
+		bucketName := testrand.BucketName()
+
+		// Create project and bucket
+		_, err := db.Console().Projects().Insert(ctx, &console.Project{ID: projectID})
+		require.NoError(t, err)
+
+		_, err = db.Buckets().CreateBucket(ctx, buckets.Bucket{
+			ID:        testrand.UUID(),
+			Name:      bucketName,
+			ProjectID: projectID,
+		})
+		require.NoError(t, err)
+
+		// Insert configuration
+		config := buckets.NotificationConfig{
+			ConfigID:  "test-config",
+			TopicName: "projects/test-project/topics/test-topic",
+			Events:    []string{"s3:ObjectCreated:Put"},
+		}
+
+		err = db.Buckets().UpdateBucketNotificationConfig(ctx, []byte(bucketName), projectID, config)
+		require.NoError(t, err)
+
+		// Verify it exists
+		retrieved, err := db.Buckets().GetBucketNotificationConfig(ctx, []byte(bucketName), projectID)
+		require.NoError(t, err)
+		require.NotNil(t, retrieved)
+		assert.Equal(t, config.ConfigID, retrieved.ConfigID)
+
+		// Delete configuration
+		err = db.Buckets().DeleteBucketNotificationConfig(ctx, []byte(bucketName), projectID)
+		require.NoError(t, err)
+
+		// Verify it's gone
+		retrieved, err = db.Buckets().GetBucketNotificationConfig(ctx, []byte(bucketName), projectID)
+		require.NoError(t, err)
+		require.Nil(t, retrieved)
+
+		// Delete non-existent configuration (should not error)
+		err = db.Buckets().DeleteBucketNotificationConfig(ctx, []byte(bucketName), projectID)
+		require.NoError(t, err)
+	})
+}
+
+func TestBucketNotificationConfig_CascadeDelete(t *testing.T) {
+	satellitedbtest.Run(t, func(ctx *testcontext.Context, t *testing.T, db satellite.DB) {
+		projectID := testrand.UUID()
+		bucketName := testrand.BucketName()
+
+		// Create project and bucket
+		_, err := db.Console().Projects().Insert(ctx, &console.Project{ID: projectID})
+		require.NoError(t, err)
+
+		_, err = db.Buckets().CreateBucket(ctx, buckets.Bucket{
+			ID:        testrand.UUID(),
+			Name:      bucketName,
+			ProjectID: projectID,
+		})
+		require.NoError(t, err)
+
+		// Insert notification configuration
+		config := buckets.NotificationConfig{
+			ConfigID:  "test-config",
+			TopicName: "projects/test-project/topics/test-topic",
+			Events:    []string{"s3:ObjectCreated:Put"},
+		}
+
+		err = db.Buckets().UpdateBucketNotificationConfig(ctx, []byte(bucketName), projectID, config)
+		require.NoError(t, err)
+
+		// Verify configuration exists
+		retrieved, err := db.Buckets().GetBucketNotificationConfig(ctx, []byte(bucketName), projectID)
+		require.NoError(t, err)
+		require.NotNil(t, retrieved)
+		assert.Equal(t, config.ConfigID, retrieved.ConfigID)
+
+		// Delete the bucket (should cascade delete the notification config)
+		err = db.Buckets().DeleteBucket(ctx, []byte(bucketName), projectID)
+		require.NoError(t, err)
+
+		// Verify notification configuration was cascade deleted
+		retrieved, err = db.Buckets().GetBucketNotificationConfig(ctx, []byte(bucketName), projectID)
+		require.NoError(t, err)
+		require.Nil(t, retrieved)
+	})
+}
+
+func TestBucketNotificationConfig_NullableFilters(t *testing.T) {
+	satellitedbtest.Run(t, func(ctx *testcontext.Context, t *testing.T, db satellite.DB) {
+		projectID := testrand.UUID()
+		bucketName := testrand.BucketName()
+
+		// Create project and bucket
+		_, err := db.Console().Projects().Insert(ctx, &console.Project{ID: projectID})
+		require.NoError(t, err)
+
+		_, err = db.Buckets().CreateBucket(ctx, buckets.Bucket{
+			ID:        testrand.UUID(),
+			Name:      bucketName,
+			ProjectID: projectID,
+		})
+		require.NoError(t, err)
+
+		// Test 1: No filters (nil byte slices)
+		config1 := buckets.NotificationConfig{
+			ConfigID:     "config-no-filters",
+			TopicName:    "projects/test-project/topics/test-topic",
+			Events:       []string{"s3:ObjectCreated:Put"},
+			FilterPrefix: nil,
+			FilterSuffix: nil,
+		}
+
+		err = db.Buckets().UpdateBucketNotificationConfig(ctx, []byte(bucketName), projectID, config1)
+		require.NoError(t, err)
+
+		retrieved, err := db.Buckets().GetBucketNotificationConfig(ctx, []byte(bucketName), projectID)
+		require.NoError(t, err)
+		require.NotNil(t, retrieved)
+		assert.Empty(t, retrieved.FilterPrefix)
+		assert.Empty(t, retrieved.FilterSuffix)
+
+		// Test 2: Only prefix filter
+		config2 := buckets.NotificationConfig{
+			ConfigID:     "config-prefix-only",
+			TopicName:    "projects/test-project/topics/test-topic",
+			Events:       []string{"s3:ObjectCreated:Put"},
+			FilterPrefix: []byte("logs/"),
+			FilterSuffix: nil,
+		}
+
+		err = db.Buckets().UpdateBucketNotificationConfig(ctx, []byte(bucketName), projectID, config2)
+		require.NoError(t, err)
+
+		retrieved, err = db.Buckets().GetBucketNotificationConfig(ctx, []byte(bucketName), projectID)
+		require.NoError(t, err)
+		require.NotNil(t, retrieved)
+		assert.Equal(t, []byte("logs/"), retrieved.FilterPrefix)
+		assert.Empty(t, retrieved.FilterSuffix)
+
+		// Test 3: Only suffix filter
+		config3 := buckets.NotificationConfig{
+			ConfigID:     "config-suffix-only",
+			TopicName:    "projects/test-project/topics/test-topic",
+			Events:       []string{"s3:ObjectCreated:Put"},
+			FilterPrefix: nil,
+			FilterSuffix: []byte(".jpg"),
+		}
+
+		err = db.Buckets().UpdateBucketNotificationConfig(ctx, []byte(bucketName), projectID, config3)
+		require.NoError(t, err)
+
+		retrieved, err = db.Buckets().GetBucketNotificationConfig(ctx, []byte(bucketName), projectID)
+		require.NoError(t, err)
+		require.NotNil(t, retrieved)
+		assert.Empty(t, retrieved.FilterPrefix)
+		assert.Equal(t, []byte(".jpg"), retrieved.FilterSuffix)
+	})
+}
+
+func TestBucketNotificationConfig_Validation(t *testing.T) {
+	satellitedbtest.Run(t, func(ctx *testcontext.Context, t *testing.T, db satellite.DB) {
+		projectID := testrand.UUID()
+		bucketName := testrand.BucketName()
+
+		// Create project and bucket
+		_, err := db.Console().Projects().Insert(ctx, &console.Project{ID: projectID})
+		require.NoError(t, err)
+
+		_, err = db.Buckets().CreateBucket(ctx, buckets.Bucket{
+			ID:        testrand.UUID(),
+			Name:      bucketName,
+			ProjectID: projectID,
+		})
+		require.NoError(t, err)
+
+		// Test: Empty topic name should error
+		t.Run("empty topic name", func(t *testing.T) {
+			config := buckets.NotificationConfig{
+				ConfigID:  "config-empty-topic",
+				TopicName: "",
+				Events:    []string{"s3:ObjectCreated:Put"},
+			}
+
+			err := db.Buckets().UpdateBucketNotificationConfig(ctx, []byte(bucketName), projectID, config)
+			require.Error(t, err)
+		})
+
+		// Test: Nil events should error
+		t.Run("nil events", func(t *testing.T) {
+			config := buckets.NotificationConfig{
+				ConfigID:  "config-nil-events",
+				TopicName: "projects/test-project/topics/test-topic",
+				Events:    nil,
+			}
+
+			err := db.Buckets().UpdateBucketNotificationConfig(ctx, []byte(bucketName), projectID, config)
+			require.Error(t, err)
+		})
+
+		// Test: Empty events should error
+		t.Run("empty events", func(t *testing.T) {
+			config := buckets.NotificationConfig{
+				ConfigID:  "config-empty-events",
+				TopicName: "projects/test-project/topics/test-topic",
+				Events:    []string{},
+			}
+
+			err := db.Buckets().UpdateBucketNotificationConfig(ctx, []byte(bucketName), projectID, config)
+			require.Error(t, err)
+		})
+	})
+}
+
+func TestBucketNotificationConfig_EventsSerialization(t *testing.T) {
+	satellitedbtest.Run(t, func(ctx *testcontext.Context, t *testing.T, db satellite.DB) {
+		projectID := testrand.UUID()
+		bucketName := testrand.BucketName()
+
+		// Create project and bucket
+		_, err := db.Console().Projects().Insert(ctx, &console.Project{ID: projectID})
+		require.NoError(t, err)
+
+		_, err = db.Buckets().CreateBucket(ctx, buckets.Bucket{
+			ID:        testrand.UUID(),
+			Name:      bucketName,
+			ProjectID: projectID,
+		})
+		require.NoError(t, err)
+
+		for _, tc := range []struct {
+			name   string
+			events []string
+		}{
+			{
+				name:   "single event",
+				events: []string{"s3:ObjectCreated:Put"},
+			},
+			{
+				name:   "multiple specific events",
+				events: []string{"s3:ObjectCreated:Put", "s3:ObjectCreated:Copy", "s3:ObjectRemoved:Delete"},
+			},
+			{
+				name:   "wildcard events",
+				events: []string{"s3:ObjectCreated:*", "s3:ObjectRemoved:*"},
+			},
+			{
+				name:   "mixed specific and wildcard",
+				events: []string{"s3:ObjectCreated:*", "s3:ObjectRemoved:Delete"},
+			},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				config := buckets.NotificationConfig{
+					ConfigID:  "config-" + tc.name,
+					TopicName: "projects/test-project/topics/test-topic",
+					Events:    tc.events,
+				}
+
+				err := db.Buckets().UpdateBucketNotificationConfig(ctx, []byte(bucketName), projectID, config)
+				require.NoError(t, err)
+
+				retrieved, err := db.Buckets().GetBucketNotificationConfig(ctx, []byte(bucketName), projectID)
+				require.NoError(t, err)
+				require.NotNil(t, retrieved)
+				assert.Equal(t, tc.events, retrieved.Events)
+			})
+		}
+	})
+}
+
+func TestCreateBucketWithAttribution(t *testing.T) {
+	satellitedbtest.Run(t, func(ctx *testcontext.Context, t *testing.T, db satellite.DB) {
+		projectID := testrand.UUID()
+
+		_, err := db.Console().Projects().Insert(ctx, &console.Project{ID: projectID})
+		require.NoError(t, err)
+
+		t.Run("Basic", func(t *testing.T) {
+			bucket := buckets.Bucket{
+				ID:        testrand.UUID(),
+				ProjectID: projectID,
+				Name:      testrand.BucketName(),
+				Placement: storj.PlacementConstraint(testrand.Intn(100)),
+				UserAgent: testrand.RandAlphaNumeric(32),
+				Created:   time.Now(),
+			}
+
+			dbBucket, err := db.Buckets().CreateBucketWithAttribution(ctx, bucket, nil)
+			require.NoError(t, err)
+			require.Zero(t, cmp.Diff(bucket, dbBucket, cmpopts.EquateApproxTime(time.Minute)))
+
+			dbBucket, err = db.Buckets().GetBucket(ctx, []byte(bucket.Name), bucket.ProjectID)
+			require.NoError(t, err)
+			require.Zero(t, cmp.Diff(bucket, dbBucket, cmpopts.EquateApproxTime(time.Minute)))
+
+			attrInfo, err := db.Attribution().Get(ctx, bucket.ProjectID, []byte(bucket.Name))
+			require.NoError(t, err)
+			require.Zero(t, cmp.Diff(attribution.Info{
+				ProjectID:  bucket.ProjectID,
+				BucketName: []byte(bucket.Name),
+				Placement:  &bucket.Placement,
+				UserAgent:  bucket.UserAgent,
+				CreatedAt:  time.Now(),
+			}, *attrInfo, cmpopts.EquateApproxTime(time.Minute)))
+		})
+
+		t.Run("Preexisting attribution with same placement", func(t *testing.T) {
+			bucketName := testrand.BucketName()
+			placement := storj.PlacementConstraint(testrand.Intn(100))
+
+			expectedAttrInfo, err := db.Attribution().Insert(ctx, &attribution.Info{
+				ProjectID:  projectID,
+				BucketName: []byte(bucketName),
+				Placement:  &placement,
+				UserAgent:  testrand.RandAlphaNumeric(32),
+			})
+			require.NoError(t, err)
+
+			newUserAgent := testrand.RandAlphaNumeric(32)
+			_, err = db.Buckets().CreateBucketWithAttribution(ctx, buckets.Bucket{
+				ID:        testrand.UUID(),
+				ProjectID: projectID,
+				Name:      bucketName,
+				Placement: placement,
+				UserAgent: newUserAgent,
+			}, nil)
+			require.NoError(t, err)
+
+			expectedAttrInfo.UserAgent = newUserAgent
+
+			attrInfo, err := db.Attribution().Get(ctx, projectID, []byte(bucketName))
+			require.NoError(t, err)
+			require.Zero(t, cmp.Diff(*expectedAttrInfo, *attrInfo, cmpopts.EquateApproxTime(time.Minute)))
+		})
+
+		t.Run("Preexisting attribution with different placement", func(t *testing.T) {
+			bucketName := testrand.BucketName()
+			attrPlacement := storj.PlacementConstraint(testrand.Intn(100))
+
+			expectedAttrInfo, err := db.Attribution().Insert(ctx, &attribution.Info{
+				ProjectID:  projectID,
+				BucketName: []byte(bucketName),
+				Placement:  &attrPlacement,
+				UserAgent:  testrand.RandAlphaNumeric(32),
+			})
+			require.NoError(t, err)
+
+			_, err = db.Buckets().CreateBucketWithAttribution(ctx, buckets.Bucket{
+				ID:        testrand.UUID(),
+				ProjectID: projectID,
+				Name:      bucketName,
+				Placement: attrPlacement + 1,
+				UserAgent: testrand.RandAlphaNumeric(32),
+			}, nil)
+			require.ErrorIs(t, err, buckets.ErrAttributionPlacementMismatch.Instance())
+
+			_, err = db.Buckets().GetBucket(ctx, []byte(bucketName), projectID)
+			require.ErrorIs(t, err, buckets.ErrBucketNotFound.Instance())
+
+			attrInfo, err := db.Attribution().Get(ctx, projectID, []byte(bucketName))
+			require.NoError(t, err)
+			require.Equal(t, expectedAttrInfo, attrInfo)
+		})
+
+		t.Run("Preexisting attribution with sunset placement", func(t *testing.T) {
+			bucketName := testrand.BucketName()
+			sunsetPlacement := storj.PlacementConstraint(30)
+			replacementPlacement := storj.DefaultPlacement
+			sunsetPlacements := buckets.PlacementMigrations{sunsetPlacement: replacementPlacement}
+
+			expectedAttrInfo, err := db.Attribution().Insert(ctx, &attribution.Info{
+				ProjectID:  projectID,
+				BucketName: []byte(bucketName),
+				Placement:  &sunsetPlacement,
+				UserAgent:  testrand.RandAlphaNumeric(32),
+			})
+			require.NoError(t, err)
+
+			// a placement change to something other than the replacement is rejected.
+			_, err = db.Buckets().CreateBucketWithAttribution(ctx, buckets.Bucket{
+				ID:        testrand.UUID(),
+				ProjectID: projectID,
+				Name:      bucketName,
+				Placement: sunsetPlacement + 1,
+				UserAgent: testrand.RandAlphaNumeric(32),
+			}, sunsetPlacements)
+			require.ErrorIs(t, err, buckets.ErrAttributionPlacementMismatch.Instance())
+
+			newUserAgent := testrand.RandAlphaNumeric(32)
+			dbBucket, err := db.Buckets().CreateBucketWithAttribution(ctx, buckets.Bucket{
+				ID:        testrand.UUID(),
+				ProjectID: projectID,
+				Name:      bucketName,
+				Placement: replacementPlacement,
+				UserAgent: newUserAgent,
+			}, sunsetPlacements)
+			require.NoError(t, err)
+			require.Equal(t, replacementPlacement, dbBucket.Placement)
+
+			// the attribution placement is updated to the replacement and the user agent is updated.
+			expectedAttrInfo.UserAgent = newUserAgent
+			expectedAttrInfo.Placement = &replacementPlacement
+			attrInfo, err := db.Attribution().Get(ctx, projectID, []byte(bucketName))
+			require.NoError(t, err)
+			require.Zero(t, cmp.Diff(*expectedAttrInfo, *attrInfo, cmpopts.EquateApproxTime(time.Minute)))
+		})
+
+		t.Run("Preexisting attribution not in sunset placements", func(t *testing.T) {
+			bucketName := testrand.BucketName()
+			attrPlacement := storj.PlacementConstraint(31)
+
+			_, err := db.Attribution().Insert(ctx, &attribution.Info{
+				ProjectID:  projectID,
+				BucketName: []byte(bucketName),
+				Placement:  &attrPlacement,
+				UserAgent:  testrand.RandAlphaNumeric(32),
+			})
+			require.NoError(t, err)
+
+			_, err = db.Buckets().CreateBucketWithAttribution(ctx, buckets.Bucket{
+				ID:        testrand.UUID(),
+				ProjectID: projectID,
+				Name:      bucketName,
+				Placement: storj.DefaultPlacement,
+				UserAgent: testrand.RandAlphaNumeric(32),
+			}, buckets.PlacementMigrations{30: storj.DefaultPlacement})
+			require.ErrorIs(t, err, buckets.ErrAttributionPlacementMismatch.Instance())
+		})
+
+		t.Run("Preexisting attribution with nil placement", func(t *testing.T) {
+			bucketName := testrand.BucketName()
+			placement := storj.PlacementConstraint(testrand.Intn(100))
+
+			expectedAttrInfo, err := db.Attribution().Insert(ctx, &attribution.Info{
+				ProjectID:  projectID,
+				BucketName: []byte(bucketName),
+				Placement:  nil,
+				UserAgent:  testrand.RandAlphaNumeric(32),
+			})
+			require.NoError(t, err)
+
+			newUserAgent := testrand.RandAlphaNumeric(32)
+			_, err = db.Buckets().CreateBucketWithAttribution(ctx, buckets.Bucket{
+				ID:        testrand.UUID(),
+				ProjectID: projectID,
+				Name:      bucketName,
+				Placement: placement,
+				UserAgent: newUserAgent,
+			}, nil)
+			require.NoError(t, err)
+
+			expectedAttrInfo.UserAgent = newUserAgent
+
+			attrInfo, err := db.Attribution().Get(ctx, projectID, []byte(bucketName))
+			require.NoError(t, err)
+			require.Zero(t, cmp.Diff(*expectedAttrInfo, *attrInfo, cmpopts.EquateApproxTime(time.Minute)))
+		})
 	})
 }

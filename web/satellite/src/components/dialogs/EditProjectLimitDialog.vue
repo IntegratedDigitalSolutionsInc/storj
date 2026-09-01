@@ -17,13 +17,13 @@
                         height="40"
                         rounded="lg"
                     >
-                        <component :is="Gauge" :size="18" />
+                        <component :is="iconComponent" :size="18" />
                     </v-sheet>
                 </template>
                 <v-card-title class="font-weight-bold">{{ hasCustomLimit ? 'Edit' : 'Set' }} {{ limitType }} Limit</v-card-title>
                 <template #append>
                     <v-btn
-                        icon="$close"
+                        :icon="X"
                         variant="text"
                         size="small"
                         color="default"
@@ -37,8 +37,8 @@
 
             <v-form v-model="formValid" class="pa-6" @submit.prevent>
                 <v-row>
-                    <v-col cols="6">
-                        <p class="text-subtitle-2 mb-2">Current Limit</p>
+                    <v-col cols="12" sm="6">
+                        <p class="text-title-small mb-2">Current Limit</p>
                         <v-text-field
                             class="edit-project-limit__text-field"
                             variant="solo-filled"
@@ -71,8 +71,8 @@
                             </template>
                         </v-text-field>
                     </v-col>
-                    <v-col cols="6">
-                        <p class="text-subtitle-2 mb-2">Set {{ limitType }} Limit</p>
+                    <v-col cols="12" sm="6">
+                        <p class="text-title-small mb-2">Set {{ limitType }} Limit</p>
                         <v-text-field
                             class="edit-project-limit__text-field"
                             variant="outlined"
@@ -112,7 +112,7 @@
                     <v-col v-if="hasCustomLimit" cols="12">
                         <v-card class="pa-2 pl-4 mt-n4" variant="flat">
                             <div class="d-flex justify-space-between align-center">
-                                <div><p class="text-body-2">Don't need a limit?</p></div>
+                                <div><p class="text-body-medium">Don't need a limit?</p></div>
                                 <div>
                                     <v-btn :loading="isLoading" variant="text" @click="unSetLimit">
                                         Remove Limit
@@ -172,14 +172,14 @@ import {
     VAlert,
     VSheet,
 } from 'vuetify/components';
-import { ChevronDown, ChevronUp, Gauge } from 'lucide-vue-next';
+import { ChevronDown, ChevronUp, Cloud, CloudDownload, X } from '@lucide/vue';
 
 import { AnalyticsErrorEventSource, AnalyticsEvent } from '@/utils/constants/analyticsEventNames';
 import { useAnalyticsStore } from '@/store/modules/analyticsStore';
 import { useProjectsStore } from '@/store/modules/projectsStore';
-import { useNotify } from '@/utils/hooks';
+import { useNotify } from '@/composables/useNotify';
 import { useLoading } from '@/composables/useLoading';
-import { RequiredRule, ValidationRule } from '@/types/common';
+import { type ValidationRule, RequiredRule  } from '@/types/common';
 import { LimitToChange } from '@/types/projects';
 import { Dimensions, Memory } from '@/utils/bytesSize';
 import { decimalShift } from '@/utils/strings';
@@ -295,7 +295,7 @@ function unSetLimit(): void {
  */
 async function onSaveClick(): Promise<void> {
     if (shouldContactSupport.value) {
-        window.open(configStore.state.config.projectLimitsIncreaseRequestURL, '_blank', 'noreferrer');
+        window.open(configStore.projectLimitsIncreaseRequestURL, '_blank', 'noreferrer');
         return;
     }
     if (!formValid.value) return;
@@ -307,7 +307,7 @@ async function onSaveClick(): Promise<void> {
                 await projectsStore.updateProjectBandwidthLimit(input.value);
             }
         } catch (error) {
-            notify.error(error.message, AnalyticsErrorEventSource.EDIT_PROJECT_LIMIT);
+            notify.notifyError(error, AnalyticsErrorEventSource.EDIT_PROJECT_LIMIT);
             return;
         }
 
@@ -315,6 +315,7 @@ async function onSaveClick(): Promise<void> {
             props.limitType === LimitToChange.Storage
                 ? AnalyticsEvent.PROJECT_STORAGE_LIMIT_UPDATED
                 : AnalyticsEvent.PROJECT_BANDWIDTH_LIMIT_UPDATED,
+            { project_id: projectsStore.state.selectedProject.id },
         );
         notify.success('Limit updated successfully.');
 
@@ -351,6 +352,10 @@ watch(() => model.value, shown => {
 
 watch(() => activeMeasurement.value, unit => {
     inputText.value = (input.value / Memory[unit]).toString();
+});
+
+const iconComponent = computed(() => {
+    return props.limitType === LimitToChange.Storage ? Cloud : CloudDownload;
 });
 </script>
 

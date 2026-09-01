@@ -20,10 +20,10 @@
                         color="default"
                         rounded="lg"
                     >
-                        <v-expansion-panel-title color="" class="pr-5">
+                        <v-expansion-panel-title class="pr-5">
                             <span>{{ statusLabel }}</span>
                             <template v-if="isClosable" #actions>
-                                <v-row class="ma-0 align-center">
+                                <v-row class="ma-0 align-center flex-nowrap">
                                     <v-icon v-if="!isExpanded" :icon="ChevronUp" class="mr-3" />
                                     <v-icon v-else :icon="ChevronDown" class="mr-3" />
                                     <v-btn variant="outlined" color="default" size="x-small" :icon="X" title="Close" @click="closeDialog" />
@@ -97,12 +97,12 @@ import {
     VBtn,
 } from 'vuetify/components';
 import { useRouter } from 'vue-router';
-import { ChevronDown, ChevronUp, CircleX, X } from 'lucide-vue-next';
+import { ChevronDown, ChevronUp, CircleX, X } from '@lucide/vue';
 
-import { BrowserObject, UploadingBrowserObject, UploadingStatus, useObjectBrowserStore } from '@/store/modules/objectBrowserStore';
+import { type BrowserObject, type UploadingBrowserObject, UploadingStatus, useObjectBrowserStore  } from '@/store/modules/objectBrowserStore';
 import { AnalyticsErrorEventSource } from '@/utils/constants/analyticsEventNames';
 import { Duration } from '@/utils/time';
-import { useNotify } from '@/utils/hooks';
+import { useNotify } from '@/composables/useNotify';
 import { useAppStore } from '@/store/modules/appStore';
 import { useBucketsStore } from '@/store/modules/bucketsStore';
 import { useProjectsStore } from '@/store/modules/projectsStore';
@@ -166,10 +166,11 @@ const statusLabel = computed((): string => {
  * Returns upload progress.
  */
 const progress = computed((): number => {
-    return uploading.value.reduce((total: number, item: UploadingBrowserObject) => {
+    const activeUploads = uploading.value.filter(f => f.status === UploadingStatus.InProgress);
+    return activeUploads.reduce((total: number, item: UploadingBrowserObject) => {
         total += item.progress || 0;
         return total;
-    }, 0) / uploading.value.length;
+    }, 0) / activeUploads.length;
 });
 
 /**

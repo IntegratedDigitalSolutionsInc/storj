@@ -8,7 +8,6 @@
         variant="outlined"
         :type="cardExpired ? 'error' : 'info'"
         :title="`Credit Card ${cardExpired ? 'Expired' : 'Expiring Soon'}`"
-        rounded="lg"
         class="my-4 pb-4"
         border
     >
@@ -42,7 +41,7 @@ const billingStore = useBillingStore();
 const usersStore = useUsersStore();
 const configStore = useConfigStore();
 
-const billingEnabled = computed<boolean>(() => configStore.getBillingEnabled(usersStore.state.user.hasVarPartner));
+const billingEnabled = computed<boolean>(() => configStore.getBillingEnabled(usersStore.state.user));
 const cardExpiring = computed<boolean>(() => billingStore.defaultCard.isExpiring);
 const cardExpired = computed<boolean>(() => billingStore.defaultCard.isExpired);
 

@@ -8,8 +8,6 @@ import (
 	"database/sql"
 	"errors"
 
-	"cloud.google.com/go/spanner"
-
 	"storj.io/common/storj"
 	"storj.io/common/uuid"
 	"storj.io/storj/shared/tagsql"
@@ -81,32 +79,32 @@ func (p *PostgresAdapter) GetStreamPieceCountByAlias(ctx context.Context, opts G
 }
 
 // GetStreamPieceCountByAlias returns piece count by node alias.
-func (s *SpannerAdapter) GetStreamPieceCountByAlias(ctx context.Context, opts GetStreamPieceCountByNodeID) (result map[NodeAlias]int64, err error) {
-	countByAlias := map[NodeAlias]int64{}
-	err = s.client.Single().Query(ctx, spanner.Statement{
-		SQL: `
-			SELECT remote_alias_pieces
-			FROM   segments
-			WHERE  stream_id = @stream_id AND remote_alias_pieces IS NOT null
-		`,
-		Params: map[string]interface{}{
-			"stream_id": opts.StreamID,
-		},
-	}).Do(func(row *spanner.Row) error {
-		var aliasPieces AliasPieces
-		err = row.Columns(&aliasPieces)
-		if err != nil {
-			return Error.New("failed to scan segments: %w", err)
-		}
+func (t *TiDBAdapter) GetStreamPieceCountByAlias(ctx context.Context, opts GetStreamPieceCountByNodeID) (result map[NodeAlias]int64, err error) {
+	defer mon.Task()(&ctx)(&err)
 
-		for i := range aliasPieces {
-			countByAlias[aliasPieces[i].Alias]++
+	countByAlias := map[NodeAlias]int64{}
+	err = withRows(t.db.QueryContext(ctx, `
+		SELECT remote_alias_pieces
+		FROM   segments
+		WHERE  stream_id = ? AND remote_alias_pieces IS NOT NULL
+	`, opts.StreamID))(func(rows tagsql.Rows) error {
+		for rows.Next() {
+			var aliasPieces AliasPieces
+			err = rows.Scan(&aliasPieces)
+			if err != nil {
+				return Error.New("failed to scan segments: %w", err)
+			}
+			for i := range aliasPieces {
+				countByAlias[aliasPieces[i].Alias]++
+			}
 		}
 		return nil
 	})
 	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return result, nil
+		}
 		return result, Error.New("unable to fetch object segments: %w", err)
 	}
-
 	return countByAlias, nil
 }

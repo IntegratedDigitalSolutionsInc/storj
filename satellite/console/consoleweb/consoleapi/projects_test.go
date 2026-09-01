@@ -6,11 +6,11 @@ package consoleapi_test
 import (
 	"bytes"
 	"context"
-	"database/sql"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -94,7 +94,7 @@ func TestGetProjectMembersAndInvitationsOrdering(t *testing.T) {
 		sat := planet.Satellites[0]
 		p := planet.Uplinks[0].Projects[0].ID
 
-		user, err := sat.DB.Console().Users().GetByEmail(ctx, planet.Uplinks[0].User[sat.ID()].Email)
+		user, err := sat.DB.Console().Users().GetByEmailAndTenant(ctx, planet.Uplinks[0].User[sat.ID()].Email, nil)
 		require.NoError(t, err)
 
 		members, invitees := createTestMembers(ctx, t, sat.DB.Console(), p, &user.ID)
@@ -131,7 +131,7 @@ func TestGetProjectMembersAndInvitationsOrdering(t *testing.T) {
 
 		for _, tt := range tests {
 			endpoint := fmt.Sprintf("projects/%s/members?limit=100&page=1&order=%d&order-direction=%d", p.String(), tt.order, tt.orderDir)
-			body, status, err := doRequestWithAuth(ctx, t, sat, user, http.MethodGet, endpoint, nil)
+			body, status, err := doRequestWithAuth(ctx, sat, user, http.MethodGet, endpoint, nil)
 			require.NoError(t, err)
 			require.Equal(t, http.StatusOK, status)
 
@@ -207,7 +207,7 @@ func TestGetProjectMembersAndInvitationsSearch(t *testing.T) {
 		sat := planet.Satellites[0]
 		p := planet.Uplinks[0].Projects[0].ID
 
-		user, err := sat.DB.Console().Users().GetByEmail(ctx, planet.Uplinks[0].User[sat.ID()].Email)
+		user, err := sat.DB.Console().Users().GetByEmailAndTenant(ctx, planet.Uplinks[0].User[sat.ID()].Email, nil)
 		require.NoError(t, err)
 
 		members, invitees := createTestMembers(ctx, t, sat.DB.Console(), p, &user.ID)
@@ -255,7 +255,7 @@ func TestGetProjectMembersAndInvitationsSearch(t *testing.T) {
 			params.Add("search", tt.search)
 			endpoint += params.Encode()
 
-			body, status, err := doRequestWithAuth(ctx, t, sat, user, http.MethodGet, endpoint, nil)
+			body, status, err := doRequestWithAuth(ctx, sat, user, http.MethodGet, endpoint, nil)
 			require.NoError(t, err)
 			require.Equal(t, http.StatusOK, status)
 
@@ -287,7 +287,7 @@ func TestGetProjectMembersAndInvitationsLimitAndPage(t *testing.T) {
 		sat := planet.Satellites[0]
 		p := planet.Uplinks[0].Projects[0].ID
 
-		user, err := sat.DB.Console().Users().GetByEmail(ctx, planet.Uplinks[0].User[sat.ID()].Email)
+		user, err := sat.DB.Console().Users().GetByEmailAndTenant(ctx, planet.Uplinks[0].User[sat.ID()].Email, nil)
 		require.NoError(t, err)
 
 		members, _ := createTestMembers(ctx, t, sat.DB.Console(), p, &user.ID)
@@ -299,11 +299,11 @@ func TestGetProjectMembersAndInvitationsLimitAndPage(t *testing.T) {
 		for i := 0; i < 2; i++ {
 			endpoint := fmt.Sprintf("projects/%s/members?order=1&order-direction=1&", p.String())
 			params := url.Values{}
-			params.Add("limit", fmt.Sprint(limit))
-			params.Add("page", fmt.Sprint(page))
+			params.Add("limit", strconv.Itoa(limit))
+			params.Add("page", strconv.Itoa(page))
 			endpoint += params.Encode()
 
-			body, status, err := doRequestWithAuth(ctx, t, sat, user, http.MethodGet, endpoint, nil)
+			body, status, err := doRequestWithAuth(ctx, sat, user, http.MethodGet, endpoint, nil)
 			require.NoError(t, err)
 			require.Equal(t, http.StatusOK, status)
 
@@ -332,34 +332,29 @@ func TestDeleteProjectMembers(t *testing.T) {
 		sat := planet.Satellites[0]
 		p := planet.Uplinks[0].Projects[0].ID
 
-		user, err := sat.DB.Console().Users().GetByEmail(ctx, planet.Uplinks[0].User[sat.ID()].Email)
+		user, err := sat.DB.Console().Users().GetByEmailAndTenant(ctx, planet.Uplinks[0].User[sat.ID()].Email, nil)
 		require.NoError(t, err)
 
 		members, invitees := createTestMembers(ctx, t, sat.DB.Console(), p, &user.ID)
 
-		var emails string
-		var firstAppendDone bool
+		var emails []string
 		for _, m := range members {
-			if firstAppendDone {
-				emails += ","
-			} else {
-				firstAppendDone = true
-			}
-			emails += m.Email
+			emails = append(emails, m.Email)
 		}
 		for e := range invitees {
-			if len(members) > 0 {
-				emails += ","
-			}
-			emails += e
+			emails = append(emails, e)
 		}
 
-		endpoint := fmt.Sprintf("projects/%s/members?", p.String())
-		params := url.Values{}
-		params.Add("emails", emails)
-		endpoint += params.Encode()
+		endpoint := fmt.Sprintf("projects/%s/members", p.String())
 
-		body, status, err := doRequestWithAuth(ctx, t, sat, user, http.MethodDelete, endpoint, nil)
+		payload := console.DeleteMembersAndInvitationsRequest{
+			Emails:         emails,
+			RemoveAccesses: false,
+		}
+		payloadBytes, err := json.Marshal(payload)
+		require.NoError(t, err)
+
+		body, status, err := doRequestWithAuth(ctx, sat, user, http.MethodDelete, endpoint, bytes.NewBuffer(payloadBytes))
 		require.NoError(t, err)
 		require.Equal(t, http.StatusOK, status)
 		require.NotContains(t, string(body), "error")
@@ -370,12 +365,16 @@ func TestDeleteProjectMembers(t *testing.T) {
 		require.Equal(t, user.ID, page.ProjectMembers[0].MemberID)
 
 		// test error
-		endpoint = fmt.Sprintf("projects/%s/members?", p.String())
-		params = url.Values{}
-		params.Add("emails", "nonmember@storj.test")
-		endpoint += params.Encode()
+		endpoint = fmt.Sprintf("projects/%s/members", p.String())
 
-		body, status, err = doRequestWithAuth(ctx, t, sat, user, http.MethodDelete, endpoint, nil)
+		payload = console.DeleteMembersAndInvitationsRequest{
+			Emails:         []string{"nonmember@storj.test"},
+			RemoveAccesses: false,
+		}
+		payloadBytes, err = json.Marshal(payload)
+		require.NoError(t, err)
+
+		body, status, err = doRequestWithAuth(ctx, sat, user, http.MethodDelete, endpoint, bytes.NewBuffer(payloadBytes))
 		require.NoError(t, err)
 		require.Equal(t, http.StatusInternalServerError, status)
 		require.Contains(t, string(body), "error")
@@ -395,10 +394,14 @@ func TestDeleteProject(t *testing.T) {
 		p := planet.Uplinks[0].Projects[0].ID
 		p2 := planet.Uplinks[1].Projects[0].ID
 
-		user, err := sat.DB.Console().Users().GetByEmail(ctx, planet.Uplinks[0].User[sat.ID()].Email)
+		// pause rollup archive loop because the test inserts bandwidth rollups
+		// during time periods the loop would clean up
+		sat.Accounting.RollupArchive.Loop.Pause()
+
+		user, err := sat.DB.Console().Users().GetByEmailAndTenant(ctx, planet.Uplinks[0].User[sat.ID()].Email, nil)
 		require.NoError(t, err)
 
-		user.PaidTier = true
+		user.Kind = console.PaidUser
 		user.MFAEnabled = true
 		mfaSecret, err := console.NewMFASecretKey()
 		require.NoError(t, err)
@@ -419,29 +422,29 @@ func TestDeleteProject(t *testing.T) {
 		require.NoError(t, err)
 
 		require.NoError(t, sat.DB.Console().Users().Update(ctx, user.ID, console.UpdateUserRequest{
-			PaidTier:     &user.PaidTier,
+			Kind:         &user.Kind,
 			MFAEnabled:   &user.MFAEnabled,
 			MFASecretKey: &mfaSecretKeyPtr,
 		}))
 
 		// test deleting project as non-owner fails
-		endpoint := fmt.Sprintf("projects/%s", p2.String())
+		endpoint := "projects/" + p2.String()
 
 		payload, err := json.Marshal(consoleapi.AccountActionData{Step: console.DeleteProjectInit, Data: ""})
 		require.NoError(t, err)
 
-		body, status, err := doRequestWithAuth(ctx, t, sat, user, http.MethodDelete, endpoint, bytes.NewBuffer(payload))
+		body, status, err := doRequestWithAuth(ctx, sat, user, http.MethodDelete, endpoint, bytes.NewBuffer(payload))
 		require.NoError(t, err)
 		require.Equal(t, http.StatusUnauthorized, status)
 		require.Contains(t, string(body), "error")
 
-		endpoint = fmt.Sprintf("projects/%s", p.String())
+		endpoint = "projects/" + p.String()
 
 		// account delete step out of range: lesser
 		payload, err = json.Marshal(consoleapi.AccountActionData{Step: -1, Data: ""})
 		require.NoError(t, err)
 
-		body, status, err = doRequestWithAuth(ctx, t, sat, user, http.MethodDelete, endpoint, bytes.NewBuffer(payload))
+		body, status, err = doRequestWithAuth(ctx, sat, user, http.MethodDelete, endpoint, bytes.NewBuffer(payload))
 		require.NoError(t, err)
 		require.Equal(t, http.StatusBadRequest, status)
 		require.Contains(t, string(body), "error")
@@ -450,7 +453,7 @@ func TestDeleteProject(t *testing.T) {
 		payload, err = json.Marshal(consoleapi.AccountActionData{Step: 100, Data: ""})
 		require.NoError(t, err)
 
-		body, status, err = doRequestWithAuth(ctx, t, sat, user, http.MethodDelete, endpoint, bytes.NewBuffer(payload))
+		body, status, err = doRequestWithAuth(ctx, sat, user, http.MethodDelete, endpoint, bytes.NewBuffer(payload))
 		require.NoError(t, err)
 		require.Equal(t, http.StatusBadRequest, status)
 		require.Contains(t, string(body), "error")
@@ -459,7 +462,7 @@ func TestDeleteProject(t *testing.T) {
 		payload, err = json.Marshal(consoleapi.AccountActionData{Step: console.VerifyAccountEmailStep, Data: ""})
 		require.NoError(t, err)
 
-		body, status, err = doRequestWithAuth(ctx, t, sat, user, http.MethodDelete, endpoint, bytes.NewBuffer(payload))
+		body, status, err = doRequestWithAuth(ctx, sat, user, http.MethodDelete, endpoint, bytes.NewBuffer(payload))
 		require.NoError(t, err)
 		require.Equal(t, http.StatusBadRequest, status)
 		require.Contains(t, string(body), "error")
@@ -472,7 +475,7 @@ func TestDeleteProject(t *testing.T) {
 		ptr := &expires
 		require.NoError(t, sat.DB.Console().Users().Update(ctx, user.ID, console.UpdateUserRequest{LoginLockoutExpiration: &ptr}))
 
-		body, status, err = doRequestWithAuth(ctx, t, sat, user, http.MethodDelete, endpoint, bytes.NewBuffer(payload))
+		body, status, err = doRequestWithAuth(ctx, sat, user, http.MethodDelete, endpoint, bytes.NewBuffer(payload))
 		require.NoError(t, err)
 		require.Equal(t, http.StatusUnauthorized, status)
 		require.Contains(t, string(body), "error")
@@ -491,7 +494,7 @@ func TestDeleteProject(t *testing.T) {
 		payload, err = json.Marshal(consoleapi.AccountActionData{Step: console.DeleteProjectInit})
 		require.NoError(t, err)
 
-		body, status, err = doRequestWithAuth(ctx, t, sat, user, http.MethodDelete, endpoint, bytes.NewBuffer(payload))
+		body, status, err = doRequestWithAuth(ctx, sat, user, http.MethodDelete, endpoint, bytes.NewBuffer(payload))
 		require.NoError(t, err)
 		require.Equal(t, http.StatusConflict, status)
 
@@ -502,7 +505,7 @@ func TestDeleteProject(t *testing.T) {
 		require.NoError(t, sat.API.Buckets.Service.DeleteBucket(ctx, []byte(bucket.Name), p))
 
 		// test deleting project with api key fails
-		body, status, err = doRequestWithAuth(ctx, t, sat, user, http.MethodDelete, endpoint, bytes.NewBuffer(payload))
+		body, status, err = doRequestWithAuth(ctx, sat, user, http.MethodDelete, endpoint, bytes.NewBuffer(payload))
 		require.NoError(t, err)
 		require.Equal(t, http.StatusConflict, status)
 
@@ -514,7 +517,7 @@ func TestDeleteProject(t *testing.T) {
 		// test pro user deleting project with current usage fails
 		require.NoError(t, sat.DB.Orders().UpdateBucketBandwidthSettle(ctx, p, []byte("testbucket"), pb.PieceAction_GET, 1000000, 0, timestamp.Add(-time.Hour)))
 
-		body, status, err = doRequestWithAuth(ctx, t, sat, user, http.MethodDelete, endpoint, bytes.NewBuffer(payload))
+		body, status, err = doRequestWithAuth(ctx, sat, user, http.MethodDelete, endpoint, bytes.NewBuffer(payload))
 		require.NoError(t, err)
 		require.Equal(t, http.StatusConflict, status)
 
@@ -530,7 +533,7 @@ func TestDeleteProject(t *testing.T) {
 
 		require.NoError(t, sat.DB.Orders().UpdateBucketBandwidthSettle(ctx, p, []byte("testbucket"), pb.PieceAction_GET, 1000000, 0, lastMonth))
 
-		body, status, err = doRequestWithAuth(ctx, t, sat, user, http.MethodDelete, endpoint, bytes.NewBuffer(payload))
+		body, status, err = doRequestWithAuth(ctx, sat, user, http.MethodDelete, endpoint, bytes.NewBuffer(payload))
 		require.NoError(t, err)
 		require.Equal(t, http.StatusConflict, status)
 
@@ -546,7 +549,7 @@ func TestDeleteProject(t *testing.T) {
 		payload, err = json.Marshal(consoleapi.AccountActionData{Step: console.VerifyAccountPasswordStep, Data: user.FullName})
 		require.NoError(t, err)
 
-		body, status, err = doRequestWithAuth(ctx, t, sat, user, http.MethodDelete, endpoint, bytes.NewBuffer(payload))
+		body, status, err = doRequestWithAuth(ctx, sat, user, http.MethodDelete, endpoint, bytes.NewBuffer(payload))
 		require.NoError(t, err)
 		require.Equal(t, http.StatusOK, status)
 		require.Empty(t, body)
@@ -555,7 +558,7 @@ func TestDeleteProject(t *testing.T) {
 		payload, err = json.Marshal(consoleapi.AccountActionData{Step: console.VerifyAccountMfaStep, Data: goodCode})
 		require.NoError(t, err)
 
-		body, status, err = doRequestWithAuth(ctx, t, sat, user, http.MethodDelete, endpoint, bytes.NewBuffer(payload))
+		body, status, err = doRequestWithAuth(ctx, sat, user, http.MethodDelete, endpoint, bytes.NewBuffer(payload))
 		require.NoError(t, err)
 		require.Equal(t, http.StatusOK, status)
 		require.Empty(t, body)
@@ -567,7 +570,7 @@ func TestDeleteProject(t *testing.T) {
 		payload, err = json.Marshal(consoleapi.AccountActionData{Step: console.VerifyAccountEmailStep, Data: code})
 		require.NoError(t, err)
 
-		body, status, err = doRequestWithAuth(ctx, t, sat, user, http.MethodDelete, endpoint, bytes.NewBuffer(payload))
+		body, status, err = doRequestWithAuth(ctx, sat, user, http.MethodDelete, endpoint, bytes.NewBuffer(payload))
 		require.NoError(t, err)
 		require.Equal(t, http.StatusOK, status)
 		require.Empty(t, body)
@@ -576,32 +579,14 @@ func TestDeleteProject(t *testing.T) {
 		payload, err = json.Marshal(consoleapi.AccountActionData{Step: console.DeleteProjectStep})
 		require.NoError(t, err)
 
-		body, status, err = doRequestWithAuth(ctx, t, sat, user, http.MethodDelete, endpoint, bytes.NewBuffer(payload))
+		body, status, err = doRequestWithAuth(ctx, sat, user, http.MethodDelete, endpoint, bytes.NewBuffer(payload))
 		require.NoError(t, err)
 		require.Equal(t, http.StatusOK, status)
 		require.Empty(t, body)
 
 		project, err := sat.DB.Console().Projects().Get(ctx, p)
-		require.Error(t, err)
-		require.ErrorIs(t, err, sql.ErrNoRows)
-		require.Nil(t, project)
-
-		// free user can't delete project
-		user2, err := sat.DB.Console().Users().GetByEmail(ctx, planet.Uplinks[1].User[sat.ID()].Email)
 		require.NoError(t, err)
-
-		payload, err = json.Marshal(consoleapi.AccountActionData{Step: console.DeleteProjectInit})
-		require.NoError(t, err)
-
-		endpoint = fmt.Sprintf("projects/%s", p2.String())
-		body, status, err = doRequestWithAuth(ctx, t, sat, user2, http.MethodDelete, endpoint, bytes.NewBuffer(payload))
-		require.NoError(t, err)
-		require.Equal(t, http.StatusInternalServerError, status)
-		require.Contains(t, string(body), "You must upgrade")
-
-		project, err = sat.DB.Console().Projects().Get(ctx, p2)
-		require.NoError(t, err)
-		require.NotNil(t, project)
+		require.Equal(t, console.ProjectDisabled, *project.Status)
 	})
 }
 
@@ -678,7 +663,7 @@ func TestEdgeURLOverrides(t *testing.T) {
 				require.NoError(t, err)
 				require.EqualValues(t, 1, count)
 
-				body, status, err := doRequestWithAuth(ctx, t, sat, user, http.MethodGet, "projects", nil)
+				body, status, err := doRequestWithAuth(ctx, sat, user, http.MethodGet, "projects", nil)
 				require.NoError(t, err)
 				require.Equal(t, http.StatusOK, status)
 

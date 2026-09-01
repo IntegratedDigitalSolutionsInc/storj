@@ -5,16 +5,16 @@
     <v-dialog
         v-model="model"
         scrollable
-        max-width="550px"
+        max-width="560px"
         transition="fade-transition"
         :persistent="loading"
     >
         <v-card ref="content">
             <v-card-item class="pa-6">
-                <v-card-title class="font-weight-bold"> Add Tokens </v-card-title>
+                <v-card-title class="font-weight-bold"> Add STORJ Tokens </v-card-title>
                 <template #append>
                     <v-btn
-                        icon="$close"
+                        :icon="X"
                         variant="text"
                         size="small"
                         color="default"
@@ -26,10 +26,11 @@
             <v-divider />
 
             <v-card-item class="py-4">
-                <v-window v-model="step">
+                <v-window v-model="step" :touch="false">
                     <v-window-item :value="AddTokensDialogStep.AddTokens">
                         <AddTokensStep
                             is-root
+                            @close="model = false"
                             @success="() => setStep(AddTokensDialogStep.Success)"
                         />
                     </v-window-item>
@@ -46,6 +47,7 @@
 <script setup lang="ts">
 import { ref, watch } from 'vue';
 import { VBtn, VCard, VCardItem, VCardTitle, VDialog, VDivider, VWindow, VWindowItem } from 'vuetify/components';
+import { X } from '@lucide/vue';
 
 import AddTokensStep from '@/components/dialogs/upgradeAccountFlow/AddTokensStep.vue';
 import SuccessStep from '@/components/dialogs/upgradeAccountFlow/SuccessStep.vue';

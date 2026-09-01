@@ -36,8 +36,8 @@ func TestUnmarshal(t *testing.T) {
 	for _, tt := range []struct {
 		name string
 		csv  string
-		obj  interface{}
-		out  interface{}
+		obj  any
+		out  any
 		err  string
 	}{
 		{
@@ -154,8 +154,57 @@ func TestUnmarshal(t *testing.T) {
 			obj:  &notag{},
 			err:  `strictcsv: field "Field" missing csv tag`,
 		},
+		{
+			name: "unknown tag option rejected",
+			csv:  "field\nvalue\n",
+			obj: &struct {
+				Field string `csv:"field,bogus"`
+			}{},
+			err: `strictcsv: field "Field" has unknown csv tag option "bogus"`,
+		},
+		{
+			name: "optional header present",
+			csv:  "field,extra\nvalue,X\n",
+			obj: &struct {
+				Field string `csv:"field"`
+				Extra string `csv:"extra,optional"`
+			}{},
+			out: &struct {
+				Field string `csv:"field"`
+				Extra string `csv:"extra,optional"`
+			}{Field: "value", Extra: "X"},
+		},
+		{
+			name: "optional header absent",
+			csv:  "field\nvalue\n",
+			obj: &struct {
+				Field string `csv:"field"`
+				Extra string `csv:"extra,optional"`
+			}{},
+			out: &struct {
+				Field string `csv:"field"`
+				Extra string `csv:"extra,optional"`
+			}{Field: "value"},
+		},
+		{
+			name: "optional does not exempt from unmapped-header check",
+			csv:  "field,extra\nvalue,X\n",
+			obj: &struct {
+				Field string `csv:"field"`
+			}{},
+			err: `strictcsv: CSV header "extra" is not mapped to struct field`,
+		},
+		{
+			name: "required header still missing when only some fields are optional",
+			csv:  "field\nvalue\n",
+			obj: &struct {
+				Field    string `csv:"field"`
+				Required string `csv:"required"`
+				Extra    string `csv:"extra,optional"`
+			}{},
+			err: `strictcsv: field headers ["required"] missing from CSV`,
+		},
 	} {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			err := UnmarshalString(tt.csv, tt.obj)
 			if tt.err != "" {
@@ -168,8 +217,58 @@ func TestUnmarshal(t *testing.T) {
 	}
 }
 
+func TestUnmarshalAllowExtraColumns(t *testing.T) {
+	type target struct {
+		Field string `csv:"field"`
+	}
+
+	t.Run("extra column silently ignored", func(t *testing.T) {
+		var got target
+		err := UnmarshalString("field,extra\nvalue,junk\n", &got, AllowExtraColumns())
+		require.NoError(t, err)
+		require.Equal(t, target{Field: "value"}, got)
+	})
+
+	t.Run("extra column ignored between mapped columns", func(t *testing.T) {
+		type multi struct {
+			A string `csv:"a"`
+			B string `csv:"b"`
+		}
+		var got multi
+		err := UnmarshalString("a,extra,b\n1,junk,2\n", &got, AllowExtraColumns())
+		require.NoError(t, err)
+		require.Equal(t, multi{A: "1", B: "2"}, got)
+	})
+
+	t.Run("still errors on missing required column", func(t *testing.T) {
+		type multi struct {
+			A string `csv:"a"`
+			B string `csv:"b"`
+		}
+		err := UnmarshalString("a,extra\n1,junk\n", &multi{}, AllowExtraColumns())
+		require.EqualError(t, err, `strictcsv: field headers ["b"] missing from CSV`)
+	})
+
+	t.Run("still errors on duplicate mapped column", func(t *testing.T) {
+		err := UnmarshalString("field,field\nv,w\n", &target{}, AllowExtraColumns())
+		require.EqualError(t, err, `strictcsv: CSV header "field" is duplicated`)
+	})
+
+	t.Run("slice of structs", func(t *testing.T) {
+		var got []target
+		err := UnmarshalString("field,extra\n1,x\n2,y\n", &got, AllowExtraColumns())
+		require.NoError(t, err)
+		require.Equal(t, []target{{Field: "1"}, {Field: "2"}}, got)
+	})
+
+	t.Run("default is still strict", func(t *testing.T) {
+		err := UnmarshalString("field,extra\nvalue,junk\n", &target{})
+		require.EqualError(t, err, `strictcsv: CSV header "extra" is not mapped to struct field`)
+	})
+}
+
 func TestUnmarshalFailsToUnmarshalField(t *testing.T) {
-	for _, s := range []interface{}{
+	for _, s := range []any{
 		&struct {
 			Field int64 `csv:"field"`
 		}{},

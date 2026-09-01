@@ -2,203 +2,315 @@
 // See LICENSE for copying information.
 
 <template>
-    <v-card>
-        <v-text-field
-            v-model="search"
-            label="Search"
-            :prepend-inner-icon="Search"
-            single-line
-            variant="solo-filled"
-            flat
-            hide-details
-            clearable
-            density="comfortable"
-            rounded="lg"
-            :maxlength="MAX_SEARCH_VALUE_LENGTH"
-            class="mx-2 mt-2"
-        />
+    <v-text-field
+        v-model="search"
+        label="Search"
+        :prepend-inner-icon="Search"
+        single-line
+        variant="solo-filled"
+        flat
+        hide-details
+        clearable
+        density="comfortable"
+        xl11 :maxlength="MAX_SEARCH_VALUE_LENGTH"
+        class="mb-5"
+    />
 
-        <v-data-table-server
-            :sort-by="sortBy"
-            :headers="headers"
-            :items="displayedItems"
-            :search="search"
-            :loading="areBucketsFetching"
-            :items-length="page.totalCount"
-            items-per-page-text="Buckets per page"
-            :items-per-page-options="tableSizeOptions(page.totalCount)"
-            no-data-text="No buckets found"
-            hover
-            @update:itemsPerPage="onUpdateLimit"
-            @update:page="onUpdatePage"
-            @update:sortBy="onUpdateSort"
-        >
-            <template #item.name="{ item }">
-                <v-btn
-                    class="rounded-lg w-100 px-1 ml-n1 justify-start"
-                    variant="text"
-                    height="40"
-                    color="default"
-                    :disabled="bucketsBeingDeleted.has(item.name)"
-                    @click="openBucket(item.name)"
-                >
-                    <template #default>
-                        <img class="mr-3" src="../assets/icon-bucket-tonal.svg" alt="Bucket">
-                        <div class="max-width">
-                            <p class="font-weight-bold text-lowercase text-truncate">{{ item.name }}</p>
-                        </div>
-                    </template>
-                </v-btn>
-            </template>
-            <template #item.storage="{ item }">
-                <span>
-                    {{ Size.toBase10String(item.storage * Memory.GB) }}
-                </span>
-            </template>
-            <template #item.egress="{ item }">
-                <span>
-                    {{ item.egress.toFixed(2) + 'GB' }}
-                </span>
-            </template>
-            <template #item.objectCount="{ item }">
-                <span>
-                    {{ item.objectCount.toLocaleString() }}
-                </span>
-            </template>
-            <template #item.segmentCount="{ item }">
-                <span>
-                    {{ item.segmentCount.toLocaleString() }}
-                </span>
-            </template>
-            <template #item.since="{ item }">
-                <span class="text-no-wrap">
-                    {{ Time.formattedDate(item.since) }}
-                </span>
-            </template>
-            <template #item.location="{ item }">
-                <div class="text-no-wrap">
-                    <v-icon size="28" class="mr-1 pa-1 rounded-lg border">
-                        <component :is="item.location === 'global' ? Earth : LandPlot" :size="18" />
-                    </v-icon>
-                    <v-chip variant="tonal" color="default" size="small" class="text-capitalize">
-                        {{ item.location || `unknown(${item.defaultPlacement})` }}
-                    </v-chip>
-                </div>
-            </template>
-            <template #item.versioning="{ item }">
-                <div class="text-no-wrap">
-                    <v-tooltip location="top" :text="getVersioningInfo(item.versioning)">
-                        <template #activator="{ props }">
-                            <v-icon v-bind="props" size="28" :icon="getVersioningIcon(item.versioning)" class="mr-1 pa-1 rounded-lg border" />
-                        </template>
-                    </v-tooltip>
-                    <v-chip variant="tonal" color="default" size="small">
-                        {{ item.versioning }}
-                    </v-chip>
-                </div>
-            </template>
-            <template #item.actions="{ item }">
-                <v-tooltip v-if="bucketsBeingDeleted.has(item.name)" location="top" text="Deleting bucket">
+    <v-data-table-server
+        :sort-by="sortBy"
+        :headers="headers"
+        :items="displayedItems"
+        :search="search"
+        :loading="areBucketsFetching"
+        :items-length="page.totalCount"
+        items-per-page-text="Buckets per page"
+        :items-per-page-options="tableSizeOptions(page.totalCount)"
+        no-data-text="No buckets found"
+        class="border"
+        hover
+        @update:items-per-page="onUpdateLimit"
+        @update:page="onUpdatePage"
+        @update:sort-by="onUpdateSort"
+    >
+        <template #header.egress="{ column, isSorted, getSortIcon }">
+            <div
+                class="v-data-table-header__content"
+                :class="{
+                    'v-data-table-header__content--sortable': column.sortable,
+                    'v-data-table-header__content--sorted': isSorted(column),
+                }"
+            >
+                <span>{{ column.title }}</span>
+
+                <v-tooltip v-if="billingEnabled" width="250" location="top">
                     <template #activator="{ props }">
-                        <v-progress-circular width="2" size="22" color="error" indeterminate v-bind="props" />
-                    </template>
-                </v-tooltip>
-                <v-menu v-else location="bottom end" transition="scale-transition">
-                    <template #activator="{ props: activatorProps }">
-                        <v-btn
-                            title="Bucket Actions"
-                            :icon="Ellipsis"
-                            color="default"
-                            variant="outlined"
-                            size="small"
-                            rounded="md"
-                            density="comfortable"
-                            v-bind="activatorProps"
+                        <v-icon
+                            v-bind="props"
+                            size="12"
+                            :icon="Info"
+                            class="ml-2 text-medium-emphasis"
+                            @click.stop
                         />
                     </template>
-                    <v-list class="pa-1">
+                    The download bandwidth usage is only for the current billing period of one month.
+                </v-tooltip>
+
+                <v-icon
+                    v-if="column.sortable"
+                    :icon="getSortIcon(column)"
+                    size="16"
+                    class="v-data-table-header__sort-icon"
+                />
+            </div>
+        </template>
+
+        <template #item.name="{ item }">
+            <v-btn
+                class="rounded-lg w-100 pl-1 pr-3 ml-n1 justify-start"
+                variant="text"
+                height="40"
+                color="default"
+                :disabled="bucketsBeingDeleted.has(item.name)"
+                @click="openBucket(item.name)"
+            >
+                <template #default>
+                    <IconBucketTonal class="mr-3" />
+                    <div class="max-width">
+                        <p class="font-weight-bold text-lowercase text-truncate">{{ item.name }}</p>
+                    </div>
+                </template>
+            </v-btn>
+        </template>
+        <template #item.creatorEmail="{ item }">
+            <span class="text-no-wrap">
+                {{ item.creatorEmail }}
+            </span>
+        </template>
+        <template #item.storage="{ item }">
+            <span>
+                {{ Size.toBase10String(item.storage * Memory.GB) }}
+            </span>
+        </template>
+        <template #item.egress="{ item }">
+            <span>
+                {{ item.egress.toFixed(2) + 'GB' }}
+            </span>
+        </template>
+        <template #item.objectCount="{ item }">
+            <span>
+                {{ item.objectCount.toLocaleString() }}
+            </span>
+        </template>
+        <template #item.segmentCount="{ item }">
+            <span>
+                {{ item.segmentCount.toLocaleString() }}
+            </span>
+        </template>
+        <template #item.since="{ item }">
+            <span class="text-no-wrap">
+                {{ Time.formattedDate(item.createdAt) }}
+            </span>
+        </template>
+        <template #item.location="{ item }">
+            <div class="text-no-wrap">
+                <v-icon size="28" class="mr-1 pa-1 rounded-lg border">
+                    <component :is="getTierIcon(item)" :size="18" />
+                </v-icon>
+                <v-chip variant="tonal" :color="item.location === 'global' ? 'success' : 'primary'" size="small" class="text-capitalize font-weight-semibold">
+                    {{ item.location || `unknown(${item.defaultPlacement})` }}
+                </v-chip>
+            </div>
+        </template>
+        <template #item.versioning="{ item }">
+            <div class="text-no-wrap">
+                <v-tooltip location="top" :text="getVersioningInfo(item.versioning)">
+                    <template #activator="{ props }">
+                        <v-icon v-bind="props" size="28" :icon="getVersioningIcon(item.versioning)" class="mr-1 pa-1 rounded-lg border" />
+                    </template>
+                </v-tooltip>
+                <v-chip variant="tonal" :color="getVersioningChipColor(item.versioning)" size="small" class="font-weight-semibold">
+                    {{ getVersioningFormattedStatus(item.versioning) }}
+                </v-chip>
+            </div>
+        </template>
+        <template #item.objectLockEnabled="{ item }">
+            <div class="text-no-wrap">
+                <v-tooltip location="top" :text="getObjectLockInfo(item)">
+                    <template #activator="{ props }">
+                        <v-icon v-bind="props" size="28" :icon="item.objectLockEnabled ? LockKeyhole : LockKeyholeOpen" class="mr-1 pa-1 rounded-lg border" />
+                    </template>
+                </v-tooltip>
+                <v-chip variant="tonal" :color="item.objectLockEnabled ? 'success' : 'default'" size="small" class="font-weight-semibold">
+                    {{ item.objectLockEnabled ? 'On' : 'Off' }}
+                </v-chip>
+            </div>
+        </template>
+        <template #item.eventingEnabled="{ item }">
+            <div class="text-no-wrap">
+                <v-tooltip location="top" :text="getEventingInfo(item.eventingEnabled)">
+                    <template #activator="{ props }">
+                        <v-icon v-bind="props" size="28" :icon="item.eventingEnabled ? Bell : BellOff" class="mr-1 pa-1 rounded-lg border" />
+                    </template>
+                </v-tooltip>
+                <v-chip variant="tonal" :color="item.eventingEnabled ? 'success' : 'default'" size="small" class="font-weight-semibold">
+                    {{ item.eventingEnabled ? 'On' : 'Off' }}
+                </v-chip>
+            </div>
+        </template>
+        <template #item.actions="{ item }">
+            <v-tooltip v-if="bucketsBeingDeleted.has(item.name)" location="top" text="Deleting bucket">
+                <template #activator="{ props }">
+                    <v-progress-circular width="2" size="22" color="error" indeterminate v-bind="props" />
+                </template>
+            </v-tooltip>
+            <v-menu v-else location="bottom end" transition="scale-transition">
+                <template #activator="{ props: activatorProps }">
+                    <v-btn
+                        title="Bucket Actions"
+                        :icon="Ellipsis"
+                        color="default"
+                        variant="outlined"
+                        size="small"
+                        rounded="md"
+                        density="comfortable"
+                        v-bind="activatorProps"
+                    />
+                </template>
+                <v-list class="pa-1">
+                    <v-list-item
+                        density="comfortable"
+                        link
+                        @click="openBucket(item.name)"
+                    >
+                        <template #prepend>
+                            <component :is="ArrowRight" :size="18" />
+                        </template>
+                        <v-list-item-title
+                            class="ml-3 text-body-medium font-weight-medium"
+                        >
+                            Open Bucket
+                        </v-list-item-title>
+                    </v-list-item>
+                    <div>
+                        <v-list-item
+                            v-if="versioningUIEnabled && item.versioning !== Versioning.NotSupported"
+                            density="comfortable"
+                            link
+                            :disabled="item.versioning === Versioning.Enabled && item.objectLockEnabled"
+                            @click="() => onToggleVersioning(item)"
+                        >
+                            <template #prepend>
+                                <component :is="History" v-if="item.versioning !== Versioning.Enabled" :size="18" />
+                                <component :is="CirclePause" v-else :size="18" />
+                            </template>
+                            <v-list-item-title class="ml-3">
+                                {{ item.versioning !== Versioning.Enabled ? 'Enable Versioning' : 'Suspend Versioning' }}
+                            </v-list-item-title>
+                        </v-list-item>
+                        <v-tooltip
+                            v-if="item.versioning === Versioning.Enabled && item.objectLockEnabled"
+                            activator="parent"
+                            location="left"
+                            max-width="300"
+                        >
+                            Versioning cannot be suspended on a bucket with object lock enabled
+                        </v-tooltip>
+                    </div>
+                    <v-list-item v-if="showLockActionItem(item)" link @click="() => showSetBucketObjectLockDialog(item.name)">
+                        <template #prepend>
+                            <component :is="Lock" :size="18" />
+                        </template>
+                        <v-list-item-title class="ml-3">
+                            {{ item.objectLockEnabled ? 'Lock Settings' : 'Enable Lock' }}
+                        </v-list-item-title>
+                    </v-list-item>
+
+                    <template v-if="bucketEventingEnabled">
+                        <v-list-item
+                            v-if="item.eventingEnabled"
+                            density="comfortable"
+                            link
+                            @click="() => onDisableEventing(item.name)"
+                        >
+                            <template #prepend>
+                                <component :is="BellOff" :size="18" />
+                            </template>
+                            <v-list-item-title class="ml-3">
+                                Disable Eventing
+                            </v-list-item-title>
+                        </v-list-item>
                         <v-list-item
                             density="comfortable"
                             link
-                            @click="openBucket(item.name)"
+                            @click="() => onConfigureEventing(item.name)"
                         >
                             <template #prepend>
-                                <component :is="ArrowRight" :size="18" />
+                                <component :is="Bell" :size="18" />
                             </template>
-                            <v-list-item-title
-                                class="ml-3 text-body-2 font-weight-medium"
-                            >
-                                Open Bucket
+                            <v-list-item-title class="ml-3">
+                                Configure Eventing
                             </v-list-item-title>
                         </v-list-item>
-                        <div>
-                            <v-list-item
-                                v-if="versioningUIEnabled && item.versioning !== Versioning.NotSupported"
-                                density="comfortable"
-                                link
-                                :disabled="item.versioning === Versioning.Enabled && item.objectLockEnabled"
-                                @click="() => onToggleVersioning(item)"
-                            >
-                                <template #prepend>
-                                    <component :is="History" v-if="item.versioning !== Versioning.Enabled" :size="18" />
-                                    <component :is="CirclePause" v-else :size="18" />
-                                </template>
-                                <v-list-item-title class="ml-3">
-                                    {{ item.versioning !== Versioning.Enabled ? 'Enable Versioning' : 'Suspend Versioning' }}
-                                </v-list-item-title>
-                            </v-list-item>
-                            <v-tooltip
-                                v-if="item.versioning === Versioning.Enabled && item.objectLockEnabled"
-                                activator="parent"
-                                location="left"
-                                max-width="300"
-                            >
-                                Versioning cannot be suspended on a bucket with object lock enabled
-                            </v-tooltip>
-                        </div>
+                    </template>
+
+                    <template v-if="configStore.isDefaultBrand">
                         <v-list-item link @click="() => showShareBucketDialog(item.name)">
                             <template #prepend>
-                                <component :is="Share" :size="18" />
+                                <component :is="Share2" :size="18" />
                             </template>
                             <v-list-item-title class="ml-3">
                                 Share Bucket
                             </v-list-item-title>
                         </v-list-item>
-                        <v-list-item link @click="() => showBucketDetailsModal(item.name)">
+                        <v-list-item v-if="downloadPrefixEnabled" link @click="() => onDownloadBucket(item.name)">
                             <template #prepend>
-                                <component :is="ReceiptText" :size="18" />
+                                <component :is="DownloadIcon" :size="18" />
                             </template>
                             <v-list-item-title class="ml-3">
-                                Bucket Details
+                                Download Bucket
                             </v-list-item-title>
                         </v-list-item>
-                        <v-divider class="my-1" />
-                        <v-list-item class="text-error text-body-2" link @click="() => showDeleteBucketDialog(item.name)">
-                            <template #prepend>
-                                <component :is="Trash2" :size="18" />
-                            </template>
-                            <v-list-item-title class="ml-3">
-                                Delete Bucket
-                            </v-list-item-title>
-                        </v-list-item>
-                    </v-list>
-                </v-menu>
-            </template>
-        </v-data-table-server>
-    </v-card>
-    <delete-bucket-dialog v-model="isDeleteBucketDialogShown" :bucket-name="bucketToDelete" />
-    <enter-bucket-passphrase-dialog v-model="isBucketPassphraseDialogOpen" @passphraseEntered="passphraseDialogCallback" />
-    <share-dialog v-model="isShareBucketDialogShown" :bucket-name="shareBucketName" />
+                    </template>
+                    <v-list-item link @click="() => showBucketDetailsModal(item.name)">
+                        <template #prepend>
+                            <component :is="ReceiptText" :size="18" />
+                        </template>
+                        <v-list-item-title class="ml-3">
+                            Bucket Details
+                        </v-list-item-title>
+                    </v-list-item>
+                    <v-divider class="my-1" />
+                    <v-list-item class="text-error text-body-medium" link @click="() => showDeleteBucketDialog(item)">
+                        <template #prepend>
+                            <component :is="Trash2" :size="18" />
+                        </template>
+                        <v-list-item-title class="ml-3">
+                            Delete Bucket
+                        </v-list-item-title>
+                    </v-list-item>
+                </v-list>
+            </v-menu>
+        </template>
+    </v-data-table-server>
+    <cannot-delete-dialog v-model="isCannotDeleteDialogShown" :bucket="bucketToDelete" />
+    <delete-bucket-dialog v-model="isDeleteBucketDialogShown" :bucket-name="bucketToDelete.name" />
+    <enter-bucket-passphrase-dialog v-model="isBucketPassphraseDialogOpen" @passphrase-entered="passphraseDialogCallback" />
     <bucket-details-dialog v-model="isBucketDetailsDialogShown" :bucket-name="bucketDetailsName" />
+    <set-bucket-object-lock-config-dialog v-if="objectLockUIEnabled" v-model="isSetBucketObjectLockDialogShown" :bucket-name="bucketObjectLockName" />
     <toggle-versioning-dialog v-model="bucketToToggleVersioning" @toggle="fetchBuckets" />
+    <template v-if="configStore.isDefaultBrand">
+        <share-dialog v-model="isShareBucketDialogShown" :bucket-name="shareBucketName" />
+        <download-prefix-dialog v-if="downloadPrefixEnabled" v-model="isDownloadPrefixDialogShown" :prefix-type="DownloadPrefixType.Bucket" :bucket="bucketToDownload" />
+    </template>
+    <configure-bucket-eventing-dialog v-if="bucketEventingEnabled" v-model="isConfigureEventingDialogShown" :bucket-name="bucketToConfigureEventing" @updated="fetchBuckets" />
+    <disable-bucket-eventing-dialog v-if="bucketEventingEnabled" v-model="isDisableEventingDialogShown" :bucket-name="bucketToConfigureEventing" @disabled="fetchBuckets" />
 </template>
 
 <script setup lang="ts">
-import { computed, FunctionalComponent, onBeforeUnmount, onMounted, ref, watch } from 'vue';
+import { type FunctionalComponent, computed, defineAsyncComponent, onBeforeUnmount, onMounted, ref, watch  } from 'vue';
 import { useRouter } from 'vue-router';
 import {
     VBtn,
-    VCard,
     VChip,
     VDataTableServer,
     VDivider,
@@ -212,46 +324,66 @@ import {
     VTooltip,
 } from 'vuetify/components';
 import {
+    Archive,
+    ArrowRight,
+    Bell,
+    BellOff,
     CircleCheck,
     CircleHelp,
     CircleMinus,
     CirclePause,
     CircleX,
-    Ellipsis,
-    Search,
-    ReceiptText,
-    Share,
-    Trash2,
-    ArrowRight,
+    DownloadIcon,
     Earth,
+    Ellipsis,
     History,
+    Info,
     LandPlot,
-} from 'lucide-vue-next';
+    Lock,
+    LockKeyhole,
+    LockKeyholeOpen,
+    MapPin,
+    ReceiptText,
+    Search,
+    Share2,
+    Trash2,
+} from '@lucide/vue';
 
 import { Memory, Size } from '@/utils/bytesSize';
-import { Bucket, BucketCursor, BucketMetadata, BucketPage } from '@/types/buckets';
+import { type BucketCursor, type BucketPage, type PlacementDetails, Bucket, BucketMetadata  } from '@/types/buckets';
 import { useBucketsStore } from '@/store/modules/bucketsStore';
 import { useConfigStore } from '@/store/modules/configStore';
-import { useNotify } from '@/utils/hooks';
+import { useNotify } from '@/composables/useNotify';
 import { AnalyticsErrorEventSource } from '@/utils/constants/analyticsEventNames';
 import { useProjectsStore } from '@/store/modules/projectsStore';
 import { DEFAULT_PAGE_LIMIT } from '@/types/pagination';
-import { tableSizeOptions, MAX_SEARCH_VALUE_LENGTH, DataTableHeader } from '@/types/common';
-import { EdgeCredentials } from '@/types/accessGrants';
+import { type DataTableHeader, MAX_SEARCH_VALUE_LENGTH, tableSizeOptions  } from '@/types/common';
+import type { EdgeCredentials } from '@/types/accessGrants';
 import { ROUTES } from '@/router';
 import { usePreCheck } from '@/composables/usePreCheck';
 import { Versioning } from '@/types/versioning';
 import { Time } from '@/utils/time';
-import { useObjectBrowserStore } from '@/store/modules/objectBrowserStore';
+import { capitalizedMode, NO_MODE_SET } from '@/types/objectLock';
+import { DownloadPrefixType } from '@/types/browser';
+import { ProjectRole } from '@/types/projectMembers';
+import { useUsersStore } from '@/store/modules/usersStore';
 
 import DeleteBucketDialog from '@/components/dialogs/DeleteBucketDialog.vue';
 import EnterBucketPassphraseDialog from '@/components/dialogs/EnterBucketPassphraseDialog.vue';
 import ShareDialog from '@/components/dialogs/ShareDialog.vue';
 import BucketDetailsDialog from '@/components/dialogs/BucketDetailsDialog.vue';
 import ToggleVersioningDialog from '@/components/dialogs/ToggleVersioningDialog.vue';
+import SetBucketObjectLockConfigDialog from '@/components/dialogs/SetBucketObjectLockConfigDialog.vue';
+import DownloadPrefixDialog from '@/components/dialogs/DownloadPrefixDialog.vue';
+import CannotDeleteDialog from '@/components/dialogs/CannotDeleteDialog.vue';
+import ConfigureBucketEventingDialog from '@/components/dialogs/ConfigureBucketEventingDialog.vue';
+import DisableBucketEventingDialog from '@/components/dialogs/DisableBucketEventingDialog.vue';
 
+// Async import to avoid circular chunk dependencies
+const IconBucketTonal = defineAsyncComponent(() => import('@/components/icons/IconBucketTonal.vue'));
+
+const userStore = useUsersStore();
 const bucketsStore = useBucketsStore();
-const obStore = useObjectBrowserStore();
 const projectsStore = useProjectsStore();
 const configStore = useConfigStore();
 
@@ -260,26 +392,48 @@ const router = useRouter();
 const { withTrialCheck, withManagedPassphraseCheck } = usePreCheck();
 
 const FIRST_PAGE = 1;
+const ICONS: Record<string, FunctionalComponent> = {
+    Earth,
+    MapPin,
+    Archive,
+};
+
 const areBucketsFetching = ref<boolean>(true);
 const search = ref<string>('');
 const searchTimer = ref<NodeJS.Timeout>();
 const bucketDetailsName = ref<string>('');
+const bucketObjectLockName = ref<string>('');
 const shareBucketName = ref<string>('');
+const isCannotDeleteDialogShown = ref<boolean>(false);
 const isDeleteBucketDialogShown = ref<boolean>(false);
-const bucketToDelete = ref<string>('');
+const bucketToDelete = ref<Bucket>(new Bucket());
 const isBucketPassphraseDialogOpen = ref(false);
 const isShareBucketDialogShown = ref<boolean>(false);
+const isSetBucketObjectLockDialogShown = ref<boolean>(false);
 const isBucketDetailsDialogShown = ref<boolean>(false);
+const isDownloadPrefixDialogShown = ref<boolean>(false);
+const bucketToDownload = ref<string>('');
 const pageWidth = ref<number>(document.body.clientWidth);
 const sortBy = ref<SortItem[] | undefined>([{ key: 'name', order: 'asc' }]);
 const bucketToToggleVersioning = ref<BucketMetadata | null>(null);
+const bucketToConfigureEventing = ref<string>('');
+const isConfigureEventingDialogShown = ref<boolean>(false);
+const isDisableEventingDialogShown = ref<boolean>(false);
 
 let passphraseDialogCallback: () => void = () => {};
 
 type SortItem = {
     key: keyof Bucket;
     order: boolean | 'asc' | 'desc';
-}
+};
+
+const bucketEventingEnabled = computed<boolean>(() => configStore.state.config.bucketEventingUIEnabled);
+
+const showNewPricingTiers = computed<boolean>(() => configStore.state.config.showNewPricingTiers);
+
+const userEmail = computed<string>(() => userStore.state.user.email);
+
+const projectRole = computed<ProjectRole>(() => projectsStore.state.selectedProjectConfig.role);
 
 const displayedItems = computed<Bucket[]>(() => {
     const items = page.value.buckets;
@@ -289,17 +443,38 @@ const displayedItems = computed<Bucket[]>(() => {
     return items;
 });
 
+const downloadPrefixEnabled = computed<boolean>(() => configStore.state.config.downloadPrefixEnabled);
+
+const hasOtherMembers = computed<boolean>(() => projectsStore.state.selectedProjectConfig.membersCount > 1);
+
 const showRegionTag = computed<boolean>(() => {
     return configStore.state.config.enableRegionTag;
 });
 
 /**
- * Whether versioning has been enabled for current project.
+ * Whether versioning is enabled for current project.
  */
-const versioningUIEnabled = computed(() => projectsStore.versioningUIEnabled);
+const versioningUIEnabled = computed(() => configStore.state.config.versioningUIEnabled);
+
+/**
+ * Whether object lock is enabled for current project.
+ */
+const objectLockUIEnabled = computed<boolean>(() => configStore.state.config.objectLockUIEnabled);
 
 const isTableSortable = computed<boolean>(() => {
     return page.value.totalCount <= cursor.value.limit;
+});
+
+const segmentsUIEnabled = computed<boolean>(() => configStore.state.config.segmentsUIEnabled);
+
+const billingEnabled = computed<boolean>(() => configStore.getBillingEnabled(userStore.state.user));
+
+/**
+ * Whether this project has new pricing.
+ */
+const newPricingEnabled = computed<boolean>(() => {
+    if (!billingEnabled.value) return false;
+    return configStore.getProjectHasNewPricing(projectsStore.state.selectedProject.createdAt);
 });
 
 const headers = computed<DataTableHeader[]>(() => {
@@ -310,24 +485,45 @@ const headers = computed<DataTableHeader[]>(() => {
             key: 'name',
             sortable: isTableSortable.value,
         },
-        { title: 'Objects', key: 'objectCount', sortable: isTableSortable.value },
-        { title: 'Segments', key: 'segmentCount', sortable: isTableSortable.value },
-        { title: 'Storage', key: 'storage', sortable: isTableSortable.value },
-        { title: 'Download', key: 'egress', sortable: isTableSortable.value },
     ];
 
+    hdrs.push(
+        { title: 'Objects', key: 'objectCount', sortable: isTableSortable.value },
+    );
+
+    if (!newPricingEnabled.value && segmentsUIEnabled.value)
+        hdrs.push(
+            { title: 'Segments', key: 'segmentCount', sortable: isTableSortable.value },
+        );
+
+    hdrs.push(
+        { title: 'Storage', key: 'storage', sortable: isTableSortable.value },
+        { title: 'Download', key: 'egress', sortable: isTableSortable.value },
+    );
+
     if (showRegionTag.value) {
-        hdrs.push({ title: 'Location', key: 'location', sortable: isTableSortable.value });
+        hdrs.push({ title: showNewPricingTiers.value ? 'Storage Tier' : 'Location', key: 'location', sortable: isTableSortable.value });
     }
 
     if (versioningUIEnabled.value) {
         hdrs.push({ title: 'Versioning', key: 'versioning', sortable: isTableSortable.value });
     }
 
-    hdrs.push(
-        { title: 'Date Created', key: 'since', sortable: isTableSortable.value },
-        { title: '', key: 'actions', width: '0', sortable: false },
-    );
+    if (objectLockUIEnabled.value) {
+        hdrs.push({ title: 'Lock', key: 'objectLockEnabled', sortable: isTableSortable.value });
+    }
+
+    if (bucketEventingEnabled.value) {
+        hdrs.push({ title: 'Eventing', key: 'eventingEnabled', sortable: isTableSortable.value });
+    }
+
+    hdrs.push({ title: 'Date Created', key: 'since', sortable: isTableSortable.value });
+
+    if (hasOtherMembers.value) {
+        hdrs.push({ title: 'Created By', key: 'creatorEmail', sortable: isTableSortable.value });
+    }
+
+    hdrs.push({ title: '', key: 'actions', width: '0', sortable: false });
 
     return hdrs;
 });
@@ -372,6 +568,26 @@ const edgeCredentials = computed((): EdgeCredentials => {
  */
 const bucketsBeingDeleted = computed((): Set<string> => bucketsStore.state.bucketsBeingDeleted);
 
+const selfServeDetails = computed<PlacementDetails[]>(() => projectsStore.state.selectedProjectConfig.availablePlacements);
+
+function getTierIcon(bucket: Bucket): FunctionalComponent {
+    // Legacy global location.
+    if (bucket.location === 'global') return Earth;
+
+    const details = selfServeDetails.value.find(detail => bucket.defaultPlacement === detail.id);
+    if (details?.lucideIcon) {
+        // We can't dynamically import icons from lucide, because vite needs to know all imports at compile time.
+        const icon = ICONS[details.lucideIcon];
+        if (icon) return icon;
+    }
+
+    return LandPlot;
+}
+
+function showLockActionItem(bucket: Bucket): boolean {
+    return objectLockUIEnabled.value && bucket.versioning === Versioning.Enabled;
+}
+
 /**
  * Fetches bucket using api.
  */
@@ -380,7 +596,7 @@ async function fetchBuckets(page = FIRST_PAGE, limit = DEFAULT_PAGE_LIMIT): Prom
         await bucketsStore.getBuckets(page, projectsStore.state.selectedProject.id, limit);
         if (areBucketsFetching.value) areBucketsFetching.value = false;
     } catch (error) {
-        notify.error(`Unable to fetch buckets. ${error.message}`, AnalyticsErrorEventSource.BUCKET_TABLE);
+        notify.notifyError(error, AnalyticsErrorEventSource.BUCKET_TABLE);
     }
 }
 
@@ -417,8 +633,16 @@ function sort(items: Bucket[], sortOptions: SortItem[] | undefined): void {
     case 'versioning':
         items.sort((a, b) => option.order === 'asc' ? a.versioning.localeCompare(b.versioning) : b.versioning.localeCompare(a.versioning));
         break;
+    case 'eventingEnabled':
+        items.sort((a, b) => option.order === 'asc'
+            ? Number(a.eventingEnabled) - Number(b.eventingEnabled)
+            : Number(b.eventingEnabled) - Number(a.eventingEnabled));
+        break;
     case 'since':
         items.sort((a, b) => option.order === 'asc' ? a.since.getTime() - b.since.getTime() : b.since.getTime() - a.since.getTime());
+        break;
+    case 'creatorEmail':
+        items.sort((a, b) => option.order === 'asc' ? a.creatorEmail.localeCompare(b.creatorEmail) : b.creatorEmail.localeCompare(a.creatorEmail));
         break;
     default:
         items.sort((a, b) => option.order === 'asc' ? a.name.localeCompare(b.name) : b.name.localeCompare(a.name));
@@ -432,6 +656,31 @@ async function onToggleVersioning(bucket: Bucket) {
     withTrialCheck(() => { withManagedPassphraseCheck(() => {
         bucketToToggleVersioning.value = new BucketMetadata(bucket.name, bucket.versioning);
     });});
+}
+/**
+ * Opens the configure eventing dialog for the bucket.
+ */
+function onConfigureEventing(bucketName: string) {
+    withTrialCheck(() => { withManagedPassphraseCheck(() => {
+        bucketToConfigureEventing.value = bucketName;
+        isConfigureEventingDialogShown.value = true;
+    });});
+}
+
+function onDisableEventing(bucketName: string) {
+    withTrialCheck(() => { withManagedPassphraseCheck(() => {
+        bucketToConfigureEventing.value = bucketName;
+        isDisableEventingDialogShown.value = true;
+    });});
+}
+
+/**
+ * Returns helper info based on eventing status.
+ */
+function getEventingInfo(enabled: boolean): string {
+    return enabled
+        ? 'Event notifications are configured for this bucket.'
+        : 'No event notifications configured.';
 }
 
 /**
@@ -453,6 +702,24 @@ function getVersioningInfo(status: Versioning): string {
 }
 
 /**
+ * Returns helper info based on object lock status.
+ */
+function getObjectLockInfo(bucket: Bucket): string {
+    switch (true) {
+    case !bucket.objectLockEnabled:
+        return 'Object lock not enabled.';
+    case bucket.defaultRetentionMode === NO_MODE_SET:
+        return 'Default Mode: None';
+    case bucket.defaultRetentionDays !== null:
+        return `Default Mode: ${capitalizedMode(bucket.defaultRetentionMode)} / ${bucket.defaultRetentionDays} day${ bucket.defaultRetentionDays > 1 ? 's' : '' } retention`;
+    case bucket.defaultRetentionYears !== null:
+        return `Default Mode: ${capitalizedMode(bucket.defaultRetentionMode)} / ${bucket.defaultRetentionYears} year${ bucket.defaultRetentionYears > 1 ? 's' : '' } retention`;
+    default:
+        return 'Unknown object lock status.';
+    }
+}
+
+/**
  * Returns icon based on versioning status.
  */
 function getVersioningIcon(status: Versioning): FunctionalComponent {
@@ -467,6 +734,35 @@ function getVersioningIcon(status: Versioning): FunctionalComponent {
         return CircleMinus;
     default:
         return CircleHelp;
+    }
+}
+
+/**
+ * Returns chip color based on versioning status.
+ */
+function getVersioningChipColor(status: Versioning): string {
+    switch (status) {
+    case Versioning.Enabled:
+        return 'success';
+    case Versioning.Suspended:
+        return 'warning';
+    default:
+        return 'default';
+    }
+}
+
+function getVersioningFormattedStatus(status: Versioning): string {
+    switch (status) {
+    case Versioning.Unversioned:
+        return 'Off';
+    case Versioning.Enabled:
+        return 'On';
+    case Versioning.NotSupported:
+        return 'No';
+    case Versioning.Suspended:
+        return 'Paused';
+    default:
+        return status;
     }
 }
 
@@ -510,9 +806,6 @@ function openBucket(bucketName: string): void {
                 }
             }
 
-            const objCount = bucketsStore.state.page.buckets?.find((bucket) => bucket.name === bucketName)?.objectCount ?? 0;
-            obStore.setObjectCountOfSelectedBucket(objCount);
-
             await router.push({
                 name: ROUTES.Bucket.name,
                 params: {
@@ -528,6 +821,32 @@ function openBucket(bucketName: string): void {
 }
 
 /**
+ * Handles download bucket action.
+ */
+function onDownloadBucket(bucketName: string): void {
+    withTrialCheck(() => { withManagedPassphraseCheck(async () => {
+        if (!bucketName) {
+            return;
+        }
+
+        function setBucketDownload(): void {
+            bucketToDownload.value = bucketName;
+            isDownloadPrefixDialogShown.value = true;
+        }
+
+        if (promptForPassphrase.value) {
+            passphraseDialogCallback = setBucketDownload;
+
+            bucketsStore.setFileComponentBucketName(bucketName);
+            isBucketPassphraseDialogOpen.value = true;
+            return;
+        }
+
+        setBucketDownload();
+    });});
+}
+
+/**
  * Displays the Bucket Details dialog.
  */
 function showBucketDetailsModal(bucketName: string): void {
@@ -538,9 +857,22 @@ function showBucketDetailsModal(bucketName: string): void {
 /**
  * Displays the Delete Bucket dialog.
  */
-function showDeleteBucketDialog(bucketName: string): void {
-    bucketToDelete.value = bucketName;
+function showDeleteBucketDialog(bucket: Bucket): void {
+    bucketToDelete.value = bucket;
+
+    if (projectRole.value === ProjectRole.Member && bucket.creatorEmail !== userEmail.value) {
+        isCannotDeleteDialogShown.value = true;
+        return;
+    }
+
     isDeleteBucketDialogShown.value = true;
+}
+
+function showSetBucketObjectLockDialog(bucketName: string): void {
+    withTrialCheck(() => { withManagedPassphraseCheck(() => {
+        bucketObjectLockName.value = bucketName;
+        isSetBucketObjectLockDialogShown.value = true;
+    });});
 }
 
 /**

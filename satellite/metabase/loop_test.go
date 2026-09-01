@@ -13,9 +13,11 @@ import (
 
 	"storj.io/common/storj"
 	"storj.io/common/testcontext"
+	"storj.io/common/testrand"
 	"storj.io/common/uuid"
 	"storj.io/storj/satellite/metabase"
 	"storj.io/storj/satellite/metabase/metabasetest"
+	"storj.io/storj/shared/dbutil"
 )
 
 func TestIterateLoopSegments(t *testing.T) {
@@ -28,6 +30,21 @@ func TestIterateLoopSegments(t *testing.T) {
 				},
 				ErrClass: &metabase.ErrInvalidRequest,
 				ErrText:  "BatchSize is negative",
+			}.Check(ctx, t, db)
+			metabasetest.Verify{}.Check(ctx, t, db)
+		})
+
+		t.Run("Limit is too large", func(t *testing.T) {
+			defer metabasetest.DeleteAll{}.Check(ctx, t, db)
+			// rejected rather than clamped, so that a caller grouping the entries it
+			// receives by the size it asked for cannot end up with a group spanning
+			// two pages, whose earlier entries the iterator has already overwritten
+			metabasetest.IterateLoopSegments{
+				Opts: metabase.IterateLoopSegments{
+					BatchSize: 50001,
+				},
+				ErrClass: &metabase.ErrInvalidRequest,
+				ErrText:  "BatchSize is too large, maximum is 50000",
 			}.Check(ctx, t, db)
 			metabasetest.Verify{}.Check(ctx, t, db)
 		})
@@ -245,6 +262,7 @@ func TestIterateLoopSegments(t *testing.T) {
 						EncryptedKey:      []byte{3},
 						EncryptedKeyNonce: []byte{4},
 						EncryptedETag:     []byte{5},
+						EncryptedChecksum: []byte{6},
 					}
 				}
 			}
@@ -348,58 +366,205 @@ func TestIterateLoopSegments(t *testing.T) {
 			require.NoError(t, err)
 		})
 
-		t.Run("spanner stale reads", func(t *testing.T) {
-			if db.Implementation().String() != "spanner" {
-				t.Skip("test works only with spanner")
+		t.Run("entries of a batch do not share AliasPieces", func(t *testing.T) {
+			defer metabasetest.DeleteAll{}.Check(ctx, t, db)
+
+			// AliasPieces.SetBytes reuses the backing array, so an iterator scanning
+			// every row into one entry used to hand out entries that all pointed at the
+			// last row's aliases. Consumers (the ranged loop's provider) collect a whole
+			// batch before processing it, so each entry must own its aliases.
+			const numberOfSegments = 5
+
+			obj := metabasetest.RandObjectStream()
+			metabasetest.CreateTestObject{
+				// give every segment its own storage node, hence its own alias
+				CreateSegment: func(object metabase.Object, index int) metabase.Segment {
+					pieces := metabase.Pieces{{Number: 0, StorageNode: testrand.NodeID()}}
+					position := metabase.SegmentPosition{Part: 0, Index: uint32(index)}
+
+					metabasetest.BeginSegment{
+						Opts: metabase.BeginSegment{
+							ObjectStream:        object.ObjectStream,
+							Position:            position,
+							RootPieceID:         storj.PieceID{byte(index + 1)},
+							Pieces:              pieces,
+							ObjectExistsChecked: true,
+						},
+					}.Check(ctx, t, db)
+
+					metabasetest.CommitSegment{
+						Opts: metabase.CommitSegment{
+							ObjectStream:      object.ObjectStream,
+							Position:          position,
+							RootPieceID:       storj.PieceID{1},
+							Pieces:            pieces,
+							EncryptedKey:      []byte{3},
+							EncryptedKeyNonce: []byte{4},
+							EncryptedETag:     []byte{5},
+							EncryptedChecksum: []byte{6},
+							EncryptedSize:     1024,
+							PlainSize:         512,
+							PlainOffset:       int64(index) * 512,
+							Redundancy:        metabasetest.DefaultRedundancy,
+						},
+					}.Check(ctx, t, db)
+
+					return metabase.Segment{}
+				},
+			}.Run(ctx, t, db, obj, numberOfSegments)
+
+			var entries []metabase.LoopSegmentEntry
+			err := db.IterateLoopSegments(ctx, metabase.IterateLoopSegments{
+				BatchSize: numberOfSegments,
+			}, func(ctx context.Context, lsi metabase.LoopSegmentsIterator) error {
+				var entry metabase.LoopSegmentEntry
+				for lsi.Next(ctx, &entry) {
+					entries = append(entries, entry)
+				}
+				return nil
+			})
+			require.NoError(t, err)
+			require.Len(t, entries, numberOfSegments)
+
+			aliasMap, err := db.LatestNodesAliasMap(ctx)
+			require.NoError(t, err)
+
+			seen := map[metabase.NodeAlias]bool{}
+			for _, entry := range entries {
+				require.Len(t, entry.AliasPieces, 1)
+				alias := entry.AliasPieces[0].Alias
+				require.False(t, seen[alias], "AliasPieces are shared between entries of a batch")
+				seen[alias] = true
+
+				// and they must still describe the same node as the converted pieces
+				require.Len(t, entry.Pieces, 1)
+				id, ok := aliasMap.Node(alias)
+				require.True(t, ok)
+				require.Equal(t, entry.Pieces[0].StorageNode, id)
+			}
+		})
+
+		t.Run("batch size", func(t *testing.T) {
+			defer metabasetest.DeleteAll{}.Check(ctx, t, db)
+
+			segments := []metabase.RawSegment{}
+			expectedSegments := []metabase.LoopSegmentEntry{}
+			expectedSource := db.ChooseAdapter(uuid.UUID{}).Name()
+			for i := 0; i < 10; i++ {
+				segment := metabasetest.DefaultRawSegment(metabasetest.RandObjectStream(), metabase.SegmentPosition{})
+				segments = append(segments, segment)
+				expectedSegments = append(expectedSegments, metabase.LoopSegmentEntry{
+					StreamID:      segment.StreamID,
+					Position:      segment.Position,
+					CreatedAt:     segment.CreatedAt,
+					ExpiresAt:     segment.ExpiresAt,
+					RepairedAt:    segment.RepairedAt,
+					RootPieceID:   segment.RootPieceID,
+					EncryptedSize: segment.EncryptedSize,
+					PlainOffset:   segment.PlainOffset,
+					PlainSize:     segment.PlainSize,
+					Pieces:        segment.Pieces,
+					Redundancy:    segment.Redundancy,
+					Placement:     segment.Placement,
+					Source:        expectedSource,
+				})
+			}
+
+			err := db.TestingBatchInsertSegments(ctx, segments)
+			require.NoError(t, err)
+
+			for _, batchSize := range []int{0, 1, 2, 3, 8, 9, 2000} {
+				metabasetest.IterateLoopSegments{
+					Opts: metabase.IterateLoopSegments{
+						BatchSize: batchSize,
+					},
+					Result: expectedSegments,
+				}.Check(ctx, t, db)
+			}
+		})
+
+		t.Run("fixed read timestamp", func(t *testing.T) {
+			impl := db.Implementation()
+			supported := impl == dbutil.Cockroach || impl == dbutil.TiDB
+			if !supported {
+				// backends without fixed-timestamp reads must refuse instead
+				// of silently falling back to live reads
+				metabasetest.IterateLoopSegments{
+					Opts: metabase.IterateLoopSegments{
+						BatchSize:     1,
+						ReadTimestamp: time.Now(),
+					},
+					ErrClass: &metabase.ErrInvalidRequest,
+					ErrText:  "/ReadTimestamp is not supported/",
+				}.Check(ctx, t, db)
+
+				// unless the caller allows live reads, for testing and
+				// restored backups
+				defer metabasetest.DeleteAll{}.Check(ctx, t, db)
+
+				segment := metabasetest.DefaultRawSegment(metabasetest.RandObjectStream(), metabase.SegmentPosition{})
+				require.NoError(t, db.TestingBatchInsertSegments(ctx, []metabase.RawSegment{segment}))
+
+				metabasetest.IterateLoopSegments{
+					Opts: metabase.IterateLoopSegments{
+						BatchSize:      1,
+						ReadTimestamp:  time.Now(),
+						AllowLiveReads: true,
+					},
+					Result: []metabase.LoopSegmentEntry{{
+						StreamID:      segment.StreamID,
+						Position:      segment.Position,
+						CreatedAt:     segment.CreatedAt,
+						ExpiresAt:     segment.ExpiresAt,
+						RepairedAt:    segment.RepairedAt,
+						RootPieceID:   segment.RootPieceID,
+						EncryptedSize: segment.EncryptedSize,
+						PlainOffset:   segment.PlainOffset,
+						PlainSize:     segment.PlainSize,
+						Pieces:        segment.Pieces,
+						Redundancy:    segment.Redundancy,
+						Placement:     segment.Placement,
+						Source:        db.ChooseAdapter(uuid.UUID{}).Name(),
+					}},
+				}.Check(ctx, t, db)
+				return
 			}
 
 			defer metabasetest.DeleteAll{}.Check(ctx, t, db)
 
-			metabasetest.IterateLoopSegments{
-				Opts: metabase.IterateLoopSegments{
-					BatchSize:            1,
-					SpannerReadTimestamp: time.Time{},
-				},
-				Result: nil,
-			}.Check(ctx, t, db)
-
-			metabasetest.IterateLoopSegments{
-				Opts: metabase.IterateLoopSegments{
-					BatchSize:            1,
-					SpannerReadTimestamp: time.Now().Add(-time.Microsecond),
-				},
-				Result: nil,
-			}.Check(ctx, t, db)
-
-			metabasetest.IterateLoopSegments{
-				Opts: metabase.IterateLoopSegments{
-					BatchSize:            1,
-					SpannerReadTimestamp: time.Now().Add(-time.Hour),
-				},
-				Result: nil,
-			}.Check(ctx, t, db)
-
+			// These read timestamps come from the local clock but are resolved
+			// against database commit timestamps, and the two clocks agree only
+			// to within some unknown skew. So beforeUpload needs a quiet window
+			// on both sides: far enough after the preceding commits (schema
+			// creation, the previous subtest's cleanup) that it does not read an
+			// older state, and far enough before the upload that it cannot land
+			// after it. Skew in either direction is otherwise a coin flip.
+			const clockMargin = 1200 * time.Millisecond
+			time.Sleep(clockMargin)
 			beforeUpload := time.Now()
-			object := metabasetest.CreateObject(ctx, t, db, metabasetest.RandObjectStream(), 1)
-			// using only time.Now() make this test flaky on CI
-			afterUpload := time.Now().Add(time.Second)
+			time.Sleep(clockMargin)
 
+			object := metabasetest.CreateObject(ctx, t, db, metabasetest.RandObjectStream(), 1)
+			// let the read timestamps be safely in the past; TiDB and
+			// CockroachDB refuse timestamps at or after the current time
+			time.Sleep(clockMargin)
+			afterUpload := time.Now().Add(-100 * time.Millisecond)
+
+			// reading before the object was committed must not see it
 			metabasetest.IterateLoopSegments{
 				Opts: metabase.IterateLoopSegments{
-					BatchSize:            1,
-					SpannerReadTimestamp: beforeUpload,
+					BatchSize:     1,
+					ReadTimestamp: beforeUpload,
 				},
 				Result: nil,
 			}.Check(ctx, t, db)
 
+			// reading after the object was committed must see it
 			defaultSegment := metabasetest.DefaultRawSegment(object.ObjectStream, metabase.SegmentPosition{})
-
-			expectedSource := db.ChooseAdapter(object.ProjectID).Name()
-
 			metabasetest.IterateLoopSegments{
 				Opts: metabase.IterateLoopSegments{
-					BatchSize:            1,
-					SpannerReadTimestamp: afterUpload,
+					BatchSize:     1,
+					ReadTimestamp: afterUpload,
 				},
 				Result: []metabase.LoopSegmentEntry{
 					{
@@ -410,10 +575,103 @@ func TestIterateLoopSegments(t *testing.T) {
 						RootPieceID:   defaultSegment.RootPieceID,
 						Redundancy:    defaultSegment.Redundancy,
 						Pieces:        defaultSegment.Pieces,
-						Source:        expectedSource,
+						Source:        db.ChooseAdapter(object.ProjectID).Name(),
 					},
 				},
 			}.Check(ctx, t, db)
+		})
+
+		t.Run("consistent snapshot across concurrent copy", func(t *testing.T) {
+			// This is the property the gc-bf safepoint exists for: a server-side
+			// copy interleaved with the bloom-filter scan must not hide a live
+			// piece. A copy relocates a piece reference to a new segment (same
+			// RootPieceID/pieces as the original); if that copy sorts before the
+			// loop cursor while the original is deleted, a live read of the next
+			// batch sees neither, and GC would drop still-referenced pieces. A
+			// pinned ReadTimestamp reads one snapshot across all batches, so the
+			// original stays visible and its pieces are retained.
+			impl := db.Implementation()
+			if impl != dbutil.Cockroach && impl != dbutil.TiDB {
+				t.Skip("requires fixed-timestamp reads")
+			}
+
+			// StreamID controls scan order (ORDER BY stream_id ASC). The filler
+			// sorts first so the cursor advances past it before we mutate, while
+			// the original is still ahead; the copy sorts before the cursor so a
+			// non-snapshot read of the next batch skips it.
+			newStream := func(first byte, key string) metabase.ObjectStream {
+				s := metabasetest.RandObjectStream()
+				s.ObjectKey = metabase.ObjectKey(key)
+				s.StreamID = uuid.UUID{first}
+				return s
+			}
+			copyStreamFor := func(o metabase.Object, first byte, key string) metabase.ObjectStream {
+				s := o.ObjectStream
+				s.ObjectKey = metabase.ObjectKey(key)
+				s.StreamID = uuid.UUID{first}
+				return s
+			}
+
+			// scanWithCopy runs a BatchSize=1 loop and, right after the first
+			// segment, server-side copies original to copyStream and deletes the
+			// original, then reports the stream IDs the scan observed.
+			scanWithCopy := func(readTS time.Time, original metabase.Object, copyStream metabase.ObjectStream) []uuid.UUID {
+				var seen []uuid.UUID
+				injected := false
+				err := db.IterateLoopSegments(ctx, metabase.IterateLoopSegments{
+					BatchSize:     1,
+					ReadTimestamp: readTS,
+				}, func(iterCtx context.Context, it metabase.LoopSegmentsIterator) error {
+					var item metabase.LoopSegmentEntry
+					for it.Next(iterCtx, &item) {
+						seen = append(seen, item.StreamID)
+						if injected {
+							continue
+						}
+						injected = true
+						metabasetest.CreateObjectCopy{
+							OriginalObject:   original,
+							CopyObjectStream: &copyStream,
+						}.Run(ctx, t, db)
+						_, err := db.DeleteObjectExactVersion(iterCtx, metabase.DeleteObjectExactVersion{
+							ObjectLocation: original.Location(),
+							Version:        original.Version,
+						})
+						require.NoError(t, err)
+					}
+					return nil
+				})
+				require.NoError(t, err)
+				return seen
+			}
+
+			// Pinned: the snapshot hides the mid-scan copy+delete, so the
+			// original (and its still-live pieces) stays visible to the scan.
+			metabasetest.DeleteAll{}.Check(ctx, t, db)
+			metabasetest.CreateObject(ctx, t, db, newStream(0x40, "filler"), 1)
+			original := metabasetest.CreateObject(ctx, t, db, newStream(0x80, "original"), 1)
+			// let the read timestamp be safely in the past; TiDB and CockroachDB
+			// refuse timestamps at or after the current time
+			time.Sleep(1200 * time.Millisecond)
+			readTS := time.Now().Add(-100 * time.Millisecond)
+
+			seen := scanWithCopy(readTS, original, copyStreamFor(original, 0x10, "copy-pinned"))
+			require.Contains(t, seen, original.StreamID,
+				"pinned scan must still see the original's live pieces despite the concurrent copy+delete")
+
+			// Control: without a pinned snapshot the same interleaving hides the
+			// piece — the original is gone and the copy sorts before the cursor,
+			// so the next batch sees neither. This is the data loss the safepoint
+			// prevents; asserting it proves the test above is not vacuous.
+			metabasetest.DeleteAll{}.Check(ctx, t, db)
+			metabasetest.CreateObject(ctx, t, db, newStream(0x40, "filler"), 1)
+			original = metabasetest.CreateObject(ctx, t, db, newStream(0x80, "original"), 1)
+			copyStream := copyStreamFor(original, 0x10, "copy-live")
+
+			seen = scanWithCopy(time.Time{}, original, copyStream)
+			require.NotContains(t, seen, original.StreamID, "control: original should be deleted")
+			require.NotContains(t, seen, copyStream.StreamID,
+				"control: a live read misses the piece the safepoint is designed to retain")
 		})
 	})
 }

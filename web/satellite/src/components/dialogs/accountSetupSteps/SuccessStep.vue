@@ -7,11 +7,11 @@
             <v-col class="text-center py-10">
                 <component :is="CircleCheckBig" :size="40" />
 
-                <p class="text-overline mt-4 mb-2">
+                <p class="text-label-medium mt-4 mb-2">
                     Account Complete
                 </p>
-                <h2 class="mb-3">You are now ready to use Storj</h2>
-                <p class="mb-2">Create your first bucket, and start uploading files.</p>
+                <h2 class="mb-3">You are now ready to use {{ configStore.brandName }}</h2>
+                <p class="mb-2">{{ configStore.state.config.newProjectTierLockEnabled ? 'Start by creating a project to organize your data.' : 'Create your first bucket, and start uploading files.' }}</p>
                 <p>Let us know if you need any help getting started!</p>
                 <v-btn
                     id="continue-btn"
@@ -30,22 +30,23 @@
 
 <script setup lang="ts">
 import { VBtn, VCol, VContainer, VRow } from 'vuetify/components';
-import { CircleCheckBig, ChevronRight } from 'lucide-vue-next';
-import { nextTick } from 'vue';
+import { CircleCheckBig, ChevronRight } from '@lucide/vue';
 import { useRouter } from 'vue-router';
 
 import { useUsersStore } from '@/store/modules/usersStore';
 import { AnalyticsEvent } from '@/utils/constants/analyticsEventNames';
 import { ONBOARDING_STEPPER_STEPS } from '@/types/users';
-import { useAppStore } from '@/store/modules/appStore';
 import { useAnalyticsStore } from '@/store/modules/analyticsStore';
 import { ROUTES } from '@/router';
 import { useProjectsStore } from '@/store/modules/projectsStore';
+import { useConfigStore } from '@/store/modules/configStore';
+import { useAppStore } from '@/store/modules/appStore';
 
 const analyticsStore = useAnalyticsStore();
-const appStore = useAppStore();
 const projectsStore = useProjectsStore();
 const userStore = useUsersStore();
+const configStore = useConfigStore();
+const appStore = useAppStore();
 
 const router = useRouter();
 
@@ -53,24 +54,32 @@ defineProps<{
     loading: boolean,
 }>();
 
-async function finishSetup() {
+const emit = defineEmits<{
+    finish: [];
+}>();
+
+async function finishSetup(): Promise<void> {
+    await Promise.all([
+        userStore.updateSettings({ onboardingStep: ONBOARDING_STEPPER_STEPS[0] }),
+        userStore.getUser(),
+    ]);
+
     const projects = projectsStore.state.projects;
-    if (!projects.length) {
-        await projectsStore.createDefaultProject(userStore.state.user.id);
+    if (!projectsStore.state.invitations.length && projects.length) {
+        projectsStore.selectProject(projects[0].id);
+
+        await router.push({
+            name: ROUTES.Dashboard.name,
+            params: { id: projectsStore.state.selectedProject.urlId },
+        });
+        analyticsStore.eventTriggered(AnalyticsEvent.NAVIGATE_PROJECTS);
     }
-    projectsStore.selectProject(projects[0].id);
 
-    analyticsStore.eventTriggered(AnalyticsEvent.NAVIGATE_PROJECTS);
-    await userStore.updateSettings({ onboardingStep: ONBOARDING_STEPPER_STEPS[0] });
-    await userStore.getUser();
+    if (configStore.state.config.optInPopupEnabled && userStore.state.user.isPaid) {
+        appStore.togglePricingOptInDialog(true);
+    }
 
-    appStore.toggleAccountSetup(false);
-
-    await nextTick();
-    router.push({
-        name: ROUTES.Dashboard.name,
-        params: { id: projectsStore.state.selectedProject.urlId },
-    });
+    emit('finish');
 }
 
 defineExpose({

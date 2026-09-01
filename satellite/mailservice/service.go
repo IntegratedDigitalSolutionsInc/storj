@@ -1,21 +1,27 @@
 // Copyright (C) 2019 Storj Labs, Inc.
 // See LICENSE for copying information
 
+//go:generate go run gen.go -dir ../../web/satellite/static/emails
+
 package mailservice
 
 import (
 	"bytes"
 	"context"
+	"fmt"
 	htmltemplate "html/template"
 	"path/filepath"
 	"sync"
+	texttemplate "text/template"
 	"time"
 
 	"github.com/spacemonkeygo/monkit/v3"
+	"github.com/zeebo/errs"
 	"go.uber.org/zap"
 
 	"storj.io/common/context2"
 	"storj.io/storj/private/post"
+	"storj.io/storj/satellite/tenancy"
 )
 
 // Config defines values needed by mailservice service.
@@ -30,6 +36,33 @@ type Config struct {
 	ClientID          string `help:"oauth2 app's client id" default:""`
 	ClientSecret      string `help:"oauth2 app's client secret" default:""`
 	TokenURI          string `help:"uri which is used when retrieving new access token" default:""`
+}
+
+// WhiteLabelConfig holds tenant-specific branding and SMTP configuration.
+type WhiteLabelConfig struct {
+	BrandName         string
+	LogoURL           string
+	ExternalAddress   string
+	HomepageURL       string
+	SupportURL        string
+	DocsURL           string
+	SourceCodeURL     string
+	SocialURL         string
+	PrivacyPolicyURL  string
+	TermsOfServiceURL string
+	TermsOfUseURL     string
+	BlogURL           string
+	CompanyName       string
+	AddressLine1      string
+	AddressLine2      string
+	PrimaryColor      string
+}
+
+// TenantConfig holds configuration for multiple tenants.
+type TenantConfig struct {
+	TenantSenderMap    map[string]Sender
+	WhiteLabelConfig   map[string]WhiteLabelConfig
+	TenantExtraHeaders map[string]map[string]string
 }
 
 var (
@@ -50,6 +83,12 @@ type Message interface {
 	Subject() string
 }
 
+type emailVars struct {
+	WhiteLabelConfig
+	// Data is the message-specific data to be used in the template.
+	Data any
+}
+
 // Service sends template-backed email messages through SMTP.
 //
 // architecture: Service
@@ -57,27 +96,29 @@ type Service struct {
 	log    *zap.Logger
 	Sender Sender
 
+	tenantConfig        TenantConfig
+	defaultBranding     WhiteLabelConfig
+	defaultExtraHeaders map[string]string
+
 	html *htmltemplate.Template
-	// TODO(yar): prepare plain text version
-	// text *texttemplate.Template
+	text *texttemplate.Template
 
 	sending sync.WaitGroup
 }
 
 // New creates new service.
-func New(log *zap.Logger, sender Sender, templatePath string) (*Service, error) {
+func New(log *zap.Logger, sender Sender, templatePath string, cfg TenantConfig, defaultBranding WhiteLabelConfig, defaultExtraHeaders map[string]string) (*Service, error) {
 	var err error
-	service := &Service{log: log, Sender: sender}
-
-	// TODO(yar): prepare plain text version
-	// service.text, err = texttemplate.ParseGlob(filepath.Join(templatePath, "*.txt"))
-	// if err != nil {
-	// 	return nil, err
-	// }
+	service := &Service{log: log, Sender: sender, tenantConfig: cfg, defaultBranding: defaultBranding, defaultExtraHeaders: defaultExtraHeaders}
 
 	service.html, err = htmltemplate.ParseGlob(filepath.Join(templatePath, "*.html"))
 	if err != nil {
-		return nil, err
+		return nil, errs.Wrap(err)
+	}
+
+	service.text, err = texttemplate.ParseGlob(filepath.Join(templatePath, "*.txt"))
+	if err != nil {
+		return nil, errs.Wrap(err)
 	}
 
 	return service, nil
@@ -102,7 +143,7 @@ func (service *Service) SendRenderedAsync(ctx context.Context, to []post.Address
 	go func() {
 		defer service.sending.Done()
 
-		ctx, cancel := context.WithTimeout(context2.WithoutCancellation(ctx), 5*time.Second)
+		ctx, cancel := context.WithTimeout(context2.WithoutCancellation(ctx), 10*time.Second)
 		defer cancel()
 
 		err := service.SendRendered(ctx, to, msg)
@@ -114,36 +155,43 @@ func (service *Service) SendRenderedAsync(ctx context.Context, to []post.Address
 
 		if err != nil {
 			service.log.Error("fail sending email",
+				zap.String("subject", msg.Subject()),
 				zap.Strings("recipients", recipients),
 				zap.Error(err))
 		} else {
 			service.log.Info("email sent successfully",
+				zap.String("subject", msg.Subject()),
 				zap.Strings("recipients", recipients))
 		}
 	}()
 }
 
 // SendRendered renders content from htmltemplate and texttemplate templates then sends it.
+// It merges tenant-specific email variables with the message data before rendering.
 func (service *Service) SendRendered(ctx context.Context, to []post.Address, msg Message) (err error) {
 	defer mon.Task()(&ctx)(&err)
 
-	var htmlBuffer bytes.Buffer
-	var textBuffer bytes.Buffer
+	// Get tenant-specific email variables
+	templateVars := service.getEmailVars(ctx)
+	templateVars.Data = msg
 
-	// TODO(yar): prepare plain text version
-	// if err = service.text.ExecuteTemplate(&textBuffer, msg.Template() + ".txt", msg); err != nil {
-	// 	return
-	// }
+	var htmlBuffer, textBuffer bytes.Buffer
 
-	if err = service.html.ExecuteTemplate(&htmlBuffer, msg.Template()+".html", msg); err != nil {
-		return
+	if err = service.html.ExecuteTemplate(&htmlBuffer, msg.Template()+".html", templateVars); err != nil {
+		return err
+	}
+	if err = service.text.ExecuteTemplate(&textBuffer, msg.Template()+".txt", templateVars); err != nil {
+		return err
 	}
 
+	sender := service.getSenderForTenant(ctx)
+
 	m := &post.Message{
-		From:      service.Sender.FromAddress(),
+		From:      sender.FromAddress(),
 		To:        to,
-		Subject:   msg.Subject(),
+		Subject:   fmt.Sprintf("%s - %s", templateVars.BrandName, msg.Subject()),
 		PlainText: textBuffer.String(),
+		Headers:   service.getExtraHeadersForTenant(ctx),
 		Parts: []post.Part{
 			{
 				Type:    "text/html; charset=UTF-8",
@@ -152,5 +200,70 @@ func (service *Service) SendRendered(ctx context.Context, to []post.Address, msg
 		},
 	}
 
-	return service.Sender.SendEmail(ctx, m)
+	err = sender.SendEmail(ctx, m)
+	if err != nil {
+		tenantID := tenancy.TenantIDFromContext(ctx)
+		if tenantID != "" {
+			err = errs.Combine(err, errs.New("error sending email for tenant ID: %s", tenantID))
+		}
+	}
+
+	return err
+}
+
+func (service *Service) getEmailVars(ctx context.Context) emailVars {
+	defer mon.Task()(&ctx)(nil)
+
+	defaultVars := emailVars{
+		WhiteLabelConfig: service.defaultBranding,
+	}
+
+	if len(service.tenantConfig.WhiteLabelConfig) == 0 {
+		// No config provider - return Storj defaults
+		return defaultVars
+	}
+
+	tenantID := tenancy.TenantIDFromContext(ctx)
+	wlCfg := service.tenantConfig.WhiteLabelConfig[tenantID]
+	if wlCfg == (WhiteLabelConfig{}) {
+		return defaultVars
+	}
+
+	return emailVars{
+		WhiteLabelConfig: wlCfg,
+	}
+}
+
+func (service *Service) getSenderForTenant(ctx context.Context) Sender {
+	defer mon.Task()(&ctx)(nil)
+
+	tenantID := tenancy.TenantIDFromContext(ctx)
+	if tenantID != "" {
+		if sender, exists := service.tenantConfig.TenantSenderMap[tenantID]; exists {
+			return sender
+		}
+	}
+
+	return service.Sender
+}
+
+// getExtraHeadersForTenant returns extra SMTP headers for the current tenant, or the
+// default headers when no tenant-specific sender is configured. This prevents provider-specific
+// headers (e.g. X-Mailgun-*) from being sent through third-party SMTP gateways.
+func (service *Service) getExtraHeadersForTenant(ctx context.Context) map[string]string {
+	tenantID := tenancy.TenantIDFromContext(ctx)
+	if tenantID != "" {
+		if _, hasSender := service.tenantConfig.TenantSenderMap[tenantID]; hasSender {
+			return service.tenantConfig.TenantExtraHeaders[tenantID]
+		}
+	}
+	return service.defaultExtraHeaders
+}
+
+// TestSetTenantSender sets tenant-specific sender for testing purposes.
+func (service *Service) TestSetTenantSender(tenantID string, sender Sender) {
+	if service.tenantConfig.TenantSenderMap == nil {
+		service.tenantConfig.TenantSenderMap = make(map[string]Sender)
+	}
+	service.tenantConfig.TenantSenderMap[tenantID] = sender
 }

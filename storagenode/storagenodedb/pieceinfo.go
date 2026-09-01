@@ -85,7 +85,7 @@ func (db *v0PieceInfoDB) getAllPiecesOwnedBy(ctx context.Context, blobStore blob
 // WalkSatelliteV0Pieces executes walkFunc for each locally stored piece, stored with storage
 // format V0 in the namespace of the given satellite. If walkFunc returns a non-nil error,
 // WalkSatelliteV0Pieces will stop iterating and return the error immediately. The ctx parameter
-// parameter is intended specifically to allow canceling iteration early.
+// is intended specifically to allow canceling iteration early.
 //
 // If blobStore is nil, the .Stat() and .FullPath() methods of the provided StoredPieceAccess
 // instances will not work, but otherwise everything should be ok.
@@ -163,7 +163,7 @@ func (db *v0PieceInfoDB) Delete(ctx context.Context, satelliteID storj.NodeID, p
 }
 
 // GetExpired gets ExpiredInfo records for pieces that are expired.
-func (db *v0PieceInfoDB) GetExpired(ctx context.Context, expiredAt time.Time) (info []pieces.ExpiredInfo, err error) {
+func (db *v0PieceInfoDB) GetExpired(ctx context.Context, expiredAt time.Time) (info []*pieces.ExpiredInfoRecords, err error) {
 	defer mon.Task()(&ctx)(&err)
 
 	rows, err := db.QueryContext(ctx, `
@@ -178,16 +178,25 @@ func (db *v0PieceInfoDB) GetExpired(ctx context.Context, expiredAt time.Time) (i
 	}
 	defer func() { err = errs.Combine(err, rows.Close()) }()
 
+	expiredListsBySatelliteID := make(map[storj.NodeID]*pieces.ExpiredInfoRecords)
+	expiredLists := make([]*pieces.ExpiredInfoRecords, 0)
+
 	for rows.Next() {
 		expired := pieces.ExpiredInfo{InPieceInfo: true}
 		err = rows.Scan(&expired.SatelliteID, &expired.PieceID)
 		if err != nil {
 			return nil, ErrPieceInfo.Wrap(err)
 		}
-		info = append(info, expired)
+		satRecords, ok := expiredListsBySatelliteID[expired.SatelliteID]
+		if !ok {
+			satRecords = pieces.NewExpiredInfoRecords(expired.SatelliteID, true, 1)
+			expiredLists = append(expiredLists, satRecords)
+			expiredListsBySatelliteID[expired.SatelliteID] = satRecords
+		}
+		satRecords.Append(expired.PieceID, 0)
 	}
 
-	return info, ErrPieceInfo.Wrap(rows.Err())
+	return expiredLists, ErrPieceInfo.Wrap(rows.Err())
 }
 
 func (db *v0PieceInfoDB) DeleteExpirations(ctx context.Context, expiredAt time.Time) (err error) {

@@ -2,11 +2,12 @@
 // See LICENSE for copying information.
 
 import {
+    type BucketCursor,
+    type BucketsApi,
     Bucket,
-    BucketCursor,
     BucketMetadata,
     BucketPage,
-    BucketsApi,
+    PlacementDetails,
 } from '@/types/buckets';
 import { HttpClient } from '@/utils/httpClient';
 import { APIError } from '@/utils/error';
@@ -27,9 +28,10 @@ export class BucketsHttpApi implements BucketsApi {
      * @returns BucketPage
      * @throws Error
      */
-    public async get(projectID: string, before: Date, cursor: BucketCursor): Promise<BucketPage> {
+    public async get(projectID: string, since: Date, before: Date, cursor: BucketCursor): Promise<BucketPage> {
         const paramsString = Object.entries({
             projectID,
+            since: since.toISOString(),
             before: before.toISOString(),
             limit: cursor.limit,
             search: encodeURIComponent(cursor.search),
@@ -55,6 +57,7 @@ export class BucketsHttpApi implements BucketsApi {
                     usage.bucketName,
                     getVersioning(usage.versioning),
                     usage.objectLockEnabled,
+                    usage.eventingEnabled || false,
                     usage.defaultPlacement,
                     usage.location,
                     usage.storage,
@@ -66,6 +69,8 @@ export class BucketsHttpApi implements BucketsApi {
                     usage.defaultRetentionMode,
                     usage.defaultRetentionDays,
                     usage.defaultRetentionYears,
+                    new Date(usage.createdAt),
+                    usage.creatorEmail,
                 ),
             ) || [],
             result.search,
@@ -107,6 +112,7 @@ export class BucketsHttpApi implements BucketsApi {
             result.bucketName,
             getVersioning(result.versioning),
             result.objectLockEnabled,
+            result.eventingEnabled || false,
             result.defaultPlacement,
             result.location,
             result.storage,
@@ -118,6 +124,7 @@ export class BucketsHttpApi implements BucketsApi {
             result.defaultRetentionMode,
             result.defaultRetentionDays,
             result.defaultRetentionYears,
+            new Date(result.createdAt),
         );
     }
 
@@ -172,6 +179,36 @@ export class BucketsHttpApi implements BucketsApi {
                 bVersioning.placement.location,
             ),
             bVersioning.objectLockEnabled,
+        )) || [];
+    }
+
+    /**
+     * Fetch placement details
+     *
+     * @returns PlacementDetails[]
+     * @throws Error
+     */
+    public async getPlacementDetails(projectID: string): Promise<PlacementDetails[]> {
+        const path = `${this.ROOT_PATH}/placement-details?projectID=${projectID}`;
+        const response = await this.client.get(path);
+
+        if (!response.ok) {
+            throw new APIError({
+                status: response.status,
+                message: 'Can not get placement details',
+                requestID: response.headers.get('x-request-id'),
+            });
+        }
+
+        const result = await response.json();
+
+        return result?.map(detail => new PlacementDetails(
+            detail.id,
+            detail.idName,
+            detail.name,
+            detail.title,
+            detail.description,
+            detail.pending,
         )) || [];
     }
 }

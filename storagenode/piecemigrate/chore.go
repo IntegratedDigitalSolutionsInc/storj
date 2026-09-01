@@ -1,0 +1,684 @@
+// Copyright (C) 2024 Storj Labs, Inc.
+// See LICENSE for copying information.
+
+package piecemigrate
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"io/fs"
+	"math/rand"
+	"os"
+	"path/filepath"
+	"strconv"
+	"sync"
+	"time"
+
+	"github.com/spacemonkeygo/monkit/v3"
+	"github.com/zeebo/errs"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"golang.org/x/exp/maps"
+
+	"storj.io/common/errs2"
+	"storj.io/common/pb"
+	"storj.io/common/storj"
+	"storj.io/common/sync2"
+	"storj.io/storj/storagenode/blobstore/filestore"
+	"storj.io/storj/storagenode/contact"
+	"storj.io/storj/storagenode/pieces"
+	"storj.io/storj/storagenode/piecestore"
+	"storj.io/storj/storagenode/satstore"
+)
+
+var mon = monkit.Package()
+
+// migrateError is a migration error with a type classification for metrics.
+type migrateError struct {
+	errType string
+	err     error
+}
+
+func (e *migrateError) Error() string { return e.err.Error() }
+func (e *migrateError) Unwrap() error { return e.err }
+
+func migrationErr(errType string, err error) error {
+	return &migrateError{errType: errType, err: err}
+}
+
+func migrationErrType(err error) string {
+	var me *migrateError
+	if errors.As(err, &me) {
+		return me.errType
+	}
+	return "unknown"
+}
+
+// Backend is the minimal interface that the old piece backend needs to
+// implement for the migration to work.
+//
+// TODO(artur): make at least OldPieceBackend implement this interface,
+// or give up and just put the pieces' type for the old backend.
+type Backend interface {
+	Writer(context.Context, storj.NodeID, storj.PieceID, pb.PieceHashAlgorithm) (*pieces.Writer, error)
+	Reader(context.Context, storj.NodeID, storj.PieceID) (*pieces.Reader, error)
+	WalkSatellitePiecesMigration(context.Context, storj.NodeID, func(pieces.StoredPieceAccess) error) error
+	Delete(context.Context, storj.NodeID, storj.PieceID) error
+}
+
+// Config defines the configuration for the chore.
+type Config struct {
+	BufferSize        int           `help:"how many pieces to buffer" default:"1"`
+	Delay             time.Duration `help:"constant delay between migration of two pieces. 0 means no delay" default:"0"`
+	Jitter            bool          `help:"whether to add jitter to the delay; has no effect if delay is 0" default:"true"`
+	Interval          time.Duration `help:"how long to wait between pooling satellites for active migration" default:"10m"`
+	MigrateRegardless bool          `help:"whether to also migrate pieces for satellites outside currently set" default:"false"`
+	MigrateExpired    bool          `help:"whether to also migrate expired pieces" default:"true"`
+	DeleteExpired     bool          `help:"whether to also delete expired pieces; has no effect if expired are migrated" default:"true"`
+	CleanupEmptyDirs  bool          `help:"whether to clean up empty directories after piece migration" default:"true"`
+
+	SuppressCentralMigration bool `help:"if true, whether to suppress central control of migration initiation" default:"false"`
+}
+
+// WriteStateChecker can check if new uploads for a satellite are being directed
+// to the new store rather than the old piecestore backend.
+type WriteStateChecker interface {
+	IsWritingToNew(sat storj.NodeID) bool
+}
+
+// Chore migrates pieces.
+//
+// architecture: Chore
+type Chore struct {
+	log      *zap.Logger
+	services errs2.Group
+	Loop     *sync2.Cycle
+
+	config             Config
+	old                Backend
+	new                piecestore.PieceBackend
+	reportingBatchSize int
+	oldBlobsPath       string // path to old blobs directory for cleanup
+	writeChecker       WriteStateChecker
+
+	migrationQueue   chan migrationItem
+	baselineDataRate *monkit.FloatVal
+	closing          sync2.Event
+
+	mu                sync.Mutex
+	migratingActive   map[storj.NodeID]bool
+	migratingProgress map[storj.NodeID]*migrationProgress
+}
+
+type migrationItem struct {
+	satellite storj.NodeID
+	piece     storj.PieceID
+}
+
+type migrationProgress struct {
+	enqueued             int64            // total pieces enqueued for this satellite
+	processed            int64            // total pieces processed (success + error)
+	successes            int64            // successfully migrated pieces
+	errors               map[string]int64 // failed migrations by error type
+	remainingDirectories int64            // remaining directories after last cleanup scan
+}
+
+// NewChore initializes and returns a new Chore instance with an explicit old blobs path for directory cleanup.
+func NewChore(log *zap.Logger, config Config, store *satstore.SatelliteStore, old Backend, new piecestore.PieceBackend, contactService *contact.Service, oldBlobsPath string) *Chore {
+
+	log.Info("piece migration chore initialized",
+		zap.String("old_blobs_path", oldBlobsPath),
+		zap.Bool("cleanup_enabled", config.CleanupEmptyDirs))
+
+	chore := &Chore{
+		log:  log,
+		Loop: sync2.NewCycle(config.Interval),
+
+		config:             config,
+		old:                old,
+		new:                new,
+		reportingBatchSize: 10000,
+		oldBlobsPath:       oldBlobsPath,
+
+		migrationQueue:    make(chan migrationItem, config.BufferSize),
+		baselineDataRate:  mon.FloatVal("migration_chore"),
+		migratingActive:   make(map[storj.NodeID]bool),
+		migratingProgress: make(map[storj.NodeID]*migrationProgress),
+	}
+
+	_ = store.Range(func(sat storj.NodeID, data []byte) error {
+		b, _ := strconv.ParseBool(string(bytes.TrimSpace(data)))
+		chore.SetMigrate(sat, true, b)
+		return nil
+	})
+
+	if !config.SuppressCentralMigration && contactService != nil {
+		contactService.RegisterCheckinCallback(func(ctx context.Context, satelliteID storj.NodeID, resp *pb.CheckInResponse) error {
+			if resp.HashstoreSettings == nil {
+				return nil
+			}
+			active, _ := chore.getMigrate(satelliteID)
+			if active {
+				return nil
+			}
+			active = resp.HashstoreSettings.ActiveMigrate
+			chore.SetMigrate(satelliteID, true, active)
+			return store.Set(ctx, satelliteID, []byte(strconv.FormatBool(active)))
+		})
+	}
+
+	return chore
+}
+
+// Stats implements monkit.StatSource.
+func (chore *Chore) Stats(cb func(key monkit.SeriesKey, field string, val float64)) {
+	b2f64 := func(b bool) float64 {
+		if b {
+			return 1
+		}
+		return 0
+	}
+
+	chore.mu.Lock()
+	active := maps.Clone(chore.migratingActive)
+	progress := make(map[storj.NodeID]*migrationProgress, len(chore.migratingProgress))
+	for sat, p := range chore.migratingProgress {
+		clone := *p
+		clone.errors = maps.Clone(p.errors)
+		progress[sat] = &clone
+	}
+	chore.mu.Unlock()
+
+	cb(monkit.NewSeriesKey("queue"), "length", float64(len(chore.migrationQueue)))
+
+	// Report migration status from active map
+	for sat, isActive := range active {
+		cb(monkit.NewSeriesKey("migration_status").WithTag("sat", sat.String()), "active", b2f64(isActive))
+	}
+
+	// Report progress statistics (may include satellites no longer active)
+	for sat, p := range progress {
+		key := monkit.NewSeriesKey("migration_progress").WithTag("sat", sat.String())
+		cb(key, "enqueued", float64(p.enqueued))
+		cb(key, "processed", float64(p.processed))
+		cb(key, "successes", float64(p.successes))
+		cb(key, "remaining_directories", float64(p.remainingDirectories))
+
+		var totalErrors int64
+		for errType, count := range p.errors {
+			totalErrors += count
+			errKey := monkit.NewSeriesKey("migration_progress").
+				WithTag("sat", sat.String()).
+				WithTag("error_type", errType)
+			cb(errKey, "errors", float64(count))
+		}
+		cb(key, "errors", float64(totalErrors))
+	}
+}
+
+// TryMigrateOne enqueues a migration item for the given satellite and
+// piece if the queue has capacity. Fails silently if the queue is full.
+func (chore *Chore) TryMigrateOne(sat storj.NodeID, piece storj.PieceID) {
+	select {
+	case chore.migrationQueue <- migrationItem{satellite: sat, piece: piece}:
+	default:
+	}
+}
+
+// SetMigrate enables or disables migration for the given satellite. If
+// migrate is true, adds the satellite with its migration status to the
+// active set; otherwise, removes it.
+func (chore *Chore) SetMigrate(sat storj.NodeID, migrate, activeMigration bool) {
+	chore.mu.Lock()
+	defer chore.mu.Unlock()
+
+	if migrate {
+		chore.migratingActive[sat] = activeMigration
+		if _, ok := chore.migratingProgress[sat]; !ok {
+			chore.migratingProgress[sat] = &migrationProgress{}
+		}
+	} else {
+		delete(chore.migratingActive, sat)
+	}
+}
+
+func (chore *Chore) getMigrate(sat storj.NodeID) (bool, bool) {
+	chore.mu.Lock()
+	defer chore.mu.Unlock()
+
+	active, ok := chore.migratingActive[sat]
+	return active, ok
+}
+
+// SetWriteStateChecker sets the checker used to determine if new uploads for a
+// satellite are being directed to the new backend. Empty directory cleanup is
+// only performed for satellites where the checker confirms that no new pieces
+// are being written to the old backend.
+func (chore *Chore) SetWriteStateChecker(checker WriteStateChecker) {
+	chore.writeChecker = checker
+}
+
+// Run runs the chore.
+func (chore *Chore) Run(ctx context.Context) (err error) {
+	defer mon.Task()(&ctx)(&err)
+
+	chore.services.Go(func() error {
+		return chore.Loop.Run(ctx, chore.runOnce)
+	})
+	chore.services.Go(func() error {
+		return chore.processQueue(ctx)
+	})
+
+	return errs.Combine(chore.services.Wait()...)
+}
+
+func (chore *Chore) runOnce(ctx context.Context) (err error) {
+	defer mon.Task()(&ctx)(&err)
+
+	chore.mu.Lock()
+	active := maps.Clone(chore.migratingActive)
+	chore.mu.Unlock()
+
+	for sat, isActive := range active {
+		if isActive {
+			if err := chore.enqueueSatellite(ctx, sat); err != nil {
+				chore.log.Error("failed to enqueue for migration",
+					zap.Error(err),
+					zap.Stringer("sat", sat))
+			} else {
+				chore.log.Info("enqueued for migration",
+					zap.Stringer("sat", sat))
+			}
+			if chore.config.CleanupEmptyDirs {
+				chore.cleanupEmptyDirectories(ctx, sat)
+			}
+		}
+	}
+
+	satsMarshaler := zapcore.ObjectMarshalerFunc(func(enc zapcore.ObjectEncoder) error {
+		for sat, isActive := range active {
+			enc.AddBool(sat.String(), isActive)
+		}
+		return nil
+	})
+
+	chore.log.Info("all enqueued for migration; will sleep before next pooling",
+		zap.Object("active", satsMarshaler), zap.Duration("interval", chore.config.Interval))
+
+	return nil
+}
+
+// enqueueSatellite enqueues pieces for migration from the old to the
+// new backend for a given satellite. Returns an error if it fails to
+// list the pieces.
+func (chore *Chore) enqueueSatellite(ctx context.Context, sat storj.NodeID) (err error) {
+	defer mon.Task()(&ctx)(&err)
+
+	// Initialize or get satellite progress tracking
+	chore.mu.Lock()
+	if _, ok := chore.migratingProgress[sat]; !ok {
+		chore.migratingProgress[sat] = &migrationProgress{}
+	}
+	chore.mu.Unlock()
+
+	if err = chore.old.WalkSatellitePiecesMigration(ctx, sat, func(spa pieces.StoredPieceAccess) error {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case chore.migrationQueue <- migrationItem{satellite: sat, piece: spa.PieceID()}:
+			mon.Counter("enqueued", monkit.NewSeriesTag("sat", sat.String())).Inc(1)
+			// Track enqueued piece
+			chore.mu.Lock()
+			chore.migratingProgress[sat].enqueued++
+			chore.mu.Unlock()
+			return nil
+		}
+	}); err != nil {
+		return errs.New("couldn't list new pieces to migrate: %w", err)
+	}
+
+	return nil
+}
+
+// processQueue processes the migration queue, migrating pieces from the
+// old to the new backend.
+func (chore *Chore) processQueue(ctx context.Context) (err error) {
+	defer mon.Task()(&ctx)(&err)
+
+	var (
+		n     int
+		total int64
+	)
+	for {
+		if n > 0 && n%chore.reportingBatchSize == 0 {
+			chore.log.Info("processed a bunch of pieces",
+				zap.Error(err),
+				zap.Int("successes", n),
+				zap.Int64("size", total))
+		}
+
+		select {
+		case <-chore.closing.Signaled():
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		case m := <-chore.migrationQueue:
+			if _, ok := chore.getMigrate(m.satellite); !chore.config.MigrateRegardless && !ok {
+				incProcessedPieces(m.satellite, "skipped")
+				chore.log.Debug("skipping a piece that's not part of the migration plan",
+					zap.Stringer("sat", m.satellite),
+					zap.Stringer("id", m.piece))
+				n++
+				continue
+			}
+
+			start := time.Now()
+			if size, err := chore.migrateOne(ctx, m.satellite, m.piece); err != nil {
+				incProcessedPieces(m.satellite, "error")
+				// Track failed migration
+				chore.updateProgressStats(m.satellite, false, migrationErrType(err))
+				chore.log.Info("couldn't migrate",
+					zap.Error(err),
+					zap.Stringer("sat", m.satellite),
+					zap.Stringer("id", m.piece))
+			} else {
+				d := time.Since(start)
+				incProcessedSuccesses(m.satellite, size, d)
+				chore.log.Debug("migrated a piece",
+					zap.Stringer("sat", m.satellite),
+					zap.Stringer("id", m.piece),
+					zap.Int64("size", size),
+					zap.Duration("took", d))
+				n++
+				total += size
+				// TODO(artur): use chore.baselineDataRate to determine
+				// if we should be going slower
+				chore.baselineDataRate.Observe(float64(size) / d.Seconds())
+				// Track successful migration
+				chore.updateProgressStats(m.satellite, true, "")
+			}
+		}
+		if d := chore.config.Delay; d > 0 {
+			if chore.config.Jitter {
+				d += time.Duration(rand.Int63n(int64(d / 2)))
+			}
+			chore.log.Debug("delaying before next piece", zap.Duration("delay", d))
+			time.Sleep(d)
+		}
+	}
+}
+
+func incProcessedSuccesses(sat storj.NodeID, size int64, d time.Duration) {
+	incProcessedPieces(sat, "success")
+	satTag := monkit.NewSeriesTag("sat", sat.String())
+	mon.Counter("processed_pieces_size", satTag).Inc(size)
+	mon.DurationVal("processed_pieces_duration", satTag).Observe(d)
+}
+
+func incProcessedPieces(sat storj.NodeID, result string) {
+	mon.Counter("processed_pieces",
+		monkit.NewSeriesTag("sat", sat.String()),
+		monkit.NewSeriesTag("result", result),
+	).Inc(1)
+}
+
+// migrateOne migrates a piece returning the size of the migrated piece
+// and any error encountered.
+func (chore *Chore) migrateOne(ctx context.Context, sat storj.NodeID, piece storj.PieceID) (size int64, err error) {
+	defer mon.Task()(&ctx)(&err)
+
+	src, err := chore.old.Reader(ctx, sat, piece)
+	if err != nil {
+		if errs.Is(err, fs.ErrNotExist) {
+			chore.log.Debug("not in the old backend (we might have already processed it)",
+				zap.Stringer("sat", sat),
+				zap.Stringer("id", piece))
+			return 0, nil // not in the old one, so nothing to migrate
+		}
+		return 0, migrationErr("open_reader", errs.New("opening the old reader: %w", err))
+	}
+	defer func() {
+		// we don't want upstream to think that the piece hasn't been
+		// migrated if we just couldn't close the reader; log it
+		// instead.
+		if errClose := src.Close(); errClose != nil {
+			chore.log.Debug("couldn't close the reader",
+				zap.Error(errClose),
+				zap.Stringer("sat", sat),
+				zap.Stringer("piece", piece))
+		}
+	}()
+
+	hdr, err := src.GetPieceHeader()
+	if err != nil {
+		return 0, migrationErr("read_header", errs.New("getting the piece header: %w", err))
+	}
+
+	if e := hdr.OrderLimit.PieceExpiration; !e.IsZero() && e.Before(time.Now()) && !chore.config.MigrateExpired {
+		if !chore.config.DeleteExpired {
+			return 0, nil
+		}
+	} else {
+		if size, err = chore.copyPiece(ctx, src, sat, piece, hdr); err != nil {
+			return 0, err
+		}
+	}
+
+	// after committing, the piece has been successfully migrated; we
+	// can now delete it from the old backend.
+	//
+	// TODO(artur): if it's an expired piece, should we also delete it
+	// from wherever it's tracked?
+	if err = chore.old.Delete(ctx, sat, piece); err != nil {
+		return 0, migrationErr("delete", errs.New("deleting: %w", err))
+	}
+
+	return size, nil
+}
+
+func (chore *Chore) copyPiece(ctx context.Context, src *pieces.Reader, sat storj.NodeID, piece storj.PieceID, hdr *pb.PieceHeader) (size int64, err error) {
+	dst, err := chore.new.Writer(ctx, sat, piece, hdr.HashAlgorithm, hdr.OrderLimit.PieceExpiration)
+	if err != nil {
+		return 0, migrationErr("open_writer", errs.New("opening the new writer: %w", err))
+	}
+	defer func() {
+		// if it's necessary to cancel the write, it likely means that
+		// committing it was unsuccessful. it's not a big deal if we
+		// cannot cancel it afterward, but just to be aware of it
+		// happening, we're going to log the error, if any.
+		if errCancel := dst.Cancel(ctx); errCancel != nil {
+			chore.log.Debug("couldn't close the writer",
+				zap.Error(errCancel),
+				zap.Stringer("sat", sat),
+				zap.Stringer("piece", piece))
+		}
+	}()
+
+	size, err = sync2.Copy(ctx, dst, src)
+	if err != nil {
+		return 0, migrationErr("copy", errs.New("while copying the piece: %w", err))
+	}
+
+	if sizeSrc, sizeDst := src.Size(), dst.Size(); !allEqual(sizeSrc, size, sizeDst) {
+		return 0, migrationErr("size_mismatch", errs.New("size mismatch: source=%d,written=%d,destination=%d", sizeSrc, size, sizeDst))
+	}
+	if !bytes.Equal(hdr.Hash, dst.Hash()) {
+		return 0, migrationErr("hash_mismatch", errs.New("hash mismatch: source=%x,destination=%x", hdr.Hash, dst.Hash()))
+	}
+
+	if err = dst.Commit(ctx, hdr); err != nil {
+		return 0, migrationErr("commit", errs.New("committing: %w", err))
+	}
+
+	return size, nil
+}
+
+func allEqual(a, b, c int64) bool {
+	return a == b && b == c
+}
+
+// cleanupEmptyDirectories attempts to remove empty prefix directories for a satellite.
+// It tries os.Remove on each prefix directory directly — empty directories are removed,
+// non-empty ones fail with ENOTEMPTY instantly. This avoids expensive ReadDir calls on
+// previously-large directories whose on-disk block structure is still huge.
+//
+// For directories that can't be removed, a second pass checks for zero-sized file
+// debris (artifacts from incomplete writes). If a directory contains only zero-sized
+// files older than minZeroFileAge, those files are deleted and removal is retried.
+func (chore *Chore) cleanupEmptyDirectories(ctx context.Context, satellite storj.NodeID) {
+	defer mon.Task()(&ctx)(nil)
+
+	if chore.oldBlobsPath == "" {
+		return
+	}
+
+	if chore.writeChecker != nil && !chore.writeChecker.IsWritingToNew(satellite) {
+		chore.log.Debug("skipping empty directory cleanup: satellite is still writing to old backend",
+			zap.Stringer("sat", satellite))
+		return
+	}
+
+	namespaceStr := filestore.PathEncoding.EncodeToString(satellite.Bytes())
+	satelliteDir := filepath.Join(chore.oldBlobsPath, namespaceStr)
+
+	entries, err := os.ReadDir(satelliteDir)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			chore.log.Debug("couldn't read satellite directory for cleanup",
+				zap.String("dir", satelliteDir),
+				zap.Error(err))
+		}
+		chore.mu.Lock()
+		if p, ok := chore.migratingProgress[satellite]; ok {
+			p.remainingDirectories = 0
+		}
+		chore.mu.Unlock()
+		return
+	}
+
+	// First pass: try os.Remove on each prefix directory. Empty dirs succeed,
+	// non-empty dirs fail instantly with ENOTEMPTY.
+	removed := 0
+	var failedDirs []string
+	for _, entry := range entries {
+		if !entry.IsDir() || len(entry.Name()) != 2 {
+			continue
+		}
+		dirPath := filepath.Join(satelliteDir, entry.Name())
+		if err := os.Remove(dirPath); err != nil {
+			failedDirs = append(failedDirs, dirPath)
+		} else {
+			removed++
+		}
+	}
+
+	// Second pass: for directories that couldn't be removed, check if they
+	// contain only zero-sized file debris. If so, clean the debris and retry.
+	remaining := 0
+	for _, dirPath := range failedDirs {
+		if chore.cleanZeroSizedFiles(dirPath) {
+			if err := os.Remove(dirPath); err != nil {
+				remaining++
+			} else {
+				removed++
+			}
+		} else {
+			remaining++
+		}
+	}
+
+	chore.mu.Lock()
+	if p, ok := chore.migratingProgress[satellite]; ok {
+		p.remainingDirectories = int64(remaining)
+	}
+	chore.mu.Unlock()
+
+	if removed > 0 {
+		chore.log.Info("cleanup removed empty prefix directories",
+			zap.Stringer("sat", satellite),
+			zap.Int("removed", removed),
+			zap.Int("remaining", remaining))
+		mon.Counter("cleanup_directories_removed").Inc(int64(removed))
+	}
+
+	if remaining == 0 {
+		if err := os.Remove(satelliteDir); err == nil {
+			chore.log.Info("removed empty satellite directory",
+				zap.String("dir", satelliteDir))
+			mon.Counter("cleanup_directories_removed").Inc(1)
+		}
+	}
+}
+
+// minZeroFileAge is the minimum age of a zero-sized file before it can be
+// deleted. This prevents deleting files that are actively being written.
+const minZeroFileAge = time.Minute
+
+// cleanZeroSizedFiles reads a directory and deletes any zero-sized files older
+// than minZeroFileAge. Returns true if all files were zero-sized debris and were
+// successfully deleted (i.e., the directory should now be empty).
+func (chore *Chore) cleanZeroSizedFiles(dirPath string) bool {
+	f, err := os.Open(dirPath)
+	if err != nil {
+		return false
+	}
+	defer func() { _ = f.Close() }()
+
+	entries, err := f.Readdir(-1)
+	if err != nil {
+		return false
+	}
+
+	now := time.Now()
+	allCleaned := true
+	for _, entry := range entries {
+		if entry.IsDir() || entry.Size() != 0 {
+			return false // real content, not just debris
+		}
+		if now.Sub(entry.ModTime()) < minZeroFileAge {
+			allCleaned = false // too recent to delete safely
+			continue
+		}
+		filePath := filepath.Join(dirPath, entry.Name())
+		if err := os.Remove(filePath); err != nil {
+			chore.log.Debug("couldn't delete zero-sized file",
+				zap.String("file", filePath),
+				zap.Error(err))
+			allCleaned = false
+		} else {
+			mon.Counter("cleanup_zero_sized_files_removed").Inc(1)
+		}
+	}
+	return allCleaned
+}
+
+// updateProgressStats updates the migration progress statistics for a satellite.
+// For failed migrations, errType classifies the failure (e.g. "open_reader", "copy").
+func (chore *Chore) updateProgressStats(satellite storj.NodeID, success bool, errType string) {
+	chore.mu.Lock()
+	defer chore.mu.Unlock()
+
+	p, ok := chore.migratingProgress[satellite]
+	if !ok {
+		p = &migrationProgress{}
+		chore.migratingProgress[satellite] = p
+	}
+	p.processed++
+	if success {
+		p.successes++
+	} else {
+		if p.errors == nil {
+			p.errors = make(map[string]int64)
+		}
+		p.errors[errType]++
+	}
+}
+
+// Close shuts down the chore's loop and releases associated resources.
+// Always returns nil.
+func (chore *Chore) Close() (err error) {
+	chore.Loop.Close()
+	chore.closing.Signal()
+	return nil
+}

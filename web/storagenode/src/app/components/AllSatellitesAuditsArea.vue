@@ -22,6 +22,10 @@
                     <p class="audits-area__content__item__info__label">Online</p>
                     <p class="audits-area__content__item__info__value" :class="[ item.onlineScore.statusClassName ]">{{ item.onlineScore.label }}</p>
                 </div>
+                <div class="audits-area__content__item__info">
+                    <p class="audits-area__content__item__info__label">Vetted</p>
+                    <p class="audits-area__content__item__info__value" :class="[ getVettedStatusClass(item.satelliteName) ]">{{ getVettedStatusLabel(item.satelliteName) }}</p>
+                </div>
             </div>
         </div>
         <div v-if="isLoadMoreButtonVisible" class="audits-area__load-more-button" @click="loadMore">
@@ -30,54 +34,56 @@
     </div>
 </template>
 
-<script lang="ts">
-import { Component, Vue } from 'vue-property-decorator';
+<script setup lang="ts">
+import { computed, ref } from 'vue';
 
-import { SatelliteScores } from '@/storagenode/sno/sno';
-
+import { SatelliteInfo, SatelliteScores } from '@/storagenode/sno/sno';
+import { useNodeStore } from '@/app/store/modules/nodeStore';
 import DisqualifyIcon from '@/../static/images/disqualify.svg';
 
-// @vue/component
-@Component({
-    components: { DisqualifyIcon },
-})
-export default class AllSatellitesAuditsArea extends Vue {
-    /**
-     * Number of score blocks displayed on page.
-     */
-    public numberOfItemsOnPage = 6;
-    /**
-     * Number of blocks added to displayed on page by clocking "Load more".
-     */
-    private readonly ITEMS_TO_ADD_COUNT: number = 6;
+const nodeStore = useNodeStore();
 
-    /**
-     * Returns reduced number of satellites score items depends on numberOfItemsOnPage.
-     */
-    public get auditItems(): SatelliteScores[] {
-        return this.satellitesScores.slice(0, this.numberOfItemsOnPage);
-    }
+const ITEMS_TO_ADD_COUNT = 6;
 
-    /**
-     * Indicates if all existing items are shown on page.
-     */
-    public get isLoadMoreButtonVisible(): boolean {
-        return this.auditItems.length !== this.satellitesScores.length;
-    }
+const numberOfItemsOnPage = ref<number>(6);
 
-    /**
-     * Returns list of satellites score from store.
-     */
-    private get satellitesScores(): SatelliteScores[] {
-        return this.$store.state.node.satellitesScores;
-    }
+const auditItems = computed<SatelliteScores[]>(()  => {
+    return satellitesScores.value.slice(0, numberOfItemsOnPage.value);
+});
 
-    /**
-     * Increments number of shown satellite score items by ITEMS_TO_ADD_COUNT.
-     */
-    public loadMore(): void {
-        this.numberOfItemsOnPage += this.ITEMS_TO_ADD_COUNT;
+const isLoadMoreButtonVisible = computed<boolean>(() => {
+    return auditItems.value.length !== satellitesScores.value.length;
+});
+
+const satellitesScores = computed<SatelliteScores[]>(() => {
+    return nodeStore.state.satellitesScores as SatelliteScores[];
+});
+
+const satellites = computed<SatelliteInfo[]>(() => {
+    return nodeStore.state.satellites;
+});
+
+function loadMore(): void {
+    numberOfItemsOnPage.value += ITEMS_TO_ADD_COUNT;
+}
+
+function getVettedStatusLabel(satelliteName: string): string {
+    const satellite = findSatelliteByName(satelliteName);
+    if (satellite?.vettedAt) {
+        return satellite.vettedAt.toLocaleDateString();
     }
+    return 'Not vetted';
+}
+
+function getVettedStatusClass(satelliteName: string): string {
+    const satellite = findSatelliteByName(satelliteName);
+    return satellite?.vettedAt ? 'vetted' : 'not-vetted';
+}
+
+function findSatelliteByName(satelliteName: string): SatelliteInfo | undefined {
+    // SatelliteScores uses satelliteName but SatelliteInfo uses url
+    // We need to match by URL since that's what's typically shown as the name
+    return satellites.value.find(satellite => satellite.url === satelliteName);
 }
 </script>
 
@@ -91,7 +97,7 @@ export default class AllSatellitesAuditsArea extends Vue {
         &__content {
             width: 100%;
             display: grid;
-            grid-gap: 15px;
+            gap: 15px;
             grid-template-columns: repeat(3, 1fr);
 
             &__item {
@@ -164,7 +170,7 @@ export default class AllSatellitesAuditsArea extends Vue {
     .disqualification {
         color: var(--critical-color);
 
-        ::v-deep path {
+        :deep(path) {
             fill: var(--critical-color);
         }
     }
@@ -172,19 +178,27 @@ export default class AllSatellitesAuditsArea extends Vue {
     .warning {
         color: var(--warning-color);
 
-        ::v-deep path {
+        :deep(path) {
             fill: var(--warning-color);
         }
     }
 
-    @media screen and (max-width: 800px) {
+    .vetted {
+        color: var(--success-color, #00bf5f);
+    }
+
+    .not-vetted {
+        color: var(--warning-color);
+    }
+
+    @media screen and (width <= 800px) {
 
         .audits-area__content {
             grid-template-columns: repeat(2, 1fr);
         }
     }
 
-    @media screen and (max-width: 500px) {
+    @media screen and (width <= 500px) {
 
         .audits-area__content {
             grid-template-columns: 1fr;

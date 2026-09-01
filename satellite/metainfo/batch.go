@@ -39,6 +39,10 @@ func (endpoint *Endpoint) CompressedBatch(ctx context.Context, req *pb.Compresse
 		return nil, errs.Wrap(err)
 	}
 
+	if len(unReq.Requests) == 0 {
+		return &pb.CompressedBatchResponse{}, nil
+	}
+
 	unResp, err := endpoint.Batch(ctx, &unReq)
 	if err != nil {
 		return nil, errs.Wrap(err)
@@ -57,6 +61,17 @@ func (endpoint *Endpoint) CompressedBatch(ctx context.Context, req *pb.Compresse
 		resp.Data = unrespData
 		resp.Selected = pb.CompressedBatchRequest_NONE
 	}
+
+	rpc := ""
+	for i, resp := range unResp.Responses {
+		rpc += fmt.Sprintf("%T", resp.Response)
+		if i >= 2 {
+			rpc += "..."
+			break
+		}
+	}
+
+	mon.IntVal("compressed_batch_response_sizes", monkit.NewSeriesTag("rpc", rpc)).Observe(int64(len(resp.Data)))
 
 	return resp, nil
 }
@@ -228,7 +243,7 @@ func (endpoint *Endpoint) Batch(ctx context.Context, req *pb.BatchRequest) (resp
 				continue
 			}
 
-			response, err := endpoint.BeginObject(ctx, singleRequest.ObjectBegin)
+			response, err := endpoint.beginObject(ctx, singleRequest.ObjectBegin, multipartUpload(i, req.Requests))
 			if err != nil {
 				return resp, err
 			}
@@ -354,6 +369,17 @@ func (endpoint *Endpoint) Batch(ctx context.Context, req *pb.BatchRequest) (resp
 			resp.Responses = append(resp.Responses, &pb.BatchResponseItem{
 				Response: &pb.BatchResponseItem_ObjectFinishDelete{
 					ObjectFinishDelete: response,
+				},
+			})
+		case *pb.BatchRequestItem_ObjectsDelete:
+			singleRequest.ObjectsDelete.Header = req.Header
+			response, err := endpoint.DeleteObjects(ctx, singleRequest.ObjectsDelete)
+			if err != nil {
+				return resp, err
+			}
+			resp.Responses = append(resp.Responses, &pb.BatchResponseItem{
+				Response: &pb.BatchResponseItem_ObjectsDelete{
+					ObjectsDelete: response,
 				},
 			})
 		case *pb.BatchRequestItem_ObjectGetRetention:
@@ -526,6 +552,22 @@ func (endpoint *Endpoint) Batch(ctx context.Context, req *pb.BatchRequest) (resp
 					SegmentFinishDelete: response,
 				},
 			})
+		case *pb.BatchRequestItem_SegmentBeginRetryPieces:
+			singleRequest.SegmentBeginRetryPieces.Header = req.Header
+
+			if singleRequest.SegmentBeginRetryPieces.SegmentId.IsZero() && !lastSegmentID.IsZero() {
+				singleRequest.SegmentBeginRetryPieces.SegmentId = lastSegmentID
+			}
+
+			response, err := endpoint.RetryBeginSegmentPieces(ctx, singleRequest.SegmentBeginRetryPieces)
+			if err != nil {
+				return resp, err
+			}
+			resp.Responses = append(resp.Responses, &pb.BatchResponseItem{
+				Response: &pb.BatchResponseItem_SegmentBeginRetryPieces{
+					SegmentBeginRetryPieces: response,
+				},
+			})
 
 			// Revoke API key.
 		case *pb.BatchRequestItem_RevokeApiKey:
@@ -587,4 +629,11 @@ func shouldDoInlineObject(index int, requests []*pb.BatchRequestItem) (_ *pb.Seg
 	}
 
 	return makeInlineSegReq.SegmentMakeInline, commitObjReq.ObjectCommit, true
+}
+
+// multipartUpload checks whether the current ObjectBegin request is part of a multipart upload
+// or regular upload. We can detect that by checking if the next request is segment creation (inline/remote)
+// which is never the case for multipart uploads.
+func multipartUpload(index int, requests []*pb.BatchRequestItem) bool {
+	return !(len(requests) > index+1 && (requests[index+1].GetSegmentBegin() != nil || requests[index+1].GetSegmentMakeInline() != nil))
 }

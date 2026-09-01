@@ -14,7 +14,7 @@
                         autofocus
                         class="my-2"
                         maxlength="6"
-                        @update:modelValue="value => onValueChange(value)"
+                        @update:model-value="value => onValueChange(value)"
                     />
                 </v-card>
 
@@ -50,7 +50,7 @@
                     class="mt-5"
                     required
                     maxlength="50"
-                    @update:modelValue="value => onValueChange(value)"
+                    @update:model-value="value => onValueChange(value)"
                 />
                 <v-btn
                     type="submit"
@@ -65,7 +65,7 @@
             </v-form>
         </v-card-text>
     </v-card>
-    <p class="mt-8 text-center text-body-2">
+    <p class="mt-8 text-center text-body-medium">
         Or use a <a
             class="link font-weight-bold"
             @click="model = !model"

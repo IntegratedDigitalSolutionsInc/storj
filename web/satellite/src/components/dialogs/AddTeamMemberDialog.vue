@@ -26,7 +26,7 @@
 
                 <template #append>
                     <v-btn
-                        icon="$close"
+                        :icon="X"
                         variant="text"
                         size="small"
                         color="default"
@@ -57,6 +57,7 @@
                             :rules="emailRules"
                             maxlength="72"
                             label="Enter e-mail"
+                            placeholder="Enter e-mail here"
                             hint="Members will have read, write, and delete permissions."
                             required
                             autofocus
@@ -107,15 +108,16 @@ import {
     VCardActions,
     VSheet,
 } from 'vuetify/components';
-import { UserPlus } from 'lucide-vue-next';
+import { UserPlus, X } from '@lucide/vue';
 
-import { EmailRule, RequiredRule, ValidationRule } from '@/types/common';
+import { type ValidationRule, EmailRule, RequiredRule  } from '@/types/common';
 import { AnalyticsErrorEventSource, AnalyticsEvent } from '@/utils/constants/analyticsEventNames';
 import { useAnalyticsStore } from '@/store/modules/analyticsStore';
 import { useProjectMembersStore } from '@/store/modules/projectMembersStore';
-import { useNotify } from '@/utils/hooks';
+import { useNotify } from '@/composables/useNotify';
 import { useLoading } from '@/composables/useLoading';
 import { useConfigStore } from '@/store/modules/configStore';
+import { useProjectsStore } from '@/store/modules/projectsStore';
 
 const props = defineProps<{
     projectId: string;
@@ -126,6 +128,7 @@ const model = defineModel<boolean>({ required: true });
 const analyticsStore = useAnalyticsStore();
 const pmStore = useProjectMembersStore();
 const configStore = useConfigStore();
+const projectStore = useProjectsStore();
 
 const notify = useNotify();
 const { isLoading, withLoading } = useLoading();
@@ -141,10 +144,10 @@ const emailRules: ValidationRule<string>[] = [
 /**
  * Handles primary button click.
  */
-async function onPrimaryClick(): Promise<void> {
+function onPrimaryClick(): void {
     if (!valid.value) return;
 
-    await withLoading(async () => {
+    withLoading(async () => {
         try {
             await pmStore.inviteMember(email.value, props.projectId);
 
@@ -159,17 +162,15 @@ async function onPrimaryClick(): Promise<void> {
 
             email.value = '';
         } catch (error) {
-            error.message = `Error inviting project member. ${error.message}`;
             notify.notifyError(error, AnalyticsErrorEventSource.ADD_PROJECT_MEMBER_MODAL);
             return;
         }
 
-        analyticsStore.eventTriggered(AnalyticsEvent.PROJECT_MEMBERS_INVITE_SENT);
+        analyticsStore.eventTriggered(AnalyticsEvent.PROJECT_MEMBERS_INVITE_SENT, { project_id: projectStore.state.selectedProject.id });
 
         try {
             await pmStore.getProjectMembers(1, props.projectId);
         } catch (error) {
-            error.message = `Unable to fetch project members. ${error.message}`;
             notify.notifyError(error, AnalyticsErrorEventSource.ADD_PROJECT_MEMBER_MODAL);
         }
 

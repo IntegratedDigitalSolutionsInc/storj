@@ -6,6 +6,7 @@ package consoledb
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strconv"
 	"strings"
 
@@ -81,7 +82,44 @@ func (events *accountFreezeEvents) Get(ctx context.Context, userID uuid.UUID, ev
 	return fromDBXAccountFreezeEvent(dbxEvent)
 }
 
+// HasEvents checks if there's a freeze event of the specified types for the given user ID.
+func (events *accountFreezeEvents) HasEvents(ctx context.Context, userID uuid.UUID, eventTypes ...console.AccountFreezeEventType) (_ bool, err error) {
+	defer mon.Task()(&ctx)(&err)
+
+	if len(eventTypes) == 0 {
+		return false, Error.New("eventTypes cannot be empty")
+	}
+
+	var rows tagsql.Rows
+	if len(eventTypes) == 1 {
+		rows, err = events.db.QueryContext(ctx, events.db.Rebind(`
+		SELECT 1
+		FROM account_freeze_events
+			WHERE user_id = ? AND event = ?
+			LIMIT 1
+		`), userID, int(eventTypes[0]))
+	} else {
+		types := make([]string, 0, len(eventTypes))
+		for _, t := range eventTypes {
+			types = append(types, strconv.Itoa(int(t)))
+		}
+		rows, err = events.db.QueryContext(ctx, events.db.Rebind(`
+		SELECT 1
+		FROM account_freeze_events
+			WHERE user_id = ? AND event IN (`+strings.Join(types, ",")+`)
+			LIMIT 1
+		`), userID)
+	}
+	if err != nil {
+		return false, Error.Wrap(err)
+	}
+	defer func() { err = errs.Combine(err, rows.Close()) }()
+
+	return rows.Next(), rows.Err()
+}
+
 // GetAllEvents is a method for querying all account freeze events or events of particular types from the database.
+// Events are filtered to users matching cursor.TenantID: nil means users with no tenant, non-nil means that specific tenant.
 func (events *accountFreezeEvents) GetAllEvents(ctx context.Context, cursor console.FreezeEventsCursor, optionalEventTypes []console.AccountFreezeEventType) (freezeEvents *console.FreezeEventsPage, err error) {
 	defer mon.Task()(&ctx)(&err)
 
@@ -97,27 +135,36 @@ func (events *accountFreezeEvents) GetAllEvents(ctx context.Context, cursor cons
 		cursor.StartingAfter = &uuid.UUID{}
 	}
 
-	var rows tagsql.Rows
+	tenantFilter := "u.tenant_id IS NULL"
+	args := []interface{}{cursor.StartingAfter}
+	if cursor.TenantID != nil {
+		tenantFilter = "u.tenant_id = ?"
+		args = append(args, *cursor.TenantID)
+	}
+
+	var query string
 	if len(optionalEventTypes) == 0 {
-		rows, err = events.db.QueryContext(ctx, events.db.Rebind(`
-		SELECT user_id, event, days_till_escalation, notifications_count, created_at
-		FROM account_freeze_events
-			WHERE user_id > ?
-			ORDER BY user_id LIMIT ?
-		`), cursor.StartingAfter, cursor.Limit+1)
+		query = `
+			SELECT afe.user_id, afe.event, afe.days_till_escalation, afe.notifications_count, afe.created_at
+			FROM account_freeze_events afe
+			JOIN users u ON u.id = afe.user_id
+			WHERE afe.user_id > ? AND ` + tenantFilter + `
+			ORDER BY afe.user_id LIMIT ?`
 	} else {
 		types := make([]string, 0, len(optionalEventTypes))
 		for _, t := range optionalEventTypes {
 			types = append(types, strconv.Itoa(int(t)))
 		}
-		rows, err = events.db.QueryContext(ctx, events.db.Rebind(`
-		SELECT user_id, event, days_till_escalation, notifications_count, created_at
-		FROM account_freeze_events
-			WHERE user_id > ? AND event IN (`+strings.Join(types, ",")+`)
-			ORDER BY user_id LIMIT ?
-		`), cursor.StartingAfter, cursor.Limit+1)
+		query = `
+			SELECT afe.user_id, afe.event, afe.days_till_escalation, afe.notifications_count, afe.created_at
+			FROM account_freeze_events afe
+			JOIN users u ON u.id = afe.user_id
+			WHERE afe.user_id > ? AND afe.event IN (` + strings.Join(types, ",") + `) AND ` + tenantFilter + `
+			ORDER BY afe.user_id LIMIT ?`
 	}
+	args = append(args, cursor.Limit+1)
 
+	rows, err := events.db.QueryContext(ctx, events.db.Rebind(query), args...)
 	if err != nil {
 		return nil, Error.Wrap(err)
 	}
@@ -151,13 +198,22 @@ func (events *accountFreezeEvents) GetAllEvents(ctx context.Context, cursor cons
 
 // GetTrialExpirationFreezesToEscalate is a method that gets free trial expiration freezes that correspond to users
 // that are not pending deletion (have not been escalated).
-func (events *accountFreezeEvents) GetTrialExpirationFreezesToEscalate(ctx context.Context, limit int, cursor *console.FreezeEventsByEventAndUserStatusCursor) (_ []console.AccountFreezeEvent, next *console.FreezeEventsByEventAndUserStatusCursor, err error) {
+// tenantID filters by tenant: nil returns users with no tenant, non-nil returns users with that tenant.
+func (events *accountFreezeEvents) GetTrialExpirationFreezesToEscalate(ctx context.Context, tenantID *string, limit int, cursor *console.FreezeEventsByEventAndUserStatusCursor) (_ []console.AccountFreezeEvent, next *console.FreezeEventsByEventAndUserStatusCursor, err error) {
 	defer mon.Task()(&ctx)(&err)
 
-	evs, next, err := events.db.Paged_AccountFreezeEvent_By_User_Status_Not_And_AccountFreezeEvent_Event(
+	var userTenantID dbx.User_TenantId_Field
+	if tenantID != nil {
+		userTenantID = dbx.User_TenantId(*tenantID)
+	} else {
+		userTenantID = dbx.User_TenantId_Null()
+	}
+
+	evs, next, err := events.db.Paged_AccountFreezeEvent_By_User_Status_Not_And_User_TenantId_And_AccountFreezeEvent_Event(
 		ctx,
 		// where user.status != pending_deletion
 		dbx.User_Status(int(console.PendingDeletion)),
+		userTenantID,
 		// and event = trial_expiration_freeze
 		dbx.AccountFreezeEvent_Event(int(console.TrialExpirationFreeze)),
 		limit,
@@ -177,12 +233,141 @@ func (events *accountFreezeEvents) GetTrialExpirationFreezesToEscalate(ctx conte
 	return eventsToReturn, next, nil
 }
 
+// GetOptOutFreezes is a method that gets opt-out freezes that correspond to users
+// that are not deleted. This includes already-escalated (PendingDeletion) users so that they
+// can be unfrozen if their opt-in status changes.
+// tenantID filters by tenant: nil returns users with no tenant, non-nil returns users with that tenant.
+func (events *accountFreezeEvents) GetOptOutFreezes(ctx context.Context, tenantID *string, limit int, cursor *console.FreezeEventsByEventAndUserStatusCursor) (_ []console.AccountFreezeEvent, next *console.FreezeEventsByEventAndUserStatusCursor, err error) {
+	defer mon.Task()(&ctx)(&err)
+
+	var userTenantID dbx.User_TenantId_Field
+	if tenantID != nil {
+		userTenantID = dbx.User_TenantId(*tenantID)
+	} else {
+		userTenantID = dbx.User_TenantId_Null()
+	}
+
+	evs, next, err := events.db.Paged_AccountFreezeEvent_By_User_Status_Not_And_User_TenantId_And_AccountFreezeEvent_Event(
+		ctx,
+		// where user.status != deleted
+		dbx.User_Status(int(console.Deleted)),
+		userTenantID,
+		// and event = opt_out_freeze
+		dbx.AccountFreezeEvent_Event(int(console.OptOutFreeze)),
+		limit,
+		cursor,
+	)
+	if err != nil {
+		return nil, nil, err
+	}
+	eventsToReturn := make([]console.AccountFreezeEvent, 0, len(evs))
+	for _, ev := range evs {
+		event, err := fromDBXAccountFreezeEvent(ev)
+		if err != nil {
+			return nil, nil, err
+		}
+		eventsToReturn = append(eventsToReturn, *event)
+	}
+	return eventsToReturn, next, nil
+}
+
+// GetEscalatedEventsBefore is used to get a list of freeze events of some types that were escalated
+// before the given time.
+// NB: This method is specifically used to list events for deletion, so a specific event that is not deleted
+// will continue to be returned.
+func (events *accountFreezeEvents) GetEscalatedEventsBefore(ctx context.Context, params console.GetEscalatedEventsBeforeParams) (_ []console.EventWithUser, err error) {
+	defer mon.Task()(&ctx)(&err)
+
+	// status_updated_at is projected so the outer query can order by it. For the
+	// multi-type UNION ALL case, ordering must happen at the outer (combined) level
+	// -- ordering inside the subqueries does not constrain the order of the combined
+	// result, which OFFSET paging depends on. user_id is a unique tie-breaker so
+	// paging stays deterministic when rows share a timestamp or leave the set between
+	// calls (e.g. as their data is finalized).
+	baseQuery := `
+			SELECT afe.event as event, u.id AS user_id, u.status_updated_at AS status_updated_at
+				FROM account_freeze_events AS afe
+			JOIN users AS u
+				ON u.id = afe.user_id
+			WHERE u.status = ?
+				AND (u.status_updated_at IS NULL OR u.status_updated_at < ?)
+				AND afe.event = ?`
+
+	const orderAndPage = "\nORDER BY status_updated_at ASC, user_id ASC, event ASC\nLIMIT ? OFFSET ?"
+
+	query := fmt.Sprintf("SELECT event, user_id FROM (%s) AS combined_results%s", baseQuery, orderAndPage)
+
+	queryParams := make([]interface{}, 0)
+	if len(params.EventTypes) > 1 {
+		/*
+			craft a query like this:
+			SELECT event, user_id FROM (
+				(SELECT ... status_updated_at ...
+					JOIN ...
+					WHERE u.status = ?
+						AND u.status_updated_at < ?
+						AND afe.event = ?)
+			UNION ALL
+				(SELECT ... status_updated_at ...
+						JOIN ...
+						WHERE u.status = ?
+							AND u.status_updated_at < ?
+							AND afe.event = ?)
+			) AS combined_results ORDER BY status_updated_at ASC, user_id ASC LIMIT ? OFFSET ?
+		*/
+		query = ``
+		for i, eventType := range params.EventTypes {
+			queryParams = append(queryParams, console.PendingDeletion, eventType.OlderThan, eventType.EventType)
+			if i == 0 {
+				query = fmt.Sprintf(`SELECT event, user_id FROM ((%s)`, baseQuery)
+				continue
+			}
+			query += fmt.Sprintf("\n UNION ALL (%s)", baseQuery)
+
+			if i == len(params.EventTypes)-1 {
+				query += "\n) AS combined_results" + orderAndPage
+			}
+		}
+		queryParams = append(queryParams, params.Limit, params.Offset)
+	} else {
+		queryParams = append(queryParams, console.PendingDeletion, params.EventTypes[0].OlderThan, params.EventTypes[0].EventType, params.Limit, params.Offset)
+	}
+
+	rows, err := events.db.QueryContext(ctx, events.db.Rebind(query), queryParams...)
+	if err != nil {
+		return nil, Error.Wrap(err)
+	}
+	defer func() { err = errs.Combine(err, rows.Close()) }()
+
+	evs := make([]console.EventWithUser, 0, params.Limit)
+	for rows.Next() {
+		var eventType int
+		var userIDBytes []byte
+
+		err = rows.Scan(&eventType, &userIDBytes)
+		if err != nil {
+			return nil, Error.Wrap(err)
+		}
+
+		userID, err := uuid.FromBytes(userIDBytes)
+		if err != nil {
+			return nil, Error.Wrap(err)
+		}
+
+		evs = append(evs, console.EventWithUser{
+			UserID: userID,
+			Type:   console.AccountFreezeEventType(eventType),
+		})
+	}
+
+	return evs, rows.Err()
+}
+
 // GetAll is a method for querying all account freeze events from the database by user ID.
 func (events *accountFreezeEvents) GetAll(ctx context.Context, userID uuid.UUID) (freezes *console.UserFreezeEvents, err error) {
 	defer mon.Task()(&ctx)(&err)
 
-	// dbxEvents will have a max length of 6.
-	// because there's at most 1 instance each of 6 types of events for a user.
+	// dbxEvents will have a max length of 9 (one per event type) for a given user.
 	dbxEvents, err := events.db.All_AccountFreezeEvent_By_UserId(ctx,
 		dbx.AccountFreezeEvent_UserId(userID.Bytes()),
 	)
@@ -219,24 +404,49 @@ func (events *accountFreezeEvents) GetAll(ctx context.Context, userID uuid.UUID)
 			if err != nil {
 				return nil, err
 			}
+			continue
 		}
 		if eventType == console.DelayedBotFreeze {
 			freezes.DelayedBotFreeze, err = fromDBXAccountFreezeEvent(event)
 			if err != nil {
 				return nil, err
 			}
+			continue
 		}
 		if eventType == console.BotFreeze {
 			freezes.BotFreeze, err = fromDBXAccountFreezeEvent(event)
 			if err != nil {
 				return nil, err
 			}
+			continue
 		}
 		if eventType == console.TrialExpirationFreeze {
 			freezes.TrialExpirationFreeze, err = fromDBXAccountFreezeEvent(event)
 			if err != nil {
 				return nil, err
 			}
+			continue
+		}
+		if eventType == console.OptOutFreeze {
+			freezes.OptOutFreeze, err = fromDBXAccountFreezeEvent(event)
+			if err != nil {
+				return nil, err
+			}
+			continue
+		}
+		if eventType == console.InactivityWarning {
+			freezes.InactivityWarning, err = fromDBXAccountFreezeEvent(event)
+			if err != nil {
+				return nil, err
+			}
+			continue
+		}
+		if eventType == console.InactivityFreeze {
+			freezes.InactivityFreeze, err = fromDBXAccountFreezeEvent(event)
+			if err != nil {
+				return nil, err
+			}
+			continue
 		}
 	}
 

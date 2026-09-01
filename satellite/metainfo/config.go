@@ -5,15 +5,20 @@ package metainfo
 
 import (
 	"fmt"
+	"io"
+	"net/http"
+	"slices"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"storj.io/common/memory"
+	"storj.io/common/storj"
 	"storj.io/common/uuid"
-	"storj.io/storj/satellite/console"
 	"storj.io/storj/satellite/metabase"
 	"storj.io/storj/satellite/nodeselection"
+	"storj.io/storj/shared/dbutil"
 	"storj.io/uplink/private/eestream"
 )
 
@@ -59,9 +64,19 @@ func (rs *RSConfig) Override(o nodeselection.ECParameters) *RSConfig {
 	if o.Minimum > 0 {
 		ro.Min = o.Minimum
 	}
-	if o.Success > 0 {
-		ro.Success = o.Success
+
+	if o.Success != nil {
+		if v := o.Success(o.Minimum); v > 0 {
+			ro.Success = v
+		}
 	}
+
+	if o.Repair != nil {
+		if v := o.Repair(o.Minimum); v > 0 {
+			ro.Repair = v
+		}
+	}
+
 	if o.Total > 0 {
 		ro.Total = o.Total
 		// for legacy configuration that does not define repair.
@@ -70,9 +85,7 @@ func (rs *RSConfig) Override(o nodeselection.ECParameters) *RSConfig {
 			ro.Repair = ro.Total
 		}
 	}
-	if o.Repair > 0 {
-		ro.Repair = o.Repair
-	}
+
 	return ro
 }
 
@@ -145,7 +158,20 @@ type UploadLimiterConfig struct {
 	Enabled           bool          `help:"whether rate limiting is enabled." releaseDefault:"true" devDefault:"true"`
 	SingleObjectLimit time.Duration `help:"how often we can upload to the single object (the same location) per API instance" default:"1s" devDefault:"1ms"`
 
-	CacheCapacity int `help:"number of object locations to cache." releaseDefault:"10000" devDefault:"10" testDefault:"100"`
+	CacheCapacity int `help:"DEPRECATED. number of object locations to cache." releaseDefault:"10000" devDefault:"10" testDefault:"100"`
+
+	BurstLimit   int `help:"the number of requests to allow bursts beyond the rate limit" default:"3"`
+	HashCount    int `help:"the number of hash indexes to make into the rate limit map" default:"3"`
+	SizeExponent int `help:"two to this power is the amount of rate limits to store in ram. higher has less collisions." releaseDefault:"21" devDefault:"17" testDefault:"16"`
+}
+
+// DownloadLimiterConfig is a configuration struct for endpoint download limiting.
+type DownloadLimiterConfig struct {
+	Enabled           bool          `help:"whether rate limiting is enabled." releaseDefault:"true" devDefault:"true"`
+	SingleObjectLimit time.Duration `help:"how often we can upload to the single object (the same location) per API instance" default:"1ms"`
+	BurstLimit        int           `help:"the number of requests to allow bursts beyond the rate limit" default:"3"`
+	HashCount         int           `help:"the number of hash indexes to make into the rate limit map" default:"3"`
+	SizeExponent      int           `help:"two to this power is the amount of rate limits to store in ram. higher has less collisions." releaseDefault:"21" devDefault:"17" testDefault:"16"`
 }
 
 // ProjectLimitConfig is a configuration struct for default project limits.
@@ -160,48 +186,154 @@ type UserInfoValidationConfig struct {
 	CacheCapacity   int           `help:"user info cache capacity" default:"10000"`
 }
 
+// ProjectEntitlementConfig is a configuration struct for project entitlements.
+type ProjectEntitlementConfig struct {
+	CacheExpiration time.Duration `help:"delete objects hook cache expiration" default:"10m"`
+	CacheCapacity   int           `help:"delete objects hook cache capacity" default:"10000"`
+}
+
+// DeleteObjectsHookConfig is a configuration struct for delete objects hook.
+type DeleteObjectsHookConfig struct {
+	Enabled        bool `help:"whether delete objects hook is enabled" default:"false"`
+	MaxConcurrency int  `help:"maximum number of concurrent delete objects hook executions" default:"2"`
+	BufferSize     int  `help:"number of delete events to buffer before processing" default:"100"`
+}
+
+// APIKeyTailsConfig is a configuration struct for API key tails processing.
+type APIKeyTailsConfig struct {
+	CombinerQueueEnabled bool          `help:"whether combiner queue is enabled for processing API key tails" default:"false"`
+	QueueSize            int           `help:"size of API key tails combiner queue" default:"100"`
+	CacheExpiration      time.Duration `help:"API key tails cache expiration" default:"5m"`
+	CacheCapacity        int           `help:"API key tails cache capacity" default:"10000"`
+}
+
+// MaxCommitDelayConfig contains per-operation MaxCommitDelay settings.
+// Default is used for operations that don't have a specific override (e.g., deletes).
+type MaxCommitDelayConfig struct {
+	Projects UUIDsFlag `default:"" help:"list of project IDs for which commit delay is enabled"`
+
+	Default       time.Duration `default:"0ms" help:"default max commit delay for operations without specific config"`
+	BeginObject   time.Duration `default:"0ms" help:"max commit delay for BeginObject transactions"`
+	CommitSegment time.Duration `default:"0ms" help:"max commit delay for CommitSegment transactions"`
+	CommitObject  time.Duration `default:"0ms" help:"max commit delay for CommitObject transactions"`
+}
+
+func (c *MaxCommitDelayConfig) get(projectID uuid.UUID, d time.Duration) *time.Duration {
+	if _, ok := c.Projects[projectID]; !ok {
+		return nil
+	}
+
+	if d > 0 {
+		return &d
+	}
+	return nil
+}
+
+// ForDefault returns the default max commit delay for the given project, or nil if not set.
+func (c *MaxCommitDelayConfig) ForDefault(projectID uuid.UUID) *time.Duration {
+	return c.get(projectID, c.Default)
+}
+
+// ForBeginObject returns the max commit delay for BeginObject transactions for the given project, or nil if not set.
+func (c *MaxCommitDelayConfig) ForBeginObject(projectID uuid.UUID) *time.Duration {
+	return c.get(projectID, c.BeginObject)
+}
+
+// ForCommitSegment returns the max commit delay for CommitSegment transactions, or nil if not set.
+func (c *MaxCommitDelayConfig) ForCommitSegment(projectID uuid.UUID) *time.Duration {
+	return c.get(projectID, c.CommitSegment)
+}
+
+// ForCommitObject returns the max commit delay for CommitObject transactions for the given project, or nil if not set.
+func (c *MaxCommitDelayConfig) ForCommitObject(projectID uuid.UUID) *time.Duration {
+	return c.get(projectID, c.CommitObject)
+}
+
 // Config is a configuration struct that is everything you need to start a metainfo.
 type Config struct {
-	DatabaseURL          string      `help:"the database connection string to use" default:"postgres://"`
+	dbutil.ConnParams
+	DatabaseURL          string      `help:"the database connection string to use; several backends can be given semicolon-separated, each optionally prefixed with 'label=' to name it (the default label is its position in the list)" default:"postgres://"`
 	MinRemoteSegmentSize memory.Size `default:"1240" testDefault:"0" help:"minimum remote segment size"` // TODO: fix tests to work with 1024
 	MaxInlineSegmentSize memory.Size `default:"4KiB" help:"maximum inline segment size"`
 	// we have such default value because max value for ObjectKey is 1024(1 Kib) but EncryptedObjectKey
 	// has encryption overhead 16 bytes. So overall size is 1024 + 16 * 16.
-	MaxEncryptedObjectKeyLength  int                 `default:"4000" help:"maximum encrypted object key length"`
-	MaxSegmentSize               memory.Size         `default:"64MiB" help:"maximum segment size"`
-	MaxMetadataSize              memory.Size         `default:"2KiB" help:"maximum segment metadata size"`
-	MaxCommitInterval            time.Duration       `default:"48h" testDefault:"1h" help:"maximum time allowed to pass between creating and committing a segment"`
-	MinPartSize                  memory.Size         `default:"5MiB" testDefault:"0" help:"minimum allowed part size (last part has no minimum size limit)"`
-	MaxNumberOfParts             int                 `default:"10000" help:"maximum number of parts object can contain"`
-	Overlay                      bool                `default:"true" help:"toggle flag if overlay is enabled"`
-	RS                           RSConfig            `releaseDefault:"29/35/80/110-256B" devDefault:"4/6/8/10-256B" help:"redundancy scheme configuration in the format k/m/o/n-sharesize"`
-	RateLimiter                  RateLimiterConfig   `help:"rate limiter configuration"`
-	UploadLimiter                UploadLimiterConfig `help:"object upload limiter configuration"`
-	ProjectLimits                ProjectLimitConfig  `help:"project limit configuration"`
-	SuccessTrackerKind           string              `default:"percent" help:"success tracker kind, bitshift or percent"`
-	SuccessTrackerTickDuration   time.Duration       `default:"10m" help:"how often to bump the generation in the node success tracker"`
-	SuccessTrackerTrustedUplinks []string            `help:"list of trusted uplinks for success tracker"`
+	MaxEncryptedObjectKeyLength  int                   `default:"4000" help:"maximum encrypted object key length"`
+	MaxSegmentSize               memory.Size           `default:"64MiB" help:"maximum segment size"`
+	MaxMetadataSize              memory.Size           `default:"2KiB" help:"maximum segment metadata size"`
+	MaxCommitInterval            time.Duration         `default:"48h" testDefault:"1h" help:"maximum time allowed to pass between creating and committing a segment"`
+	MinPartSize                  memory.Size           `default:"5MiB" testDefault:"0" help:"minimum allowed part size (last part has no minimum size limit)"`
+	MaxNumberOfParts             int                   `default:"10000" help:"maximum number of parts object can contain"`
+	Overlay                      bool                  `default:"true" help:"toggle flag if overlay is enabled"`
+	RS                           RSConfig              `releaseDefault:"29/35/80/110-256B" devDefault:"4/6/8/10-256B" help:"redundancy scheme configuration in the format k/m/o/n-sharesize"`
+	RateLimiter                  RateLimiterConfig     `help:"rate limiter configuration"`
+	UploadLimiter                UploadLimiterConfig   `help:"object upload limiter configuration"`
+	DownloadLimiter              DownloadLimiterConfig `help:"object download limiter configuration"`
+	ProjectLimits                ProjectLimitConfig    `help:"project limit configuration"`
+	SuccessTrackerKind           string                `default:"percent" help:"success tracker kind, bitshift or percent"`
+	SuccessTrackerTickDuration   time.Duration         `default:"10m" help:"how often to bump the generation in the node success tracker"`
+	FailureTrackerTickDuration   time.Duration         `default:"5s" help:"how often to bump the generation in the node failure tracker"`
+	RetryTrackerTickDuration     time.Duration         `default:"5s" help:"how often to bump the generation in the node retry tracker"`
+	SuccessTrackerTrustedUplinks []string              `help:"list of trusted uplinks for success tracker, deprecated. please use success-tracker-uplinks for uplinks that should get their own success tracker profiles and trusted-uplinks for uplinks that are trusted individually."`
+	SuccessTrackerUplinks        []string              `help:"list of uplinks for success tracker"`
+	SuccessTrackerMonitorEnabled bool                  `help:"enable monkit monitoring of success tracker" default:"false"`
+	SuccessTrackerMonitorFilter  string                `help:"filter for nodes that should be monitored by success tracker monitor" default:"none()"`
+	FailureTrackerChanceToSkip   float64               `help:"the chance to skip a failure tracker generation bump" default:".6"`
+	TrustedUplinks               []string              `help:"list of trusted uplinks"`
+	AlwaysUpdateGlobalTracker    bool                  `help:"if true, always update the global tracker with info, even if the uplink is registered" default:"false"`
 
 	// TODO remove this flag when server-side copy implementation will be finished
 	ServerSideCopy         bool `help:"enable code for server-side copy, deprecated. please leave this to true." default:"true"`
 	ServerSideCopyDisabled bool `help:"disable already enabled server-side copy. this is because once server side copy is enabled, delete code should stay changed, even if you want to disable server side copy" default:"false"`
-	UseListObjectsIterator bool `help:"switch to iterator based implementation." default:"false"`
 
-	NodeAliasCacheFullRefresh bool `help:"node alias cache does a full refresh when a value is missing" default:"false"`
+	UseListObjectsForListing bool `help:"switch to new ListObjects implementation" default:"false" devDefault:"true" testDefault:"true"`
 
-	UseBucketLevelObjectVersioning bool `help:"enable the use of bucket level object versioning" default:"false"`
-	// flag to simplify testing by enabling bucket level versioning feature only for specific projects
-	UseBucketLevelObjectVersioningProjects []string `help:"list of projects which will have UseBucketLevelObjectVersioning feature flag enabled" default:"" hidden:"true"`
-
-	ObjectLockEnabled bool `help:"enable the use of bucket-level Object Lock" default:"false"`
+	ListObjects ListObjectsFlags `help:"tuning parameters for list objects"`
 
 	UserInfoValidation UserInfoValidationConfig `help:"Config for user info validation"`
 
+	ProjectEntitlement ProjectEntitlementConfig `help:"Config for fetching project entitlements"`
+
+	SunsetPlacements              PlacementMigrationsFlag `help:"comma-separated 'old:new' placement pairs; recreating a bucket whose attribution has placement 'old' with requested placement 'new' is allowed once sunset-placements-effective-date has passed (e.g. 30:0,31:12,32:0)" default:"30:0,31:12,32:0" testDefault:""`
+	SunsetPlacementsEffectiveDate string                  `help:"date (RFC3339) after which sunset placement migrations are allowed during bucket recreation" default:"2026-07-04T00:00:00Z" testDefault:""`
+
+	SendEdgeUrlOverrides bool `help:"send edge URL overrides through the GetProjectInfo endpoint" default:"false"`
+
+	DeleteObjectsEnabled bool `help:"enable the use of the DeleteObjects endpoint" default:"true"`
+
+	BucketTaggingEnabled bool `help:"enable the use of the bucket tagging endpoints" default:"false"`
+
+	ChecksumsEnabled bool `help:"allow object and segment checksums to be set" default:"false"`
+
+	LimitEmailNotificationsEnabled bool `help:"enable project limit email notification event detection and queueing" default:"false"`
+
+	BucketEventingServiceAccount string `help:"service account email to impersonate for sending bucket eventing test event" default:""`
+
+	APIKeyTailsConfig APIKeyTailsConfig `help:"Config for API key tails processing"`
+
+	CopyMoveSegmentLimit int64 `help:"the maximum number of segments that can be copied or moved in a single operation" default:"10000"`
+
+	MaxCommitDelay MaxCommitDelayConfig `help:"max commit delay configuration per operation type" hidden:"true"`
+
 	// TODO remove when we benchmarking are done and decision is made.
 	TestListingQuery                bool      `default:"false" help:"test the new query for non-recursive listing"`
-	TestOptimizedInlineObjectUpload bool      `default:"false" devDefault:"true" help:"enables optimization for uploading objects with single inline segment"`
-	TestingPrecommitDeleteMode      int       `default:"0" help:"which code path to use for precommit delete step for unversioned objects, 0 is the default (old) code path."`
-	TestingSpannerProjects          UUIDsFlag `default:""  help:"list of project IDs for which Spanner metabase DB is enabled" hidden:"true"`
+	TestOptimizedInlineObjectUpload bool      `default:"false" help:"enables optimization for uploading objects with single inline segment"`
+	TestingMigratedProjects         UUIDsFlag `default:"" help:"list of project IDs which have been migrated to the new metabase backend" hidden:"true"`
+	TestingMigrationMode            bool      `default:"false" help:"sets metainfo API into migration mode, only read actions are allowed" hidden:"true"`
+	TestingTimestampVersioning      bool      `default:"false" help:"use timestamps for assigning version numbers" hidden:"true"`
+
+	TestingDeleteBucketBatchSize int `default:"15" help:"how many objects to delete in a single batch during a bucket deletion"`
+
+	TestingAlternativeBeginObject         bool      `default:"true" help:"enable alternative (negative version) begin object implementation globally" hidden:"true"`
+	TestingAlternativeBeginObjectProjects UUIDsFlag `default:"" help:"list of project IDs for which will use alternative (negative version) begin object implementation" hidden:"true"`
+
+	ProjectToAdapter ProjectBackendsFlag `default:"" help:"comma separated list of project IDs and the metabase backend serving them in format 'project_id:backend_label'; a backend is labeled in database-url and defaults to its position there, so an index still names it" hidden:"true"`
+
+	DefaultListMode string `default:"plain" testDefault:"key-probe" help:"ListObjects query mode used for projects without a project-list-mode override (one of: plain, key-probe, local-reorder)" hidden:"true"`
+	ProjectListMode string `default:"" help:"comma separated list of per project ListObjects query mode overrides in format 'project_id:mode'" hidden:"true"`
+
+	CreateRemainderChargeOnObjectDelete bool `help:"whether to create a remainder charge when an object is deleted before minimum retention" default:"false"`
+
+	OmLicenseForAllUntil string `help:"if set, all users will be granted the om license with expiration date set to this value (RFC3339)" default:"false" hidden:"true"`
 }
 
 // Metabase constructs Metabase configuration based on Metainfo configuration with specific application name.
@@ -211,64 +343,113 @@ func (c Config) Metabase(applicationName string) metabase.Config {
 		MinPartSize:                c.MinPartSize,
 		MaxNumberOfParts:           c.MaxNumberOfParts,
 		ServerSideCopy:             c.ServerSideCopy,
-		NodeAliasCacheFullRefresh:  c.NodeAliasCacheFullRefresh,
-		TestingPrecommitDeleteMode: metabase.TestingPrecommitDeleteMode(c.TestingPrecommitDeleteMode),
-		TestingSpannerProjects:     c.TestingSpannerProjects,
+		TestingTimestampVersioning: c.TestingTimestampVersioning,
+		ProjectToAdapter:           c.ProjectToAdapter.Backends(),
+		DefaultListMode:            metabase.ListMode(c.DefaultListMode),
+		ProjectListMode:            projectListModeMap(c.ProjectListMode),
 	}
 }
 
-// ExtendedConfig extended config keeps additional helper fields and methods around Config.
-type ExtendedConfig struct {
-	Config
+// projectListModeMap parses the ProjectListMode string into a map of project IDs
+// to ListObjects query modes. Silently ignores any invalid entries.
+func projectListModeMap(projectListMode string) map[uuid.UUID]metabase.ListMode {
+	result := make(map[uuid.UUID]metabase.ListMode)
+	if projectListMode == "" {
+		return result
+	}
+	for _, entry := range strings.Split(projectListMode, ",") {
+		parts := strings.SplitN(entry, ":", 2)
+		if len(parts) != 2 {
+			continue
+		}
 
-	useBucketLevelObjectVersioningProjects map[uuid.UUID]struct{}
+		projectID, err := uuid.FromString(parts[0])
+		if err != nil || parts[1] == "" {
+			continue
+		}
+
+		result[projectID] = metabase.ListMode(parts[1])
+	}
+	return result
 }
 
-// NewExtendedConfig creates new instance of extended config.
-func NewExtendedConfig(config Config) (_ ExtendedConfig, err error) {
-	extendedConfig := ExtendedConfig{
-		Config:                                 config,
-		useBucketLevelObjectVersioningProjects: make(map[uuid.UUID]struct{}),
+// ProjectBackendsFlag assigns projects to the metabase backend serving them,
+// by the backend's label.
+//
+// It is a list rather than a map so that it keeps the order it was given:
+// String then returns the list it parsed, and feeding that back in -- which is
+// what happens every time the config file is rewritten -- is a no-op.
+//
+// Can be used as a flag.
+type ProjectBackendsFlag []ProjectBackend
+
+// ProjectBackend assigns one project to the metabase backend serving it.
+type ProjectBackend struct {
+	ProjectID uuid.UUID
+	Label     string
+}
+
+// Type is required for pflag.Value.
+func (m ProjectBackendsFlag) Type() string {
+	return "metainfo.ProjectBackendsFlag"
+}
+
+// Set is required for pflag.Value. It parses comma-separated
+// 'project_id:backend_label' pairs.
+//
+// A malformed entry is an error rather than a skip: dropping it would leave
+// the project on the default backend, which is the very outcome -- metadata
+// looked up in a database that does not have it -- that naming a backend is
+// there to avoid. Assigning one project twice is refused for the same reason,
+// rather than quietly letting one of the two win. Spaces are trimmed on both
+// sides, matching how the labels are read out of the connection string, so
+// that a list written with spaces after the commas means what it looks like.
+func (m *ProjectBackendsFlag) Set(s string) error {
+	*m = nil
+	if strings.TrimSpace(s) == "" {
+		return nil
 	}
-	for _, projectIDString := range config.UseBucketLevelObjectVersioningProjects {
-		projectID, err := uuid.FromString(projectIDString)
+
+	seen := map[uuid.UUID]bool{}
+	for _, pair := range strings.Split(s, ",") {
+		projectIDStr, label, ok := strings.Cut(pair, ":")
+		if !ok {
+			return Error.New("invalid project backend pair %q, expected 'project_id:backend_label'", pair)
+		}
+		projectID, err := uuid.FromString(strings.TrimSpace(projectIDStr))
 		if err != nil {
-			return ExtendedConfig{}, err
+			return Error.New("invalid project ID %q: %w", projectIDStr, err)
 		}
-		extendedConfig.useBucketLevelObjectVersioningProjects[projectID] = struct{}{}
-	}
+		label = strings.TrimSpace(label)
+		if label == "" || !dbutil.ValidLabel(label) {
+			return Error.New("project %s has an invalid backend label %q", projectID, label)
+		}
+		if seen[projectID] {
+			return Error.New("project %s is assigned to a backend twice", projectID)
+		}
+		seen[projectID] = true
 
-	return extendedConfig, nil
+		*m = append(*m, ProjectBackend{ProjectID: projectID, Label: label})
+	}
+	return nil
 }
 
-// UseBucketLevelObjectVersioningByProject checks if UseBucketLevelObjectVersioning should be enabled for specific project.
-func (ec ExtendedConfig) UseBucketLevelObjectVersioningByProject(project *console.Project) bool {
-	// if its globally enabled don't look at projects
-	if !ec.UseBucketLevelObjectVersioning {
-		if _, ok := ec.useBucketLevelObjectVersioningProjects[project.ID]; ok {
-			return true
-		}
-		// account for whether the project has opted in to versioning beta
-		if !project.PromptedForVersioningBeta {
-			return false
-		} else if project.PromptedForVersioningBeta && project.DefaultVersioning != console.VersioningUnsupported {
-			return true
-		} else {
-			return false
-		}
+// String is required for pflag.Value.
+func (m ProjectBackendsFlag) String() string {
+	pairs := make([]string, 0, len(m))
+	for _, backend := range m {
+		pairs = append(pairs, backend.ProjectID.String()+":"+backend.Label)
 	}
-
-	return true
+	return strings.Join(pairs, ",")
 }
 
-// ObjectLockEnabledByProject checks if bucket-level Object Lock functionality
-// should be enabled for a specific project.
-func (ec ExtendedConfig) ObjectLockEnabledByProject(project *console.Project) bool {
-	// if its globally enabled don't look at projects
-	if !ec.ObjectLockEnabled {
-		return false
+// Backends maps each project to the label of the backend serving it.
+func (m ProjectBackendsFlag) Backends() map[uuid.UUID]string {
+	backends := make(map[uuid.UUID]string, len(m))
+	for _, backend := range m {
+		backends[backend.ProjectID] = backend.Label
 	}
-	return ec.UseBucketLevelObjectVersioningByProject(project)
+	return backends
 }
 
 // UUIDsFlag is a configuration struct that keeps info about project IDs
@@ -313,4 +494,117 @@ func (m UUIDsFlag) String() string {
 		i++
 	}
 	return b.String()
+}
+
+// PlacementMigrationsFlag maps sunset placements to their replacements.
+//
+// Can be used as a flag.
+type PlacementMigrationsFlag map[storj.PlacementConstraint]storj.PlacementConstraint
+
+// Type is required for pflag.Value.
+func (m PlacementMigrationsFlag) Type() string {
+	return "metainfo.PlacementMigrationsFlag"
+}
+
+// Set is required for pflag.Value. It parses comma-separated 'old:new' placement pairs (e.g. 30:0,31:12).
+func (m *PlacementMigrationsFlag) Set(s string) error {
+	*m = make(PlacementMigrationsFlag)
+	if s == "" {
+		return nil
+	}
+
+	for _, pair := range strings.Split(s, ",") {
+		parts := strings.Split(strings.TrimSpace(pair), ":")
+		if len(parts) != 2 {
+			return Error.New("invalid placement pair %q, expected 'old:new'", pair)
+		}
+		old, err := strconv.ParseUint(parts[0], 10, 16)
+		if err != nil {
+			return Error.New("invalid placement ID %q: %w", parts[0], err)
+		}
+		newer, err := strconv.ParseUint(parts[1], 10, 16)
+		if err != nil {
+			return Error.New("invalid placement ID %q: %w", parts[1], err)
+		}
+		(*m)[storj.PlacementConstraint(old)] = storj.PlacementConstraint(newer)
+	}
+	return nil
+}
+
+// String is required for pflag.Value.
+func (m PlacementMigrationsFlag) String() string {
+	keys := make([]storj.PlacementConstraint, 0, len(m))
+	for old := range m {
+		keys = append(keys, old)
+	}
+	slices.Sort(keys)
+
+	var b strings.Builder
+	for _, old := range keys {
+		if b.Len() > 0 {
+			b.WriteString(",")
+		}
+		_, _ = fmt.Fprintf(&b, "%d:%d", old, m[old])
+	}
+	return b.String()
+}
+
+// MigrationModeFlagExtension defines custom debug endpoint for metainfo migration mode flag.
+type MigrationModeFlagExtension struct {
+	migrationMode atomic.Bool
+}
+
+// NewMigrationModeFlagExtension creates a new instance of MigrationModeFlagExtension.
+func NewMigrationModeFlagExtension(config Config) *MigrationModeFlagExtension {
+	m := &MigrationModeFlagExtension{}
+	m.migrationMode.Store(config.TestingMigrationMode)
+	return m
+}
+
+// Description is a display name for the UI.
+func (m *MigrationModeFlagExtension) Description() string {
+	return "give ability to get or set state of metainfo TestingMigrationMode flag"
+}
+
+// Path is the unique HTTP path fragment.
+func (m *MigrationModeFlagExtension) Path() string {
+	return "/metainfo/flags/migration-mode"
+}
+
+// Handler is the HTTP handler for the path.
+func (m *MigrationModeFlagExtension) Handler(w http.ResponseWriter, r *http.Request) {
+
+	switch r.Method {
+	case http.MethodGet:
+		_, err := w.Write([]byte(strconv.FormatBool(m.migrationMode.Load())))
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = fmt.Fprintf(w, "internal error: %v", err)
+		}
+	case http.MethodPut:
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = fmt.Fprintf(w, "internal error: %v", err)
+		}
+		value, err := strconv.ParseBool(string(body))
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = fmt.Fprintf(w, "internal error: %v", err)
+		}
+		m.migrationMode.Store(value)
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		_, _ = fmt.Fprintf(w, "Only GET or PUT are supported.")
+	}
+}
+
+// Enabled returns true if migration mode is enabled.
+func (m *MigrationModeFlagExtension) Enabled() bool {
+	return m.migrationMode.Load()
+}
+
+// TestingSetChecksumsEnabled sets whether object and segment checksums are allowed to be set in requests.
+func (endpoint *Endpoint) TestingSetChecksumsEnabled(enabled bool) {
+	endpoint.config.ChecksumsEnabled = enabled
 }

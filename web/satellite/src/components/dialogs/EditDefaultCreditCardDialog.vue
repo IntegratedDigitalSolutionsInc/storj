@@ -6,6 +6,7 @@
         v-model="model"
         max-width="420px"
         transition="fade-transition"
+        :scrim
         :persistent="isLoading"
     >
         <v-card>
@@ -20,10 +21,10 @@
                         <icon-card />
                     </v-sheet>
                 </template>
-                <v-card-title class="font-weight-bold">Edit Default Card</v-card-title>
+                <v-card-title class="font-weight-bold">Set Default Card</v-card-title>
                 <template #append>
                     <v-btn
-                        icon="$close"
+                        :icon="X"
                         variant="text"
                         size="small"
                         color="default"
@@ -77,16 +78,21 @@ import {
     VRadioGroup,
     VSheet,
 } from 'vuetify/components';
+import { X } from '@lucide/vue';
 
 import { useBillingStore } from '@/store/modules/billingStore';
 import { useLoading } from '@/composables/useLoading';
-import { useNotify } from '@/utils/hooks';
+import { useNotify } from '@/composables/useNotify';
 import { AnalyticsErrorEventSource } from '@/utils/constants/analyticsEventNames';
-import { CreditCard } from '@/types/payments';
+import type { CreditCard } from '@/types/payments';
 import { useUsersStore } from '@/store/modules/usersStore';
 
 import CreditCardItem from '@/components/dialogs/ccActionComponents/CreditCardItem.vue';
 import IconCard from '@/components/icons/IconCard.vue';
+
+defineProps<{
+    scrim: boolean,
+}>();
 
 const model = defineModel<boolean>({ required: true });
 

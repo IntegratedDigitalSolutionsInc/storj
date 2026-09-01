@@ -26,7 +26,7 @@
                     </v-card-title>
                     <template #append>
                         <v-btn
-                            icon="$close"
+                            :icon="X"
                             variant="text"
                             size="small"
                             color="default"
@@ -40,7 +40,7 @@
 
             <v-row>
                 <v-col class="pa-6 mx-3">
-                    <p class="mt-3 mb-1 font-weight-bold text-body-2">
+                    <p class="mt-3 mb-1 font-weight-bold text-body-medium">
                         Name:
                     </p>
                     <v-chip
@@ -52,7 +52,7 @@
                     </v-chip>
 
                     <template v-if="file?.VersionId">
-                        <p class="mt-3 mb-1 font-weight-bold text-body-2">
+                        <p class="mt-3 mb-1 font-weight-bold text-body-medium">
                             Version:
                         </p>
                         <v-chip
@@ -65,7 +65,7 @@
                     </template>
 
                     <template v-if="file?.legalHold">
-                        <p class="mt-3 mb-1 font-weight-bold text-body-2">
+                        <p class="mt-3 mb-1 font-weight-bold text-body-medium">
                             Legal Hold:
                         </p>
 
@@ -79,7 +79,7 @@
                     </template>
 
                     <template v-if="file?.retention?.active">
-                        <p class="mt-3 mb-1 font-weight-bold text-body-2">
+                        <p class="mt-3 mb-1 font-weight-bold text-body-medium">
                             Lock Mode:
                         </p>
 
@@ -91,7 +91,7 @@
                             {{ file.retention.mode.substring(0, 1) + file.retention.mode.substring(1).toLowerCase() }}
                         </v-chip>
 
-                        <p class="mt-3 mb-1 font-weight-bold text-body-2">
+                        <p class="mt-3 mb-1 font-weight-bold text-body-medium">
                             Locked until:
                         </p>
 
@@ -120,7 +120,7 @@
                             Close
                         </v-btn>
                     </v-col>
-                    <v-col>
+                    <v-col v-if="configStore.isDefaultBrand">
                         <v-btn color="primary" variant="flat" block @click="goToDocs">
                             Learn More
                         </v-btn>
@@ -147,17 +147,19 @@ import {
     VRow,
     VSheet,
 } from 'vuetify/components';
-import { Lock } from 'lucide-vue-next';
+import { Lock, X } from '@lucide/vue';
 
 import { Time } from '@/utils/time';
-import { FullBrowserObject } from '@/store/modules/objectBrowserStore';
+import type { FullBrowserObject } from '@/store/modules/objectBrowserStore';
 import {
     AnalyticsEvent,
     PageVisitSource,
 } from '@/utils/constants/analyticsEventNames';
 import { useAnalyticsStore } from '@/store/modules/analyticsStore';
+import { useConfigStore } from '@/store/modules/configStore';
 
 const analyticsStore = useAnalyticsStore();
+const configStore = useConfigStore();
 
 defineProps<{
     file: FullBrowserObject | null,

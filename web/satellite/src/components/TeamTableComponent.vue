@@ -2,119 +2,116 @@
 // See LICENSE for copying information.
 
 <template>
-    <v-card>
-        <v-text-field
-            v-model="search"
-            label="Search"
-            :prepend-inner-icon="Search"
-            single-line
-            variant="solo-filled"
-            flat
-            hide-details
-            clearable
-            density="comfortable"
-            rounded="lg"
-            :maxlength="MAX_SEARCH_VALUE_LENGTH"
-            class="mx-2 mt-2"
-        />
+    <v-text-field
+        v-model="search"
+        label="Search"
+        :prepend-inner-icon="Search"
+        single-line
+        variant="solo-filled"
+        flat
+        hide-details
+        clearable
+        density="comfortable"
+        :maxlength="MAX_SEARCH_VALUE_LENGTH"
+        class="mb-5"
+    />
 
-        <v-data-table-server
-            v-model="selectedMembers"
-            :search="search"
-            :headers="headers"
-            :items="projectMembers"
-            :loading="isLoading"
-            :items-length="page.totalCount"
-            items-per-page-text="Accounts per page"
-            :items-per-page-options="tableSizeOptions(page.totalCount)"
-            no-data-text="No results found"
-            item-value="email"
-            select-strategy="all"
-            item-selectable="selectable"
-            :show-select="isUserAdmin"
-            :hover="isUserAdmin"
-            @update:itemsPerPage="onUpdateLimit"
-            @update:page="onUpdatePage"
-            @update:sortBy="onUpdateSortBy"
-        >
-            <template #item.name="{ item }">
-                <span class="font-weight-bold">
-                    {{ item.name }}
-                </span>
-            </template>
-            <template #item.role="{ item }">
-                <v-chip :color="PROJECT_ROLE_COLORS[item.role]" variant="tonal" size="small" class="font-weight-bold">
-                    {{ item.role }}
-                </v-chip>
-            </template>
-            <template #item.actions="{ item }">
-                <v-btn
-                    v-if="hasActionMenu(item)"
-                    variant="outlined"
-                    color="default"
-                    size="small"
-                    rounded="md"
-                    class="mr-1 text-caption"
-                    density="comfortable"
-                    icon
-                >
-                    <v-icon :icon="Ellipsis" />
-                    <v-menu activator="parent">
-                        <v-list class="pa-1">
-                            <v-list-item
-                                v-if="hasChangeRoleActionItem(item)"
-                                density="comfortable"
-                                link
-                                @click="() => showChangeRoleDialog(item)"
-                            >
-                                <template #prepend>
-                                    <component :is="UserCog" :size="18" />
-                                </template>
-                                <v-list-item-title class="ml-3 text-body-2 font-weight-medium">
-                                    Change Role
-                                </v-list-item-title>
-                            </v-list-item>
-                            <v-list-item
-                                v-if="hasInviteActionItem(item)"
-                                density="comfortable"
-                                link
-                                @click="() => onResendOrCopyClick(item.expired, item.email)"
-                            >
-                                <template #prepend>
-                                    <component :is="Send" v-if="item.expired" :size="18" />
-                                    <component :is="Copy" v-else :size="18" />
-                                </template>
-                                <v-list-item-title class="ml-3 text-body-2 font-weight-medium">
-                                    {{ item.expired ? 'Resend Invite' : 'Copy Invite Link' }}
-                                </v-list-item-title>
-                            </v-list-item>
-                            <v-divider
-                                v-if="hasInviteActionItem(item) || hasChangeRoleActionItem(item)"
-                                class="my-1"
-                            />
-                            <v-list-item
-                                class="text-error"
-                                density="comfortable"
-                                link
-                                @click="() => onSingleDelete(item.email)"
-                            >
-                                <template #prepend>
-                                    <component :is="UserMinus" :size="18" />
-                                </template>
-                                <v-list-item-title class="ml-3 text-body-2 font-weight-medium">
-                                    Remove Member
-                                </v-list-item-title>
-                            </v-list-item>
-                        </v-list>
-                    </v-menu>
-                </v-btn>
-            </template>
-        </v-data-table-server>
-    </v-card>
+    <v-data-table-server
+        v-model="selectedMembers"
+        :search="search"
+        :headers="headers"
+        :items="projectMembers"
+        :loading="isLoading"
+        :items-length="page.totalCount"
+        items-per-page-text="Accounts per page"
+        :items-per-page-options="tableSizeOptions(page.totalCount)"
+        no-data-text="No results found"
+        :item-value="(item) => ({email: item.email, isInvite: hasInviteActionItem(item)})"
+        select-strategy="all"
+        item-selectable="selectable"
+        :show-select="isUserAdmin"
+        :hover="isUserAdmin"
+        @update:items-per-page="onUpdateLimit"
+        @update:page="onUpdatePage"
+        @update:sort-by="onUpdateSortBy"
+    >
+        <template #item.name="{ item }">
+            <span class="font-weight-bold">
+                {{ item.name }}
+            </span>
+        </template>
+        <template #item.role="{ item }">
+            <v-chip :color="PROJECT_ROLE_COLORS[item.role]" variant="tonal" size="small" class="font-weight-bold">
+                {{ item.role }}
+            </v-chip>
+        </template>
+        <template #item.actions="{ item }">
+            <v-btn
+                v-if="hasActionMenu(item)"
+                variant="outlined"
+                color="default"
+                size="small"
+                rounded="md"
+                class="mr-1 text-body-small"
+                density="comfortable"
+                icon
+            >
+                <v-icon :icon="Ellipsis" />
+                <v-menu activator="parent">
+                    <v-list class="pa-1">
+                        <v-list-item
+                            v-if="hasChangeRoleActionItem(item)"
+                            density="comfortable"
+                            link
+                            @click="() => showChangeRoleDialog(item)"
+                        >
+                            <template #prepend>
+                                <component :is="UserCog" :size="18" />
+                            </template>
+                            <v-list-item-title class="ml-3 text-body-medium font-weight-medium">
+                                Change Role
+                            </v-list-item-title>
+                        </v-list-item>
+                        <v-list-item
+                            v-if="hasInviteActionItem(item)"
+                            density="comfortable"
+                            link
+                            @click="() => onResendOrCopyClick(item.expired, item.email)"
+                        >
+                            <template #prepend>
+                                <component :is="Send" v-if="item.expired" :size="18" />
+                                <component :is="Copy" v-else :size="18" />
+                            </template>
+                            <v-list-item-title class="ml-3 text-body-medium font-weight-medium">
+                                {{ item.expired ? 'Resend Invite' : 'Copy Invite Link' }}
+                            </v-list-item-title>
+                        </v-list-item>
+                        <v-divider
+                            v-if="hasInviteActionItem(item) || hasChangeRoleActionItem(item)"
+                            class="my-1"
+                        />
+                        <v-list-item
+                            class="text-error"
+                            density="comfortable"
+                            link
+                            @click="() => onSingleDelete(item)"
+                        >
+                            <template #prepend>
+                                <component :is="UserMinus" :size="18" />
+                            </template>
+                            <v-list-item-title class="ml-3 text-body-medium font-weight-medium">
+                                {{ hasInviteActionItem(item) ? "Remove Invite" : "Remove Member" }}
+                            </v-list-item-title>
+                        </v-list-item>
+                    </v-list>
+                </v-menu>
+            </v-btn>
+        </template>
+    </v-data-table-server>
 
     <remove-project-member-dialog
         v-model="isRemoveMembersDialogShown"
-        :emails="membersToDelete"
+        :removables="membersToDelete"
         @deleted="onPostDelete"
     />
 
@@ -159,7 +156,6 @@
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import {
     VRow,
-    VCard,
     VCol,
     VTextField,
     VChip,
@@ -180,30 +176,31 @@ import {
     Send,
     Copy,
     UserMinus,
-    UserCog }
-    from 'lucide-vue-next';
+    UserCog,
+}
+    from '@lucide/vue';
 
 import { Time } from '@/utils/time';
 import { useProjectMembersStore } from '@/store/modules/projectMembersStore';
 import { useProjectsStore } from '@/store/modules/projectsStore';
 import {
-    ProjectInvitationItemModel,
-    ProjectMemberCursor,
+    type ProjectInvitationItemModel,
+    type ProjectMemberCursor,
+    type ProjectMembersPage,
     ProjectMemberOrderBy,
-    ProjectMembersPage,
     ProjectRole,
 } from '@/types/projectMembers';
-import { Project, PROJECT_ROLE_COLORS } from '@/types/projects';
+import { type Project, PROJECT_ROLE_COLORS  } from '@/types/projects';
 import { AnalyticsErrorEventSource, AnalyticsEvent } from '@/utils/constants/analyticsEventNames';
 import { useAnalyticsStore } from '@/store/modules/analyticsStore';
 import { DEFAULT_PAGE_LIMIT } from '@/types/pagination';
 import { useLoading } from '@/composables/useLoading';
-import { useNotify } from '@/utils/hooks';
-import { SortDirection, tableSizeOptions, MAX_SEARCH_VALUE_LENGTH, DataTableHeader } from '@/types/common';
+import { useNotify } from '@/composables/useNotify';
+import { type DataTableHeader, SortDirection, tableSizeOptions, MAX_SEARCH_VALUE_LENGTH  } from '@/types/common';
 import { useUsersStore } from '@/store/modules/usersStore';
 import { useConfigStore } from '@/store/modules/configStore';
 import { ROUTES } from '@/router';
-import { User } from '@/types/users';
+import type { User } from '@/types/users';
 
 import RemoveProjectMemberDialog from '@/components/dialogs/RemoveProjectMemberDialog.vue';
 import ChangeMemberRoleDialog from '@/components/dialogs/ChangeMemberRoleDialog.vue';
@@ -216,7 +213,7 @@ type RenderedItem = {
     date: string,
     selectable: boolean,
     expired: boolean,
-}
+};
 
 const usersStore = useUsersStore();
 const analyticsStore = useAnalyticsStore();
@@ -236,8 +233,8 @@ const isRemoveMembersDialogShown = ref<boolean>(false);
 const isChangeMembersRoleShown = ref<boolean>(false);
 const search = ref<string>('');
 const searchTimer = ref<NodeJS.Timeout>();
-const selectedMembers = ref<string[]>([]);
-const memberToDelete = ref<string>();
+const selectedMembers = ref<{ email:string, isInvite: boolean }[]>([]);
+const memberToDelete = ref<{ email:string, isInvite: boolean }>();
 const memberToUpdate = ref<RenderedItem>();
 
 const headers = ref<DataTableHeader[]>([
@@ -302,7 +299,7 @@ const projectMembers = computed((): RenderedItem[] => {
 /**
  * Returns the members to be deleted to the delete dialog.
  */
-const membersToDelete = computed<string[]>(() => {
+const membersToDelete = computed<{ email:string, isInvite: boolean }[]>(() => {
     if (memberToDelete.value) return [memberToDelete.value];
     return selectedMembers.value;
 });
@@ -346,26 +343,27 @@ async function onUpdatePage(page: number): Promise<void> {
  * Handles post delete operations.
  */
 async function onPostDelete(): Promise<void> {
-    if (selectedMembers.value.includes(usersStore.state.user.email)) {
-        router.push(ROUTES.Projects.path);
+    if (membersToDelete.value.map(s => s.email).includes(usersStore.state.user.email)) {
+        void projectsStore.getProjects();
+        await router.push(ROUTES.Projects.path);
         return;
     }
 
     search.value = '';
     selectedMembers.value = [];
-    memberToDelete.value = '';
+    memberToDelete.value = undefined;
     await onUpdatePage(FIRST_PAGE);
 }
 
-function onSingleDelete(email: string): void {
-    memberToDelete.value = email;
+function onSingleDelete(item: RenderedItem): void {
+    memberToDelete.value = { email: item.email, isInvite: hasInviteActionItem(item) };
     isRemoveMembersDialogShown.value = true;
 }
 
 /**
  * Handles update table sorting event.
  */
-async function onUpdateSortBy(sortBy: {key: keyof ProjectMemberOrderBy, order: keyof SortDirection}[]): Promise<void> {
+async function onUpdateSortBy(sortBy: { key: keyof ProjectMemberOrderBy, order: keyof SortDirection }[]): Promise<void> {
     if (!sortBy.length) return;
 
     const sorting = sortBy[0];
@@ -392,7 +390,7 @@ async function onResendOrCopyClick(expired: boolean, email: string): Promise<voi
  */
 async function resendInvite(email: string): Promise<void> {
     await withLoading(async () => {
-        analyticsStore.eventTriggered(AnalyticsEvent.RESEND_INVITE_CLICKED);
+        analyticsStore.eventTriggered(AnalyticsEvent.RESEND_INVITE_CLICKED, { project_id: selectedProject.value.id });
         try {
             await pmStore.reinviteMembers([email], selectedProject.value.id);
             if (configStore.state.config.unregisteredInviteEmailsEnabled) {
@@ -446,7 +444,7 @@ async function fetch(page = FIRST_PAGE, limit = DEFAULT_PAGE_LIMIT): Promise<voi
         try {
             await pmStore.getProjectMembers(page, selectedProject.value.id, limit);
         } catch (error) {
-            notify.error(`Unable to fetch Project Members. ${error.message}`, AnalyticsErrorEventSource.PROJECT_MEMBERS_PAGE);
+            notify.notifyError(error, AnalyticsErrorEventSource.PROJECT_MEMBERS_PAGE);
         }
     });
 }
@@ -467,7 +465,7 @@ function showDeleteDialog(): void {
 }
 
 watch(isRemoveMembersDialogShown, (value) => {
-    if (!value) memberToDelete.value = '';
+    if (!value) memberToDelete.value = undefined;
 });
 
 /**

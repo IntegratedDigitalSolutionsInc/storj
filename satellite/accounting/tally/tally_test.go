@@ -19,47 +19,87 @@ import (
 	"storj.io/common/testcontext"
 	"storj.io/common/testrand"
 	"storj.io/common/uuid"
+	"storj.io/eventkit"
+	"storj.io/eventkit/pb"
 	"storj.io/storj/private/testplanet"
 	"storj.io/storj/satellite"
 	"storj.io/storj/satellite/accounting"
 	"storj.io/storj/satellite/accounting/tally"
 	"storj.io/storj/satellite/metabase"
+	"storj.io/storj/shared/modular/eventkit/eventkitspy"
 )
 
 func TestDeleteTalliesBefore(t *testing.T) {
-	tests := []struct {
-		eraseBefore  time.Time
-		expectedRaws int
-	}{
-		{
-			eraseBefore:  time.Now(),
-			expectedRaws: 3,
-		},
-		{
-			eraseBefore:  time.Now().Add(24 * time.Hour),
-			expectedRaws: 0,
-		},
-	}
+	testplanet.Run(t, testplanet.Config{
+		SatelliteCount: 1,
+	}, func(t *testing.T, ctx *testcontext.Context, planet *testplanet.Planet) {
+		nodeIDs := []storj.NodeID{{1}, {2}, {3}}
+		nodeBWAmounts := []float64{1000, 1000, 1000}
 
-	for _, tt := range tests {
-		test := tt
-		testplanet.Run(t, testplanet.Config{
-			SatelliteCount: 1, StorageNodeCount: 0, UplinkCount: 0,
-		}, func(t *testing.T, ctx *testcontext.Context, planet *testplanet.Planet) {
-			nodeIDs := []storj.NodeID{{1}, {2}, {3}}
-			nodeBWAmounts := []float64{1000, 1000, 1000}
+		tests := []struct {
+			name         string
+			tallyTimes   []time.Duration // relative to base time
+			eraseBefore  time.Duration   // relative to base time
+			expectedRaws int
+		}{
+			{
+				name:         "delete nothing when before is earlier than all tallies",
+				tallyTimes:   []time.Duration{0, 12 * time.Hour, 36 * time.Hour},
+				eraseBefore:  -24 * time.Hour,
+				expectedRaws: 9, // 3 nodes * 3 tallies
+			},
+			{
+				name:         "delete first 24h chunk",
+				tallyTimes:   []time.Duration{0, 12 * time.Hour, 36 * time.Hour},
+				eraseBefore:  24 * time.Hour,
+				expectedRaws: 3, // only tallies at 36h remain
+			},
+			{
+				name:         "delete across multiple 24h chunks",
+				tallyTimes:   []time.Duration{0, 25 * time.Hour, 50 * time.Hour, 75 * time.Hour},
+				eraseBefore:  72 * time.Hour,
+				expectedRaws: 3, // only tallies at 75h remain
+			},
+			{
+				name:         "delete all tallies",
+				tallyTimes:   []time.Duration{0, 12 * time.Hour, 36 * time.Hour},
+				eraseBefore:  100 * time.Hour,
+				expectedRaws: 0,
+			},
+			{
+				name:         "delete at chunk boundary",
+				tallyTimes:   []time.Duration{0, 24 * time.Hour, 48 * time.Hour},
+				eraseBefore:  48 * time.Hour,
+				expectedRaws: 3, // tallies at exactly 48h remain
+			},
+		}
 
-			err := planet.Satellites[0].DB.StoragenodeAccounting().SaveTallies(ctx, time.Now(), nodeIDs, nodeBWAmounts)
-			require.NoError(t, err)
+		for _, test := range tests {
+			t.Run(test.name, func(t *testing.T) {
+				baseTime := time.Now()
 
-			err = planet.Satellites[0].DB.StoragenodeAccounting().DeleteTalliesBefore(ctx, test.eraseBefore, 1)
-			require.NoError(t, err)
+				// Create tallies at different times spanning multiple 24h periods
+				for _, tallyTime := range test.tallyTimes {
+					err := planet.Satellites[0].DB.StoragenodeAccounting().SaveTallies(ctx, baseTime.Add(tallyTime), nodeIDs, nodeBWAmounts)
+					require.NoError(t, err)
+				}
 
-			raws, err := planet.Satellites[0].DB.StoragenodeAccounting().GetTallies(ctx)
-			require.NoError(t, err)
-			assert.Len(t, raws, test.expectedRaws)
-		})
-	}
+				// Delete tallies using 24h chunk deletion
+				err := planet.Satellites[0].DB.StoragenodeAccounting().DeleteTalliesBefore(ctx, baseTime.Add(test.eraseBefore), 1)
+				require.NoError(t, err)
+
+				raws, err := planet.Satellites[0].DB.StoragenodeAccounting().GetTallies(ctx)
+				require.NoError(t, err)
+				assert.Len(t, raws, test.expectedRaws)
+
+				// cleanup state for next test if needed
+				if len(raws) > 0 {
+					err = planet.Satellites[0].DB.StoragenodeAccounting().DeleteTalliesBefore(ctx, baseTime.Add(7*24*time.Hour), 1)
+					require.NoError(t, err)
+				}
+			})
+		}
+	})
 }
 
 func TestOnlyInline(t *testing.T) {
@@ -104,6 +144,8 @@ func TestOnlyInline(t *testing.T) {
 				planet.Satellites[0].Metabase.DB,
 				planet.Satellites[0].DB.Buckets(),
 				planet.Satellites[0].DB.ProjectAccounting(),
+				nil, // productPrices
+				nil, // globalPlacementMap
 				planet.Satellites[0].Config.Tally,
 			)
 			err := collector.Run(ctx)
@@ -186,6 +228,8 @@ func TestCalculateBucketAtRestData(t *testing.T) {
 			satellite.Metabase.DB,
 			planet.Satellites[0].DB.Buckets(),
 			planet.Satellites[0].DB.ProjectAccounting(),
+			nil, // productPrices
+			nil, // globalPlacementMap
 			planet.Satellites[0].Config.Tally,
 		)
 		err = collector.Run(ctx)
@@ -194,17 +238,16 @@ func TestCalculateBucketAtRestData(t *testing.T) {
 	})
 }
 
-func TestIgnoresExpiredPointers(t *testing.T) {
+func TestIgnoresExpiredSegments(t *testing.T) {
 	testplanet.Run(t, testplanet.Config{
-		SatelliteCount: 1, StorageNodeCount: 4, UplinkCount: 1,
+		SatelliteCount: 1, StorageNodeCount: 0, UplinkCount: 1,
 	}, func(t *testing.T, ctx *testcontext.Context, planet *testplanet.Planet) {
 		satellite := planet.Satellites[0]
 
 		const bucketName = "bucket"
 
 		now := time.Now()
-		err := planet.Uplinks[0].UploadWithExpiration(ctx, planet.Satellites[0], "bucket", "path", []byte{1}, now.Add(12*time.Hour))
-		require.NoError(t, err)
+		require.NoError(t, planet.Uplinks[0].UploadWithExpiration(ctx, planet.Satellites[0], "bucket", "path", []byte{1}, now.Add(12*time.Hour)))
 
 		collector := tally.NewBucketTallyCollector(
 			satellite.Log.Named("bucket tally"),
@@ -212,19 +255,26 @@ func TestIgnoresExpiredPointers(t *testing.T) {
 			satellite.Metabase.DB,
 			planet.Satellites[0].DB.Buckets(),
 			planet.Satellites[0].DB.ProjectAccounting(),
+			nil, // productPrices
+			nil, // globalPlacementMap
 			planet.Satellites[0].Config.Tally,
 		)
-		err = collector.Run(ctx)
-		require.NoError(t, err)
+		require.NoError(t, collector.Run(ctx))
 
-		// there should be a single empty tally because all of the objects are expired
+		// there should be a single empty tally (or no tally) because all of the
+		// objects are expired
 		loc := metabase.BucketLocation{
 			ProjectID:  planet.Uplinks[0].Projects[0].ID,
 			BucketName: bucketName,
 		}
-		require.Equal(t, map[metabase.BucketLocation]*accounting.BucketTally{
-			loc: {BucketLocation: loc},
-		}, collector.Bucket)
+		switch len(collector.Bucket) {
+		case 0:
+		// great
+		case 1:
+			require.EqualValues(t, collector.Bucket[loc].ObjectCount, 0)
+		default:
+			require.Fail(t, "an unexpected amount of buckets", len(collector.Bucket))
+		}
 	})
 }
 
@@ -292,7 +342,6 @@ func TestEmptyProjectUpdatesLiveAccounting(t *testing.T) {
 		require.NoError(t, err)
 
 		planet.Satellites[0].Accounting.Tally.Loop.TriggerWait()
-		planet.Satellites[0].Accounting.Tally.Loop.Pause()
 
 		total, err := planet.Satellites[0].Accounting.ProjectUsage.GetProjectStorageTotals(ctx, project1)
 		require.NoError(t, err)
@@ -358,7 +407,9 @@ func TestTallyOnCopiedObject(t *testing.T) {
 
 		for _, tc := range testCases {
 			t.Run(tc.name, func(t *testing.T) {
-				err := planet.Uplinks[0].CreateBucket(ctx, planet.Satellites[0], tc.name)
+				planet.Satellites[0].Accounting.Tally.Loop.Pause()
+
+				err := planet.Uplinks[0].TestingCreateBucket(ctx, planet.Satellites[0], tc.name)
 				require.NoError(t, err)
 
 				data := testrand.Bytes(tc.size)
@@ -374,7 +425,6 @@ func TestTallyOnCopiedObject(t *testing.T) {
 				require.NoError(t, err)
 
 				planet.Satellites[0].Accounting.Tally.Loop.TriggerWait()
-				planet.Satellites[0].Accounting.Tally.Loop.Pause()
 
 				tallies, err := planet.Satellites[0].DB.ProjectAccounting().GetTallies(ctx)
 				require.NoError(t, err)
@@ -388,7 +438,6 @@ func TestTallyOnCopiedObject(t *testing.T) {
 				require.NoError(t, err)
 
 				planet.Satellites[0].Accounting.Tally.Loop.TriggerWait()
-				planet.Satellites[0].Accounting.Tally.Loop.Pause()
 
 				tallies, err = planet.Satellites[0].DB.ProjectAccounting().GetTallies(ctx)
 				require.NoError(t, err)
@@ -433,6 +482,8 @@ func TestBucketTallyCollectorListLimit(t *testing.T) {
 				planet.Satellites[0].Metabase.DB,
 				planet.Satellites[0].DB.Buckets(),
 				planet.Satellites[0].DB.ProjectAccounting(),
+				nil, // productPrices
+				nil, // globalPlacementMap
 				tally.Config{
 					Interval:           1 * time.Hour,
 					ListLimit:          batchSize,
@@ -488,7 +539,10 @@ func TestTallySaveTalliesBatchSize(t *testing.T) {
 			config.SaveTalliesBatchSize = batchSize
 
 			tally := tally.New(zaptest.NewLogger(t), satellite.DB.StoragenodeAccounting(), satellite.DB.ProjectAccounting(),
-				satellite.LiveAccounting.Cache, satellite.Metabase.DB, satellite.DB.Buckets(), config)
+				satellite.LiveAccounting.Cache, satellite.Metabase.DB, satellite.DB.Buckets(), config,
+				nil, // productPrices
+				nil, // globalPlacementMap
+			)
 
 			// collect and store tallies in DB
 			err := tally.Tally(ctx)
@@ -507,6 +561,505 @@ func TestTallySaveTalliesBatchSize(t *testing.T) {
 			}
 
 			require.ElementsMatch(t, expectedBucketLocations, bucketLocations)
+		}
+	})
+}
+
+func TestTallyPurge(t *testing.T) {
+	testplanet.Run(t, testplanet.Config{
+		SatelliteCount: 1, StorageNodeCount: 4, UplinkCount: 1,
+	}, func(t *testing.T, ctx *testcontext.Context, planet *testplanet.Planet) {
+		satellite := planet.Satellites[0]
+		projectID := planet.Uplinks[0].Projects[0].ID
+
+		tally := planet.Satellites[0].Accounting.Tally
+		tally.Loop.Pause()
+
+		var (
+			now        = time.Now().Truncate(time.Hour).UTC()
+			timeBefore = now.AddDate(0, 0, -366)
+			timeAt     = now.AddDate(0, 0, -365)
+			timeAfter  = now.AddDate(0, 0, -364)
+
+			tallyBefore = accounting.BucketTally{BucketLocation: metabase.BucketLocation{ProjectID: projectID, BucketName: "before"}}
+			tallyAt     = accounting.BucketTally{BucketLocation: metabase.BucketLocation{ProjectID: projectID, BucketName: "at"}}
+			tallyAfter  = accounting.BucketTally{BucketLocation: metabase.BucketLocation{ProjectID: projectID, BucketName: "after"}}
+		)
+
+		err := satellite.DB.ProjectAccounting().SaveTallies(ctx, timeBefore, map[metabase.BucketLocation]*accounting.BucketTally{
+			tallyBefore.BucketLocation: &tallyBefore,
+		})
+		require.NoError(t, err)
+
+		err = satellite.DB.ProjectAccounting().SaveTallies(ctx, timeAt, map[metabase.BucketLocation]*accounting.BucketTally{
+			tallyAt.BucketLocation: &tallyAt,
+		})
+		require.NoError(t, err)
+
+		err = satellite.DB.ProjectAccounting().SaveTallies(ctx, timeAfter, map[metabase.BucketLocation]*accounting.BucketTally{
+			tallyAfter.BucketLocation: &tallyAfter,
+		})
+		require.NoError(t, err)
+
+		// Capture the pre-purge state.
+		prePurge, err := satellite.DB.ProjectAccounting().GetTallies(ctx)
+		require.NoError(t, err)
+		require.ElementsMatch(t, []accounting.BucketTally{tallyBefore, tallyAt, tallyAfter}, prePurge)
+
+		// Inject now as the time and run the loop to initiate the purge.
+		tally.SetNow(func() time.Time { return now })
+		tally.Loop.TriggerWait()
+
+		// Capture the post-purge state and assert that the "before" tally
+		// has deleted.
+		postPurge, err := satellite.DB.ProjectAccounting().GetTallies(ctx)
+		require.NoError(t, err)
+		require.ElementsMatch(t, []accounting.BucketTally{tallyAt, tallyAfter}, postPurge)
+	})
+}
+
+func TestBucketTallyCollectorWithStorageRemainder(t *testing.T) {
+	testplanet.Run(t, testplanet.Config{
+		SatelliteCount: 1, StorageNodeCount: 1, UplinkCount: 5,
+		Reconfigure: testplanet.Reconfigure{
+			Satellite: func(log *zap.Logger, index int, config *satellite.Config) {
+				config.Tally.SmallObjectRemainder = true
+			},
+		},
+	}, func(t *testing.T, ctx *testcontext.Context, planet *testplanet.Planet) {
+		sat := planet.Satellites[0]
+		sat.Accounting.Tally.Loop.Pause()
+
+		t.Run("single remainder", func(t *testing.T) {
+			projectID := planet.Uplinks[0].Projects[0].ID
+			publicProjectID := planet.Uplinks[0].Projects[0].PublicID
+
+			// Upload objects of various sizes to test remainder logic.
+			err := planet.Uplinks[0].Upload(ctx, sat, "bucket-small", "object1", testrand.Bytes(5*memory.KiB))
+			require.NoError(t, err)
+
+			err = planet.Uplinks[0].Upload(ctx, sat, "bucket-medium", "object2", testrand.Bytes(30*memory.KiB))
+			require.NoError(t, err)
+
+			err = planet.Uplinks[0].Upload(ctx, sat, "bucket-large", "object3", testrand.Bytes(100*memory.KiB))
+			require.NoError(t, err)
+
+			// Set remainder to 50KB - objects smaller than this should be counted as 50KB.
+			remainder := int64(50 * memory.KiB)
+			productPrices := map[int32]tally.ProductUsagePriceModel{
+				0: {
+					ProductID:             0,
+					StorageRemainderBytes: remainder,
+				},
+			}
+			globalPlacementMap := tally.PlacementProductMap{0: 0}
+
+			collector := tally.NewBucketTallyCollector(
+				sat.Log.Named("bucket tally remainder"),
+				time.Now(),
+				sat.Metabase.DB,
+				sat.DB.Buckets(),
+				sat.DB.ProjectAccounting(),
+				productPrices,
+				globalPlacementMap,
+				sat.Config.Tally,
+			)
+			err = collector.Run(ctx)
+			require.NoError(t, err)
+
+			// Verify all buckets were collected.
+			require.GreaterOrEqual(t, len(collector.Bucket), 3, "should have at least 3 buckets")
+
+			bucketSmall := collector.Bucket[metabase.BucketLocation{
+				ProjectID:  projectID,
+				BucketName: "bucket-small",
+			}]
+			bucketMedium := collector.Bucket[metabase.BucketLocation{
+				ProjectID:  projectID,
+				BucketName: "bucket-medium",
+			}]
+			bucketLarge := collector.Bucket[metabase.BucketLocation{
+				ProjectID:  projectID,
+				BucketName: "bucket-large",
+			}]
+
+			require.NotNil(t, bucketSmall, "bucket-small should exist")
+			require.NotNil(t, bucketMedium, "bucket-medium should exist")
+			require.NotNil(t, bucketLarge, "bucket-large should exist")
+
+			// Verify remainder is applied correctly:
+			// Small bucket (5KB) should be counted as 50KB (remainder applies).
+			require.Equal(t, bucketSmall.TotalBytes, remainder,
+				"Small object (5KB) size should be equal to remainder size (50KB)")
+			require.EqualValues(t, 1, bucketSmall.ObjectCount, "should have 1 object")
+			// RemainderBytes = TotalBytes - BytesByRemainder[0]
+			// For small object, TotalBytes = 50KB (remainder), BytesByRemainder[0] = actual bytes (~5KB).
+			// So RemainderBytes should be ~45KB (the difference).
+			require.Greater(t, bucketSmall.RemainderBytes, int64(0),
+				"Small bucket should have positive RemainderBytes")
+			require.Less(t, bucketSmall.RemainderBytes, bucketSmall.TotalBytes,
+				"RemainderBytes should be less than TotalBytes")
+
+			// Medium bucket (30KB) should be counted as 50KB (remainder applies).
+			require.Equal(t, bucketMedium.TotalBytes, remainder,
+				"Medium object (30KB) size should be equal to remainder size (50KB)")
+			require.EqualValues(t, 1, bucketMedium.ObjectCount, "should have 1 object")
+			require.Greater(t, bucketMedium.RemainderBytes, int64(0),
+				"Medium bucket should have positive RemainderBytes")
+			require.Less(t, bucketMedium.RemainderBytes, bucketMedium.TotalBytes,
+				"RemainderBytes should be less than TotalBytes for medium bucket")
+
+			// Large bucket (100KB) should be counted at actual size (already larger than remainder).
+			// The actual bytes will be > 100KB due to encoding overhead, so just verify it's reasonable.
+			require.Greater(t, bucketLarge.TotalBytes, remainder,
+				"Large object (100KB) should be larger than remainder (50KB)")
+			require.Greater(t, bucketLarge.TotalBytes, int64(100*memory.KiB),
+				"Large object should be at least 100KB")
+			require.EqualValues(t, 1, bucketLarge.ObjectCount, "should have 1 object")
+			// For large bucket, TotalBytes = BytesByRemainder[0] (actual size, no remainder applied).
+			// So RemainderBytes = TotalBytes - BytesByRemainder[0] = 0
+			require.Equal(t, bucketLarge.RemainderBytes, int64(0),
+				"Large bucket should have zero RemainderBytes when actual size > remainder")
+
+			// Verify size ordering: small = medium < large (since small and medium both get remainder).
+			require.Equal(t, bucketSmall.TotalBytes, bucketMedium.TotalBytes,
+				"Small and medium buckets should have equal sizes (both at remainder)")
+			require.Greater(t, bucketLarge.TotalBytes, bucketMedium.TotalBytes,
+				"Large bucket should have more bytes than medium bucket")
+
+			// Verify PublicProjectID is populated for all buckets.
+			require.Equal(t, publicProjectID, bucketSmall.PublicProjectID)
+			require.Equal(t, publicProjectID, bucketMedium.PublicProjectID)
+			require.Equal(t, publicProjectID, bucketLarge.PublicProjectID)
+		})
+
+		t.Run("multiple remainders", func(t *testing.T) {
+			projectID := planet.Uplinks[1].Projects[0].ID
+
+			// Upload objects to different buckets.
+			err := planet.Uplinks[1].Upload(ctx, sat, "bucket-no-remainder", "object", testrand.Bytes(30*memory.KiB))
+			require.NoError(t, err)
+
+			// Configure different remainders for different product IDs.
+			// In reality, different buckets would have different product IDs via entitlements.
+			productPrices := map[int32]tally.ProductUsagePriceModel{
+				0: {ProductID: 0, StorageRemainderBytes: 0},          // No remainder
+				1: {ProductID: 1, StorageRemainderBytes: 50 * 1024},  // 50KB
+				2: {ProductID: 2, StorageRemainderBytes: 100 * 1024}, // 100KB
+			}
+
+			globalPlacementMap := tally.PlacementProductMap{
+				0: 0, // Default placement → product 0 (no remainder).
+			}
+
+			collector := tally.NewBucketTallyCollector(
+				sat.Log.Named("bucket tally"),
+				time.Now(),
+				sat.Metabase.DB,
+				sat.DB.Buckets(),
+				sat.DB.ProjectAccounting(),
+				productPrices,
+				globalPlacementMap,
+				sat.Config.Tally,
+			)
+			err = collector.Run(ctx)
+			require.NoError(t, err)
+
+			require.GreaterOrEqual(t, len(collector.Bucket), 1)
+
+			// Verify the bucket exists.
+			bucket := collector.Bucket[metabase.BucketLocation{
+				ProjectID:  projectID,
+				BucketName: "bucket-no-remainder",
+			}]
+			require.NotNil(t, bucket, "bucket-no-remainder should exist")
+			require.EqualValues(t, 1, bucket.ObjectCount, "should have 1 object")
+		})
+
+		t.Run("deleted bucket", func(t *testing.T) {
+			projectID := planet.Uplinks[3].Projects[0].ID
+			publicProjectID := planet.Uplinks[3].Projects[0].PublicID
+
+			const bucketName = "bucket-to-delete"
+
+			// Upload creates the bucket via CreateBucketWithAttribution, which writes the
+			// value_attributions row. That row persists after the bucket is deleted and is
+			// the authoritative placement source for the tally query.
+			err := planet.Uplinks[3].Upload(ctx, sat, bucketName, "object", testrand.Bytes(5*memory.KiB))
+			require.NoError(t, err)
+
+			remainder := int64(50 * memory.KiB)
+			productPrices := map[int32]tally.ProductUsagePriceModel{
+				0: {ProductID: 0, StorageRemainderBytes: remainder},
+			}
+			globalPlacementMap := tally.PlacementProductMap{0: 0}
+			newCollector := func() *tally.BucketTallyCollector {
+				return tally.NewBucketTallyCollector(
+					sat.Log.Named("bucket tally"),
+					time.Now(),
+					sat.Metabase.DB,
+					sat.DB.Buckets(),
+					sat.DB.ProjectAccounting(),
+					productPrices,
+					globalPlacementMap,
+					sat.Config.Tally,
+				)
+			}
+
+			bucketLoc := metabase.BucketLocation{ProjectID: projectID, BucketName: bucketName}
+
+			// Run 1: bucket exists and has data — establishes a non-empty previous tally.
+			c1 := newCollector()
+			require.NoError(t, c1.Run(ctx))
+			require.NotNil(t, c1.Bucket[bucketLoc], "bucket should exist before deletion")
+			require.Greater(t, c1.Bucket[bucketLoc].TotalBytes, int64(0))
+			require.NoError(t, sat.DB.ProjectAccounting().SaveTallies(ctx, time.Now(), c1.Bucket))
+
+			// Delete all objects first, then delete the bucket metadata row.
+			require.NoError(t, planet.Uplinks[3].DeleteObject(ctx, sat, bucketName, "object"))
+			require.NoError(t, sat.DB.Buckets().DeleteBucket(ctx, []byte(bucketName), projectID))
+
+			// Run 2: bucket no longer exists in bucket_metainfos, but its last tally was
+			// non-empty. A zero tally entry must be emitted to cap billing — without it,
+			// carry-forward billing would charge for the gap until the next tally.
+			c2 := newCollector()
+			require.NoError(t, c2.Run(ctx))
+
+			zeroEntry := c2.Bucket[bucketLoc]
+			require.NotNil(t, zeroEntry, "deleted bucket must appear as zero tally to cap billing")
+			require.EqualValues(t, 0, zeroEntry.TotalBytes)
+			require.EqualValues(t, 0, zeroEntry.ObjectCount)
+			require.EqualValues(t, 0, zeroEntry.TotalSegments)
+			require.Equal(t, publicProjectID, zeroEntry.PublicProjectID)
+			require.NoError(t, sat.DB.ProjectAccounting().SaveTallies(ctx, time.Now().Add(time.Minute), c2.Bucket))
+
+			// Run 3: after the zero tally is persisted, the bucket must NOT appear again.
+			// No further zero entries are needed once the gap is capped.
+			c3 := newCollector()
+			require.NoError(t, c3.Run(ctx))
+			require.Nil(t, c3.Bucket[bucketLoc], "bucket should not reappear after zero tally is saved")
+		})
+
+		t.Run("empty buckets", func(t *testing.T) {
+			projectID := planet.Uplinks[2].Projects[0].ID
+			publicProjectID := planet.Uplinks[2].Projects[0].PublicID
+
+			// Test that emptied buckets (objects deleted but bucket still exists) get empty tallies.
+			err := planet.Uplinks[2].Upload(ctx, sat, "bucket-to-empty", "object", testrand.Bytes(30*memory.KiB))
+			require.NoError(t, err)
+
+			remainder := int64(50 * memory.KiB)
+			productPrices := map[int32]tally.ProductUsagePriceModel{
+				0: {ProductID: 0, StorageRemainderBytes: remainder},
+			}
+			globalPlacementMap := tally.PlacementProductMap{0: 0}
+
+			// Run collector and save tally (this creates a previous non-empty tally).
+			collector := tally.NewBucketTallyCollector(
+				sat.Log.Named("bucket tally"),
+				time.Now(),
+				sat.Metabase.DB,
+				sat.DB.Buckets(),
+				sat.DB.ProjectAccounting(),
+				productPrices,
+				globalPlacementMap,
+				sat.Config.Tally,
+			)
+			err = collector.Run(ctx)
+			require.NoError(t, err)
+
+			bucketLoc := metabase.BucketLocation{
+				ProjectID:  projectID,
+				BucketName: "bucket-to-empty",
+			}
+
+			// Verify the bucket has data.
+			bucket := collector.Bucket[bucketLoc]
+			require.NotNil(t, bucket, "bucket should exist")
+			require.Greater(t, bucket.TotalBytes, int64(0), "bucket should have data")
+			require.EqualValues(t, 1, bucket.ObjectCount, "should have 1 object")
+
+			// Save this tally so it becomes a "previous tally".
+			err = sat.DB.ProjectAccounting().SaveTallies(ctx, time.Now(), collector.Bucket)
+			require.NoError(t, err)
+
+			// Delete the object from the bucket (bucket still exists in bucket_metainfos).
+			err = planet.Uplinks[2].DeleteObject(ctx, sat, "bucket-to-empty", "object")
+			require.NoError(t, err)
+
+			// Run collector again - emptied bucket should still be present with empty tally.
+			collector2 := tally.NewBucketTallyCollector(
+				sat.Log.Named("bucket tally"),
+				time.Now(),
+				sat.Metabase.DB,
+				sat.DB.Buckets(),
+				sat.DB.ProjectAccounting(),
+				productPrices,
+				globalPlacementMap,
+				sat.Config.Tally,
+			)
+			err = collector2.Run(ctx)
+			require.NoError(t, err)
+
+			// The emptied bucket should appear with zero tally (to mark it as now empty).
+			emptiedBucket := collector2.Bucket[bucketLoc]
+			require.NotNil(t, emptiedBucket, "emptied bucket should still appear in tally")
+			require.EqualValues(t, 0, emptiedBucket.TotalBytes, "emptied bucket should have zero bytes")
+			require.EqualValues(t, 0, emptiedBucket.ObjectCount, "emptied bucket should have zero objects")
+			require.EqualValues(t, 0, emptiedBucket.TotalSegments, "emptied bucket should have zero segments")
+			require.EqualValues(t, 0, emptiedBucket.RemainderBytes, "emptied bucket should have zero RemainderBytes")
+			// Verify PublicProjectID is still populated for the emptied bucket.
+			require.Equal(t, publicProjectID, emptiedBucket.PublicProjectID)
+		})
+
+		t.Run("all bucket states combined", func(t *testing.T) {
+			// Exercises all three bucket states in a single tally run to verify they coexist:
+			//   regular — live bucket with a previous non-empty tally: found in both the
+			//             tally branch and the metainfo branch; HasPreviousTally=true wins.
+			//   deleted — bucket row is gone but last tally was non-empty: found only in the
+			//             tally branch; must still produce a zero tally to cap billing.
+			//   fresh   — live bucket with no tally history: found only in the metainfo branch;
+			//             HasPreviousTally=false, so not pre-populated; appears via CollectBucketTallies.
+			projectID := planet.Uplinks[4].Projects[0].ID
+			publicProjectID := planet.Uplinks[4].Projects[0].PublicID
+
+			const (
+				regularBucket = "bucket-regular"
+				deletedBucket = "bucket-deleted"
+				freshBucket   = "bucket-fresh"
+			)
+
+			productPrices := map[int32]tally.ProductUsagePriceModel{
+				0: {ProductID: 0, StorageRemainderBytes: int64(50 * memory.KiB)},
+			}
+			globalPlacementMap := tally.PlacementProductMap{0: 0}
+			newCollector := func() *tally.BucketTallyCollector {
+				return tally.NewBucketTallyCollector(
+					sat.Log.Named("bucket tally"),
+					time.Now(),
+					sat.Metabase.DB,
+					sat.DB.Buckets(),
+					sat.DB.ProjectAccounting(),
+					productPrices,
+					globalPlacementMap,
+					sat.Config.Tally,
+				)
+			}
+
+			// Establish non-empty tallies for the regular and to-be-deleted buckets.
+			require.NoError(t, planet.Uplinks[4].Upload(ctx, sat, regularBucket, "object", testrand.Bytes(5*memory.KiB)))
+			require.NoError(t, planet.Uplinks[4].Upload(ctx, sat, deletedBucket, "object", testrand.Bytes(5*memory.KiB)))
+
+			c1 := newCollector()
+			require.NoError(t, c1.Run(ctx))
+			require.NoError(t, sat.DB.ProjectAccounting().SaveTallies(ctx, time.Now(), c1.Bucket))
+
+			// Transition to the test state:
+			//   regular: unchanged — still has objects, bucket row intact
+			//   deleted: remove object + bucket row
+			//   fresh:   upload objects for the first time (no prior tally)
+			require.NoError(t, planet.Uplinks[4].DeleteObject(ctx, sat, deletedBucket, "object"))
+			require.NoError(t, sat.DB.Buckets().DeleteBucket(ctx, []byte(deletedBucket), projectID))
+			require.NoError(t, planet.Uplinks[4].Upload(ctx, sat, freshBucket, "object", testrand.Bytes(5*memory.KiB)))
+
+			// Run the combined tally.
+			c2 := newCollector()
+			require.NoError(t, c2.Run(ctx))
+
+			regularLoc := metabase.BucketLocation{ProjectID: projectID, BucketName: regularBucket}
+			deletedLoc := metabase.BucketLocation{ProjectID: projectID, BucketName: deletedBucket}
+			freshLoc := metabase.BucketLocation{ProjectID: projectID, BucketName: freshBucket}
+
+			// Regular bucket: in both branches, HasPreviousTally=true wins; objects present → non-zero.
+			regular := c2.Bucket[regularLoc]
+			require.NotNil(t, regular, "regular bucket should appear")
+			require.Greater(t, regular.TotalBytes, int64(0), "regular bucket should have non-zero bytes")
+			require.Greater(t, regular.ObjectCount, int64(0), "regular bucket should have objects")
+			require.Equal(t, publicProjectID, regular.PublicProjectID)
+
+			// Deleted bucket: tally branch only, objects gone → zero tally caps billing gap.
+			deleted := c2.Bucket[deletedLoc]
+			require.NotNil(t, deleted, "deleted bucket must appear to emit a zero tally")
+			require.EqualValues(t, 0, deleted.TotalBytes, "deleted bucket should have zero bytes")
+			require.EqualValues(t, 0, deleted.ObjectCount, "deleted bucket should have zero objects")
+			require.Equal(t, publicProjectID, deleted.PublicProjectID)
+
+			// Fresh bucket: metainfo branch only, not pre-populated; CollectBucketTallies finds the objects.
+			fresh := c2.Bucket[freshLoc]
+			require.NotNil(t, fresh, "fresh bucket should appear via live object scan")
+			require.Greater(t, fresh.TotalBytes, int64(0), "fresh bucket should have non-zero bytes")
+			require.Greater(t, fresh.ObjectCount, int64(0), "fresh bucket should have objects")
+			require.Equal(t, publicProjectID, fresh.PublicProjectID)
+		})
+	})
+}
+
+func TestEventkitIntegration(t *testing.T) {
+	testplanet.Run(t, testplanet.Config{
+		SatelliteCount: 1, StorageNodeCount: 1, UplinkCount: 1,
+		NonParallel: true,
+	}, func(t *testing.T, ctx *testcontext.Context, planet *testplanet.Planet) {
+		sat := planet.Satellites[0]
+		uplink := planet.Uplinks[0]
+		publicProjectID := uplink.Projects[0].PublicID
+
+		// Upload some test data to create buckets with objects
+		err := uplink.Upload(ctx, sat, "test-bucket", "test-object", testrand.Bytes(5*memory.KiB))
+		require.NoError(t, err)
+
+		err = uplink.Upload(ctx, sat, "another-bucket", "another-object", testrand.Bytes(10*memory.KiB))
+		require.NoError(t, err)
+
+		eventkitspy.Clear()
+
+		config := sat.Config.Tally
+		config.EventkitTrackingEnabled = true
+
+		service := tally.New(
+			sat.Log.Named("tally"),
+			sat.DB.StoragenodeAccounting(),
+			sat.DB.ProjectAccounting(),
+			sat.LiveAccounting.Cache,
+			sat.Metabase.DB,
+			sat.DB.Buckets(),
+			config,
+			nil,
+			nil,
+		)
+
+		err = service.Tally(ctx)
+		require.NoError(t, err)
+
+		tallies, err := sat.DB.ProjectAccounting().GetTallies(ctx)
+		require.NoError(t, err)
+		require.NotEmpty(t, tallies)
+
+		var events []*eventkit.Event
+		for _, event := range eventkitspy.GetEvents() {
+			if event.Name == "storage_tally" {
+				events = append(events, event)
+			}
+		}
+
+		for _, event := range events {
+			tags := make(map[string]eventkit.Tag, len(event.Tags))
+			for _, tag := range event.Tags {
+				tags[tag.Key] = tag
+			}
+
+			require.Contains(t, tags, "bucket_name")
+			require.Contains(t, tags, "placement")
+			require.Contains(t, tags, "timestamp")
+			require.Contains(t, tags, "bytes")
+			require.Contains(t, tags, "segments")
+			require.Contains(t, tags, "objects")
+			require.Contains(t, tags, "event_type")
+
+			// Verify project_id is the public project ID, not the internal one.
+			publicProjectIDTag, ok := tags["public_project_id"]
+			require.True(t, ok)
+			require.NotNil(t, publicProjectIDTag)
+			require.Equal(t, publicProjectID.Bytes(), publicProjectIDTag.Value.(*pb.Tag_Bytes).Bytes)
 		}
 	})
 }

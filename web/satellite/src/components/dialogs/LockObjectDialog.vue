@@ -28,7 +28,7 @@
                     </v-card-title>
                     <template #append>
                         <v-btn
-                            icon="$close"
+                            :icon="X"
                             variant="text"
                             size="small"
                             color="default"
@@ -40,7 +40,7 @@
 
             <v-divider />
 
-            <v-window v-model="step" class="overflow-y-auto">
+            <v-window v-model="step" :touch="false" class="overflow-y-auto">
                 <v-window-item :value="LockStep.Settings">
                     <v-row>
                         <v-col class="pa-6 mx-3">
@@ -48,7 +48,7 @@
                                 {{ info }}
                             </p>
 
-                            <p class="mt-4 mb-2 font-weight-bold text-body-2">
+                            <p class="mt-4 mb-2 font-weight-bold text-body-medium">
                                 Name:
                             </p>
 
@@ -63,7 +63,7 @@
                             </v-chip>
 
                             <template v-if="file?.VersionId">
-                                <p class="my-2 font-weight-bold text-body-2">
+                                <p class="my-2 font-weight-bold text-body-medium">
                                     Version:
                                 </p>
 
@@ -78,11 +78,11 @@
                             </template>
 
                             <template v-if="!existingRetention.active">
-                                <p class="my-2 font-weight-bold text-body-2">
+                                <p class="my-2 font-weight-bold text-body-medium">
                                     Select lock type:
                                 </p>
 
-                                <p class="mb-2 text-body-2">
+                                <p class="mb-2 text-body-medium">
                                     Governance allows authorized users to modify the lock.
                                     Compliance prevents any changes to the lock.
                                 </p>
@@ -90,19 +90,19 @@
                                 <v-chip-group
                                     v-model="lockType"
                                     class="mb-4"
-                                    selected-class="text-primary font-weight-bold"
+                                    selected-class="font-weight-bold"
                                     mandatory
                                     column
                                     filter
                                 >
-                                    <v-chip v-for="type in [GOVERNANCE_LOCK, COMPLIANCE_LOCK]" :key="type" :value="type">
+                                    <v-chip v-for="type in [GOVERNANCE_LOCK, COMPLIANCE_LOCK]" :key="type" :value="type" variant="outlined">
                                         {{ type.substring(0, 1) + type.substring(1).toLowerCase() }}
                                     </v-chip>
                                 </v-chip-group>
                             </template>
 
                             <template v-if="existingRetention.active">
-                                <p class="mb-2 font-weight-bold text-body-2">
+                                <p class="mb-2 font-weight-bold text-body-medium">
                                     Current lock expiration:
                                 </p>
 
@@ -116,14 +116,14 @@
                                 </v-chip>
                             </template>
 
-                            <p class="mb-2 font-weight-bold text-body-2">
+                            <p class="mb-2 font-weight-bold text-body-medium">
                                 {{ existingRetention.active ? 'Extend lock by:' : 'Select the lock retention period:' }}
                             </p>
 
                             <v-chip-group
                                 v-model="selectedRange"
                                 class="mb-4"
-                                selected-class="text-primary font-weight-bold"
+                                selected-class="font-weight-bold"
                                 mandatory
                                 column
                                 filter
@@ -136,6 +136,7 @@
                             <v-date-picker
                                 v-if="selectedRange?.label == customRangeLabel.label"
                                 v-model="customUntilDate"
+                                :allowed-dates="allowDate"
                                 width="100%"
                                 header="Choose Date"
                                 show-adjacent-months
@@ -153,7 +154,7 @@
                                 This file has been locked successfully.
                             </p>
 
-                            <p class="mt-4 mb-2 font-weight-bold text-body-2">
+                            <p class="mt-4 mb-2 font-weight-bold text-body-medium">
                                 Name:
                             </p>
 
@@ -167,7 +168,7 @@
                             </v-chip>
 
                             <template v-if="file?.VersionId">
-                                <p class="my-2 font-weight-bold text-body-2">
+                                <p class="my-2 font-weight-bold text-body-medium">
                                     Version:
                                 </p>
 
@@ -182,7 +183,7 @@
                             </template>
 
                             <template v-if="!!lockedUntil">
-                                <p class="my-2 font-weight-bold text-body-2">
+                                <p class="my-2 font-weight-bold text-body-medium">
                                     Lock expiration:
                                 </p>
 
@@ -219,7 +220,7 @@
                         <v-btn
                             color="primary"
                             variant="flat"
-                            :disabled="!selectedRange?.date && !customUntilDate"
+                            :disabled="nextButtonDisabled"
                             :loading="isLoading"
                             block
                             @click="onLockOrExit"
@@ -252,14 +253,14 @@ import {
     VWindow,
     VWindowItem,
 } from 'vuetify/components';
-import { Lock } from 'lucide-vue-next';
+import { Lock, X } from '@lucide/vue';
 
-import { BrowserObject, useObjectBrowserStore } from '@/store/modules/objectBrowserStore';
+import { type BrowserObject, useObjectBrowserStore  } from '@/store/modules/objectBrowserStore';
 import { useLoading } from '@/composables/useLoading';
-import { useNotify } from '@/utils/hooks';
+import { useNotify } from '@/composables/useNotify';
 import { AnalyticsErrorEventSource } from '@/utils/constants/analyticsEventNames';
 import { Time } from '@/utils/time';
-import { COMPLIANCE_LOCK, GOVERNANCE_LOCK, ObjLockMode, Retention } from '@/types/objectLock';
+import { type ObjLockMode, COMPLIANCE_LOCK, GOVERNANCE_LOCK, Retention  } from '@/types/objectLock';
 
 enum LockStep {
     Settings,
@@ -337,6 +338,11 @@ const nextButtonLabel = computed<string>(() => {
     return step.value === LockStep.Settings ? 'Set Lock' : 'Close';
 });
 
+const nextButtonDisabled = computed<boolean>(() => {
+    return (!existingRetention.value.active && !lockType.value) ||
+        (!selectedRange.value?.date && !customUntilDate.value);
+});
+
 const lockedUntil = computed<string>(() => {
     const until = selectedRange.value?.label === customRangeLabel.label ? getModifiedCustomDate() : selectedRange.value?.date;
     if (!until) {
@@ -351,6 +357,18 @@ function getFormattedExpiration(date: Date): string {
         Time.formattedDateWithGMTOffset(date)} at
         ${date.toLocaleTimeString('en-GB', { hour: 'numeric', minute: 'numeric' })}
     `;
+}
+
+function allowDate(date: unknown): boolean {
+    if (!date) return false;
+    const d = new Date(date as string);
+    if (isNaN(d.getTime())) return false;
+
+    d.setHours(0, 0, 0, 0);
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+
+    return d >= today;
 }
 
 function getModifiedCustomDate(): Date {

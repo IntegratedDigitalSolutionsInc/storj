@@ -11,8 +11,6 @@ import (
 	"testing"
 	"time"
 
-	"cloud.google.com/go/spanner"
-	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"storj.io/common/testcontext"
@@ -20,7 +18,6 @@ import (
 	"storj.io/common/uuid"
 	"storj.io/storj/satellite/metabase"
 	"storj.io/storj/satellite/metabase/metabasetest"
-	"storj.io/storj/shared/dbutil/spannerutil"
 )
 
 func TestIterateObjectsWithStatus(t *testing.T) {
@@ -101,9 +98,7 @@ func TestIterateObjectsWithStatus(t *testing.T) {
 				},
 			}.Check(ctx, t, db)
 
-			encryptedMetadata := testrand.Bytes(1024)
-			encryptedMetadataNonce := testrand.Nonce()
-			encryptedMetadataKey := testrand.Bytes(265)
+			userData := metabasetest.RandEncryptedUserDataWithChecksum()
 
 			metabasetest.BeginObjectExactVersion{
 				Opts: metabase.BeginObjectExactVersion{
@@ -113,11 +108,9 @@ func TestIterateObjectsWithStatus(t *testing.T) {
 			}.Check(ctx, t, db)
 			metabasetest.CommitObject{
 				Opts: metabase.CommitObject{
-					ObjectStream:                  committed,
-					OverrideEncryptedMetadata:     true,
-					EncryptedMetadataNonce:        encryptedMetadataNonce[:],
-					EncryptedMetadata:             encryptedMetadata,
-					EncryptedMetadataEncryptedKey: encryptedMetadataKey,
+					ObjectStream:         committed,
+					SetEncryptedMetadata: true,
+					EncryptedUserData:    userData,
 				},
 			}.Check(ctx, t, db)
 
@@ -129,17 +122,17 @@ func TestIterateObjectsWithStatus(t *testing.T) {
 					Pending:               false,
 					IncludeCustomMetadata: true,
 					IncludeSystemMetadata: true,
+					IncludeETag:           true,
+					IncludeChecksum:       true,
 				},
 				Result: []metabase.ObjectEntry{{
-					ObjectKey:                     committed.ObjectKey,
-					Version:                       committed.Version,
-					StreamID:                      committed.StreamID,
-					CreatedAt:                     now,
-					Status:                        metabase.CommittedUnversioned,
-					Encryption:                    metabasetest.DefaultEncryption,
-					EncryptedMetadataNonce:        encryptedMetadataNonce[:],
-					EncryptedMetadata:             encryptedMetadata,
-					EncryptedMetadataEncryptedKey: encryptedMetadataKey,
+					ObjectKey:         committed.ObjectKey,
+					Version:           committed.Version,
+					StreamID:          committed.StreamID,
+					CreatedAt:         now,
+					Status:            metabase.CommittedUnversioned,
+					Encryption:        metabasetest.DefaultEncryption,
+					EncryptedUserData: userData,
 				}},
 			}.Check(ctx, t, db)
 
@@ -151,6 +144,8 @@ func TestIterateObjectsWithStatus(t *testing.T) {
 					Pending:               true,
 					IncludeCustomMetadata: true,
 					IncludeSystemMetadata: true,
+					IncludeETag:           true,
+					IncludeChecksum:       true,
 				},
 				Result: []metabase.ObjectEntry{{
 					ObjectKey:  pending.ObjectKey,
@@ -181,6 +176,8 @@ func TestIterateObjectsWithStatus(t *testing.T) {
 					Pending:               false,
 					IncludeCustomMetadata: true,
 					IncludeSystemMetadata: true,
+					IncludeETag:           true,
+					IncludeChecksum:       true,
 				},
 				Result: expected,
 			}.Check(ctx, t, db)
@@ -205,6 +202,8 @@ func TestIterateObjectsWithStatus(t *testing.T) {
 					Pending:               false,
 					IncludeCustomMetadata: true,
 					IncludeSystemMetadata: true,
+					IncludeETag:           true,
+					IncludeChecksum:       true,
 				},
 				Result: expected,
 			}.Check(ctx, t, db)
@@ -232,6 +231,8 @@ func TestIterateObjectsWithStatus(t *testing.T) {
 					Pending:               false,
 					IncludeCustomMetadata: true,
 					IncludeSystemMetadata: true,
+					IncludeETag:           true,
+					IncludeChecksum:       true,
 				},
 				Result: expected,
 			}.Check(ctx, t, db)
@@ -261,6 +262,8 @@ func TestIterateObjectsWithStatus(t *testing.T) {
 					Pending:               false,
 					IncludeCustomMetadata: true,
 					IncludeSystemMetadata: true,
+					IncludeETag:           true,
+					IncludeChecksum:       true,
 				},
 				Result: expected,
 			}.Check(ctx, t, db)
@@ -294,6 +297,8 @@ func TestIterateObjectsWithStatus(t *testing.T) {
 					Pending:               false,
 					IncludeCustomMetadata: true,
 					IncludeSystemMetadata: true,
+					IncludeETag:           true,
+					IncludeChecksum:       true,
 				},
 				Result: []metabase.ObjectEntry{
 					objects["a"],
@@ -316,6 +321,8 @@ func TestIterateObjectsWithStatus(t *testing.T) {
 					Pending:               false,
 					IncludeCustomMetadata: true,
 					IncludeSystemMetadata: true,
+					IncludeETag:           true,
+					IncludeChecksum:       true,
 
 					Cursor: metabase.IterateCursor{Key: "a", Version: objects["a"].Version - 1},
 				},
@@ -339,6 +346,8 @@ func TestIterateObjectsWithStatus(t *testing.T) {
 					Pending:               false,
 					IncludeCustomMetadata: true,
 					IncludeSystemMetadata: true,
+					IncludeETag:           true,
+					IncludeChecksum:       true,
 
 					Cursor: metabase.IterateCursor{Key: "b", Version: 0},
 				},
@@ -362,6 +371,8 @@ func TestIterateObjectsWithStatus(t *testing.T) {
 					Pending:               false,
 					IncludeCustomMetadata: true,
 					IncludeSystemMetadata: true,
+					IncludeETag:           true,
+					IncludeChecksum:       true,
 
 					Prefix: "b/",
 				},
@@ -380,6 +391,8 @@ func TestIterateObjectsWithStatus(t *testing.T) {
 					Pending:               false,
 					IncludeCustomMetadata: true,
 					IncludeSystemMetadata: true,
+					IncludeETag:           true,
+					IncludeChecksum:       true,
 
 					Prefix: "b/",
 					Cursor: metabase.IterateCursor{Key: "a"},
@@ -399,6 +412,8 @@ func TestIterateObjectsWithStatus(t *testing.T) {
 					Pending:               false,
 					IncludeCustomMetadata: true,
 					IncludeSystemMetadata: true,
+					IncludeETag:           true,
+					IncludeChecksum:       true,
 
 					Prefix: "b/",
 					Cursor: metabase.IterateCursor{Key: "b/2", Version: metabase.MaxVersion},
@@ -417,6 +432,8 @@ func TestIterateObjectsWithStatus(t *testing.T) {
 					Pending:               false,
 					IncludeCustomMetadata: true,
 					IncludeSystemMetadata: true,
+					IncludeETag:           true,
+					IncludeChecksum:       true,
 
 					Prefix: "b/",
 					Cursor: metabase.IterateCursor{Key: "c/"},
@@ -448,6 +465,8 @@ func TestIterateObjectsWithStatus(t *testing.T) {
 					Pending:               false,
 					IncludeCustomMetadata: true,
 					IncludeSystemMetadata: true,
+					IncludeETag:           true,
+					IncludeChecksum:       true,
 				},
 				Result: []metabase.ObjectEntry{
 					objects["a"],
@@ -465,6 +484,8 @@ func TestIterateObjectsWithStatus(t *testing.T) {
 					Pending:               false,
 					IncludeCustomMetadata: true,
 					IncludeSystemMetadata: true,
+					IncludeETag:           true,
+					IncludeChecksum:       true,
 
 					Cursor: metabase.IterateCursor{Key: "a", Version: objects["a"].Version - 1},
 				},
@@ -483,6 +504,8 @@ func TestIterateObjectsWithStatus(t *testing.T) {
 					Pending:               false,
 					IncludeCustomMetadata: true,
 					IncludeSystemMetadata: true,
+					IncludeETag:           true,
+					IncludeChecksum:       true,
 
 					Cursor: metabase.IterateCursor{Key: "b", Version: metabase.MaxVersion},
 				},
@@ -501,6 +524,8 @@ func TestIterateObjectsWithStatus(t *testing.T) {
 					Pending:               false,
 					IncludeCustomMetadata: true,
 					IncludeSystemMetadata: true,
+					IncludeETag:           true,
+					IncludeChecksum:       true,
 
 					Prefix: "b/",
 				},
@@ -518,6 +543,8 @@ func TestIterateObjectsWithStatus(t *testing.T) {
 					Pending:               false,
 					IncludeCustomMetadata: true,
 					IncludeSystemMetadata: true,
+					IncludeETag:           true,
+					IncludeChecksum:       true,
 
 					Prefix: "b/",
 					Cursor: metabase.IterateCursor{Key: "a"},
@@ -536,6 +563,8 @@ func TestIterateObjectsWithStatus(t *testing.T) {
 					Pending:               false,
 					IncludeCustomMetadata: true,
 					IncludeSystemMetadata: true,
+					IncludeETag:           true,
+					IncludeChecksum:       true,
 
 					Prefix: "b/",
 					Cursor: metabase.IterateCursor{Key: "b/2", Version: metabase.MaxVersion},
@@ -553,6 +582,8 @@ func TestIterateObjectsWithStatus(t *testing.T) {
 					Pending:               false,
 					IncludeCustomMetadata: true,
 					IncludeSystemMetadata: true,
+					IncludeETag:           true,
+					IncludeChecksum:       true,
 
 					Prefix: "b/",
 					Cursor: metabase.IterateCursor{Key: "c/"},
@@ -567,6 +598,8 @@ func TestIterateObjectsWithStatus(t *testing.T) {
 					Pending:               false,
 					IncludeCustomMetadata: true,
 					IncludeSystemMetadata: true,
+					IncludeETag:           true,
+					IncludeChecksum:       true,
 
 					Prefix: "c/",
 					Cursor: metabase.IterateCursor{Key: "c/", Version: metabase.MaxVersion},
@@ -585,6 +618,7 @@ func TestIterateObjectsWithStatus(t *testing.T) {
 					Pending:               false,
 					IncludeCustomMetadata: true,
 					IncludeSystemMetadata: true,
+					IncludeETag:           true,
 
 					Prefix: "c//",
 				},
@@ -595,10 +629,6 @@ func TestIterateObjectsWithStatus(t *testing.T) {
 		})
 
 		t.Run("boundaries", func(t *testing.T) {
-			if _, ok := db.ChooseAdapter(uuid.UUID{}).(*metabase.SpannerAdapter); ok {
-				// TODO(spanner): find a fix for this
-				t.Skip("test runs too slow for spanner")
-			}
 			defer metabasetest.DeleteAll{}.Check(ctx, t, db)
 			projectID, bucketName := uuid.UUID{1}, metabase.BucketName("bucky")
 
@@ -607,7 +637,9 @@ func TestIterateObjectsWithStatus(t *testing.T) {
 				ObjectStream: metabase.ObjectStream{
 					ProjectID:  projectID,
 					BucketName: bucketName,
+					Version:    1,
 				},
+				Status: metabase.CommittedVersioned,
 			}
 
 			for a := 0; a <= 0xFF; a++ {
@@ -707,120 +739,125 @@ func TestIterateObjectsWithStatus(t *testing.T) {
 			require.NoError(t, err)
 		})
 
-		t.Run("include metadata", func(t *testing.T) {
+		t.Run("verify-early-exit", func(t *testing.T) {
+			// Stopping iteration before the underlying rows are exhausted must
+			// not return an error: the iterator's Close() has to call rows.Err()
+			// before rows.Close() to satisfy the tagsql leak tracker. This
+			// mirrors ListObjects reading a single page out of a full batch.
 			defer metabasetest.DeleteAll{}.Check(ctx, t, db)
+			projectID, bucketName := uuid.UUID{1}, metabase.BucketName("bucky")
+			objects := createObjects(ctx, t, db, 10, projectID, bucketName)
 
-			obj1 := metabasetest.RandObjectStream()
-			metabasetest.CreateTestObject{
-				CommitObject: &metabase.CommitObject{
-					ObjectStream:                  obj1,
-					Encryption:                    metabasetest.DefaultEncryption,
-					OverrideEncryptedMetadata:     true,
-					EncryptedMetadata:             []byte{3},
-					EncryptedMetadataEncryptedKey: []byte{4},
-					EncryptedMetadataNonce:        []byte{5},
-				},
-			}.Run(ctx, t, db, obj1, 4)
-
-			var collector metabasetest.IterateCollector
-			err := db.IterateObjectsAllVersionsWithStatus(ctx, metabase.IterateObjectsWithStatus{
-				ProjectID:             obj1.ProjectID,
-				BucketName:            obj1.BucketName,
-				Recursive:             true,
-				Pending:               false,
-				IncludeCustomMetadata: true,
-				IncludeSystemMetadata: true,
-			}, collector.Add)
-
-			require.NoError(t, err)
-
-			for _, entry := range collector {
-				require.Equal(t, entry.EncryptedMetadata, []byte{3})
-				require.Equal(t, entry.EncryptedMetadataEncryptedKey, []byte{4})
-				require.Equal(t, entry.EncryptedMetadataNonce, []byte{5})
+			// BatchSize matches the object count so the first batch is full of
+			// rows that are never read past the first one.
+			readOne := func(ctx context.Context, it metabase.ObjectsIterator) error {
+				var entry metabase.ObjectEntry
+				require.True(t, it.Next(ctx, &entry))
+				return nil
+			}
+			for _, recursive := range []bool{true, false} {
+				opts := metabase.IterateObjectsWithStatus{
+					ProjectID:  projectID,
+					BucketName: bucketName,
+					Recursive:  recursive,
+					BatchSize:  len(objects),
+				}
+				require.NoError(t, db.IterateObjectsAllVersionsWithStatus(ctx, opts, readOne))
+				require.NoError(t, db.IterateObjectsAllVersionsWithStatusAscending(ctx, opts, readOne))
 			}
 		})
 
-		t.Run("exclude custom metadata", func(t *testing.T) {
+		for _, tt := range objectIncludesScenarios {
+			t.Run(tt.name, func(t *testing.T) {
+				defer metabasetest.DeleteAll{}.Check(ctx, t, db)
+
+				objStream := metabasetest.RandObjectStream()
+				object, _ := metabasetest.CreateTestObject{
+					CommitObject: &metabase.CommitObject{
+						ObjectStream:         objStream,
+						Encryption:           metabasetest.DefaultEncryption,
+						SetEncryptedMetadata: true,
+						EncryptedUserData:    metabasetest.RandEncryptedUserDataWithChecksum(),
+					},
+				}.Run(ctx, t, db, objStream, 4)
+
+				metabasetest.IterateObjectsWithStatus{
+					Opts: metabase.IterateObjectsWithStatus{
+						ProjectID:             object.ProjectID,
+						BucketName:            object.BucketName,
+						Recursive:             true,
+						Pending:               false,
+						IncludeCustomMetadata: tt.includes.customMetadata,
+						IncludeSystemMetadata: tt.includes.systemMetadata,
+						IncludeETag:           tt.includes.eTag,
+						IncludeChecksum:       tt.includes.checksum,
+					},
+					Result: []metabase.ObjectEntry{tt.getExpectedEntry(object)},
+				}.Check(ctx, t, db)
+			})
+		}
+
+		t.Run("Include ETag or custom metadata", func(t *testing.T) {
 			defer metabasetest.DeleteAll{}.Check(ctx, t, db)
 
-			obj1 := metabasetest.RandObjectStream()
-			metabasetest.CreateTestObject{
-				CommitObject: &metabase.CommitObject{
-					ObjectStream:                  obj1,
-					Encryption:                    metabasetest.DefaultEncryption,
-					EncryptedMetadata:             []byte{3},
-					EncryptedMetadataEncryptedKey: []byte{4},
-					EncryptedMetadataNonce:        []byte{5},
-				},
-			}.Run(ctx, t, db, obj1, 4)
+			projectID := testrand.UUID()
+			bucketName := metabase.BucketName(testrand.BucketName())
 
-			var collector metabasetest.IterateCollector
-			err := db.IterateObjectsAllVersionsWithStatus(ctx, metabase.IterateObjectsWithStatus{
-				ProjectID:             obj1.ProjectID,
-				BucketName:            obj1.BucketName,
-				Recursive:             true,
-				Pending:               false,
-				IncludeCustomMetadata: false,
-				IncludeSystemMetadata: true,
-			}, collector.Add)
+			var objects []metabase.RawObject
 
-			require.NoError(t, err)
+			for i, inc := range []struct{ eTag, customMetadata bool }{
+				{true, false}, {false, true}, {true, true},
+			} {
+				userData := metabasetest.RandEncryptedUserData()
+				if !inc.customMetadata {
+					userData.EncryptedMetadata = nil
+				}
+				if !inc.eTag {
+					userData.EncryptedETag = nil
+				}
 
-			for _, entry := range collector {
-				require.Nil(t, entry.EncryptedMetadataNonce)
-				require.Nil(t, entry.EncryptedMetadata)
-				require.Nil(t, entry.EncryptedMetadataEncryptedKey)
+				objStream := metabase.ObjectStream{
+					ProjectID:  projectID,
+					BucketName: bucketName,
+					ObjectKey:  metabase.ObjectKey(strconv.Itoa(i)),
+					Version:    1,
+					StreamID:   uuid.UUID{byte(i + 1)},
+				}
+
+				object, _ := metabasetest.CreateTestObject{
+					CommitObject: &metabase.CommitObject{
+						ObjectStream:         objStream,
+						Encryption:           metabasetest.DefaultEncryption,
+						SetEncryptedMetadata: true,
+						EncryptedUserData:    userData,
+					},
+				}.Run(ctx, t, db, objStream, 4)
+
+				objects = append(objects, metabase.RawObject(object))
 			}
-		})
 
-		t.Run("exclude system metadata", func(t *testing.T) {
-			defer metabasetest.DeleteAll{}.Check(ctx, t, db)
-
-			obj1 := metabasetest.RandObjectStream()
-			metabasetest.CreateTestObject{
-				CommitObject: &metabase.CommitObject{
-					ObjectStream:                  obj1,
-					Encryption:                    metabasetest.DefaultEncryption,
-					OverrideEncryptedMetadata:     true,
-					EncryptedMetadata:             []byte{3},
-					EncryptedMetadataEncryptedKey: []byte{4},
-					EncryptedMetadataNonce:        []byte{5},
-				},
-			}.Run(ctx, t, db, obj1, 4)
-
-			var collector metabasetest.IterateCollector
-			err := db.IterateObjectsAllVersionsWithStatus(ctx, metabase.IterateObjectsWithStatus{
-				ProjectID:             obj1.ProjectID,
-				BucketName:            obj1.BucketName,
-				Recursive:             true,
-				Pending:               false,
-				IncludeCustomMetadata: true,
-				IncludeSystemMetadata: false,
-			}, collector.Add)
-
-			require.NoError(t, err)
-
-			for _, entry := range collector {
-				// fields that should always be set
-				require.NotEmpty(t, entry.ObjectKey)
-				require.NotEmpty(t, entry.StreamID)
-				require.NotZero(t, entry.Version)
-				require.Equal(t, metabase.CommittedUnversioned, entry.Status)
-				require.False(t, entry.Encryption.IsZero())
-
-				require.True(t, entry.CreatedAt.IsZero())
-				require.Nil(t, entry.ExpiresAt)
-
-				require.Zero(t, entry.SegmentCount)
-				require.Zero(t, entry.TotalPlainSize)
-				require.Zero(t, entry.TotalEncryptedSize)
-				require.Zero(t, entry.FixedSegmentSize)
-
-				require.NotNil(t, entry.EncryptedMetadataNonce)
-				require.NotNil(t, entry.EncryptedMetadata)
-				require.NotNil(t, entry.EncryptedMetadataEncryptedKey)
+			var expectedEntries []metabase.ObjectEntry
+			for _, obj := range objects {
+				expectedEntries = append(expectedEntries, objectEntryFromRaw(obj))
 			}
+
+			// This object has both EncryptedMetadata and EncryptedETag set.
+			// Expect only EncryptedETag to be returned.
+			expectedEntries[2].EncryptedMetadata = nil
+
+			metabasetest.IterateObjectsWithStatus{
+				Opts: metabase.IterateObjectsWithStatus{
+					ProjectID:                   projectID,
+					BucketName:                  bucketName,
+					Recursive:                   true,
+					Pending:                     false,
+					IncludeSystemMetadata:       true,
+					IncludeCustomMetadata:       false,
+					IncludeETag:                 false,
+					IncludeETagOrCustomMetadata: true,
+				},
+				Result: expectedEntries,
+			}.Check(ctx, t, db)
 		})
 
 		t.Run("verify-cursor-continuation", func(t *testing.T) {
@@ -1059,9 +1096,7 @@ func TestIterateObjectsWithStatus(t *testing.T) {
 			objA0 := metabasetest.CreateObject(ctx, t, db, a0, 0)
 			objB0 := metabasetest.CreateObjectVersioned(ctx, t, db, b0, 0)
 			objB1 := metabasetest.CreateObjectVersionedOutOfOrder(ctx, t, db, b1, 0, 1001)
-			metabasetest.CreatePendingObject(ctx, t, db, c0, 0)
-			now := time.Now()
-			zombieDeadline := now.Add(24 * time.Hour)
+			objC0 := metabasetest.CreatePendingObject(ctx, t, db, c0, 0)
 
 			metabasetest.IterateObjectsWithStatus{
 				Opts: metabase.IterateObjectsWithStatus{
@@ -1084,20 +1119,7 @@ func TestIterateObjectsWithStatus(t *testing.T) {
 					metabase.RawObject(objA0),
 					metabase.RawObject(objB0),
 					metabase.RawObject(objB1),
-					{
-						ObjectStream: metabase.ObjectStream{
-							ProjectID:  c0.ProjectID,
-							BucketName: c0.BucketName,
-							ObjectKey:  c0.ObjectKey,
-							Version:    1000,
-							StreamID:   c0.StreamID,
-						},
-						CreatedAt: now,
-						Status:    metabase.Pending,
-
-						Encryption:             metabasetest.DefaultEncryption,
-						ZombieDeletionDeadline: &zombieDeadline,
-					},
+					metabase.RawObject(objC0),
 				},
 			}.Check(ctx, t, db)
 		})
@@ -1119,7 +1141,7 @@ func TestIterateObjectsWithStatus(t *testing.T) {
 			a1 := a0
 			a1.Version = 1001
 
-			metabasetest.BeginObjectExactVersion{
+			pendingObj := metabasetest.BeginObjectExactVersion{
 				Opts: metabase.BeginObjectExactVersion{
 					ObjectStream: metabase.ObjectStream{
 						ProjectID:  b0.ProjectID,
@@ -1131,8 +1153,6 @@ func TestIterateObjectsWithStatus(t *testing.T) {
 					Encryption: metabasetest.DefaultEncryption,
 				},
 			}.Check(ctx, t, db)
-			now := time.Now()
-			zombieDeadline := now.Add(24 * time.Hour)
 
 			objA0 := metabasetest.CreateObjectVersioned(ctx, t, db, a0, 0)
 			objA1 := metabasetest.CreateObjectVersioned(ctx, t, db, a1, 0)
@@ -1148,10 +1168,10 @@ func TestIterateObjectsWithStatus(t *testing.T) {
 				},
 				Result: []metabase.ObjectEntry{
 					{
-						ObjectKey: b0.ObjectKey,
-						Version:   1000,
-						StreamID:  b0.StreamID,
-						CreatedAt: now,
+						ObjectKey: pendingObj.ObjectKey,
+						Version:   pendingObj.Version,
+						StreamID:  pendingObj.StreamID,
+						CreatedAt: pendingObj.CreatedAt,
 						Status:    metabase.Pending,
 
 						Encryption: metabasetest.DefaultEncryption,
@@ -1163,20 +1183,7 @@ func TestIterateObjectsWithStatus(t *testing.T) {
 				Objects: []metabase.RawObject{
 					metabase.RawObject(objA0),
 					metabase.RawObject(objA1),
-					{
-						ObjectStream: metabase.ObjectStream{
-							ProjectID:  b0.ProjectID,
-							BucketName: b0.BucketName,
-							ObjectKey:  b0.ObjectKey,
-							Version:    1000,
-							StreamID:   b0.StreamID,
-						},
-						CreatedAt: now,
-						Status:    metabase.Pending,
-
-						Encryption:             metabasetest.DefaultEncryption,
-						ZombieDeletionDeadline: &zombieDeadline,
-					},
+					metabase.RawObject(pendingObj),
 				},
 			}.Check(ctx, t, db)
 		})
@@ -1874,8 +1881,6 @@ func TestIterateObjectsWithStatus(t *testing.T) {
 
 		t.Run("batch iterate committed versioned, unversioned, and delete markers with pending object", func(t *testing.T) {
 			defer metabasetest.DeleteAll{}.Check(ctx, t, db)
-			now := time.Now()
-			zombieDeadline := now.Add(24 * time.Hour)
 
 			var expected []metabase.ObjectEntry
 			var objLocation metabase.ObjectLocation
@@ -1885,16 +1890,9 @@ func TestIterateObjectsWithStatus(t *testing.T) {
 			objLocation = pendingStream1.Location()
 			pendingStream1.Version = 100
 
-			metabasetest.CreatePendingObject(ctx, t, db, pendingStream1, 0)
+			pendingObject1 := metabasetest.CreatePendingObject(ctx, t, db, pendingStream1, 0)
 
-			pendingObject1 := metabase.RawObject{
-				ObjectStream:           pendingStream1,
-				CreatedAt:              now,
-				Status:                 metabase.Pending,
-				Encryption:             metabasetest.DefaultEncryption,
-				ZombieDeletionDeadline: &zombieDeadline,
-			}
-			expected = append(expected, objectEntryFromRaw(pendingObject1))
+			expected = append(expected, objectEntryFromRaw(metabase.RawObject(pendingObject1)))
 
 			for i := 0; i < 10; i++ {
 				unversionedStream := metabasetest.RandObjectStream()
@@ -1916,16 +1914,9 @@ func TestIterateObjectsWithStatus(t *testing.T) {
 			pendingStream2.ObjectKey = objLocation.ObjectKey
 			pendingStream2.Version = 300
 
-			metabasetest.CreatePendingObject(ctx, t, db, pendingStream2, 0)
+			pendingObject2 := metabasetest.CreatePendingObject(ctx, t, db, pendingStream2, 0)
 
-			pendingObject2 := metabase.RawObject{
-				ObjectStream:           pendingStream2,
-				CreatedAt:              now,
-				Status:                 metabase.Pending,
-				Encryption:             metabasetest.DefaultEncryption,
-				ZombieDeletionDeadline: &zombieDeadline,
-			}
-			expected = append(expected, objectEntryFromRaw(pendingObject2))
+			expected = append(expected, objectEntryFromRaw(metabase.RawObject(pendingObject2)))
 
 			sort.Slice(expected, func(i, k int) bool {
 				return expected[i].Less(expected[k])
@@ -1942,6 +1933,33 @@ func TestIterateObjectsWithStatus(t *testing.T) {
 					Recursive:             true,
 				},
 				Result: expected,
+			}.Check(ctx, t, db)
+		})
+
+		t.Run("final prefix", func(t *testing.T) {
+			defer metabasetest.DeleteAll{}.Check(ctx, t, db)
+			projectID, bucketName := uuid.UUID{1}, metabase.BucketName("bucky")
+
+			objects := createObjectsWithKeys(ctx, t, db, projectID, bucketName, []metabase.ObjectKey{
+				"\xff\x00",
+				"\xffA",
+				"\xff\xff",
+			})
+
+			metabasetest.IterateObjectsWithStatus{
+				Opts: metabase.IterateObjectsWithStatus{
+					ProjectID:             projectID,
+					BucketName:            bucketName,
+					Pending:               false,
+					Prefix:                "\xff",
+					IncludeCustomMetadata: true,
+					IncludeSystemMetadata: true,
+				},
+				Result: withoutPrefix("\xff",
+					objects["\xff\x00"],
+					objects["\xffA"],
+					objects["\xff\xff"],
+				),
 			}.Check(ctx, t, db)
 		})
 	})
@@ -2027,9 +2045,7 @@ func TestIterateObjectsWithStatusAscending(t *testing.T) {
 				},
 			}.Check(ctx, t, db)
 
-			encryptedMetadata := testrand.Bytes(1024)
-			encryptedMetadataNonce := testrand.Nonce()
-			encryptedMetadataKey := testrand.Bytes(265)
+			userData := metabasetest.RandEncryptedUserData()
 
 			metabasetest.BeginObjectExactVersion{
 				Opts: metabase.BeginObjectExactVersion{
@@ -2037,13 +2053,12 @@ func TestIterateObjectsWithStatusAscending(t *testing.T) {
 					Encryption:   metabasetest.DefaultEncryption,
 				},
 			}.Check(ctx, t, db)
+
 			metabasetest.CommitObject{
 				Opts: metabase.CommitObject{
-					ObjectStream:                  committed,
-					OverrideEncryptedMetadata:     true,
-					EncryptedMetadataNonce:        encryptedMetadataNonce[:],
-					EncryptedMetadata:             encryptedMetadata,
-					EncryptedMetadataEncryptedKey: encryptedMetadataKey,
+					ObjectStream:         committed,
+					SetEncryptedMetadata: true,
+					EncryptedUserData:    userData,
 				},
 			}.Check(ctx, t, db)
 
@@ -2055,17 +2070,17 @@ func TestIterateObjectsWithStatusAscending(t *testing.T) {
 					Pending:               false,
 					IncludeCustomMetadata: true,
 					IncludeSystemMetadata: true,
+					IncludeETag:           true,
+					IncludeChecksum:       true,
 				},
 				Result: []metabase.ObjectEntry{{
-					ObjectKey:                     committed.ObjectKey,
-					Version:                       committed.Version,
-					StreamID:                      committed.StreamID,
-					CreatedAt:                     now,
-					Status:                        metabase.CommittedUnversioned,
-					Encryption:                    metabasetest.DefaultEncryption,
-					EncryptedMetadataNonce:        encryptedMetadataNonce[:],
-					EncryptedMetadata:             encryptedMetadata,
-					EncryptedMetadataEncryptedKey: encryptedMetadataKey,
+					ObjectKey:         committed.ObjectKey,
+					Version:           committed.Version,
+					StreamID:          committed.StreamID,
+					CreatedAt:         now,
+					Status:            metabase.CommittedUnversioned,
+					Encryption:        metabasetest.DefaultEncryption,
+					EncryptedUserData: userData,
 				}},
 			}.Check(ctx, t, db)
 
@@ -2077,6 +2092,8 @@ func TestIterateObjectsWithStatusAscending(t *testing.T) {
 					Pending:               true,
 					IncludeCustomMetadata: true,
 					IncludeSystemMetadata: true,
+					IncludeETag:           true,
+					IncludeChecksum:       true,
 				},
 				Result: []metabase.ObjectEntry{{
 					ObjectKey:  pending.ObjectKey,
@@ -2107,6 +2124,8 @@ func TestIterateObjectsWithStatusAscending(t *testing.T) {
 					Pending:               false,
 					IncludeCustomMetadata: true,
 					IncludeSystemMetadata: true,
+					IncludeETag:           true,
+					IncludeChecksum:       true,
 				},
 				Result: expected,
 			}.Check(ctx, t, db)
@@ -2131,6 +2150,8 @@ func TestIterateObjectsWithStatusAscending(t *testing.T) {
 					Pending:               false,
 					IncludeCustomMetadata: true,
 					IncludeSystemMetadata: true,
+					IncludeETag:           true,
+					IncludeChecksum:       true,
 				},
 				Result: expected,
 			}.Check(ctx, t, db)
@@ -2158,6 +2179,8 @@ func TestIterateObjectsWithStatusAscending(t *testing.T) {
 					Pending:               false,
 					IncludeCustomMetadata: true,
 					IncludeSystemMetadata: true,
+					IncludeETag:           true,
+					IncludeChecksum:       true,
 				},
 				Result: expected,
 			}.Check(ctx, t, db)
@@ -2187,6 +2210,8 @@ func TestIterateObjectsWithStatusAscending(t *testing.T) {
 					Pending:               false,
 					IncludeCustomMetadata: true,
 					IncludeSystemMetadata: true,
+					IncludeETag:           true,
+					IncludeChecksum:       true,
 				},
 				Result: expected,
 			}.Check(ctx, t, db)
@@ -2220,6 +2245,8 @@ func TestIterateObjectsWithStatusAscending(t *testing.T) {
 					Pending:               false,
 					IncludeCustomMetadata: true,
 					IncludeSystemMetadata: true,
+					IncludeETag:           true,
+					IncludeChecksum:       true,
 				},
 				Result: []metabase.ObjectEntry{
 					objects["a"],
@@ -2242,6 +2269,8 @@ func TestIterateObjectsWithStatusAscending(t *testing.T) {
 					Pending:               false,
 					IncludeCustomMetadata: true,
 					IncludeSystemMetadata: true,
+					IncludeETag:           true,
+					IncludeChecksum:       true,
 
 					Cursor: metabase.IterateCursor{Key: "a", Version: objects["a"].Version + 1},
 				},
@@ -2265,6 +2294,8 @@ func TestIterateObjectsWithStatusAscending(t *testing.T) {
 					Pending:               false,
 					IncludeCustomMetadata: true,
 					IncludeSystemMetadata: true,
+					IncludeETag:           true,
+					IncludeChecksum:       true,
 
 					Cursor: metabase.IterateCursor{Key: "b", Version: 0},
 				},
@@ -2288,6 +2319,8 @@ func TestIterateObjectsWithStatusAscending(t *testing.T) {
 					Pending:               false,
 					IncludeCustomMetadata: true,
 					IncludeSystemMetadata: true,
+					IncludeETag:           true,
+					IncludeChecksum:       true,
 
 					Prefix: "b/",
 				},
@@ -2306,6 +2339,8 @@ func TestIterateObjectsWithStatusAscending(t *testing.T) {
 					Pending:               false,
 					IncludeCustomMetadata: true,
 					IncludeSystemMetadata: true,
+					IncludeETag:           true,
+					IncludeChecksum:       true,
 
 					Prefix: "b/",
 					Cursor: metabase.IterateCursor{Key: "a"},
@@ -2325,6 +2360,8 @@ func TestIterateObjectsWithStatusAscending(t *testing.T) {
 					Pending:               false,
 					IncludeCustomMetadata: true,
 					IncludeSystemMetadata: true,
+					IncludeETag:           true,
+					IncludeChecksum:       true,
 
 					Prefix: "b/",
 					Cursor: metabase.IterateCursor{Key: "b/2", Version: -3},
@@ -2343,6 +2380,8 @@ func TestIterateObjectsWithStatusAscending(t *testing.T) {
 					Pending:               false,
 					IncludeCustomMetadata: true,
 					IncludeSystemMetadata: true,
+					IncludeETag:           true,
+					IncludeChecksum:       true,
 
 					Prefix: "b/",
 					Cursor: metabase.IterateCursor{Key: "c/"},
@@ -2374,6 +2413,8 @@ func TestIterateObjectsWithStatusAscending(t *testing.T) {
 					Pending:               false,
 					IncludeCustomMetadata: true,
 					IncludeSystemMetadata: true,
+					IncludeETag:           true,
+					IncludeChecksum:       true,
 				},
 				Result: []metabase.ObjectEntry{
 					objects["a"],
@@ -2391,6 +2432,8 @@ func TestIterateObjectsWithStatusAscending(t *testing.T) {
 					Pending:               false,
 					IncludeCustomMetadata: true,
 					IncludeSystemMetadata: true,
+					IncludeETag:           true,
+					IncludeChecksum:       true,
 
 					Cursor: metabase.IterateCursor{Key: "a", Version: objects["a"].Version + 1},
 				},
@@ -2409,6 +2452,8 @@ func TestIterateObjectsWithStatusAscending(t *testing.T) {
 					Pending:               false,
 					IncludeCustomMetadata: true,
 					IncludeSystemMetadata: true,
+					IncludeETag:           true,
+					IncludeChecksum:       true,
 
 					Cursor: metabase.IterateCursor{Key: "b", Version: 0},
 				},
@@ -2427,6 +2472,8 @@ func TestIterateObjectsWithStatusAscending(t *testing.T) {
 					Pending:               false,
 					IncludeCustomMetadata: true,
 					IncludeSystemMetadata: true,
+					IncludeETag:           true,
+					IncludeChecksum:       true,
 
 					Prefix: "b/",
 				},
@@ -2444,6 +2491,8 @@ func TestIterateObjectsWithStatusAscending(t *testing.T) {
 					Pending:               false,
 					IncludeCustomMetadata: true,
 					IncludeSystemMetadata: true,
+					IncludeETag:           true,
+					IncludeChecksum:       true,
 
 					Prefix: "b/",
 					Cursor: metabase.IterateCursor{Key: "a"},
@@ -2462,6 +2511,8 @@ func TestIterateObjectsWithStatusAscending(t *testing.T) {
 					Pending:               false,
 					IncludeCustomMetadata: true,
 					IncludeSystemMetadata: true,
+					IncludeETag:           true,
+					IncludeChecksum:       true,
 
 					Prefix: "b/",
 					Cursor: metabase.IterateCursor{Key: "b/2", Version: -3},
@@ -2479,6 +2530,8 @@ func TestIterateObjectsWithStatusAscending(t *testing.T) {
 					Pending:               false,
 					IncludeCustomMetadata: true,
 					IncludeSystemMetadata: true,
+					IncludeETag:           true,
+					IncludeChecksum:       true,
 
 					Prefix: "b/",
 					Cursor: metabase.IterateCursor{Key: "c/"},
@@ -2493,6 +2546,8 @@ func TestIterateObjectsWithStatusAscending(t *testing.T) {
 					Pending:               false,
 					IncludeCustomMetadata: true,
 					IncludeSystemMetadata: true,
+					IncludeETag:           true,
+					IncludeChecksum:       true,
 
 					Prefix: "c/",
 					Cursor: metabase.IterateCursor{Key: "c/"},
@@ -2511,6 +2566,8 @@ func TestIterateObjectsWithStatusAscending(t *testing.T) {
 					Pending:               false,
 					IncludeCustomMetadata: true,
 					IncludeSystemMetadata: true,
+					IncludeETag:           true,
+					IncludeChecksum:       true,
 
 					Prefix: "c//",
 				},
@@ -2521,10 +2578,6 @@ func TestIterateObjectsWithStatusAscending(t *testing.T) {
 		})
 
 		t.Run("boundaries", func(t *testing.T) {
-			if _, ok := db.ChooseAdapter(uuid.UUID{}).(*metabase.SpannerAdapter); ok {
-				// TODO(spanner): find a fix for this
-				t.Skip("test runs too slow for spanner")
-			}
 			defer metabasetest.DeleteAll{}.Check(ctx, t, db)
 			projectID, bucketName := uuid.UUID{1}, metabase.BucketName("bucky")
 
@@ -2533,7 +2586,9 @@ func TestIterateObjectsWithStatusAscending(t *testing.T) {
 				ObjectStream: metabase.ObjectStream{
 					ProjectID:  projectID,
 					BucketName: bucketName,
+					Version:    1,
 				},
+				Status: metabase.CommittedVersioned,
 			}
 
 			for a := 0; a <= 0xFF; a++ {
@@ -2569,6 +2624,8 @@ func TestIterateObjectsWithStatusAscending(t *testing.T) {
 						Prefix:                prefix.ObjectKey,
 						Pending:               false,
 						IncludeCustomMetadata: true,
+						IncludeETag:           true,
+						IncludeChecksum:       true,
 					}, collector.Add)
 					require.NoError(t, err)
 
@@ -2584,6 +2641,8 @@ func TestIterateObjectsWithStatusAscending(t *testing.T) {
 						Recursive:             true,
 						Pending:               false,
 						IncludeCustomMetadata: true,
+						IncludeETag:           true,
+						IncludeChecksum:       true,
 					}, collector.Add)
 					require.NoError(t, err)
 				}
@@ -2607,6 +2666,8 @@ func TestIterateObjectsWithStatusAscending(t *testing.T) {
 				Pending:               false,
 				IncludeCustomMetadata: true,
 				IncludeSystemMetadata: true,
+				IncludeETag:           true,
+				IncludeChecksum:       true,
 			}, collector.Add)
 			require.NoError(t, err)
 		})
@@ -2629,124 +2690,103 @@ func TestIterateObjectsWithStatusAscending(t *testing.T) {
 				BatchSize:             1,
 				Pending:               false,
 				IncludeCustomMetadata: true,
+				IncludeETag:           true,
+				IncludeChecksum:       true,
 			}, collector.Add)
 			require.NoError(t, err)
 		})
 
-		t.Run("include metadata", func(t *testing.T) {
+		for _, tt := range objectIncludesScenarios {
+			t.Run(tt.name, func(t *testing.T) {
+				defer metabasetest.DeleteAll{}.Check(ctx, t, db)
+
+				objStream := metabasetest.RandObjectStream()
+				object, _ := metabasetest.CreateTestObject{
+					CommitObject: &metabase.CommitObject{
+						ObjectStream:         objStream,
+						Encryption:           metabasetest.DefaultEncryption,
+						SetEncryptedMetadata: true,
+						EncryptedUserData:    metabasetest.RandEncryptedUserDataWithChecksum(),
+					},
+				}.Run(ctx, t, db, objStream, 4)
+
+				metabasetest.IterateObjectsWithStatusAscending{
+					Opts: metabase.IterateObjectsWithStatus{
+						ProjectID:             object.ProjectID,
+						BucketName:            object.BucketName,
+						Recursive:             true,
+						Pending:               false,
+						IncludeCustomMetadata: tt.includes.customMetadata,
+						IncludeSystemMetadata: tt.includes.systemMetadata,
+						IncludeETag:           tt.includes.eTag,
+						IncludeChecksum:       tt.includes.checksum,
+					},
+					Result: []metabase.ObjectEntry{tt.getExpectedEntry(object)},
+				}.Check(ctx, t, db)
+			})
+		}
+
+		t.Run("Include ETag or custom metadata", func(t *testing.T) {
 			defer metabasetest.DeleteAll{}.Check(ctx, t, db)
 
-			obj1 := metabasetest.RandObjectStream()
-			metabasetest.CreateTestObject{
-				CommitObject: &metabase.CommitObject{
-					ObjectStream:                  obj1,
-					Encryption:                    metabasetest.DefaultEncryption,
-					OverrideEncryptedMetadata:     true,
-					EncryptedMetadata:             []byte{3},
-					EncryptedMetadataEncryptedKey: []byte{4},
-					EncryptedMetadataNonce:        []byte{5},
-				},
-			}.Run(ctx, t, db, obj1, 4)
+			projectID := testrand.UUID()
+			bucketName := metabase.BucketName(testrand.BucketName())
 
-			var collector metabasetest.IterateCollector
-			err := db.IterateObjectsAllVersionsWithStatus(ctx, metabase.IterateObjectsWithStatus{
-				ProjectID:             obj1.ProjectID,
-				BucketName:            obj1.BucketName,
-				Recursive:             true,
-				Pending:               false,
-				IncludeCustomMetadata: true,
-				IncludeSystemMetadata: true,
-			}, collector.Add)
+			var objects []metabase.RawObject
 
-			require.NoError(t, err)
+			for i, inc := range []struct{ eTag, customMetadata bool }{
+				{true, false}, {false, true}, {true, true},
+			} {
+				userData := metabasetest.RandEncryptedUserData()
+				if !inc.customMetadata {
+					userData.EncryptedMetadata = nil
+				}
+				if !inc.eTag {
+					userData.EncryptedETag = nil
+				}
 
-			for _, entry := range collector {
-				require.Equal(t, entry.EncryptedMetadata, []byte{3})
-				require.Equal(t, entry.EncryptedMetadataEncryptedKey, []byte{4})
-				require.Equal(t, entry.EncryptedMetadataNonce, []byte{5})
+				objStream := metabase.ObjectStream{
+					ProjectID:  projectID,
+					BucketName: bucketName,
+					ObjectKey:  metabase.ObjectKey(strconv.Itoa(i)),
+					Version:    1,
+					StreamID:   uuid.UUID{byte(i + 1)},
+				}
+
+				object, _ := metabasetest.CreateTestObject{
+					CommitObject: &metabase.CommitObject{
+						ObjectStream:         objStream,
+						Encryption:           metabasetest.DefaultEncryption,
+						SetEncryptedMetadata: true,
+						EncryptedUserData:    userData,
+					},
+				}.Run(ctx, t, db, objStream, 4)
+
+				objects = append(objects, metabase.RawObject(object))
 			}
-		})
 
-		t.Run("exclude custom metadata", func(t *testing.T) {
-			defer metabasetest.DeleteAll{}.Check(ctx, t, db)
-
-			obj1 := metabasetest.RandObjectStream()
-			metabasetest.CreateTestObject{
-				CommitObject: &metabase.CommitObject{
-					ObjectStream:                  obj1,
-					Encryption:                    metabasetest.DefaultEncryption,
-					EncryptedMetadata:             []byte{3},
-					EncryptedMetadataEncryptedKey: []byte{4},
-					EncryptedMetadataNonce:        []byte{5},
-				},
-			}.Run(ctx, t, db, obj1, 4)
-
-			var collector metabasetest.IterateCollector
-			err := db.IterateObjectsAllVersionsWithStatus(ctx, metabase.IterateObjectsWithStatus{
-				ProjectID:             obj1.ProjectID,
-				BucketName:            obj1.BucketName,
-				Recursive:             true,
-				Pending:               false,
-				IncludeCustomMetadata: false,
-				IncludeSystemMetadata: true,
-			}, collector.Add)
-
-			require.NoError(t, err)
-
-			for _, entry := range collector {
-				require.Nil(t, entry.EncryptedMetadataNonce)
-				require.Nil(t, entry.EncryptedMetadata)
-				require.Nil(t, entry.EncryptedMetadataEncryptedKey)
+			var expectedEntries []metabase.ObjectEntry
+			for _, obj := range objects {
+				expectedEntries = append(expectedEntries, objectEntryFromRaw(obj))
 			}
-		})
 
-		t.Run("exclude system metadata", func(t *testing.T) {
-			defer metabasetest.DeleteAll{}.Check(ctx, t, db)
+			// This object has both EncryptedMetadata and EncryptedETag set.
+			// Expect only EncryptedETag to be returned.
+			expectedEntries[2].EncryptedMetadata = nil
 
-			obj1 := metabasetest.RandObjectStream()
-			metabasetest.CreateTestObject{
-				CommitObject: &metabase.CommitObject{
-					ObjectStream:                  obj1,
-					Encryption:                    metabasetest.DefaultEncryption,
-					OverrideEncryptedMetadata:     true,
-					EncryptedMetadata:             []byte{3},
-					EncryptedMetadataEncryptedKey: []byte{4},
-					EncryptedMetadataNonce:        []byte{5},
+			metabasetest.IterateObjectsWithStatusAscending{
+				Opts: metabase.IterateObjectsWithStatus{
+					ProjectID:                   projectID,
+					BucketName:                  bucketName,
+					Recursive:                   true,
+					Pending:                     false,
+					IncludeSystemMetadata:       true,
+					IncludeCustomMetadata:       false,
+					IncludeETag:                 false,
+					IncludeETagOrCustomMetadata: true,
 				},
-			}.Run(ctx, t, db, obj1, 4)
-
-			var collector metabasetest.IterateCollector
-			err := db.IterateObjectsAllVersionsWithStatus(ctx, metabase.IterateObjectsWithStatus{
-				ProjectID:             obj1.ProjectID,
-				BucketName:            obj1.BucketName,
-				Recursive:             true,
-				Pending:               false,
-				IncludeCustomMetadata: true,
-				IncludeSystemMetadata: false,
-			}, collector.Add)
-
-			require.NoError(t, err)
-
-			for _, entry := range collector {
-				// fields that should always be set
-				require.NotEmpty(t, entry.ObjectKey)
-				require.NotEmpty(t, entry.StreamID)
-				require.NotZero(t, entry.Version)
-				require.Equal(t, metabase.CommittedUnversioned, entry.Status)
-				require.False(t, entry.Encryption.IsZero())
-
-				require.True(t, entry.CreatedAt.IsZero())
-				require.Nil(t, entry.ExpiresAt)
-
-				require.Zero(t, entry.SegmentCount)
-				require.Zero(t, entry.TotalPlainSize)
-				require.Zero(t, entry.TotalEncryptedSize)
-				require.Zero(t, entry.FixedSegmentSize)
-
-				require.NotNil(t, entry.EncryptedMetadataNonce)
-				require.NotNil(t, entry.EncryptedMetadata)
-				require.NotNil(t, entry.EncryptedMetadataEncryptedKey)
-			}
+				Result: expectedEntries,
+			}.Check(ctx, t, db)
 		})
 
 		t.Run("verify-cursor-continuation", func(t *testing.T) {
@@ -2985,9 +3025,7 @@ func TestIterateObjectsWithStatusAscending(t *testing.T) {
 			objA0 := metabasetest.CreateObject(ctx, t, db, a0, 0)
 			objB0 := metabasetest.CreateObjectVersioned(ctx, t, db, b0, 0)
 			objB1 := metabasetest.CreateObjectVersionedOutOfOrder(ctx, t, db, b1, 0, 1001)
-			metabasetest.CreatePendingObject(ctx, t, db, c0, 0)
-			now := time.Now()
-			zombieDeadline := now.Add(24 * time.Hour)
+			objC0 := metabasetest.CreatePendingObject(ctx, t, db, c0, 0)
 
 			metabasetest.IterateObjectsWithStatusAscending{
 				Opts: metabase.IterateObjectsWithStatus{
@@ -3010,20 +3048,7 @@ func TestIterateObjectsWithStatusAscending(t *testing.T) {
 					metabase.RawObject(objA0),
 					metabase.RawObject(objB0),
 					metabase.RawObject(objB1),
-					{
-						ObjectStream: metabase.ObjectStream{
-							ProjectID:  c0.ProjectID,
-							BucketName: c0.BucketName,
-							ObjectKey:  c0.ObjectKey,
-							Version:    1000,
-							StreamID:   c0.StreamID,
-						},
-						CreatedAt: now,
-						Status:    metabase.Pending,
-
-						Encryption:             metabasetest.DefaultEncryption,
-						ZombieDeletionDeadline: &zombieDeadline,
-					},
+					metabase.RawObject(objC0),
 				},
 			}.Check(ctx, t, db)
 		})
@@ -3045,7 +3070,7 @@ func TestIterateObjectsWithStatusAscending(t *testing.T) {
 			a1 := a0
 			a1.Version = 1001
 
-			metabasetest.BeginObjectExactVersion{
+			pendingObj := metabasetest.BeginObjectExactVersion{
 				Opts: metabase.BeginObjectExactVersion{
 					ObjectStream: metabase.ObjectStream{
 						ProjectID:  b0.ProjectID,
@@ -3057,8 +3082,6 @@ func TestIterateObjectsWithStatusAscending(t *testing.T) {
 					Encryption: metabasetest.DefaultEncryption,
 				},
 			}.Check(ctx, t, db)
-			now := time.Now()
-			zombieDeadline := now.Add(24 * time.Hour)
 
 			objA0 := metabasetest.CreateObjectVersioned(ctx, t, db, a0, 0)
 			objA1 := metabasetest.CreateObjectVersioned(ctx, t, db, a1, 0)
@@ -3074,10 +3097,10 @@ func TestIterateObjectsWithStatusAscending(t *testing.T) {
 				},
 				Result: []metabase.ObjectEntry{
 					{
-						ObjectKey: b0.ObjectKey,
-						Version:   1000,
-						StreamID:  b0.StreamID,
-						CreatedAt: now,
+						ObjectKey: pendingObj.ObjectKey,
+						Version:   pendingObj.Version,
+						StreamID:  pendingObj.StreamID,
+						CreatedAt: pendingObj.CreatedAt,
 						Status:    metabase.Pending,
 
 						Encryption: metabasetest.DefaultEncryption,
@@ -3089,20 +3112,7 @@ func TestIterateObjectsWithStatusAscending(t *testing.T) {
 				Objects: []metabase.RawObject{
 					metabase.RawObject(objA0),
 					metabase.RawObject(objA1),
-					{
-						ObjectStream: metabase.ObjectStream{
-							ProjectID:  b0.ProjectID,
-							BucketName: b0.BucketName,
-							ObjectKey:  b0.ObjectKey,
-							Version:    1000,
-							StreamID:   b0.StreamID,
-						},
-						CreatedAt: now,
-						Status:    metabase.Pending,
-
-						Encryption:             metabasetest.DefaultEncryption,
-						ZombieDeletionDeadline: &zombieDeadline,
-					},
+					metabase.RawObject(pendingObj),
 				},
 			}.Check(ctx, t, db)
 		})
@@ -3800,8 +3810,6 @@ func TestIterateObjectsWithStatusAscending(t *testing.T) {
 
 		t.Run("batch iterate committed versioned, unversioned, and delete markers with pending object", func(t *testing.T) {
 			defer metabasetest.DeleteAll{}.Check(ctx, t, db)
-			now := time.Now()
-			zombieDeadline := now.Add(24 * time.Hour)
 
 			var expected []metabase.ObjectEntry
 			var objLocation metabase.ObjectLocation
@@ -3811,16 +3819,9 @@ func TestIterateObjectsWithStatusAscending(t *testing.T) {
 			objLocation = pendingStream1.Location()
 			pendingStream1.Version = 100
 
-			metabasetest.CreatePendingObject(ctx, t, db, pendingStream1, 0)
+			pendingObject1 := metabasetest.CreatePendingObject(ctx, t, db, pendingStream1, 0)
 
-			pendingObject1 := metabase.RawObject{
-				ObjectStream:           pendingStream1,
-				CreatedAt:              now,
-				Status:                 metabase.Pending,
-				Encryption:             metabasetest.DefaultEncryption,
-				ZombieDeletionDeadline: &zombieDeadline,
-			}
-			expected = append(expected, objectEntryFromRaw(pendingObject1))
+			expected = append(expected, objectEntryFromRaw(metabase.RawObject(pendingObject1)))
 
 			for i := 0; i < 10; i++ {
 				unversionedStream := metabasetest.RandObjectStream()
@@ -3842,16 +3843,9 @@ func TestIterateObjectsWithStatusAscending(t *testing.T) {
 			pendingStream2.ObjectKey = objLocation.ObjectKey
 			pendingStream2.Version = 300
 
-			metabasetest.CreatePendingObject(ctx, t, db, pendingStream2, 0)
+			pendingObject2 := metabasetest.CreatePendingObject(ctx, t, db, pendingStream2, 0)
 
-			pendingObject2 := metabase.RawObject{
-				ObjectStream:           pendingStream2,
-				CreatedAt:              now,
-				Status:                 metabase.Pending,
-				Encryption:             metabasetest.DefaultEncryption,
-				ZombieDeletionDeadline: &zombieDeadline,
-			}
-			expected = append(expected, objectEntryFromRaw(pendingObject2))
+			expected = append(expected, objectEntryFromRaw(metabase.RawObject(pendingObject2)))
 
 			metabasetest.IterateObjectsWithStatusAscending{
 				Opts: metabase.IterateObjectsWithStatus{
@@ -3864,6 +3858,33 @@ func TestIterateObjectsWithStatusAscending(t *testing.T) {
 					Recursive:             true,
 				},
 				Result: expected,
+			}.Check(ctx, t, db)
+		})
+
+		t.Run("final prefix", func(t *testing.T) {
+			defer metabasetest.DeleteAll{}.Check(ctx, t, db)
+			projectID, bucketName := uuid.UUID{1}, metabase.BucketName("bucky")
+
+			objects := createObjectsWithKeys(ctx, t, db, projectID, bucketName, []metabase.ObjectKey{
+				"\xff\x00",
+				"\xffA",
+				"\xff\xff",
+			})
+
+			metabasetest.IterateObjectsWithStatusAscending{
+				Opts: metabase.IterateObjectsWithStatus{
+					ProjectID:             projectID,
+					BucketName:            bucketName,
+					Pending:               false,
+					Prefix:                "\xff",
+					IncludeCustomMetadata: true,
+					IncludeSystemMetadata: true,
+				},
+				Result: withoutPrefix("\xff",
+					objects["\xff\x00"],
+					objects["\xffA"],
+					objects["\xff\xff"],
+				),
 			}.Check(ctx, t, db)
 		})
 	})
@@ -4013,8 +4034,6 @@ func TestIterateObjectsSkipCursor(t *testing.T) {
 		t.Run("batch-size", func(t *testing.T) {
 			defer metabasetest.DeleteAll{}.Check(ctx, t, db)
 
-			afterDelimiter := metabase.ObjectKey(metabase.Delimiter + 1)
-
 			objects := createObjectsWithKeys(ctx, t, db, projectID, bucketName, []metabase.ObjectKey{
 				"2017/05/08",
 				"2017/05/08/a",
@@ -4022,7 +4041,7 @@ func TestIterateObjectsSkipCursor(t *testing.T) {
 				"2017/05/08/c",
 				"2017/05/08/d",
 				"2017/05/08/e",
-				"2017/05/08" + afterDelimiter,
+				"2017/05/08" + metabase.DelimiterNext,
 				"2017/05/09/a",
 				"2017/05/09/b",
 				"2017/05/09/c",
@@ -4052,7 +4071,7 @@ func TestIterateObjectsSkipCursor(t *testing.T) {
 				},
 				Result: []metabase.ObjectEntry{
 					prefixEntry(metabase.ObjectKey("08/")),
-					withoutPrefix1("2017/05/", objects["2017/05/08"+afterDelimiter]),
+					withoutPrefix1("2017/05/", objects["2017/05/08"+metabase.DelimiterNext]),
 					prefixEntry(metabase.ObjectKey("09/")),
 					prefixEntry(metabase.ObjectKey("10/")),
 				},
@@ -4074,7 +4093,7 @@ func TestIterateObjectsSkipCursor(t *testing.T) {
 					IncludeSystemMetadata: true,
 				},
 				Result: []metabase.ObjectEntry{
-					withoutPrefix1("2017/05/", objects["2017/05/08"+afterDelimiter]),
+					withoutPrefix1("2017/05/", objects["2017/05/08"+metabase.DelimiterNext]),
 					prefixEntry(metabase.ObjectKey("09/")),
 					prefixEntry(metabase.ObjectKey("10/")),
 				},
@@ -4095,13 +4114,42 @@ func TestIterateObjectsSkipCursor(t *testing.T) {
 					IncludeSystemMetadata: true,
 				},
 				Result: []metabase.ObjectEntry{
-					withoutPrefix1("2017/05/", objects["2017/05/08"+afterDelimiter]),
+					withoutPrefix1("2017/05/", objects["2017/05/08"+metabase.DelimiterNext]),
 					prefixEntry(metabase.ObjectKey("09/")),
 					prefixEntry(metabase.ObjectKey("10/")),
 				},
 			}.Check(ctx, t, db)
 		})
 	})
+}
+
+func TestIterateObjectsWithStatus_Delimiter(t *testing.T) {
+	for _, tt := range []struct {
+		name      string
+		ascending bool
+	}{
+		{"Descending", false}, {"Ascending", true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			testListObjectsDelimiter(t, func(ctx *testcontext.Context, t *testing.T, db *metabase.DB, testCase listObjectsDelimiterTestCase) ([]metabase.ObjectEntry, error) {
+				var result metabasetest.IterateCollector
+
+				iter := db.IterateObjectsAllVersionsWithStatus
+				if tt.ascending {
+					iter = db.IterateObjectsAllVersionsWithStatusAscending
+				}
+				err := iter(ctx, metabase.IterateObjectsWithStatus{
+					ProjectID:             testCase.projectID,
+					BucketName:            testCase.bucketName,
+					Prefix:                testCase.prefix,
+					Delimiter:             testCase.delimiter,
+					IncludeSystemMetadata: true,
+				}, result.Add)
+
+				return []metabase.ObjectEntry(result), err
+			})
+		})
+	}
 }
 
 func createObjects(ctx *testcontext.Context, t *testing.T, db *metabase.DB, numberOfObjects int, projectID uuid.UUID, bucketName metabase.BucketName) []metabase.RawObject {
@@ -4139,6 +4187,7 @@ func createObjectsWithKeys(ctx *testcontext.Context, t *testing.T, db *metabase.
 		metabasetest.CreateObject(ctx, t, db, obj, 0)
 
 		objects[key] = metabase.ObjectEntry{
+			IsLatest:   true,
 			ObjectKey:  obj.ObjectKey,
 			Version:    obj.Version,
 			StreamID:   obj.StreamID,
@@ -4175,21 +4224,37 @@ func prefixEntry(key metabase.ObjectKey) metabase.ObjectEntry {
 
 func objectEntryFromRaw(m metabase.RawObject) metabase.ObjectEntry {
 	return metabase.ObjectEntry{
-		IsPrefix:                      false,
-		ObjectKey:                     m.ObjectKey,
-		Version:                       m.Version,
-		StreamID:                      m.StreamID,
-		CreatedAt:                     m.CreatedAt,
-		ExpiresAt:                     m.ExpiresAt,
-		Status:                        m.Status,
-		SegmentCount:                  m.SegmentCount,
-		EncryptedMetadataNonce:        m.EncryptedMetadataNonce,
-		EncryptedMetadata:             m.EncryptedMetadata,
-		EncryptedMetadataEncryptedKey: m.EncryptedMetadataEncryptedKey,
-		TotalEncryptedSize:            m.TotalEncryptedSize,
-		TotalPlainSize:                m.TotalPlainSize,
-		FixedSegmentSize:              m.FixedSegmentSize,
-		Encryption:                    m.Encryption,
+		IsLatest:           false,
+		IsPrefix:           false,
+		ObjectKey:          m.ObjectKey,
+		Version:            m.Version,
+		StreamID:           m.StreamID,
+		CreatedAt:          m.CreatedAt,
+		ExpiresAt:          m.ExpiresAt,
+		Status:             m.Status,
+		SegmentCount:       m.SegmentCount,
+		EncryptedUserData:  m.EncryptedUserData,
+		TotalEncryptedSize: m.TotalEncryptedSize,
+		TotalPlainSize:     m.TotalPlainSize,
+		FixedSegmentSize:   m.FixedSegmentSize,
+		Encryption:         m.Encryption,
+	}
+}
+
+func objectEntryFromRawLatest(m metabase.RawObject) metabase.ObjectEntry {
+	obj := objectEntryFromRaw(m)
+	obj.IsLatest = true
+	return obj
+}
+
+func minimalObjectEntryFromRawLatest(obj metabase.RawObject) metabase.ObjectEntry {
+	return metabase.ObjectEntry{
+		IsLatest:   true,
+		ObjectKey:  obj.ObjectKey,
+		StreamID:   obj.StreamID,
+		Version:    obj.Version,
+		Status:     obj.Status,
+		Encryption: obj.Encryption,
 	}
 }
 
@@ -4265,75 +4330,6 @@ func BenchmarkNonRecursiveListing(b *testing.B) {
 				require.NoError(b, err)
 			}
 		})
-	})
-}
-
-func TestTupleGreaterThanSQLEvaluate(t *testing.T) {
-	metabasetest.Run(t, func(ctx *testcontext.Context, t *testing.T, db *metabase.DB) {
-		adapter := db.ChooseAdapter(uuid.UUID{})
-		evaluateSQL := func(expr string) (response bool) {
-			switch ad := adapter.(type) {
-			case *metabase.PostgresAdapter:
-				rawDB := ad.UnderlyingDB()
-				row := rawDB.QueryRowContext(ctx, "SELECT "+expr)
-				require.NoError(t, row.Err())
-				require.NoError(t, row.Scan(&response))
-			case *metabase.CockroachAdapter:
-				rawDB := ad.UnderlyingDB()
-				row := rawDB.QueryRowContext(ctx, "SELECT "+expr)
-				require.NoError(t, row.Err())
-				require.NoError(t, row.Scan(&response))
-			case *metabase.SpannerAdapter:
-				rawDB := ad.UnderlyingDB()
-				result := rawDB.Single().Query(ctx, spanner.Statement{SQL: "SELECT " + expr})
-				row, err := result.Next()
-				require.NoError(t, err)
-				require.NoError(t, row.Columns(&response))
-			default:
-				t.Skipf("unknown adapter type %T", adapter)
-			}
-			return response
-		}
-
-		expectGreater := func(a, b []string) {
-			expr1, err := spannerutil.TupleGreaterThanSQL(a, b, false)
-			require.NoError(t, err)
-			assert.True(t, evaluateSQL(expr1), expr1)
-			expr2, err := spannerutil.TupleGreaterThanSQL(b, a, false)
-			require.NoError(t, err)
-			assert.False(t, evaluateSQL(expr2), expr2)
-			expr3, err := spannerutil.TupleGreaterThanSQL(a, b, true)
-			require.NoError(t, err)
-			assert.True(t, evaluateSQL(expr3), expr3)
-			expr4, err := spannerutil.TupleGreaterThanSQL(b, a, true)
-			require.NoError(t, err)
-			assert.False(t, evaluateSQL(expr4), expr4)
-		}
-		expectEqual := func(a, b []string) {
-			expr1, err := spannerutil.TupleGreaterThanSQL(a, b, true)
-			require.NoError(t, err)
-			assert.True(t, evaluateSQL(expr1), expr1)
-			expr2, err := spannerutil.TupleGreaterThanSQL(b, a, true)
-			require.NoError(t, err)
-			assert.True(t, evaluateSQL(expr2), expr2)
-			expr3, err := spannerutil.TupleGreaterThanSQL(a, b, false)
-			require.NoError(t, err)
-			assert.False(t, evaluateSQL(expr3), expr3)
-			expr4, err := spannerutil.TupleGreaterThanSQL(b, a, false)
-			require.NoError(t, err)
-			assert.False(t, evaluateSQL(expr4), expr4)
-		}
-
-		expectGreater([]string{"0", "0", "1"}, []string{"0", "0", "0"})
-		expectGreater([]string{"0", "1", "0"}, []string{"0", "0", "0"})
-		expectGreater([]string{"1", "0", "0"}, []string{"0", "0", "0"})
-		expectGreater([]string{"1", "0", "0"}, []string{"0", "1", "1"})
-		expectGreater([]string{"1", "0", "1"}, []string{"1", "0", "0"})
-		expectGreater([]string{"1", "1", "1"}, []string{"1", "1", "0"})
-		expectGreater([]string{"1"}, []string{"0"})
-		expectEqual([]string{"0", "1", "0"}, []string{"0", "1", "0"})
-		expectEqual([]string{"0"}, []string{"0"})
-
 	})
 }
 

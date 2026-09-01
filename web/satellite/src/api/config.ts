@@ -2,7 +2,7 @@
 // See LICENSE for copying information.
 
 import { HttpClient } from '@/utils/httpClient';
-import { FrontendConfig, FrontendConfigApi } from '@/types/config';
+import { type FrontendConfig, type FrontendConfigApi, BrandingConfig  } from '@/types/config';
 import { APIError } from '@/utils/error';
 
 /**
@@ -27,5 +27,56 @@ export class FrontendConfigHttpApi implements FrontendConfigApi {
             });
         }
         return await response.json() as FrontendConfig;
+    }
+
+    /**
+     * Returns branding config based on the tenant.
+     *
+     * @throws Error
+     */
+    public async getBranding(): Promise<BrandingConfig> {
+        const response = await this.http.get(`${this.ROOT_PATH}/branding`);
+        const result = await response.json();
+
+        if (response.ok) {
+            return new BrandingConfig(
+                result.name,
+                result.logoUrls ? new Map(Object.entries(result.logoUrls)) : new Map(),
+                result.faviconUrls ? new Map(Object.entries(result.faviconUrls)) : new Map(),
+                result.colors ? new Map(Object.entries(result.colors)) : new Map(),
+                result.supportUrl,
+                result.docsUrl,
+                result.homepageUrl,
+                result.getInTouchUrl,
+                result.gatewayUrl,
+                result.privacyPolicyUrl,
+                result.termsOfServiceUrl,
+                result.freeTrialsEnabled,
+            );
+        }
+
+        throw new APIError({
+            status: response.status,
+            message: result.error || 'Cannot get branding config',
+            requestID: response.headers.get('x-request-id'),
+        });
+    }
+
+    /**
+     * Returns UI config of some kind for a partner.
+     *
+     * @param kind
+     * @param partner
+     */
+    public async getPartnerUIConfig(kind: string, partner: string): Promise<unknown> {
+        const response = await this.http.get(`/api/v0/${kind}-config/${partner}`);
+        if (!response.ok) {
+            throw new APIError({
+                status: response.status,
+                message: 'Cannot get partner UI config',
+                requestID: response.headers.get('x-request-id'),
+            });
+        }
+        return await response.json();
     }
 }

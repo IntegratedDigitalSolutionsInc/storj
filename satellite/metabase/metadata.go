@@ -5,36 +5,152 @@ package metabase
 
 import (
 	"context"
+	"database/sql"
+	"errors"
+	"strings"
 
-	"cloud.google.com/go/spanner"
-	"go.uber.org/zap"
+	"github.com/jackc/pgx/v5"
+	"github.com/zeebo/errs"
 
+	"storj.io/common/storj"
 	"storj.io/common/uuid"
+	"storj.io/storj/shared/dbutil/tidbutil"
 )
 
-// UpdateObjectLastCommittedMetadata contains arguments necessary for replacing an object metadata.
-type UpdateObjectLastCommittedMetadata struct {
-	ObjectLocation
-	StreamID uuid.UUID
+const metadataIncludesErrMsg = "the object's metadata contains populated fields not included in the provided includes"
 
-	ClearMetadata                 *string
+// ErrInsufficientMetadataIncludes is used to indicate that a provided EncryptedUserDataIncludes
+// was not sufficient for an operation to succeed.
+var ErrInsufficientMetadataIncludes = errs.Class("insufficient metadata includes")
+
+// EncryptedUserData contains user data that has been encrypted with the nonce and key.
+type EncryptedUserData struct {
 	EncryptedMetadata             []byte
 	EncryptedMetadataNonce        []byte
 	EncryptedMetadataEncryptedKey []byte
+	EncryptedETag                 []byte
+
+	Checksum Checksum
 }
 
-// Verify object stream fields.
-func (obj *UpdateObjectLastCommittedMetadata) Verify() error {
-	if err := obj.ObjectLocation.Verify(); err != nil {
+// Checksum contains an object's checksum properties.
+type Checksum struct {
+	Algorithm      storj.ObjectChecksumAlgorithm
+	IsComposite    bool
+	EncryptedValue []byte
+}
+
+// IsZero returns whether the checksum contains no data.
+func (checksum Checksum) IsZero() bool {
+	return checksum.Algorithm == storj.ObjectChecksumAlgorithmNone && !checksum.IsComposite && checksum.EncryptedValue == nil
+}
+
+// Verify checks whether the fields have been set correctly.
+func (opts EncryptedUserData) Verify() error {
+	if err := opts.VerifyForBegin(); err != nil {
 		return err
 	}
-	if obj.StreamID.IsZero() {
-		return ErrInvalidRequest.New("StreamID missing")
+	if opts.Checksum.Algorithm != storj.ObjectChecksumAlgorithmNone && opts.Checksum.EncryptedValue == nil {
+		return ErrInvalidRequest.New("Checksum.EncryptedValue must be set if Checksum.Algorithm is set")
 	}
 	return nil
 }
 
-// UpdateObjectLastCommittedMetadata updates an object metadata.
+// VerifyForBegin verifies the encrypted user data options. Unlike Verify, it does not return
+// an error if ChecksumAlgorithm is set and EncryptedChecksum is unset.
+func (opts EncryptedUserData) VerifyForBegin() error {
+	if (opts.EncryptedMetadataNonce == nil) != (opts.EncryptedMetadataEncryptedKey == nil) {
+		return ErrInvalidRequest.New("EncryptedMetadataNonce and EncryptedMetadataEncryptedKey must always be set together")
+	}
+
+	hasEncryptedData := opts.EncryptedMetadata != nil || opts.EncryptedETag != nil || opts.Checksum.EncryptedValue != nil
+	hasEncryptionKey := opts.EncryptedMetadataNonce != nil && opts.EncryptedMetadataEncryptedKey != nil
+
+	switch {
+	case hasEncryptedData && !hasEncryptionKey:
+		return ErrInvalidRequest.New("EncryptedMetadataNonce and EncryptedMetadataEncryptedKey must be set when EncryptedMetadata, EncryptedETag, or Checksum.EncryptedValue are set")
+	case !hasEncryptedData && hasEncryptionKey:
+		return ErrInvalidRequest.New("EncryptedMetadataNonce and EncryptedMetadataEncryptedKey must be empty when EncryptedMetadata, EncryptedETag, and Checksum.EncryptedValue are empty")
+	}
+
+	hasChecksumAlgo := opts.Checksum.Algorithm != storj.ObjectChecksumAlgorithmNone
+	if opts.Checksum.Algorithm < storj.ObjectChecksumAlgorithmNone || opts.Checksum.Algorithm > storj.ObjectChecksumAlgorithmSHA256 {
+		return ErrInvalidRequest.New("Checksum.Algorithm is invalid")
+	}
+	if !hasChecksumAlgo {
+		if opts.Checksum.EncryptedValue != nil {
+			return ErrInvalidRequest.New("Checksum.Algorithm must be set if Checksum.EncryptedValue is set")
+		}
+		if opts.Checksum.IsComposite {
+			return ErrInvalidRequest.New("Checksum.Algorithm must be set if Checksum.IsComposite is set")
+		}
+	}
+
+	return nil
+}
+
+// UpdateObjectLastCommittedMetadata contains arguments necessary for replacing an object's user data.
+type UpdateObjectLastCommittedMetadata struct {
+	ObjectLocation
+	StreamID uuid.UUID
+
+	EncryptedUserData
+
+	// Includes indicates which fields of the object's user data should be set. Because partially replacing
+	// user data is not allowed, if the object's user data contains populated fields that are not included
+	// by Includes, the operation will fail.
+	Includes EncryptedUserDataIncludes
+}
+
+// EncryptedUserDataIncludes represents the parts of an object's user data that an operation should affect.
+type EncryptedUserDataIncludes struct {
+	// Metadata represents the part of an object's user data dedicated to storing the object's encrypted metadata.
+	Metadata bool
+	// Metadata represents the part of an object's user data dedicated to storing the object's encrypted ETag.
+	ETag bool
+	// Checksum represents the part of an object's user data dedicated to storing the object's checksum information:
+	// the checksum algorithm, checksum type, and encrypted checksum value.
+	Checksum bool
+}
+
+// Without returns an EncryptedUserDataIncludes that includes only what is included in the receiver
+// and not included in the provided EncryptedUserDataIncludes.
+func (includes EncryptedUserDataIncludes) Without(other EncryptedUserDataIncludes) EncryptedUserDataIncludes {
+	return EncryptedUserDataIncludes{
+		Metadata: includes.Metadata && !other.Metadata,
+		ETag:     includes.ETag && !other.ETag,
+		Checksum: includes.Checksum && !other.Checksum,
+	}
+}
+
+// EncryptedUserDataIncludesAll returns an EncryptedUserDataIncludes indicating that the complete set
+// of object metadata should be included.
+func EncryptedUserDataIncludesAll() EncryptedUserDataIncludes {
+	return EncryptedUserDataIncludes{
+		Metadata: true,
+		ETag:     true,
+		Checksum: true,
+	}
+}
+
+// Verify object stream fields.
+func (opts *UpdateObjectLastCommittedMetadata) Verify() error {
+	if err := opts.ObjectLocation.Verify(); err != nil {
+		return err
+	}
+	if opts.StreamID.IsZero() {
+		return ErrInvalidRequest.New("StreamID missing")
+	}
+	if err := opts.EncryptedUserData.Verify(); err != nil {
+		return err
+	}
+	if opts.Includes == (EncryptedUserDataIncludes{}) {
+		return ErrInvalidRequest.New("Includes is missing")
+	}
+	return nil
+}
+
+// UpdateObjectLastCommittedMetadata updates an object's metadata.
 func (db *DB) UpdateObjectLastCommittedMetadata(ctx context.Context, opts UpdateObjectLastCommittedMetadata) (err error) {
 	defer mon.Task()(&ctx)(&err)
 
@@ -42,111 +158,379 @@ func (db *DB) UpdateObjectLastCommittedMetadata(ctx context.Context, opts Update
 		return err
 	}
 
-	affected, err := db.ChooseAdapter(opts.ProjectID).UpdateObjectLastCommittedMetadata(ctx, opts)
+	err = db.ChooseAdapter(opts.ProjectID).UpdateObjectLastCommittedMetadata(ctx, opts)
 	if err != nil {
 		return err
 	}
-	if affected == 0 {
-		return ErrObjectNotFound.New("object with specified version and committed status is missing")
-	}
 
-	if affected > 1 {
-		db.log.Warn("object with multiple committed versions were found!",
-			zap.Stringer("Project ID", opts.ProjectID), zap.Stringer("Bucket Name", opts.BucketName),
-			zap.String("Object Key", string(opts.ObjectKey)), zap.Stringer("Stream ID", opts.StreamID))
-		mon.Meter("multiple_committed_versions").Mark(1)
-	}
-
-	mon.Meter("object_update_metadata").Mark(int(affected))
+	mon.Meter("object_update_metadata").Mark(1)
 
 	return nil
 }
 
-// UpdateObjectLastCommittedMetadata updates an object metadata.
-func (p *PostgresAdapter) UpdateObjectLastCommittedMetadata(ctx context.Context, opts UpdateObjectLastCommittedMetadata) (affected int64, err error) {
+// UpdateObjectLastCommittedMetadata updates an object's metadata.
+func (p *PostgresAdapter) UpdateObjectLastCommittedMetadata(ctx context.Context, opts UpdateObjectLastCommittedMetadata) (err error) {
 	defer mon.Task()(&ctx)(&err)
 
-	// TODO So the issue is that during a multipart upload of an object,
+	// TODO: So the issue is that during a multipart upload of an object,
 	// uplink can update object metadata. If we add the arguments EncryptedMetadata
 	// to CommitObject, they will need to account for them being optional.
 	// Leading to scenarios where uplink calls update metadata, but wants to clear them
 	// during commit object.
+	row := p.db.QueryRowContext(ctx, `
+		WITH last_committed AS (
+			SELECT stream_id, version, status
+			FROM objects
+			WHERE
+				(project_id, bucket_name, object_key) = (@project_id, @bucket_name, @object_key)
+				AND status <> `+statusPending+`
+				AND (expires_at IS NULL OR expires_at > now())
+			ORDER BY version DESC
+			LIMIT 1
+		),
+		updated AS (
+			UPDATE objects
+			SET
+				`+opts.getUpdateFieldsForPostgres()+`
+			WHERE
+				(project_id, bucket_name, object_key) = (@project_id, @bucket_name, @object_key)
+				AND version IN (SELECT version FROM last_committed)
+				AND stream_id = @stream_id
+				AND status IN `+statusesCommitted+` -- Reject delete markers
+				`+opts.getFormatFilterForPostgres()+`
+			RETURNING 1
+		)
+		SELECT
+			(SELECT stream_id FROM last_committed),
+			(SELECT status FROM last_committed),
+			EXISTS(SELECT 1 FROM updated)`,
+		pgx.StrictNamedArgs(opts.getQueryArgs()))
+
+	var (
+		lastCommittedStreamID uuid.NullUUID
+		lastCommittedStatus   NullableObjectStatus
+		updated               bool
+	)
+	if err := row.Scan(&lastCommittedStreamID, &lastCommittedStatus, &updated); err != nil {
+		return Error.New("unable to update object metadata: %w", err)
+	}
+
+	if !updated {
+		exists := lastCommittedStreamID.Valid && lastCommittedStatus.Valid
+		streamIDMismatch := lastCommittedStreamID.UUID != opts.StreamID
+		if !exists || streamIDMismatch || lastCommittedStatus.ObjectStatus.IsDeleteMarker() {
+			return ErrObjectNotFound.New("")
+		}
+		return ErrInsufficientMetadataIncludes.New(metadataIncludesErrMsg)
+	}
+
+	return nil
+}
+
+type updateObjectMetadataPrequeryResult struct {
+	version           int64
+	encryptedMetadata []byte
+	encryptedETag     []byte
+	checksum          []byte
+}
+
+// UpdateObjectLastCommittedMetadata updates an object's metadata.
+func (t *TiDBAdapter) UpdateObjectLastCommittedMetadata(ctx context.Context, opts UpdateObjectLastCommittedMetadata) (err error) {
+	defer mon.Task()(&ctx)(&err)
+
+	// The FOR UPDATE select folds BEGIN into its first statement and
+	// CommitWithExec folds the UPDATE together with COMMIT, so this read then
+	// dependent write costs two round trips instead of four.
+	return tidbutil.WithTx(ctx, t.db, func(ctx context.Context, tx *tidbutil.Tx) error {
+		var (
+			lastStreamID uuid.UUID
+			lastStatus   ObjectStatus
+			prequery     updateObjectMetadataPrequeryResult
+		)
+		err := tx.QueryRowContext(ctx, `
+			SELECT
+				stream_id, status, version,
+				encrypted_metadata, encrypted_etag, checksum
+			FROM objects
+			WHERE
+				(project_id, bucket_name, object_key) = (?, ?, ?)
+				AND status <> `+statusPending+`
+				AND (expires_at IS NULL OR expires_at > NOW(6))
+			ORDER BY version DESC
+			LIMIT 1
+			FOR UPDATE`,
+			opts.ProjectID, opts.BucketName, opts.ObjectKey,
+		).Scan(&lastStreamID, &lastStatus, &prequery.version, &prequery.encryptedMetadata, &prequery.encryptedETag, &prequery.checksum)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return ErrObjectNotFound.New("")
+			}
+			return Error.New("unable to get last committed object info: %w", err)
+		}
+
+		if lastStreamID != opts.StreamID || lastStatus.IsDeleteMarker() {
+			return ErrObjectNotFound.New("")
+		}
+
+		if !opts.Includes.Metadata && prequery.encryptedMetadata != nil {
+			return ErrInsufficientMetadataIncludes.New(metadataIncludesErrMsg)
+		}
+		if !opts.Includes.ETag && len(prequery.encryptedETag) != 0 {
+			return ErrInsufficientMetadataIncludes.New(metadataIncludesErrMsg)
+		}
+		if !opts.Includes.Checksum && prequery.checksum != nil {
+			return ErrInsufficientMetadataIncludes.New(metadataIncludesErrMsg)
+		}
+
+		var sb strings.Builder
+		sb.WriteString("UPDATE objects SET encrypted_metadata_nonce = ?, encrypted_metadata_encrypted_key = ?")
+		args := []any{opts.EncryptedMetadataNonce, opts.EncryptedMetadataEncryptedKey}
+		if opts.Includes.Metadata {
+			sb.WriteString(", encrypted_metadata = ?")
+			args = append(args, opts.EncryptedMetadata)
+		}
+		if opts.Includes.ETag {
+			sb.WriteString(", encrypted_etag = ?")
+			args = append(args, opts.EncryptedETag)
+		}
+		if opts.Includes.Checksum {
+			sb.WriteString(", checksum = ?")
+			args = append(args, opts.Checksum)
+		}
+		sb.WriteString(" WHERE (project_id, bucket_name, object_key, version, stream_id) = (?, ?, ?, ?, ?)")
+		args = append(args, opts.ProjectID, opts.BucketName, opts.ObjectKey, prequery.version, opts.StreamID)
+
+		if err = tx.CommitWithExec(ctx, sb.String(), args...); err != nil {
+			return Error.New("unable to update object metadata: %w", err)
+		}
+		return nil
+	})
+}
+
+// UpdateObjectLastCommittedClearMetadata contains arguments necessary for replacing the
+// unencrypted, searchable clear_metadata of an object's most recently committed version.
+//
+// ClearMetadata is independent from EncryptedUserData: it is maintained out-of-band by the
+// metasearch service and is not part of the encrypted user data round trip used by uplink
+// clients, so it has its own dedicated update path rather than going through
+// UpdateObjectLastCommittedMetadata's Includes-gated encrypted-field logic (which always
+// requires the caller to resupply the current encryption nonce/key).
+type UpdateObjectLastCommittedClearMetadata struct {
+	ObjectLocation
+	StreamID uuid.UUID
+
+	ClearMetadata *string
+}
+
+// Verify verifies update clear metadata request fields.
+func (opts *UpdateObjectLastCommittedClearMetadata) Verify() error {
+	if err := opts.ObjectLocation.Verify(); err != nil {
+		return err
+	}
+	if opts.StreamID.IsZero() {
+		return ErrInvalidRequest.New("StreamID missing")
+	}
+	return nil
+}
+
+// UpdateObjectLastCommittedClearMetadata updates an object's clear_metadata (searchable, unencrypted metadata).
+func (db *DB) UpdateObjectLastCommittedClearMetadata(ctx context.Context, opts UpdateObjectLastCommittedClearMetadata) (err error) {
+	defer mon.Task()(&ctx)(&err)
+
+	if err := opts.Verify(); err != nil {
+		return err
+	}
+
+	return db.ChooseAdapter(opts.ProjectID).UpdateObjectLastCommittedClearMetadata(ctx, opts)
+}
+
+// UpdateObjectLastCommittedClearMetadata updates an object's clear_metadata (searchable, unencrypted metadata).
+func (p *PostgresAdapter) UpdateObjectLastCommittedClearMetadata(ctx context.Context, opts UpdateObjectLastCommittedClearMetadata) (err error) {
+	defer mon.Task()(&ctx)(&err)
+
 	result, err := p.db.ExecContext(ctx, `
 		UPDATE objects SET
-			encrypted_metadata_nonce         = $5,
-			encrypted_metadata               = $6,
-			encrypted_metadata_encrypted_key = $7,
-			clear_metadata                   = $8
+			clear_metadata = $5
 		WHERE
 			(project_id, bucket_name, object_key) = ($1, $2, $3) AND
 			version IN (SELECT version FROM objects WHERE
 				(project_id, bucket_name, object_key) = ($1, $2, $3) AND
 				status <> `+statusPending+` AND
 				(expires_at IS NULL OR expires_at > now())
-				ORDER BY version desc
+				ORDER BY version DESC
 				LIMIT 1
 			) AND
-			stream_id    = $4 AND
-			status       IN `+statusesCommitted,
-		opts.ProjectID, opts.BucketName, opts.ObjectKey, opts.StreamID,
-		opts.EncryptedMetadataNonce, opts.EncryptedMetadata, opts.EncryptedMetadataEncryptedKey, opts.ClearMetadata)
+			stream_id = $4 AND
+			status    IN `+statusesCommitted,
+		opts.ProjectID, opts.BucketName, opts.ObjectKey, opts.StreamID, opts.ClearMetadata)
 	if err != nil {
-		return 0, Error.New("unable to update object metadata: %w", err)
+		return Error.New("unable to update object clear metadata: %w", err)
 	}
 
-	affected, err = result.RowsAffected()
+	affected, err := result.RowsAffected()
 	if err != nil {
-		return 0, Error.New("failed to get rows affected: %w", err)
+		return Error.New("unable to update object clear metadata: %w", err)
 	}
-	return affected, nil
+	if affected == 0 {
+		return ErrObjectNotFound.New("object with specified version and committed status is missing")
+	}
+
+	return nil
 }
 
-// UpdateObjectLastCommittedMetadata updates an object metadata.
-func (s *SpannerAdapter) UpdateObjectLastCommittedMetadata(ctx context.Context, opts UpdateObjectLastCommittedMetadata) (affected int64, err error) {
+// UpdateObjectLastCommittedClearMetadata is not implemented for TiDB: TiDB is not currently
+// a target backend for the metasearch feature (no clear_metadata column exists in its schema).
+func (t *TiDBAdapter) UpdateObjectLastCommittedClearMetadata(ctx context.Context, opts UpdateObjectLastCommittedClearMetadata) (err error) {
+	return errors.New("not implemented")
+}
+
+// GetPendingObjectMetadata contains arguments necessary for retrieving the metadata of a pending object.
+type GetPendingObjectMetadata struct {
+	ObjectStream
+}
+
+// GetPendingObjectMetadataResult is the result of retrieving a pending object's encrypted metadata
+// and encryption parameters.
+type GetPendingObjectMetadataResult struct {
+	EncryptedUserData EncryptedUserData
+	Encryption        storj.EncryptionParameters
+}
+
+// GetPendingObjectMetadata returns the encrypted metadata and encryption parameters of a pending object.
+func (db *DB) GetPendingObjectMetadata(ctx context.Context, opts GetPendingObjectMetadata) (result GetPendingObjectMetadataResult, err error) {
 	defer mon.Task()(&ctx)(&err)
 
-	// TODO So the issue is that during a multipart upload of an object,
-	// uplink can update object metadata. If we add the arguments EncryptedMetadata
-	// to CommitObject, they will need to account for them being optional.
-	// Leading to scenarios where uplink calls update metadata, but wants to clear them
-	// during commit object.
-	_, err = s.client.ReadWriteTransaction(ctx, func(ctx context.Context, tx *spanner.ReadWriteTransaction) error {
-		affected, err = tx.Update(ctx, spanner.Statement{
-			SQL: `
-				UPDATE objects SET
-					encrypted_metadata_nonce         = @encrypted_metadata_nonce,
-					encrypted_metadata               = @encrypted_metadata,
-					encrypted_metadata_encrypted_key = @encrypted_metadata_encrypted_key
-				WHERE
-					(project_id, bucket_name, object_key) = (@project_id, @bucket_name, @object_key) AND
-					version IN (SELECT version FROM objects WHERE
-						(project_id, bucket_name, object_key) = (@project_id, @bucket_name, @object_key) AND
-						status <> ` + statusPending + ` AND
-						(expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP)
-						ORDER BY version desc
-						LIMIT 1
-					) AND
-					stream_id    = @stream_id AND
-					status       IN ` + statusesCommitted + `
-			`,
-			Params: map[string]interface{}{
-				"project_id":                       opts.ProjectID,
-				"bucket_name":                      opts.BucketName,
-				"object_key":                       []byte(opts.ObjectKey),
-				"stream_id":                        opts.StreamID,
-				"encrypted_metadata_nonce":         opts.EncryptedMetadataNonce,
-				"encrypted_metadata":               opts.EncryptedMetadata,
-				"encrypted_metadata_encrypted_key": opts.EncryptedMetadataEncryptedKey,
-			},
-		})
-		if err != nil {
-			return Error.New("unable to update object metadata: %w", err)
-		}
-		return nil
-	})
-
-	if err != nil {
-		return 0, Error.Wrap(err)
+	if err := opts.Verify(); err != nil {
+		return GetPendingObjectMetadataResult{}, err
 	}
-	return affected, nil
+
+	result, err = db.ChooseAdapter(opts.ProjectID).GetPendingObjectMetadata(ctx, opts)
+	if err != nil {
+		return GetPendingObjectMetadataResult{}, err
+	}
+
+	return result, nil
+}
+
+// GetPendingObjectMetadata returns the encrypted metadata and encryption parameters of a pending object.
+func (p *PostgresAdapter) GetPendingObjectMetadata(ctx context.Context, opts GetPendingObjectMetadata) (result GetPendingObjectMetadataResult, err error) {
+	defer mon.Task()(&ctx)(&err)
+
+	err = p.db.QueryRowContext(ctx, `
+		SELECT
+			encryption,
+			encrypted_metadata_encrypted_key, encrypted_metadata_nonce,
+			encrypted_metadata, encrypted_etag, checksum
+		FROM objects
+		WHERE
+			(project_id, bucket_name, object_key, version, stream_id) = ($1, $2, $3, $4, $5)
+			AND status = `+statusPending+`
+			AND (expires_at IS NULL OR expires_at > now())`,
+		opts.ProjectID, opts.BucketName, opts.ObjectKey, opts.Version, opts.StreamID,
+	).Scan(
+		&result.Encryption,
+		&result.EncryptedUserData.EncryptedMetadataEncryptedKey, &result.EncryptedUserData.EncryptedMetadataNonce,
+		&result.EncryptedUserData.EncryptedMetadata, &result.EncryptedUserData.EncryptedETag, &result.EncryptedUserData.Checksum,
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return GetPendingObjectMetadataResult{}, ErrObjectNotFound.Wrap(Error.Wrap(err))
+		}
+		return GetPendingObjectMetadataResult{}, Error.New("unable to query pending object metadata: %w", err)
+	}
+
+	return result, nil
+}
+
+// GetPendingObjectMetadata returns the encrypted metadata and encryption parameters of a pending object.
+func (t *TiDBAdapter) GetPendingObjectMetadata(ctx context.Context, opts GetPendingObjectMetadata) (result GetPendingObjectMetadataResult, err error) {
+	defer mon.Task()(&ctx)(&err)
+
+	err = t.db.QueryRowContext(ctx, `
+		SELECT
+			encryption,
+			encrypted_metadata_encrypted_key, encrypted_metadata_nonce,
+			encrypted_metadata, encrypted_etag, checksum
+		FROM objects
+		WHERE
+			(project_id, bucket_name, object_key, version, stream_id) = (?, ?, ?, ?, ?)
+			AND status = `+statusPending+`
+			AND (expires_at IS NULL OR expires_at > NOW(6))`,
+		opts.ProjectID, opts.BucketName, opts.ObjectKey, opts.Version, opts.StreamID,
+	).Scan(
+		&result.Encryption,
+		&result.EncryptedUserData.EncryptedMetadataEncryptedKey, &result.EncryptedUserData.EncryptedMetadataNonce,
+		&result.EncryptedUserData.EncryptedMetadata, &result.EncryptedUserData.EncryptedETag, &result.EncryptedUserData.Checksum,
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return GetPendingObjectMetadataResult{}, ErrObjectNotFound.Wrap(Error.Wrap(err))
+		}
+		return GetPendingObjectMetadataResult{}, Error.New("unable to query pending object metadata: %w", err)
+	}
+
+	return result, nil
+}
+
+func (opts UpdateObjectLastCommittedMetadata) getQueryArgs() map[string]any {
+	args := map[string]any{
+		"project_id":                       opts.ProjectID,
+		"bucket_name":                      opts.BucketName,
+		"object_key":                       opts.ObjectKey,
+		"stream_id":                        opts.StreamID,
+		"encrypted_metadata_nonce":         opts.EncryptedMetadataNonce,
+		"encrypted_metadata_encrypted_key": opts.EncryptedMetadataEncryptedKey,
+	}
+
+	if opts.Includes.Metadata {
+		args["encrypted_metadata"] = opts.EncryptedMetadata
+	}
+
+	if opts.Includes.ETag {
+		args["encrypted_etag"] = opts.EncryptedETag
+	}
+
+	if opts.Includes.Checksum {
+		args["checksum"] = opts.Checksum
+	}
+
+	return args
+}
+
+func (opts UpdateObjectLastCommittedMetadata) getUpdateFieldsForPostgres() string {
+	fields := `
+		encrypted_metadata_nonce         = @encrypted_metadata_nonce,
+		encrypted_metadata_encrypted_key = @encrypted_metadata_encrypted_key`
+
+	if opts.Includes.Metadata {
+		fields += ", encrypted_metadata = @encrypted_metadata"
+	}
+
+	if opts.Includes.ETag {
+		fields += ", encrypted_etag = @encrypted_etag"
+	}
+
+	if opts.Includes.Checksum {
+		fields += ", checksum = @checksum"
+	}
+
+	return fields
+}
+
+func (opts UpdateObjectLastCommittedMetadata) getFormatFilterForPostgres() string {
+	var filter string
+
+	if !opts.Includes.Metadata {
+		filter += " AND encrypted_metadata IS NULL"
+	}
+
+	if !opts.Includes.ETag {
+		filter += " AND (encrypted_etag IS NULL OR length(encrypted_etag) = 0)"
+	}
+
+	if !opts.Includes.Checksum {
+		filter += " AND checksum IS NULL"
+	}
+
+	return filter
 }

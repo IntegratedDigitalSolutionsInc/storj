@@ -49,17 +49,15 @@ func (db *satelliteDB) MigrateToLatest(ctx context.Context) error {
 
 	case dbutil.Cockroach:
 		var dbName string
-		if err := db.QueryRow(ctx, `SELECT current_database();`).Scan(&dbName); err != nil {
+		if err := db.QueryRowContext(ctx, `SELECT current_database();`).Scan(&dbName); err != nil {
 			return errs.New("error querying current database: %+v", err)
 		}
 
-		_, err := db.Exec(ctx, fmt.Sprintf(`CREATE DATABASE IF NOT EXISTS %s;`,
+		_, err := db.ExecContext(ctx, fmt.Sprintf(`CREATE DATABASE IF NOT EXISTS %s;`,
 			pgutil.QuoteIdentifier(dbName)))
 		if err != nil {
 			return errs.Wrap(err)
 		}
-	case dbutil.Spanner:
-		// nothing to do here at the moment
 	default:
 		return Error.New("unsupported database: %v", db.impl)
 	}
@@ -81,9 +79,6 @@ func (db *satelliteDB) MigrateToLatest(ctx context.Context) error {
 		}
 
 		return migration.Run(ctx, db.log.Named("migrate"))
-	case dbutil.Spanner:
-		// TODO(spanner): add incremental migration support
-		return migrate.CreateSpanner(ctx, "database", db.DB, false)
 	default:
 		return migrate.Create(ctx, "database", db.DB)
 	}
@@ -107,17 +102,15 @@ func (db *satelliteDBTesting) TestMigrateToLatest(ctx context.Context) error {
 
 	case dbutil.Cockroach:
 		var dbName string
-		if err := db.QueryRow(ctx, `SELECT current_database();`).Scan(&dbName); err != nil {
+		if err := db.QueryRowContext(ctx, `SELECT current_database();`).Scan(&dbName); err != nil {
 			return ErrMigrateMinVersion.New("error querying current database: %+v", err)
 		}
 
-		_, err := db.Exec(ctx, fmt.Sprintf(`CREATE DATABASE IF NOT EXISTS %s;`, pgutil.QuoteIdentifier(dbName)))
+		_, err := db.ExecContext(ctx, fmt.Sprintf(`CREATE DATABASE IF NOT EXISTS %s;`, pgutil.QuoteIdentifier(dbName)))
 		if err != nil {
 			return ErrMigrateMinVersion.Wrap(err)
 		}
 
-	case dbutil.Spanner:
-		// nothing to do here
 	default:
 		return Error.New("unsupported database: %v", db.impl)
 	}
@@ -135,10 +128,8 @@ func (db *satelliteDBTesting) TestMigrateToLatest(ctx context.Context) error {
 		if dbVersion != -1 && dbVersion != testMigration.Steps[0].Version {
 			return ErrMigrateMinVersion.New("the database must be empty, or be on the latest version (%d)", dbVersion)
 		}
+
 		return testMigration.Run(ctx, db.log.Named("migrate"))
-	case dbutil.Spanner:
-		// TODO(spanner): add incremental migration support
-		return migrate.CreateSpanner(ctx, "database", db.DB, true)
 	default:
 		return migrate.Create(ctx, "database", db.DB)
 	}
@@ -161,8 +152,13 @@ func (db *satelliteDB) TestMigration() *migrate.Migration {
 	return db.testMigration()
 }
 
-// ProductionMigration returns steps needed for migrating postgres database.
+// ProductionMigration returns steps needed for migrating the satellitedb database.
 func (db *satelliteDB) ProductionMigration() *migrate.Migration {
+	return db.productionMigrationPostgres()
+}
+
+// productionMigrationPostgres returns steps needed for migrating postgres database.
+func (db *satelliteDB) productionMigrationPostgres() *migrate.Migration {
 	return &migrate.Migration{
 		Table: "versions",
 		Steps: []*migrate.Step{
@@ -1001,14 +997,14 @@ func (db *satelliteDB) ProductionMigration() *migrate.Migration {
 				SeparateTx:  true,
 				Action: migrate.Func(func(ctx context.Context, log *zap.Logger, db tagsql.DB, tx tagsql.Tx) error {
 					if db.Name() == tagsql.CockroachName {
-						_, err := db.Exec(ctx,
+						_, err := db.ExecContext(ctx,
 							`ALTER TABLE accounting_rollups RENAME TO accounting_rollups_original;`,
 						)
 						if err != nil {
 							return ErrMigrate.Wrap(err)
 						}
 
-						_, err = db.Exec(ctx,
+						_, err = db.ExecContext(ctx,
 							`CREATE TABLE accounting_rollups (
 								node_id bytea NOT NULL,
 								start_time timestamp with time zone NOT NULL,
@@ -1044,7 +1040,7 @@ func (db *satelliteDB) ProductionMigration() *migrate.Migration {
 						return nil
 					}
 
-					_, err := db.Exec(ctx,
+					_, err := db.ExecContext(ctx,
 						`CREATE TABLE accounting_rollups_new (
 								node_id bytea NOT NULL,
 								start_time timestamp with time zone NOT NULL,
@@ -1143,14 +1139,14 @@ func (db *satelliteDB) ProductionMigration() *migrate.Migration {
 				Description: "add distributed column to storagenode_paystubs table",
 				Version:     140,
 				Action: migrate.Func(func(ctx context.Context, log *zap.Logger, db tagsql.DB, tx tagsql.Tx) error {
-					_, err := db.Exec(ctx, `
+					_, err := db.ExecContext(ctx, `
 							ALTER TABLE storagenode_paystubs ADD COLUMN distributed BIGINT;
 						`)
 					if err != nil {
 						return ErrMigrate.Wrap(err)
 					}
 
-					_, err = db.Exec(ctx, `
+					_, err = db.ExecContext(ctx, `
 							UPDATE storagenode_paystubs ps
 							SET distributed = coalesce((
 								SELECT sum(amount)::bigint
@@ -1163,7 +1159,7 @@ func (db *satelliteDB) ProductionMigration() *migrate.Migration {
 						return ErrMigrate.Wrap(err)
 					}
 
-					_, err = db.Exec(ctx, `
+					_, err = db.ExecContext(ctx, `
 							ALTER TABLE storagenode_paystubs ALTER COLUMN distributed SET NOT NULL;
 						`)
 					if err != nil {
@@ -1191,7 +1187,7 @@ func (db *satelliteDB) ProductionMigration() *migrate.Migration {
 				Version:     142,
 				Action: migrate.Func(func(ctx context.Context, log *zap.Logger, db tagsql.DB, tx tagsql.Tx) error {
 					if db.Name() == tagsql.CockroachName {
-						_, err := db.Exec(ctx,
+						_, err := db.ExecContext(ctx,
 							`DROP INDEX bucket_metainfos_name_project_id_key CASCADE;`,
 						)
 						if err != nil {
@@ -1200,7 +1196,7 @@ func (db *satelliteDB) ProductionMigration() *migrate.Migration {
 						return nil
 					}
 
-					_, err := db.Exec(ctx,
+					_, err := db.ExecContext(ctx,
 						`ALTER TABLE bucket_metainfos DROP CONSTRAINT bucket_metainfos_name_project_id_key;`,
 					)
 					if err != nil {
@@ -2275,7 +2271,7 @@ func (db *satelliteDB) ProductionMigration() *migrate.Migration {
 					// for crdb lets check if key was already altered, for pg we will do migration always
 					if db.Name() == tagsql.CockroachName {
 						var primaryKey string
-						err := db.QueryRow(ctx,
+						err := db.QueryRowContext(ctx,
 							`WITH constraints AS (SHOW CONSTRAINTS FROM bucket_bandwidth_rollups) SELECT details FROM constraints WHERE constraint_type = 'PRIMARY KEY';`,
 						).Scan(&primaryKey)
 						if err != nil {
@@ -2467,7 +2463,7 @@ func (db *satelliteDB) ProductionMigration() *migrate.Migration {
 					// for crdb lets check if key was already altered, for pg we will do migration always
 					if db.Name() == tagsql.CockroachName {
 						var primaryKey string
-						err := db.QueryRow(ctx,
+						err := db.QueryRowContext(ctx,
 							`WITH constraints AS (SHOW CONSTRAINTS FROM bucket_metainfos) SELECT details FROM constraints WHERE constraint_type = 'PRIMARY KEY';`,
 						).Scan(&primaryKey)
 						if err != nil {
@@ -2865,6 +2861,427 @@ func (db *satelliteDB) ProductionMigration() *migrate.Migration {
 				Version:     283,
 				Action: migrate.SQL{
 					`CREATE INDEX users_external_id_index ON users ( external_id ) WHERE external_id IS NOT NULL;`,
+				},
+			},
+			{
+				DB:          &db.migrationDB,
+				Description: "add column to projects table to track the status of the project",
+				Version:     284,
+				Action: migrate.SQL{
+					`ALTER TABLE projects ADD COLUMN status INTEGER DEFAULT 1;`,
+				},
+			},
+			{
+				DB:          &db.migrationDB,
+				Description: "drop all nodes table indexes execept primary key",
+				Version:     285,
+				Action: migrate.SQL{
+					`DROP INDEX IF EXISTS nodes_last_cont_success_free_disk_ma_mi_patch_vetted_partial_index`,
+					`DROP INDEX IF EXISTS nodes_dis_unk_aud_exit_init_rel_last_cont_success_stored_index`,
+					`DROP INDEX IF EXISTS node_last_ip`,
+					`DROP INDEX IF EXISTS nodes_dis_unk_off_exit_fin_last_success_index`,
+				},
+			},
+			{
+				DB:          &db.migrationDB,
+				Description: "add hubspot_object_id column to users",
+				Version:     286,
+				Action: migrate.SQL{
+					`ALTER TABLE users ADD COLUMN hubspot_object_id TEXT`,
+				},
+			},
+			{
+				DB:          &db.migrationDB,
+				Description: "add product_id column to bucket_storage_tallies, bucket_bandwidth_rollups, bucket_bandwidth_rollup_archive, project_bandwidth_daily_rollups",
+				Version:     287,
+				Action: migrate.SQL{
+					`ALTER TABLE bucket_storage_tallies ADD COLUMN product_id INTEGER`,
+					`ALTER TABLE bucket_bandwidth_rollups ADD COLUMN product_id INTEGER`,
+					`ALTER TABLE bucket_bandwidth_rollup_archives ADD COLUMN product_id INTEGER`,
+					`ALTER TABLE project_bandwidth_daily_rollups ADD COLUMN product_id INTEGER`,
+				},
+			},
+			{
+				DB:          &db.migrationDB,
+				Description: "add rest api keys table",
+				Version:     288,
+				Action: migrate.SQL{
+					`CREATE TABLE rest_api_keys (
+						id bytea NOT NULL,
+						user_id bytea NOT NULL REFERENCES users( id ) ON DELETE CASCADE,
+						token bytea NOT NULL,
+						name text NOT NULL,
+						expires_at timestamp with time zone,
+						created_at timestamp with time zone NOT NULL,
+						PRIMARY KEY ( id ),
+    					UNIQUE ( token )
+					);`,
+					`CREATE INDEX rest_api_keys_user_id_index ON rest_api_keys ( user_id );`,
+					`CREATE INDEX rest_api_keys_name_index ON rest_api_keys ( name );`,
+				},
+			},
+			{
+				DB:          &db.migrationDB,
+				Description: "drop table storagenode_bandwidth_rollups_phase2",
+				Version:     289,
+				Action: migrate.SQL{
+					`DROP TABLE IF EXISTS storagenode_bandwidth_rollups_phase2`,
+				},
+			},
+			{
+				DB:          &db.migrationDB,
+				Description: "add column to users table to track user kind",
+				Version:     290,
+				Action: migrate.SQL{
+					`ALTER TABLE users ADD COLUMN kind INTEGER NOT NULL DEFAULT 0;`,
+				},
+			},
+			{
+				DB:          &db.migrationDB,
+				Description: "update user kind to 1 (PRO) for paid tier users",
+				Version:     291,
+				Action: migrate.SQL{
+					`UPDATE users SET kind = 1 WHERE paid_tier = true`,
+				},
+			},
+			{
+				DB:          &db.migrationDB,
+				Description: "add domains table",
+				Version:     292,
+				Action: migrate.SQL{
+					`CREATE TABLE domains (
+						project_id bytea NOT NULL REFERENCES projects( id ),
+						subdomain text NOT NULL,
+						prefix text NOT NULL,
+						access_id text NOT NULL,
+						created_by bytea NOT NULL REFERENCES users( id ),
+						created_at timestamp with time zone NOT NULL,
+						PRIMARY KEY ( project_id, subdomain )
+					)`,
+				},
+			},
+			{
+				DB:          &db.migrationDB,
+				Description: "add placement to value_attributions table",
+				Version:     293,
+				Action: migrate.SQL{
+					`ALTER TABLE value_attributions ADD COLUMN placement INTEGER`,
+				},
+			},
+			{
+				DB:          &db.migrationDB,
+				Description: "add tags column to bucket_metainfos table",
+				Version:     294,
+				Action: migrate.SQL{
+					`ALTER TABLE bucket_metainfos ADD COLUMN tags bytea;`,
+				},
+			},
+			{
+				DB:          &db.migrationDB,
+				Description: "add api_key_tails table",
+				Version:     295,
+				Action: migrate.SQL{
+					`CREATE TABLE api_key_tails (
+						tail bytea NOT NULL,
+						parent_tail bytea NOT NULL,
+						caveat bytea NOT NULL,
+						last_used timestamp with time zone NOT NULL,
+						PRIMARY KEY ( tail )
+					)`,
+				},
+			},
+			{
+				DB:          &db.migrationDB,
+				Description: "update project path encryption to true",
+				Version:     296,
+				Action: migrate.SQL{
+					`UPDATE projects SET path_encryption = true WHERE path_encryption = false`,
+				},
+			},
+			{
+				DB:          &db.migrationDB,
+				Description: "add root_key_id column to api_key_tails table",
+				Version:     297,
+				Action: migrate.SQL{
+					`ALTER TABLE api_key_tails ADD COLUMN root_key_id bytea REFERENCES api_keys( id ) ON DELETE CASCADE;`,
+				},
+			},
+			{
+				DB:          &db.migrationDB,
+				Description: "drop paid_tier column from users table",
+				Version:     298,
+				Action: migrate.SQL{
+					`ALTER TABLE users DROP COLUMN paid_tier;`,
+				},
+			},
+			{
+				DB:          &db.migrationDB,
+				Description: "add index to users table on status and status_updated_at",
+				Version:     299,
+				Action: migrate.SQL{
+					`CREATE INDEX users_status_status_updated_at_index ON users ( status, status_updated_at ) WHERE users.status_updated_at is not NULL;`,
+				},
+			},
+			{
+				DB:          &db.migrationDB,
+				Description: "add column indexed status_updated_at to projects with status",
+				Version:     300,
+				Action: migrate.SQL{
+					`ALTER TABLE projects ADD COLUMN status_updated_at TIMESTAMP WITH TIME ZONE;`,
+				},
+			},
+			{
+				DB:          &db.migrationDB,
+				Description: "add index to projects table on status and status_updated_at",
+				Version:     301,
+				Action: migrate.SQL{
+					`CREATE INDEX projects_status_status_updated_at_index ON projects ( status, status_updated_at ) WHERE projects.status_updated_at is not NULL ;`,
+				},
+			},
+			{
+				DB:          &db.migrationDB,
+				Description: "add entitlements table",
+				Version:     302,
+				Action: migrate.SQL{
+					`CREATE TABLE entitlements (
+						scope bytea NOT NULL,
+						features jsonb NOT NULL DEFAULT '{}',
+						updated_at timestamp with time zone NOT NULL,
+						created_at timestamp with time zone NOT NULL,
+						PRIMARY KEY ( scope )
+					)`,
+				},
+			},
+			{
+				DB:          &db.migrationDB,
+				Description: "add bucket_migrations table",
+				Version:     303,
+				Action: migrate.SQL{
+					`CREATE TABLE bucket_migrations (
+						id bytea NOT NULL,
+						project_id bytea NOT NULL REFERENCES projects( id ),
+						bucket_name bytea NOT NULL,
+						from_placement integer NOT NULL,
+						to_placement integer NOT NULL,
+						migration_type integer NOT NULL,
+						state text NOT NULL,
+						bytes_processed bigint NOT NULL DEFAULT 0,
+						error_message text,
+						created_at timestamp with time zone NOT NULL,
+						updated_at timestamp with time zone NOT NULL,
+						completed_at timestamp with time zone,
+						PRIMARY KEY ( id )
+					)`,
+					`CREATE INDEX bucket_migrations_state_created_at_index ON bucket_migrations ( state, created_at )`,
+				},
+			},
+			{
+				DB:          &db.migrationDB,
+				Description: "add tenant_id column to users",
+				Version:     304,
+				Action: migrate.SQL{
+					`ALTER TABLE users ADD COLUMN tenant_id TEXT;`,
+				},
+			},
+			{
+				DB:          &db.migrationDB,
+				Description: "add indexes to users.tenant_id column",
+				Version:     305,
+				Action: migrate.SQL{
+					`CREATE INDEX users_tenant_id_index ON users ( tenant_id ) WHERE tenant_id IS NOT NULL;`,
+					`CREATE INDEX users_normalized_email_tenant_id_status_index ON users ( normalized_email, tenant_id, status ) WHERE users.tenant_id is not NULL;`,
+				},
+			},
+			{
+				DB:          &db.migrationDB,
+				Description: "remove unused GE tables",
+				Version:     306,
+				Action: migrate.SQL{
+					`DROP INDEX IF EXISTS graceful_exit_segment_transfer_nid_dr_qa_fa_lfa_index`,
+					`DROP TABLE IF EXISTS graceful_exit_progress`,
+					`DROP TABLE IF EXISTS graceful_exit_segment_transfer_queue`,
+				},
+			},
+			{
+				DB:          &db.migrationDB,
+				Description: "add bucket_eventing_configs table",
+				Version:     307,
+				Action: migrate.SQL{
+					`CREATE TABLE bucket_eventing_configs (
+						project_id bytea NOT NULL,
+						bucket_name bytea NOT NULL,
+						config_id text NOT NULL DEFAULT gen_random_uuid()::text,
+						topic_name text NOT NULL,
+						events text[] NOT NULL,
+						filter_prefix bytea,
+						filter_suffix bytea,
+						created_at timestamp with time zone NOT NULL DEFAULT CURRENT_TIMESTAMP,
+						updated_at timestamp with time zone NOT NULL DEFAULT CURRENT_TIMESTAMP,
+						CONSTRAINT bucket_eventing_configs_bucket_fkey
+							FOREIGN KEY (project_id, bucket_name)
+							REFERENCES bucket_metainfos (project_id, name)
+							ON DELETE CASCADE,
+						PRIMARY KEY ( project_id, bucket_name )
+					)`,
+				},
+			},
+			{
+				DB:          &db.migrationDB,
+				Description: "add change_histories table",
+				Version:     308,
+				Action: migrate.SQL{
+					`CREATE TABLE change_histories (
+						id bytea NOT NULL,
+						admin_email text NOT NULL,
+						user_id bytea NOT NULL,
+						project_id bytea,
+						bucket_name bytea,
+						item_type text NOT NULL,
+						operation text NOT NULL,
+						reason text NOT NULL,
+						changes jsonb NOT NULL,
+						timestamp timestamp with time zone NOT NULL DEFAULT current_timestamp,
+						PRIMARY KEY ( id )
+					)`,
+					`CREATE INDEX change_history_user_id_timestamp_idx ON change_histories ( user_id, timestamp );`,
+					`CREATE INDEX change_history_user_id_item_type_timestamp_idx ON change_histories ( user_id, item_type, timestamp );`,
+					`CREATE INDEX change_history_project_id_item_type_timestamp_idx ON change_histories ( project_id, item_type, timestamp );`,
+					`CREATE INDEX change_history_bucket_name_timestamp_idx ON change_histories ( bucket_name, timestamp );`,
+				},
+			},
+			{
+				DB:          &db.migrationDB,
+				Description: "add remainder_bytes column to bucket_storage_tallies",
+				Version:     309,
+				Action: migrate.SQL{
+					`ALTER TABLE bucket_storage_tallies ADD COLUMN remainder_bytes bigint;`,
+				},
+			},
+			{
+				DB:          &db.migrationDB,
+				Description: "add retention_remainder_charge table",
+				Version:     310,
+				Action: migrate.SQL{
+					`CREATE TABLE retention_remainder_charges (
+						project_id bytea NOT NULL,
+						bucket_name bytea NOT NULL,
+						deleted_at timestamp with time zone NOT NULL,
+						remainder_byte_hours double precision NOT NULL,
+						product_id integer,
+						billed boolean NOT NULL DEFAULT false,
+						PRIMARY KEY ( project_id, bucket_name, deleted_at )
+					);`,
+					`CREATE INDEX retention_remainder_charges_project_id_deleted_at_billed_index ON retention_remainder_charges ( project_id, deleted_at, billed ) ;`,
+				},
+			},
+			{
+				DB:          &db.migrationDB,
+				Description: "add more limits and expiration columns to registration_tokens table",
+				Version:     311,
+				Action: migrate.SQL{
+					`ALTER TABLE registration_tokens ADD COLUMN storage_limit bigint;`,
+					`ALTER TABLE registration_tokens ADD COLUMN bandwidth_limit bigint;`,
+					`ALTER TABLE registration_tokens ADD COLUMN segment_limit bigint;`,
+					`ALTER TABLE registration_tokens ADD COLUMN expires_at timestamp with time zone;`,
+				},
+			},
+			{
+				DB:          &db.migrationDB,
+				Description: "add user_kind column to registration_tokens table",
+				Version:     312,
+				Action: migrate.SQL{
+					`ALTER TABLE registration_tokens ADD COLUMN user_kind integer;`,
+				},
+			},
+			{
+				DB:          &db.migrationDB,
+				Description: "add project_limit_events table and notification_flags column to projects",
+				Version:     313,
+				Action: migrate.SQL{
+					`ALTER TABLE projects ADD COLUMN notification_flags integer;`,
+					`CREATE TABLE project_limit_events (
+						id bytea NOT NULL,
+						project_id bytea NOT NULL,
+						event integer NOT NULL,
+						is_reset boolean NOT NULL DEFAULT false,
+						created_at timestamp with time zone NOT NULL DEFAULT current_timestamp,
+						last_attempted timestamp with time zone,
+						email_sent timestamp with time zone,
+						PRIMARY KEY ( id )
+					);`,
+					`CREATE INDEX project_limit_events_project_id_created_at_index ON project_limit_events ( project_id, created_at ) WHERE email_sent IS NULL;`,
+				},
+			},
+			{
+				DB:          &db.migrationDB,
+				Description: "add optional partner column to registration_tokens table",
+				Version:     314,
+				Action: migrate.SQL{
+					`ALTER TABLE registration_tokens ADD COLUMN partner text;`,
+				},
+			},
+			{
+				DB:          &db.migrationDB,
+				Description: "add tenant_whitelabel_configs table",
+				Version:     315,
+				Action: migrate.SQL{
+					`CREATE TABLE tenant_whitelabel_configs (
+						tenant_id text NOT NULL,
+						config jsonb NOT NULL DEFAULT '{}',
+						updated_at timestamp with time zone NOT NULL,
+						created_at timestamp with time zone NOT NULL,
+						PRIMARY KEY ( tenant_id )
+					);`,
+				},
+			},
+			{
+				DB:          &db.migrationDB,
+				Description: "add opt_in_status column to user_settings table",
+				Version:     316,
+				Action: migrate.SQL{
+					`ALTER TABLE user_settings ADD COLUMN opt_in_status integer;`,
+				},
+			},
+			{
+				DB:          &db.migrationDB,
+				Description: "add inactivity_exempt column to user_settings table",
+				Version:     317,
+				Action: migrate.SQL{
+					`ALTER TABLE user_settings ADD COLUMN inactivity_exempt boolean;`,
+				},
+			},
+			{
+				DB:          &db.migrationDB,
+				Description: "widen bucket_storage_tallies.object_count and total_segments_count to 64-bit integer",
+				Version:     318,
+				Action: migrate.Func(func(ctx context.Context, log *zap.Logger, _ tagsql.DB, tx tagsql.Tx) error {
+					_, err := tx.ExecContext(ctx, `
+						ALTER TABLE bucket_storage_tallies ALTER COLUMN object_count TYPE bigint;
+						ALTER TABLE bucket_storage_tallies ALTER COLUMN total_segments_count TYPE bigint;
+					`)
+					return ErrMigrate.Wrap(err)
+				}),
+			},
+			{
+				DB:          &db.migrationDB,
+				Description: "add stripecoinpayments_invoice_license_records table",
+				Version:     319,
+				Action: migrate.SQL{
+					`CREATE TABLE stripecoinpayments_invoice_license_records (
+						id bytea NOT NULL,
+						user_id bytea NOT NULL,
+						product_id integer NOT NULL,
+						seats bigint NOT NULL,
+						billed_days integer NOT NULL,
+						days_in_period integer NOT NULL,
+						unit_amount_cents bigint NOT NULL,
+						period_start timestamp with time zone NOT NULL,
+						period_end timestamp with time zone NOT NULL,
+						state integer NOT NULL,
+						created_at timestamp with time zone NOT NULL,
+						PRIMARY KEY ( id ),
+						UNIQUE ( user_id, product_id, billed_days, period_start, period_end )
+					);`,
 				},
 			},
 			// NB: after updating testdata in `testdata`, run

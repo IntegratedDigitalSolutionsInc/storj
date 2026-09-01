@@ -14,7 +14,7 @@
                 <v-card-title class="font-weight-bold"> Add Invoice Reference </v-card-title>
                 <template #append>
                     <v-btn
-                        icon="$close"
+                        :icon="X"
                         variant="text"
                         size="small"
                         color="default"
@@ -26,6 +26,7 @@
             <v-divider />
 
             <v-card-item class="px-6">
+                <p class="mt-1 mb-4">Add any additional information you want to appear on your invoice here.</p>
                 <v-form class="pt-2" @submit.prevent="upsertInvoiceReference">
                     <v-text-field
                         v-model="reference"
@@ -83,9 +84,10 @@ import {
     VRow,
     VTextField,
 } from 'vuetify/components';
+import { X } from '@lucide/vue';
 
 import { useLoading } from '@/composables/useLoading';
-import { useNotify } from '@/utils/hooks';
+import { useNotify } from '@/composables/useNotify';
 import { useBillingStore } from '@/store/modules/billingStore';
 
 const billingStore = useBillingStore();

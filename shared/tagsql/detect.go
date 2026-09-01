@@ -52,7 +52,7 @@ func DetectContextSupport(db *sql.DB) (ContextSupport, error) {
 	// We're using reflect so we don't have to import these packages
 	// into the binary.
 	typ := reflect.TypeOf(db.Driver())
-	if typ.Kind() == reflect.Ptr {
+	if typ.Kind() == reflect.Pointer {
 		typ = typ.Elem()
 	}
 
@@ -69,7 +69,9 @@ func DetectContextSupport(db *sql.DB) (ContextSupport, error) {
 		return SupportAll, nil
 	case typ.PkgPath() == "github.com/jackc/pgx/v5/stdlib" && typ.Name() == "Driver":
 		return SupportAll, nil
-	case typ.PkgPath() == "github.com/googleapis/go-sql-spanner" && typ.Name() == "Driver":
+	case typ.PkgPath() == "storj.io/storj/shared/dbutil/tidbutil" && typ.Name() == "Driver":
+		return SupportAll, nil
+	case typ.PkgPath() == "github.com/go-sql-driver/mysql" && typ.Name() == "MySQLDriver":
 		return SupportAll, nil
 	default:
 		return SupportNone, errs.New("sql driver %q %q unsupported", typ.PkgPath(), typ.Name())

@@ -5,6 +5,7 @@
     <v-dialog
         v-model="dialog"
         activator="parent"
+        max-width="435px"
         width="auto"
         transition="fade-transition"
     >
@@ -12,14 +13,25 @@
             <v-sheet>
                 <v-card-item class="pa-6">
                     <template #prepend>
-                        <v-card-title class="font-weight-bold">
-                            Get Detailed Usage Report
-                        </v-card-title>
+                        <v-sheet
+                            class="border-sm d-flex justify-center align-center"
+                            width="40"
+                            height="40"
+                            rounded="lg"
+                        >
+                            <component :is="FileSpreadsheet" :size="18" />
+                        </v-sheet>
                     </template>
+                    <v-card-title class="font-weight-bold">
+                        Get Detailed Usage Report
+                    </v-card-title>
+                    <v-card-subtitle v-if="project">
+                        For project {{ project.name }}
+                    </v-card-subtitle>
 
                     <template #append>
                         <v-btn
-                            icon="$close"
+                            :icon="X"
                             variant="text"
                             size="small"
                             color="default"
@@ -32,22 +44,63 @@
             <v-divider />
 
             <v-form class="pa-6">
-                <p class="text-subtitle-2 mb-2">Select date range to generate your report:</p>
-                <v-chip-group v-model="option" mandatory filter color="primary">
-                    <v-chip :value="Options.Month">Past Month</v-chip>
-                    <v-chip :value="Options.Year">Past Year</v-chip>
-                    <v-chip :value="Options.Custom">Choose Dates</v-chip>
-                </v-chip-group>
-                <v-date-picker
-                    v-if="option === Options.Custom"
-                    v-model="customRange"
-                    header="Choose Dates"
-                    multiple="range"
-                    show-adjacent-months
-                    border
-                    elevation="0"
-                    rounded="lg"
-                />
+                <v-row>
+                    <v-col cols="12">
+                        <p class="text-title-small mb-2">Report Period</p>
+                        <v-chip-group v-model="option" mandatory filter>
+                            <v-chip :value="Options.Month" variant="outlined">Past Month</v-chip>
+                            <v-chip :value="Options.ThreeMonths" variant="outlined">Past 3 Months</v-chip>
+                            <v-chip :value="Options.Custom" variant="outlined">Custom Range</v-chip>
+                        </v-chip-group>
+                        <v-date-picker
+                            v-if="option === Options.Custom"
+                            v-model="customRange"
+                            :allowed-dates="allowDate"
+                            :min="minDate"
+                            header="Choose Dates"
+                            multiple="range"
+                            show-adjacent-months
+                            border
+                            elevation="0"
+                            rounded="lg"
+                            class="w-100 mt-4"
+                        />
+                    </v-col>
+
+                    <template v-if="newUsageReportEnabled">
+                        <v-col cols="12">
+                            <p class="text-title-small mb-2">Usage Details</p>
+                            <v-chip-group v-model="projectSummary" mandatory filter>
+                                <v-chip :value="true" variant="outlined">Project Summary</v-chip>
+                                <v-chip :value="false" variant="outlined">Bucket Details</v-chip>
+                            </v-chip-group>
+                        </v-col>
+
+                        <v-col cols="12">
+                            <p class="text-title-small mb-2">Cost Information</p>
+                            <v-chip-group v-model="includeCost" mandatory filter>
+                                <v-chip :value="true" variant="outlined">Include Cost</v-chip>
+                                <v-chip :value="false" variant="outlined">Usage Only</v-chip>
+                            </v-chip-group>
+                        </v-col>
+
+                        <v-col cols="12">
+                            <v-alert>
+                                Your report will include:
+                                <p v-if="includedDateString">Usage from {{ includedDateString }}.</p>
+                                <p v-if="projectSummary">
+                                    <span v-if="!project">Summary of your project(s) usage.</span>
+                                    <span v-else>Summary of your usage in the project <b>{{ project.name }}</b>.</span>
+                                </p>
+                                <p v-else>
+                                    <span v-if="!project">Summary of your bucket(s) usage.</span>
+                                    <span v-else>Summary of your bucket(s) usage in the project <b>{{ project.name }}</b>.</span>
+                                </p>
+                                <p v-if="includeCost">Detailed cost breakdown.</p>
+                            </v-alert>
+                        </v-col>
+                    </template>
+                </v-row>
             </v-form>
 
             <v-divider />
@@ -67,70 +120,97 @@
 </template>
 
 <script setup lang="ts">
-import { ref, watch } from 'vue';
+import { computed, ref, watch } from 'vue';
 import {
-    VDialog,
+    VAlert,
     VBtn,
-    VRow,
-    VCol,
-    VSheet,
     VCard,
-    VCardItem,
-    VCardTitle,
     VCardActions,
-    VDivider,
-    VChipGroup,
+    VCardItem,
+    VCardSubtitle,
+    VCardTitle,
     VChip,
-    VForm,
+    VChipGroup,
+    VCol,
     VDatePicker,
+    VDialog,
+    VDivider,
+    VForm,
+    VRow,
+    VSheet,
 } from 'vuetify/components';
+import { useDate } from 'vuetify';
+import { FileSpreadsheet, X } from '@lucide/vue';
 
 import { Download } from '@/utils/download';
 import { AnalyticsErrorEventSource } from '@/utils/constants/analyticsEventNames';
 import { useProjectsStore } from '@/store/modules/projectsStore';
-import { useNotify } from '@/utils/hooks';
+import { useNotify } from '@/composables/useNotify';
+import { useConfigStore } from '@/store/modules/configStore';
+import type { Project } from '@/types/projects';
 
 enum Options {
     Month = 0,
-    Year,
+    ThreeMonths,
     Custom,
 }
 
+const configStore = useConfigStore();
 const projectsStore = useProjectsStore();
 const notify = useNotify();
+const dateFns = useDate();
 
-const props = withDefaults(defineProps<{
-    projectID?: string
-}>(), {
-    projectID: '',
-});
+const props = defineProps<{
+    project?: Project;
+}>();
 
 const dialog = ref<boolean>(false);
 const option = ref<Options>(Options.Month);
+const projectSummary = ref(true);
+const includeCost = ref(true);
 const since = ref<Date>();
 const before = ref<Date>();
 const customRange = ref<Date[]>([]);
+
+const newUsageReportEnabled = computed(() => configStore.state.config.newDetailedUsageReportEnabled);
+
+const minDate = computed<string>(() => {
+    const today = new Date();
+    today.setMonth(today.getMonth()-3);
+    return today.toISOString().split('T')[0];
+});
+
+const includedDateString = computed(() => {
+    if (!since.value || !before.value) return '';
+
+    const sinceStr = dateFns.format(since.value, 'monthAndYear');
+    const beforeStr = dateFns.format(before.value, 'monthAndYear');
+
+    if (sinceStr === beforeStr) {
+        return sinceStr;
+    }
+
+    return `${sinceStr} - ${beforeStr}`;
+});
 
 /**
  * Sets past month as active option.
  */
 function setPastMonth(): void {
-    const now = new Date();
-
-    since.value = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 1, now.getUTCDate(), now.getUTCHours(), 0, 0, 0));
-    before.value = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), now.getUTCHours(), 0, 0, 0));
+    since.value = (dateFns.getPreviousMonth(new Date()) as Date);
+    before.value = dateFns.endOfMonth(since.value) as Date;
     option.value = Options.Month;
 }
 
 /**
- * Sets past year as active option.
+ * Sets past 3 months as active option.
  */
-function setPastYear(): void {
+function setPastThreeMonths(): void {
     const now = new Date();
 
-    since.value = new Date(Date.UTC(now.getUTCFullYear() - 1, now.getUTCMonth(), now.getUTCDate(), now.getUTCHours(), 0, 0, 0));
+    since.value = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 3, now.getUTCDate(), now.getUTCHours(), 0, 0, 0));
     before.value = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), now.getUTCHours(), 0, 0, 0));
-    option.value = Options.Year;
+    option.value = Options.ThreeMonths;
 }
 
 /**
@@ -143,6 +223,18 @@ function setChooseDates(): void {
     customRange.value = [];
 }
 
+function allowDate(date: unknown): boolean {
+    if (!date) return false;
+    const d = new Date(date as string);
+    if (isNaN(d.getTime())) return false;
+
+    d.setHours(0, 0, 0, 0);
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+
+    return d <= today;
+}
+
 function downloadReport(): void {
     if (!(since.value && before.value)) {
         notify.error('Please select date range', AnalyticsErrorEventSource.DETAILED_USAGE_REPORT_MODAL);
@@ -150,9 +242,10 @@ function downloadReport(): void {
     }
 
     try {
-        const link = projectsStore.getUsageReportLink(since.value, before.value, props.projectID);
+        const link = projectsStore.getUsageReportLink(since.value, before.value, includeCost.value, projectSummary.value, props.project?.id);
         Download.fileByLink(link);
         notify.success('Usage report download started successfully.');
+        dialog.value = false;
     } catch (error) {
         notify.notifyError(error, AnalyticsErrorEventSource.DETAILED_USAGE_REPORT_MODAL);
     }
@@ -180,8 +273,8 @@ watch(option, () => {
     case Options.Month:
         setPastMonth();
         break;
-    case Options.Year:
-        setPastYear();
+    case Options.ThreeMonths:
+        setPastThreeMonths();
         break;
     case Options.Custom:
         setChooseDates();

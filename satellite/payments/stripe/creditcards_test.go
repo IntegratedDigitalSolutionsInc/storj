@@ -8,11 +8,12 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
-	stripeLib "github.com/stripe/stripe-go/v75"
+	stripeLib "github.com/stripe/stripe-go/v81"
 
 	"storj.io/common/testcontext"
 	"storj.io/storj/private/testplanet"
 	"storj.io/storj/satellite/console"
+	"storj.io/storj/satellite/payments"
 	"storj.io/storj/satellite/payments/stripe"
 )
 
@@ -98,7 +99,7 @@ func TestCreditCards_AddByPaymentMethodID(t *testing.T) {
 		}, 1)
 		require.NoError(t, err)
 
-		_, err = satellite.API.Payments.Accounts.CreditCards().AddByPaymentMethodID(ctx, u.ID, "non-existent")
+		_, err = satellite.API.Payments.Accounts.CreditCards().AddByPaymentMethodID(ctx, u.ID, "non-existent", false)
 		require.Error(t, err)
 
 		// Add expired card to be automatically removed on successful new card addition.
@@ -137,12 +138,12 @@ func TestCreditCards_AddByPaymentMethodID(t *testing.T) {
 		})
 		require.NoError(t, err)
 
-		_, err = satellite.API.Payments.Accounts.CreditCards().AddByPaymentMethodID(ctx, u.ID, pm.ID)
+		_, err = satellite.API.Payments.Accounts.CreditCards().AddByPaymentMethodID(ctx, u.ID, pm.ID, false)
 		require.NoError(t, err)
 
-		_, err = satellite.API.Payments.Accounts.CreditCards().AddByPaymentMethodID(ctx, u.ID, pm.ID)
+		_, err = satellite.API.Payments.Accounts.CreditCards().AddByPaymentMethodID(ctx, u.ID, pm.ID, false)
 		require.Error(t, err)
-		require.True(t, stripe.ErrDuplicateCard.Has(err))
+		require.True(t, payments.ErrDuplicateCard.Has(err))
 
 		cards, err = satellite.API.Payments.Accounts.CreditCards().List(ctx, u.ID)
 		require.NoError(t, err)
@@ -172,7 +173,7 @@ func TestCreditCards_AddDuplicateCard(t *testing.T) {
 
 		card, err = satellite.API.Payments.Accounts.CreditCards().Add(ctx, u.ID, cardToken)
 		require.Error(t, err)
-		require.True(t, stripe.ErrDuplicateCard.Has(err))
+		require.True(t, payments.ErrDuplicateCard.Has(err))
 		require.Empty(t, card)
 
 		cards, err := satellite.API.Payments.Accounts.CreditCards().List(ctx, u.ID)
@@ -202,23 +203,59 @@ func TestCreditCards_Remove(t *testing.T) {
 
 		// user2ID should not be able to delete userID's cards
 		for _, card := range cards {
-			err = satellite.API.Payments.Accounts.CreditCards().Remove(ctx, user2ID, card.ID)
+			err = satellite.API.Payments.Accounts.CreditCards().Remove(ctx, user2ID, card.ID, false)
 			require.Error(t, err)
-			require.True(t, stripe.ErrCardNotFound.Has(err))
+			require.True(t, payments.ErrCardNotFound.Has(err))
 		}
 
 		// Can not remove default card
-		err = satellite.API.Payments.Accounts.CreditCards().Remove(ctx, userID, card2.ID)
+		err = satellite.API.Payments.Accounts.CreditCards().Remove(ctx, userID, card2.ID, false)
 		require.Error(t, err)
-		require.True(t, stripe.ErrDefaultCard.Has(err))
+		require.True(t, payments.ErrDefaultCard.Has(err))
 
-		err = satellite.API.Payments.Accounts.CreditCards().Remove(ctx, userID, card1.ID)
+		err = satellite.API.Payments.Accounts.CreditCards().Remove(ctx, userID, card1.ID, false)
 		require.NoError(t, err)
 
 		cards, err = satellite.API.Payments.Accounts.CreditCards().List(ctx, userID)
 		require.NoError(t, err)
 		require.Len(t, cards, 1)
 		require.Equal(t, card2, cards[0])
+	})
+}
+
+func TestCreditCards_Update(t *testing.T) {
+	testplanet.Run(t, testplanet.Config{
+		SatelliteCount: 1, StorageNodeCount: 0, UplinkCount: 2,
+	}, func(t *testing.T, ctx *testcontext.Context, planet *testplanet.Planet) {
+		satellite := planet.Satellites[0]
+		userID := planet.Uplinks[0].Projects[0].Owner.ID
+
+		cardUpdateParams := payments.CardUpdateParams{
+			ExpMonth: 10,
+			ExpYear:  2025,
+		}
+
+		card1, err := satellite.API.Payments.Accounts.CreditCards().Add(ctx, userID, "test")
+		require.NoError(t, err)
+		require.NotEqualValues(t, cardUpdateParams.ExpMonth, card1.ExpMonth)
+		require.NotEqualValues(t, cardUpdateParams.ExpYear, card1.ExpYear)
+
+		err = satellite.API.Payments.Accounts.CreditCards().Update(ctx, userID, cardUpdateParams)
+		require.True(t, payments.ErrCardNotFound.Has(err))
+
+		cardUpdateParams.CardID = card1.ID
+		err = satellite.API.Payments.Accounts.CreditCards().Update(ctx, userID, cardUpdateParams)
+		require.NoError(t, err)
+
+		cards, err := satellite.API.Payments.Accounts.CreditCards().List(ctx, userID)
+		require.NoError(t, err)
+		require.Len(t, cards, 1)
+		require.Equal(t, card1.ID, cards[0].ID)
+
+		card1 = cards[0]
+		require.NotEqual(t, cardUpdateParams.ExpMonth, card1.ExpMonth)
+		require.EqualValues(t, cardUpdateParams.ExpMonth, card1.ExpMonth)
+		require.EqualValues(t, cardUpdateParams.ExpYear, card1.ExpYear)
 	})
 }
 

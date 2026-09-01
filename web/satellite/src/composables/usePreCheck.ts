@@ -6,7 +6,7 @@ import { computed } from 'vue';
 import { useUsersStore } from '@/store/modules/usersStore';
 import { useAppStore } from '@/store/modules/appStore';
 import { useConfigStore } from '@/store/modules/configStore';
-import { ExpirationInfo, User } from '@/types/users';
+import type { ExpirationInfo, User } from '@/types/users';
 import { useProjectsStore } from '@/store/modules/projectsStore';
 
 export function usePreCheck() {
@@ -20,16 +20,21 @@ export function usePreCheck() {
     const expirationInfo = computed<ExpirationInfo>(() => user.value.getExpirationInfo(configStore.state.config.daysBeforeTrialEndNotification));
 
     const isTrialExpirationBanner = computed<boolean>(() => {
-        if (user.value.paidTier) return false;
-
-        return user.value.freezeStatus.trialExpiredFrozen || expirationInfo.value.isCloseToExpiredTrial;
+        return (
+            configStore.freeTrialsEnabled &&
+            (!configStore.isDefaultBrand || (!user.value.hasPaidPrivileges && configStore.billingEnabled)) &&
+            (user.value.freezeStatus.trialExpiredFrozen || expirationInfo.value.isCloseToExpiredTrial)
+        );
     });
 
     const isExpired = computed<boolean>(() => user.value.freezeStatus.trialExpiredFrozen);
 
     function withTrialCheck(callback: () => void | Promise<void>, skipProjectOwningCheck = false): void {
-        const isTrialExpired = !user.value.paidTier && user.value.freezeStatus.trialExpiredFrozen;
-        const isEligibleForExpirationDialog = isTrialExpired && (skipProjectOwningCheck || isUserProjectOwner.value);
+        const isEligibleForExpirationDialog =
+            configStore.freeTrialsEnabled &&
+            (!configStore.isDefaultBrand || !user.value.hasPaidPrivileges) &&
+            user.value.freezeStatus.trialExpiredFrozen &&
+            (skipProjectOwningCheck || isUserProjectOwner.value);
 
         if (isEligibleForExpirationDialog) {
             appStore.toggleExpirationDialog(true);

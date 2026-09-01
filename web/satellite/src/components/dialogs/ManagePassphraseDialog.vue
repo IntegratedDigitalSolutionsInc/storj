@@ -14,13 +14,13 @@
                 </v-card-title>
 
                 <template #append>
-                    <v-btn icon="$close" variant="text" size="small" color="default" @click="model = false" />
+                    <v-btn :icon="X" variant="text" size="small" color="default" @click="model = false" />
                 </template>
             </v-card-item>
 
             <v-divider />
 
-            <v-window v-model="step" class="overflow-y-auto">
+            <v-window v-model="step" :touch="false" class="overflow-y-auto">
                 <v-window-item :value="ManageProjectPassphraseStep.ManageOptions">
                     <manage-options-step
                         :ref="stepInfo[ManageProjectPassphraseStep.ManageOptions].ref"
@@ -46,7 +46,7 @@
                         @passphrase-changed="newPass => passphrase = newPass"
                         @submit="onNextClick"
                     >
-                        Please note that Storj does not know or store your encryption passphrase.
+                        Please note that {{ configStore.brandName }} does not know or store your encryption passphrase.
                         If you lose it, you will not be able to recover your files.
                     </enter-passphrase-step>
                 </v-window-item>
@@ -57,7 +57,7 @@
                         :name="projectName"
                         @passphrase-changed="newPass => passphrase = newPass"
                     >
-                        Please note that Storj does not know or store your encryption passphrase.
+                        Please note that {{ configStore.brandName }} does not know or store your encryption passphrase.
                         If you lose it, you will not be able to recover your files.
                     </passphrase-generated-step>
                 </v-window-item>
@@ -128,7 +128,7 @@
 </template>
 
 <script setup lang="ts">
-import { Component, Ref, WatchStopHandle, computed, ref, watch } from 'vue';
+import { type Component, type Ref, type WatchStopHandle, computed, ref, watch  } from 'vue';
 import {
     VDialog,
     VCard,
@@ -142,11 +142,12 @@ import {
     VCol,
     VBtn,
 } from 'vuetify/components';
-import { ChevronLeft, ChevronRight } from 'lucide-vue-next';
+import { ChevronLeft, ChevronRight, X } from '@lucide/vue';
 
 import { ManageProjectPassphraseStep, PassphraseOption } from '@/types/managePassphrase';
 import { useProjectsStore } from '@/store/modules/projectsStore';
-import { DialogStepComponent } from '@/types/common';
+import type { DialogStepComponent } from '@/types/common';
+import { useConfigStore } from '@/store/modules/configStore';
 
 import ManageOptionsStep from '@/components/dialogs/managePassphraseSteps/ManageOptionsStep.vue';
 import CreateStep from '@/components/dialogs/managePassphraseSteps/CreateStep.vue';
@@ -193,6 +194,7 @@ const emit = defineEmits<{
 }>();
 
 const projectsStore = useProjectsStore();
+const configStore = useConfigStore();
 
 const innerContent = ref<Component | null>(null);
 const step = ref<ManageProjectPassphraseStep>(

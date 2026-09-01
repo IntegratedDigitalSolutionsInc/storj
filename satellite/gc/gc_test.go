@@ -5,16 +5,13 @@ package gc_test
 
 import (
 	"context"
-	"fmt"
 	"sort"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
-	"go.uber.org/zap/zaptest"
 
-	"storj.io/common/encryption"
 	"storj.io/common/memory"
 	"storj.io/common/storj"
 	"storj.io/common/testcontext"
@@ -23,9 +20,8 @@ import (
 	"storj.io/storj/satellite/gc/bloomfilter"
 	"storj.io/storj/satellite/metabase"
 	"storj.io/storj/satellite/metabase/rangedloop"
+	"storj.io/storj/satellite/metabase/rangedloop/rangedlooptest"
 	"storj.io/storj/storagenode"
-	"storj.io/storj/storagenode/blobstore"
-	"storj.io/uplink/private/eestream"
 	"storj.io/uplink/private/testuplink"
 )
 
@@ -68,82 +64,69 @@ func TestGarbageCollection(t *testing.T) {
 		testDataDelete := testrand.Bytes(9 * memory.KiB)
 
 		require.NoError(t, upl.Upload(ctx, satellite, "testbucket", "test/path/keep", testDataKeep))
+		require.NoError(t, upl.Upload(ctx, satellite, "testbucket", "test/path/delete", testDataDelete))
 
-		for _, observer := range []rangedloop.Observer{
-			bloomfilter.NewObserver(zaptest.NewLogger(t), config, planet.Satellites[0].Overlay.DB),
-			bloomfilter.NewSyncObserver(zaptest.NewLogger(t), config, planet.Satellites[0].Overlay.DB),
-		} {
-			t.Run(fmt.Sprintf("%T", observer), func(t *testing.T) {
-				require.NoError(t, upl.Upload(ctx, satellite, "testbucket", "test/path/delete", testDataDelete))
+		segments, err := satellite.Metabase.DB.TestingAllSegments(ctx)
+		require.NoError(t, err)
+		require.Len(t, segments, 2)
 
-				segments, err := satellite.Metabase.DB.TestingAllSegments(ctx)
-				require.NoError(t, err)
-				require.Len(t, segments, 2)
+		sort.Slice(segments, func(i, j int) bool {
+			return segments[i].CreatedAt.Before(segments[j].CreatedAt)
+		})
 
-				sort.Slice(segments, func(i, j int) bool {
-					return segments[i].CreatedAt.Before(segments[j].CreatedAt)
-				})
+		segmentToKeep := segments[0]
+		segmentToDelete := segments[1]
 
-				segmentToKeep := segments[0]
-				segmentToDelete := segments[1]
-
-				findPiece := func(segment metabase.Segment) storj.PieceID {
-					for _, p := range segment.Pieces {
-						if p.StorageNode == targetNode.ID() {
-							return segment.RootPieceID.Derive(p.StorageNode, int32(p.Number))
-						}
-					}
-					require.Fail(t, "piece id not found")
-					return storj.PieceID{}
+		findPiece := func(segment metabase.Segment) storj.PieceID {
+			for _, p := range segment.Pieces {
+				if p.StorageNode == targetNode.ID() {
+					return segment.RootPieceID.Derive(p.StorageNode, int32(p.Number))
 				}
-
-				keptPieceID := findPiece(segmentToKeep)
-				deletedPieceID := findPiece(segmentToDelete)
-
-				require.NoError(t, upl.DeleteObject(ctx, satellite, "testbucket", "test/path/delete"))
-
-				// Check that piece of the deleted object is on the storagenode
-				pieceAccess, err := targetNode.DB.Pieces().Stat(ctx, blobstore.BlobRef{
-					Namespace: satellite.ID().Bytes(),
-					Key:       deletedPieceID.Bytes(),
-				})
-				require.NoError(t, err)
-				require.NotNil(t, pieceAccess)
-
-				// Wait for bloom filter observer to finish
-				rangedloopConfig := planet.Satellites[0].Config.RangedLoop
-
-				mbSegments := rangedloop.NewMetabaseRangeSplitter(planet.Satellites[0].Metabase.DB, rangedloopConfig.AsOfSystemInterval, rangedloopConfig.SpannerStaleInterval, rangedloopConfig.BatchSize)
-				rangedLoop := rangedloop.NewService(zap.NewNop(), planet.Satellites[0].Config.RangedLoop, mbSegments,
-					[]rangedloop.Observer{observer})
-
-				_, err = rangedLoop.RunOnce(ctx)
-				require.NoError(t, err)
-
-				// send to storagenode
-				err = gcsender.RunOnce(ctx)
-				require.NoError(t, err)
-
-				// Wait for the storagenode's RetainService queue to be empty
-				targetNode.Storage2.RetainService.TestWaitUntilEmpty()
-
-				// Check that piece of the deleted object is not on the storagenode
-				pieceAccess, err = targetNode.DB.Pieces().Stat(ctx, blobstore.BlobRef{
-					Namespace: satellite.ID().Bytes(),
-					Key:       deletedPieceID.Bytes(),
-				})
-				require.Error(t, err)
-				require.Nil(t, pieceAccess)
-
-				// Check that piece of the kept object is on the storagenode
-				pieceAccess, err = targetNode.DB.Pieces().Stat(ctx, blobstore.BlobRef{
-					Namespace: satellite.ID().Bytes(),
-					Key:       keptPieceID.Bytes(),
-				})
-				require.NoError(t, err)
-				require.NotNil(t, pieceAccess)
-			})
+			}
+			require.Fail(t, "piece id not found")
+			return storj.PieceID{}
 		}
+
+		keptPieceID := findPiece(segmentToKeep)
+		deletedPieceID := findPiece(segmentToDelete)
+
+		require.NoError(t, upl.DeleteObject(ctx, satellite, "testbucket", "test/path/delete"))
+
+		// Check that piece of the deleted object is on the storagenode
+		r, err := targetNode.Storage2.PieceBackend.Reader(ctx, satellite.ID(), deletedPieceID)
+		require.NoError(t, err)
+		require.False(t, r.Trash())
+		require.NoError(t, r.Close())
+
+		// Wait for bloom filter observer to finish
+		rangedloopConfig := planet.Satellites[0].Config.RangedLoop
+
+		observer := bloomfilter.NewObserver(zap.NewNop(), config, satellite.Overlay.DB)
+		mbSegments := rangedloop.NewMetabaseRangeSplitter(zap.NewNop(), planet.Satellites[0].Metabase.DB, rangedloopConfig)
+		rangedLoop := rangedloop.NewService(zap.NewNop(), planet.Satellites[0].Config.RangedLoop, mbSegments, []rangedloop.Observer{observer})
+
+		_, err = rangedLoop.RunOnce(ctx)
+		require.NoError(t, err)
+
+		// send to storagenode
+		err = gcsender.RunOnce(ctx)
+		require.NoError(t, err)
+
+		// Wait for the storagenode's RetainService queue to be empty
+		targetNode.StorageOld.RetainService.TestWaitUntilEmpty()
+		require.NoError(t, targetNode.Storage2.HashStoreBackend.TestingCompact(ctx))
+
+		// Check that piece of the deleted object is trashed
+		r, err = targetNode.Storage2.PieceBackend.Reader(ctx, satellite.ID(), deletedPieceID)
+		require.NoError(t, err)
+		require.True(t, r.Trash())
+		require.NoError(t, r.Close())
+
+		// Check that piece of the kept object is on the storagenode
+		r, err = targetNode.Storage2.PieceBackend.Reader(ctx, satellite.ID(), keptPieceID)
+		require.NoError(t, err)
+		require.False(t, r.Trash())
+		require.NoError(t, r.Close())
 	})
 }
 
@@ -175,9 +158,9 @@ func TestGarbageCollectionWithCopies(t *testing.T) {
 
 		allSpaceUsedForPieces := func() (all int64) {
 			for _, node := range planet.StorageNodes {
-				_, piecesContent, _, err := node.Storage2.Store.SpaceUsedTotalAndBySatellite(ctx)
+				space, err := node.Storage2.SpaceReport.DiskSpace(ctx)
 				require.NoError(t, err)
-				all += piecesContent
+				all += space.UsedForPieces
 			}
 			return all
 		}
@@ -185,120 +168,91 @@ func TestGarbageCollectionWithCopies(t *testing.T) {
 		expectedRemoteData := testrand.Bytes(8 * memory.KiB)
 		expectedInlineData := testrand.Bytes(1 * memory.KiB)
 
-		encryptedSize, err := encryption.CalcEncryptedSize(int64(len(expectedRemoteData)), storj.EncryptionParameters{
-			CipherSuite: storj.EncAESGCM,
-			BlockSize:   29 * 256 * memory.B.Int32(), // hardcoded value from uplink
-		})
+		require.NoError(t, planet.Uplinks[0].Upload(ctx, satellite, "testbucket", "remote", expectedRemoteData))
+		require.NoError(t, planet.Uplinks[0].Upload(ctx, satellite, "testbucket", "inline", expectedInlineData))
+		require.NoError(t, planet.Uplinks[0].Upload(ctx, satellite, "testbucket", "remote-no-copy", expectedRemoteData))
+
+		_, err = project.CopyObject(ctx, "testbucket", "remote", "testbucket", "remote-copy", nil)
+		require.NoError(t, err)
+		_, err = project.CopyObject(ctx, "testbucket", "inline", "testbucket", "inline-copy", nil)
 		require.NoError(t, err)
 
-		redundancyStrategy, err := planet.Satellites[0].Config.Metainfo.RS.RedundancyStrategy()
+		require.NoError(t, planet.WaitForStorageNodeEndpoints(ctx))
+
+		spaceUsedAfterUpload := allSpaceUsedForPieces()
+
+		// Wait for bloom filter observer to finish
+		rangedloopConfig := planet.Satellites[0].Config.RangedLoop
+
+		observer := bloomfilter.NewObserver(zap.NewNop(), config, satellite.Overlay.DB)
+		segments := rangedloop.NewMetabaseRangeSplitter(zap.NewNop(), planet.Satellites[0].Metabase.DB, rangedloopConfig)
+		rangedLoop := rangedloop.NewService(zap.NewNop(), planet.Satellites[0].Config.RangedLoop, segments, []rangedloop.Observer{observer})
+
+		_, err = rangedLoop.RunOnce(ctx)
 		require.NoError(t, err)
 
-		pieceSize := eestream.CalcPieceSize(encryptedSize, redundancyStrategy.ErasureScheme)
-		singleRemoteUsed := pieceSize * int64(len(planet.StorageNodes))
-		totalUsedByNodes := 2 * singleRemoteUsed // two remote objects
+		// send to storagenode
+		require.NoError(t, gcsender.RunOnce(ctx))
 
-		for _, observer := range []rangedloop.Observer{
-			bloomfilter.NewObserver(zaptest.NewLogger(t), config, planet.Satellites[0].Overlay.DB),
-			bloomfilter.NewSyncObserver(zaptest.NewLogger(t), config, planet.Satellites[0].Overlay.DB),
-		} {
-			t.Run(fmt.Sprintf("%T", observer), func(t *testing.T) {
-				for _, node := range planet.StorageNodes {
-					err := node.Storage2.Store.DeleteSatelliteBlobs(ctx, satellite.ID())
-					require.NoError(t, err)
-				}
-
-				require.NoError(t, planet.Uplinks[0].Upload(ctx, satellite, "testbucket", "remote", expectedRemoteData))
-				require.NoError(t, planet.Uplinks[0].Upload(ctx, satellite, "testbucket", "inline", expectedInlineData))
-				require.NoError(t, planet.Uplinks[0].Upload(ctx, satellite, "testbucket", "remote-no-copy", expectedRemoteData))
-
-				_, err = project.CopyObject(ctx, "testbucket", "remote", "testbucket", "remote-copy", nil)
-				require.NoError(t, err)
-				_, err = project.CopyObject(ctx, "testbucket", "inline", "testbucket", "inline-copy", nil)
-				require.NoError(t, err)
-
-				require.NoError(t, planet.WaitForStorageNodeEndpoints(ctx))
-
-				afterTotalUsedByNodes := allSpaceUsedForPieces()
-				require.Equal(t, totalUsedByNodes, afterTotalUsedByNodes)
-
-				// Wait for bloom filter observer to finish
-				rangedloopConfig := planet.Satellites[0].Config.RangedLoop
-
-				observer := bloomfilter.NewObserver(zaptest.NewLogger(t), config, planet.Satellites[0].Overlay.DB)
-				segments := rangedloop.NewMetabaseRangeSplitter(planet.Satellites[0].Metabase.DB, rangedloopConfig.AsOfSystemInterval, rangedloopConfig.SpannerStaleInterval, rangedloopConfig.BatchSize)
-				rangedLoop := rangedloop.NewService(zap.NewNop(), planet.Satellites[0].Config.RangedLoop, segments,
-					[]rangedloop.Observer{observer})
-
-				_, err = rangedLoop.RunOnce(ctx)
-				require.NoError(t, err)
-
-				// send to storagenode
-				require.NoError(t, gcsender.RunOnce(ctx))
-
-				for _, node := range planet.StorageNodes {
-					node.Storage2.RetainService.TestWaitUntilEmpty()
-				}
-
-				// we should see all space used by all objects
-				afterTotalUsedByNodes = allSpaceUsedForPieces()
-				require.Equal(t, totalUsedByNodes, afterTotalUsedByNodes)
-
-				for _, toDelete := range []string{
-					// delete ancestors, no change in used space
-					"remote",
-					"inline",
-					// delete object without copy, used space should be decreased
-					"remote-no-copy",
-				} {
-					_, err = project.DeleteObject(ctx, "testbucket", toDelete)
-					require.NoError(t, err)
-				}
-
-				planet.WaitForStorageNodeDeleters(ctx)
-
-				// run GC
-				_, err = rangedLoop.RunOnce(ctx)
-				require.NoError(t, err)
-
-				// send to storagenode
-				require.NoError(t, gcsender.RunOnce(ctx))
-
-				for _, node := range planet.StorageNodes {
-					node.Storage2.RetainService.TestWaitUntilEmpty()
-				}
-
-				// verify that we deleted only pieces for "remote-no-copy" object
-				afterTotalUsedByNodes = allSpaceUsedForPieces()
-				require.Equal(t, totalUsedByNodes, afterTotalUsedByNodes)
-
-				// delete rest of objects to verify that everything will be removed also from SNs
-				for _, toDelete := range []string{
-					"remote-copy",
-					"inline-copy",
-				} {
-					_, err = project.DeleteObject(ctx, "testbucket", toDelete)
-					require.NoError(t, err)
-				}
-
-				planet.WaitForStorageNodeDeleters(ctx)
-
-				// run GC
-				_, err = rangedLoop.RunOnce(ctx)
-				require.NoError(t, err)
-
-				// send to storagenode
-				require.NoError(t, gcsender.RunOnce(ctx))
-
-				for _, node := range planet.StorageNodes {
-					node.Storage2.RetainService.TestWaitUntilEmpty()
-				}
-
-				// verify that nothing more was deleted from storage nodes after GC
-				afterTotalUsedByNodes = allSpaceUsedForPieces()
-				require.EqualValues(t, totalUsedByNodes, afterTotalUsedByNodes)
-			})
+		for _, node := range planet.StorageNodes {
+			node.StorageOld.RetainService.TestWaitUntilEmpty()
+			require.NoError(t, node.Storage2.HashStoreBackend.TestingCompact(ctx))
 		}
+
+		// we should see all space used by all objects
+		require.Equal(t, spaceUsedAfterUpload, allSpaceUsedForPieces())
+
+		for _, toDelete := range []string{
+			// delete ancestors, no change in used space
+			"remote",
+			"inline",
+			// delete object without copy, used space should be decreased
+			"remote-no-copy",
+		} {
+			_, err = project.DeleteObject(ctx, "testbucket", toDelete)
+			require.NoError(t, err)
+		}
+
+		// run GC
+		_, err = rangedLoop.RunOnce(ctx)
+		require.NoError(t, err)
+
+		// send to storagenode
+		require.NoError(t, gcsender.RunOnce(ctx))
+
+		for _, node := range planet.StorageNodes {
+			node.StorageOld.RetainService.TestWaitUntilEmpty()
+			require.NoError(t, node.Storage2.HashStoreBackend.TestingCompact(ctx))
+		}
+
+		// verify that we deleted only pieces for "remote-no-copy" object
+		spaceUsedAfterFirstGC := allSpaceUsedForPieces()
+		require.LessOrEqual(t, spaceUsedAfterFirstGC, spaceUsedAfterUpload)
+
+		// delete rest of objects to verify that everything will be removed also from SNs
+		for _, toDelete := range []string{
+			"remote-copy",
+			"inline-copy",
+		} {
+			_, err = project.DeleteObject(ctx, "testbucket", toDelete)
+			require.NoError(t, err)
+		}
+
+		// run GC
+		_, err = rangedLoop.RunOnce(ctx)
+		require.NoError(t, err)
+
+		// send to storagenode
+		require.NoError(t, gcsender.RunOnce(ctx))
+
+		for _, node := range planet.StorageNodes {
+			node.StorageOld.RetainService.TestWaitUntilEmpty()
+			require.NoError(t, node.Storage2.HashStoreBackend.TestingCompact(ctx))
+		}
+
+		// verify that nothing more was deleted from storage nodes after GC
+		spaceUsedAfterSecondGC := allSpaceUsedForPieces()
+		require.LessOrEqual(t, spaceUsedAfterSecondGC, spaceUsedAfterFirstGC)
 	})
 }
 
@@ -330,9 +284,9 @@ func TestGarbageCollectionWithCopiesWithDuplicateMetadata(t *testing.T) {
 
 		allSpaceUsedForPieces := func() (all int64) {
 			for _, node := range planet.StorageNodes {
-				_, piecesContent, _, err := node.Storage2.Store.SpaceUsedTotalAndBySatellite(ctx)
+				space, err := node.Storage2.SpaceReport.DiskSpace(ctx)
 				require.NoError(t, err)
-				all += piecesContent
+				all += space.UsedForPieces
 			}
 			return all
 		}
@@ -340,119 +294,93 @@ func TestGarbageCollectionWithCopiesWithDuplicateMetadata(t *testing.T) {
 		expectedRemoteData := testrand.Bytes(8 * memory.KiB)
 		expectedInlineData := testrand.Bytes(1 * memory.KiB)
 
-		encryptedSize, err := encryption.CalcEncryptedSize(int64(len(expectedRemoteData)), storj.EncryptionParameters{
-			CipherSuite: storj.EncAESGCM,
-			BlockSize:   29 * 256 * memory.B.Int32(), // hardcoded value from uplink
-		})
+		require.EqualValues(t, 0, allSpaceUsedForPieces())
+
+		require.NoError(t, planet.Uplinks[0].Upload(ctx, satellite, "testbucket", "remote", expectedRemoteData))
+		require.NoError(t, planet.Uplinks[0].Upload(ctx, satellite, "testbucket", "inline", expectedInlineData))
+		require.NoError(t, planet.Uplinks[0].Upload(ctx, satellite, "testbucket", "remote-no-copy", expectedRemoteData))
+
+		_, err = project.CopyObject(ctx, "testbucket", "remote", "testbucket", "remote-copy", nil)
+		require.NoError(t, err)
+		_, err = project.CopyObject(ctx, "testbucket", "inline", "testbucket", "inline-copy", nil)
 		require.NoError(t, err)
 
-		redundancyStrategy, err := planet.Satellites[0].Config.Metainfo.RS.RedundancyStrategy()
+		require.NoError(t, planet.WaitForStorageNodeEndpoints(ctx))
+
+		spaceUsedAfterUpload := allSpaceUsedForPieces()
+
+		// Wait for bloom filter observer to finish
+		rangedloopConfig := planet.Satellites[0].Config.RangedLoop
+
+		observer := bloomfilter.NewObserver(zap.NewNop(), config, satellite.Overlay.DB)
+		segments := rangedloop.NewMetabaseRangeSplitter(zap.NewNop(), planet.Satellites[0].Metabase.DB, rangedloopConfig)
+		rangedLoop := rangedloop.NewService(zap.NewNop(), planet.Satellites[0].Config.RangedLoop, segments, []rangedloop.Observer{observer})
+
+		_, err = rangedLoop.RunOnce(ctx)
 		require.NoError(t, err)
 
-		pieceSize := eestream.CalcPieceSize(encryptedSize, redundancyStrategy.ErasureScheme)
-		singleRemoteUsed := pieceSize * int64(len(planet.StorageNodes))
-		totalUsedByNodes := 2 * singleRemoteUsed // two remote objects
+		// send to storagenode
+		require.NoError(t, gcsender.RunOnce(ctx))
 
-		for _, observer := range []rangedloop.Observer{
-			bloomfilter.NewObserver(zaptest.NewLogger(t), config, planet.Satellites[0].Overlay.DB),
-			bloomfilter.NewSyncObserver(zaptest.NewLogger(t), config, planet.Satellites[0].Overlay.DB),
-		} {
-			t.Run(fmt.Sprintf("%T", observer), func(t *testing.T) {
-				for _, node := range planet.StorageNodes {
-					err := node.Storage2.Store.DeleteSatelliteBlobs(ctx, satellite.ID())
-					require.NoError(t, err)
-				}
-
-				require.NoError(t, planet.Uplinks[0].Upload(ctx, satellite, "testbucket", "remote", expectedRemoteData))
-				require.NoError(t, planet.Uplinks[0].Upload(ctx, satellite, "testbucket", "inline", expectedInlineData))
-				require.NoError(t, planet.Uplinks[0].Upload(ctx, satellite, "testbucket", "remote-no-copy", expectedRemoteData))
-
-				_, err = project.CopyObject(ctx, "testbucket", "remote", "testbucket", "remote-copy", nil)
-				require.NoError(t, err)
-				_, err = project.CopyObject(ctx, "testbucket", "inline", "testbucket", "inline-copy", nil)
-				require.NoError(t, err)
-
-				require.NoError(t, planet.WaitForStorageNodeEndpoints(ctx))
-
-				afterTotalUsedByNodes := allSpaceUsedForPieces()
-				require.Equal(t, totalUsedByNodes, afterTotalUsedByNodes)
-
-				// Wait for bloom filter observer to finish
-				rangedloopConfig := planet.Satellites[0].Config.RangedLoop
-
-				segments := rangedloop.NewMetabaseRangeSplitter(planet.Satellites[0].Metabase.DB, rangedloopConfig.AsOfSystemInterval, rangedloopConfig.SpannerStaleInterval, rangedloopConfig.BatchSize)
-				rangedLoop := rangedloop.NewService(zap.NewNop(), planet.Satellites[0].Config.RangedLoop, segments,
-					[]rangedloop.Observer{observer})
-
-				_, err = rangedLoop.RunOnce(ctx)
-				require.NoError(t, err)
-
-				// send to storagenode
-				require.NoError(t, gcsender.RunOnce(ctx))
-
-				for _, node := range planet.StorageNodes {
-					node.Storage2.RetainService.TestWaitUntilEmpty()
-				}
-
-				// we should see all space used by all objects
-				afterTotalUsedByNodes = allSpaceUsedForPieces()
-				require.Equal(t, totalUsedByNodes, afterTotalUsedByNodes)
-
-				for _, toDelete := range []string{
-					// delete ancestors, no change in used space
-					"remote",
-					"inline",
-					// delete object without copy, used space should be decreased
-					"remote-no-copy",
-				} {
-					_, err = project.DeleteObject(ctx, "testbucket", toDelete)
-					require.NoError(t, err)
-				}
-
-				planet.WaitForStorageNodeDeleters(ctx)
-
-				// run GC
-				_, err = rangedLoop.RunOnce(ctx)
-				require.NoError(t, err)
-
-				// send to storagenode
-				require.NoError(t, gcsender.RunOnce(ctx))
-
-				for _, node := range planet.StorageNodes {
-					node.Storage2.RetainService.TestWaitUntilEmpty()
-				}
-
-				// verify that we deleted only pieces for "remote-no-copy" object
-				afterTotalUsedByNodes = allSpaceUsedForPieces()
-				require.Equal(t, totalUsedByNodes, afterTotalUsedByNodes)
-
-				// delete rest of objects to verify that everything will be removed also from SNs
-				for _, toDelete := range []string{
-					"remote-copy",
-					"inline-copy",
-				} {
-					_, err = project.DeleteObject(ctx, "testbucket", toDelete)
-					require.NoError(t, err)
-				}
-
-				planet.WaitForStorageNodeDeleters(ctx)
-
-				// run GC
-				_, err = rangedLoop.RunOnce(ctx)
-				require.NoError(t, err)
-
-				// send to storagenode
-				require.NoError(t, gcsender.RunOnce(ctx))
-
-				for _, node := range planet.StorageNodes {
-					node.Storage2.RetainService.TestWaitUntilEmpty()
-				}
-
-				// verify that nothing more was deleted from storage nodes after GC
-				afterTotalUsedByNodes = allSpaceUsedForPieces()
-				require.EqualValues(t, totalUsedByNodes, afterTotalUsedByNodes)
-			})
+		for _, node := range planet.StorageNodes {
+			node.StorageOld.RetainService.TestWaitUntilEmpty()
+			require.NoError(t, node.Storage2.HashStoreBackend.TestingCompact(ctx))
 		}
+
+		// we should see all space used by all objects
+		spaceUsedAfterFirstGC := allSpaceUsedForPieces()
+		require.LessOrEqual(t, spaceUsedAfterFirstGC, spaceUsedAfterUpload)
+
+		for _, toDelete := range []string{
+			// delete ancestors, no change in used space
+			"remote",
+			"inline",
+			// delete object without copy, used space should be decreased
+			"remote-no-copy",
+		} {
+			_, err = project.DeleteObject(ctx, "testbucket", toDelete)
+			require.NoError(t, err)
+		}
+
+		// run GC
+		_, err = rangedLoop.RunOnce(ctx)
+		require.NoError(t, err)
+
+		// send to storagenode
+		require.NoError(t, gcsender.RunOnce(ctx))
+
+		for _, node := range planet.StorageNodes {
+			node.StorageOld.RetainService.TestWaitUntilEmpty()
+			require.NoError(t, node.Storage2.HashStoreBackend.TestingCompact(ctx))
+		}
+
+		// verify that we deleted only pieces for "remote-no-copy" object
+		require.Less(t, allSpaceUsedForPieces(), spaceUsedAfterUpload)
+
+		// delete rest of objects to verify that everything will be removed also from SNs
+		for _, toDelete := range []string{
+			"remote-copy",
+			"inline-copy",
+		} {
+			_, err = project.DeleteObject(ctx, "testbucket", toDelete)
+			require.NoError(t, err)
+		}
+
+		// run GC
+		_, err = rangedLoop.RunOnce(ctx)
+		require.NoError(t, err)
+
+		// send to storagenode
+		require.NoError(t, gcsender.RunOnce(ctx))
+
+		for _, node := range planet.StorageNodes {
+			node.StorageOld.RetainService.TestWaitUntilEmpty()
+			require.NoError(t, node.Storage2.HashStoreBackend.TestingCompact(ctx))
+		}
+
+		// verify that nothing more was deleted from storage nodes after GC
+		spaceUsedAfterSecondGC := allSpaceUsedForPieces()
+		require.LessOrEqual(t, spaceUsedAfterSecondGC, spaceUsedAfterFirstGC)
 	})
 }
 
@@ -482,28 +410,19 @@ func TestGarbageCollection_PendingObject(t *testing.T) {
 		config.FalsePositiveRate = 0.000000001
 		config.InitialPieces = 10
 
-		for _, observer := range []rangedloop.Observer{
-			bloomfilter.NewObserver(zaptest.NewLogger(t), config, planet.Satellites[0].Overlay.DB),
-			bloomfilter.NewSyncObserver(zaptest.NewLogger(t), config, planet.Satellites[0].Overlay.DB),
-		} {
-			t.Run(fmt.Sprintf("%T", observer), func(t *testing.T) {
-				rangedloopConfig := planet.Satellites[0].Config.RangedLoop
-				provider := rangedloop.NewMetabaseRangeSplitter(planet.Satellites[0].Metabase.DB, rangedloopConfig.AsOfSystemInterval, rangedloopConfig.SpannerStaleInterval, rangedloopConfig.BatchSize)
-				rangedLoop := rangedloop.NewService(zap.NewNop(), planet.Satellites[0].Config.RangedLoop, provider,
-					[]rangedloop.Observer{observer})
+		observer := bloomfilter.NewObserver(zap.NewNop(), config, satellite.Overlay.DB)
+		rangedloopConfig := planet.Satellites[0].Config.RangedLoop
+		provider := rangedloop.NewMetabaseRangeSplitter(zap.NewNop(), planet.Satellites[0].Metabase.DB, rangedloopConfig)
+		rangedLoop := rangedloop.NewService(zap.NewNop(), planet.Satellites[0].Config.RangedLoop, provider, []rangedloop.Observer{observer})
 
-				_, err = rangedLoop.RunOnce(ctx)
-				require.NoError(t, err)
+		_, err = rangedLoop.RunOnce(ctx)
+		require.NoError(t, err)
 
-				testingObserver, ok := observer.(bloomfilter.TestingObserver)
-				require.True(t, ok)
-				require.NotEmpty(t, testingObserver.TestingRetainInfos())
-				info, ok := testingObserver.TestingRetainInfos().Load(planet.StorageNodes[0].ID())
-				require.True(t, ok)
-				require.NotNil(t, info)
-				require.Equal(t, 1, info.Count)
-			})
-		}
+		require.False(t, observer.TestingRetainInfos().IsEmpty())
+		info, ok := observer.TestingRetainInfos().Load(planet.StorageNodes[0].ID())
+		require.True(t, ok)
+		require.NotNil(t, info)
+		require.Equal(t, 1, info.Count)
 
 		completeMultipartUpload(ctx, t, upl, satellite, "testbucket", "multi", pendingStreamID)
 		gotData, err := upl.Download(ctx, satellite, "testbucket", "multi")
@@ -549,4 +468,100 @@ func completeMultipartUpload(ctx context.Context, t *testing.T, uplink *testplan
 
 	_, err = project.CommitUpload(ctx, bucketName, path, streamID, nil)
 	require.NoError(t, err)
+}
+
+func BenchmarkGarbageCollection(b *testing.B) {
+	const (
+		storageNodesCount     = 100
+		segmentsCount         = 10000
+		piecesPerSegment      = 10
+		rangedLoopBatchSize   = 2500
+		rangedLoopParallelism = 40
+	)
+
+	ctx := testcontext.New(b)
+	defer ctx.Cleanup()
+
+	log := zap.NewNop()
+	defer ctx.Check(log.Sync)
+
+	segments, pieceCounts := randomSegments(storageNodesCount, segmentsCount, piecesPerSegment)
+
+	bfConfig := bloomfilter.Config{
+		AccessGrant: "access",
+		Bucket:      "bucket",
+	}
+
+	overlay := &mockOverlay{pieceCounts: pieceCounts}
+
+	rlConfig := rangedloop.Config{
+		BatchSize:   rangedLoopBatchSize,
+		Parallelism: rangedLoopParallelism,
+	}
+	provider := &rangedlooptest.RangeSplitter{
+		Segments: segments,
+	}
+
+	observer := bloomfilter.NewObserver(log, bfConfig, overlay)
+	rangedLoop := rangedloop.NewService(log, rlConfig, provider, []rangedloop.Observer{observer})
+
+	durations := make(map[rangedloop.Observer]time.Duration)
+
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		d, err := rangedLoop.RunOnce(ctx)
+		require.NoError(b, err)
+
+		for _, d := range d {
+			durations[d.Observer] += d.Duration
+		}
+	}
+	observerDurations = durations
+
+	require.Len(b, observerDurations, 1)
+
+	// for _, d := range observerDurations {
+	// 	b.ReportMetric(float64(d.Nanoseconds())/float64(b.N), "ns/RunOnce")
+	// }
+}
+
+var observerDurations map[rangedloop.Observer]time.Duration
+
+type mockOverlay struct {
+	pieceCounts map[storj.NodeID]int64
+}
+
+func (o *mockOverlay) ActiveNodesPieceCounts(context.Context) (map[storj.NodeID]int64, error) {
+	return o.pieceCounts, nil
+}
+
+func randomSegments(nodesCount, segmentsCount, piecesPerSegment int) ([]rangedloop.Segment, map[storj.NodeID]int64) {
+	var nodes []storj.NodeID
+	for i := 0; i < nodesCount; i++ {
+		nodes = append(nodes, testrand.NodeID())
+	}
+
+	pieceCounts := make(map[storj.NodeID]int64)
+
+	startDate := time.Date(2000, time.August, 8, 0, 0, 0, 0, time.UTC)
+	var segments []rangedloop.Segment
+	for i := 0; i < segmentsCount; i++ {
+		var pieces []metabase.Piece
+		for j := 0; j < piecesPerSegment; j++ {
+			node := nodes[(i+j)%len(nodes)]
+			pieces = append(pieces, metabase.Piece{
+				Number:      uint16(j),
+				StorageNode: node,
+			})
+			pieceCounts[node]++
+		}
+		segments = append(segments, rangedloop.Segment{
+			CreatedAt:   startDate.Add(time.Hour * time.Duration(i)),
+			RootPieceID: testrand.PieceID(),
+			Pieces:      pieces,
+		})
+	}
+
+	return segments, pieceCounts
 }

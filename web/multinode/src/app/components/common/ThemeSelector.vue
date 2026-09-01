@@ -5,16 +5,15 @@
     <div class="theme-area">
         <v-btn-toggle v-model="activeTheme" rounded mandatory class="custom-toggle">
             <v-tooltip bottom>
-                <template #activator="{ on, attrs }">
+                <template #activator="props">
                     <v-btn
                         x-small
                         rounded
                         fab
                         class="mr-1"
                         :value="0"
-                        v-bind="attrs"
+                        v-bind="props"
                         @click="toggleTheme('light')"
-                        v-on="on"
                     >
                         <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="theme-icon">
                             <circle cx="12" cy="12" r="4" />
@@ -32,15 +31,14 @@
                 <span>Light Theme</span>
             </v-tooltip>
             <v-tooltip bottom>
-                <template #activator="{ on, attrs }">
+                <template #activator="props">
                     <v-btn
                         x-small
                         rounded
                         fab
                         :value="1"
-                        v-bind="attrs"
+                        v-bind="props"
                         @click="toggleTheme('dark')"
-                        v-on="on"
                     >
                         <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="theme-icon">
                             <path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9" />
@@ -55,42 +53,31 @@
     </div>
 </template>
 
-<script lang="ts">
-import { Component, Vue, Watch } from 'vue-property-decorator';
-import { VBtn, VBtnToggle, VTooltip } from 'vuetify/lib';
+<script setup lang="ts">
+import { onMounted, ref, watch } from 'vue';
+import { VBtn, VBtnToggle, VTooltip } from 'vuetify/components';
+import { useTheme } from 'vuetify';
 
-// @vue/component
-@Component({
-    components: {
-        VBtn,
-        VTooltip,
-        VBtnToggle,
-    },
-})
+const theme = useTheme();
 
-export default class ThemeSelector extends Vue {
+const activeTheme = ref<number>(0);
 
-    public activeTheme = 0;
-
-    toggleTheme(newTheme: string): void {
-        if (newTheme === 'dark' && !this.$vuetify.theme.dark) {
-            this.$vuetify.theme.dark = true;
-        } else if (newTheme === 'light' && this.$vuetify.theme.dark) {
-            this.$vuetify.theme.dark = false;
-        }
-        localStorage.setItem('theme', newTheme);
+function toggleTheme(newTheme: string): void {
+    if (newTheme === 'dark' && !theme.global.current.value.dark) {
+        theme.change('dark');
+    } else if (newTheme === 'light' && theme.global.current.value.dark) {
+        theme.change('light');
     }
-
-    @Watch('$vuetify.theme.dark', { immediate: true })
-    onThemeChange(newValue: boolean) {
-        this.activeTheme = newValue ? 1 : 0;
-    }
-
-    public mounted(): void {
-        this.toggleTheme(localStorage.getItem('theme') || 'light');
-    }
+    localStorage.setItem('theme', newTheme);
 }
 
+onMounted(() => {
+    toggleTheme(localStorage.getItem('theme') || 'light');
+});
+
+watch(() => theme.global.current.value.dark, newVal => {
+    activeTheme.value = newVal ? 1 : 0;
+}, { immediate: true });
 </script>
 
 <style lang="scss" scoped>
@@ -122,13 +109,5 @@ export default class ThemeSelector extends Vue {
         border: 1px solid var(--v-border-base);
         padding: 5px;
     }
-}
-
-.v-tooltip {
-    z-index: 1000;
-}
-
-.v-tooltip__content {
-    border: 1px solid var(--v-border-base);
 }
 </style>

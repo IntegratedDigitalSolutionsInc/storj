@@ -2,7 +2,9 @@
 // See LICENSE for copying information.
 
 import { HttpClient } from '@/utils/httpClient';
-import { AnalyticsErrorEventSource, AnalyticsEvent } from '@/utils/constants/analyticsEventNames';
+import { type AnalyticsErrorEventSource, AnalyticsEvent  } from '@/utils/constants/analyticsEventNames';
+import { APIError } from '@/utils/error';
+import type { UserFeedbackForm } from '@/types/analytics';
 
 /**
  * AnalyticsHttpApi is a console Analytics API.
@@ -13,13 +15,83 @@ export class AnalyticsHttpApi {
     private readonly ROOT_PATH: string = '/api/v0/analytics';
 
     /**
+     * Used to track user filled the form to join placement waitlist.
+     *
+     * @param storageNeeds - form data
+     * @param placement - the placement the form is for
+     * @param csrfProtectionToken - CSRF token
+     */
+    public async joinPlacementWaitlist(storageNeeds: string, placement: number, csrfProtectionToken: string): Promise<void> {
+        const path = `${this.ROOT_PATH}/join-placement-waitlist`;
+
+        const response = await this.http.post(path, JSON.stringify({ storageNeeds, placement }), { csrfProtectionToken });
+        if (!response.ok) {
+            const result = await response.json();
+
+            throw new APIError({
+                status: response.status,
+                message: result.error,
+                requestID: response.headers.get('x-request-id'),
+            });
+        }
+    }
+
+    /**
+     * Used to send user feedback.
+     *
+     * @param data - feedback data
+     * @param csrfProtectionToken - CSRF token
+     */
+    public async sendUserFeedback(data: UserFeedbackForm, csrfProtectionToken: string): Promise<void> {
+        const path = `${this.ROOT_PATH}/send-feedback`;
+
+        const response = await this.http.post(path, JSON.stringify(data), { csrfProtectionToken });
+        if (!response.ok) {
+            const result = await response.json();
+
+            throw new APIError({
+                status: response.status,
+                message: result.error,
+                requestID: response.headers.get('x-request-id'),
+            });
+        }
+    }
+
+    /**
+     * Used to notify the satellite about arbitrary events that occur.
+     * Throws an error if event hasn't been submitted.
+     *
+     * @param eventName - name of the event
+     * @param csrfProtectionToken - CSRF token
+     * @param props - additional properties to send with the event
+     */
+    public async ensureEventTriggered(eventName: string, csrfProtectionToken: string, props?: { [p: string]: string }): Promise<void> {
+        const path = `${this.ROOT_PATH}/event`;
+
+        const body = { eventName };
+        if (props) body['props'] = props;
+
+        const response = await this.http.post(path, JSON.stringify(body), { csrfProtectionToken });
+        if (!response.ok) {
+            const result = await response.json();
+
+            throw new APIError({
+                status: response.status,
+                message: result.error,
+                requestID: response.headers.get('x-request-id'),
+            });
+        }
+    }
+
+    /**
      * Used to notify the satellite about arbitrary events that occur.
      * Does not throw any errors so that expected UI behavior is not interrupted if the API call fails.
      *
      * @param eventName - name of the event
+     * @param csrfProtectionToken - CSRF token
      * @param props - additional properties to send with the event
      */
-    public async eventTriggered(eventName: string, props?: { [p: string]: string }): Promise<void> {
+    public async eventTriggered(eventName: string, csrfProtectionToken: string, props?: { [p: string]: string }): Promise<void> {
         try {
             const path = `${this.ROOT_PATH}/event`;
             const body = {
@@ -28,7 +100,7 @@ export class AnalyticsHttpApi {
             if (props) {
                 body['props'] = props;
             }
-            const response = await this.http.post(path, JSON.stringify(body));
+            const response = await this.http.post(path, JSON.stringify(body), { csrfProtectionToken });
             if (response.ok) {
                 return;
             }
@@ -44,15 +116,16 @@ export class AnalyticsHttpApi {
      *
      * @param eventName - name of the event
      * @param link - link that was clicked
+     * @param csrfProtectionToken - CSRF token
      */
-    public async linkEventTriggered(eventName: string, link: string): Promise<void> {
+    public async linkEventTriggered(eventName: string, link: string, csrfProtectionToken: string): Promise<void> {
         try {
             const path = `${this.ROOT_PATH}/event`;
             const body = {
                 eventName: eventName,
                 link: link,
             };
-            const response = await this.http.post(path, JSON.stringify(body));
+            const response = await this.http.post(path, JSON.stringify(body), { csrfProtectionToken });
             if (response.ok) {
                 return;
             }
@@ -67,14 +140,15 @@ export class AnalyticsHttpApi {
      * Does not throw any errors so that expected UI behavior is not interrupted if the API call fails.
      *
      * @param pageName - name of the page
+     * @param csrfProtectionToken - CSRF token
      */
-    public async pageVisit(pageName: string): Promise<void> {
+    public async pageVisit(pageName: string, csrfProtectionToken: string): Promise<void> {
         try {
             const path = `${this.ROOT_PATH}/page`;
             const body = {
                 pageName: pageName,
             };
-            const response = await this.http.post(path, JSON.stringify(body));
+            const response = await this.http.post(path, JSON.stringify(body), { csrfProtectionToken });
             if (response.ok) {
                 return;
             }
@@ -102,19 +176,22 @@ export class AnalyticsHttpApi {
      * Does not throw any errors so that expected UI behavior is not interrupted if the API call fails.
      *
      * @param source - place where event happened
+     * @param csrfProtectionToken - CSRf token
+     * @param requestID - request ID if available
+     * @param statusCode = status code if available
      */
-    public async errorEventTriggered(source: AnalyticsErrorEventSource): Promise<void> {
+    public async errorEventTriggered(source: AnalyticsErrorEventSource, csrfProtectionToken: string, requestID: string | null = null, statusCode?: number): Promise<void> {
         try {
             const path = `${this.ROOT_PATH}/event`;
             const body = {
                 eventName: AnalyticsEvent.UI_ERROR,
+                errorEventSource: source,
             };
 
-            if (source) {
-                body['errorEventSource'] = source;
-            }
+            if (requestID) body['errorEventRequestID'] = requestID;
+            if (statusCode) body['errorEventStatusCode'] = statusCode;
 
-            const response = await this.http.post(path, JSON.stringify(body));
+            const response = await this.http.post(path, JSON.stringify(body), { csrfProtectionToken });
             if (response.ok) {
                 return;
             }

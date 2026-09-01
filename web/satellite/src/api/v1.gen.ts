@@ -2,13 +2,14 @@
 // DO NOT EDIT.
 
 import { HttpClient } from '@/utils/httpClient';
-import { MemorySize, Time, UUID } from '@/types/common';
+import type { MemorySize, Time, UUID } from '@/types/common';
 
 export class APIKeyInfo {
     id: UUID;
     projectId: UUID;
     projectPublicId: UUID;
     createdBy: UUID;
+    creatorEmail: string;
     userAgent: string | null;
     name: string;
     createdAt: Time;
@@ -25,6 +26,22 @@ export class APIKeyPage {
     pageCount: number;
     currentPage: number;
     totalCount: number;
+}
+
+export class AccessPermissions {
+    allowDownload: boolean;
+    allowUpload: boolean;
+    allowList: boolean;
+    allowDelete: boolean;
+    allowPutObjectRetention?: boolean;
+    allowGetObjectRetention?: boolean;
+    allowBypassGovernanceRetention?: boolean;
+    allowPutObjectLegalHold?: boolean;
+    allowGetObjectLegalHold?: boolean;
+    allowPutBucketObjectLockConfiguration?: boolean;
+    allowGetBucketObjectLockConfiguration?: boolean;
+    allowPutBucketNotificationConfiguration?: boolean;
+    allowGetBucketNotificationConfiguration?: boolean;
 }
 
 export class BucketUsageRollup {
@@ -51,6 +68,42 @@ export class CreateAPIKeyResponse {
     keyInfo: APIKeyInfo | null;
 }
 
+export class CreateAccessRequest {
+    projectID: UUID;
+    name: string;
+    permissions: AccessPermissions;
+    buckets?: string[] | null;
+    notBefore?: Time | null;
+    notAfter?: Time | null;
+    passphrase?: string;
+}
+
+export class CreateAccessResponse {
+    name: string;
+    accessGrant: string;
+}
+
+export class CreateBucketRequest {
+    projectID: UUID;
+    name: string;
+    placement?: string;
+    objectLockEnabled?: boolean;
+    versioning?: boolean;
+    defaultRetention?: DefaultRetentionConfig | null;
+}
+
+export class CreateBucketResponse {
+    name: string;
+    createdAt: Time;
+    placement?: string;
+}
+
+export class DefaultRetentionConfig {
+    mode: string;
+    days?: number;
+    years?: number;
+}
+
 export class Project {
     id: UUID;
     publicId: UUID;
@@ -61,6 +114,7 @@ export class Project {
     maxBuckets: number | null;
     createdAt: Time;
     memberCount: number;
+    status: number | null;
     storageLimit: MemorySize | null;
     bandwidthLimit: MemorySize | null;
     userSpecifiedStorageLimit: MemorySize | null;
@@ -80,6 +134,7 @@ export class Project {
     burstLimitDelete?: number | null;
     defaultPlacement: number;
     defaultVersioning: number;
+    isClassic: boolean;
 }
 
 export class ResponseUser {
@@ -106,9 +161,10 @@ export class UpsertProjectInfo {
     bandwidthLimit: MemorySize | null;
     createdAt: Time;
     managePassphrase: boolean;
+    placement: number;
 }
 
-class APIError extends Error {
+export class APIError extends Error {
     constructor(
         public readonly msg: string,
         public readonly responseStatusCode?: number,
@@ -226,6 +282,36 @@ export class APIKeyManagementHttpApiV1 {
         const response = await this.http.delete(fullPath);
         if (response.ok) {
             return;
+        }
+        const err = await response.json();
+        throw new APIError(err.error, response.status);
+    }
+}
+
+export class BucketManagementHttpApiV1 {
+    private readonly http: HttpClient = new HttpClient();
+    private readonly ROOT_PATH: string = '/public/v1/buckets';
+
+    public async createBucket(request: CreateBucketRequest): Promise<CreateBucketResponse> {
+        const fullPath = `${this.ROOT_PATH}/`;
+        const response = await this.http.post(fullPath, JSON.stringify(request));
+        if (response.ok) {
+            return response.json().then((body) => body as CreateBucketResponse);
+        }
+        const err = await response.json();
+        throw new APIError(err.error, response.status);
+    }
+}
+
+export class AccessGrantManagementHttpApiV1 {
+    private readonly http: HttpClient = new HttpClient();
+    private readonly ROOT_PATH: string = '/public/v1/accessgrants';
+
+    public async createAccess(request: CreateAccessRequest): Promise<CreateAccessResponse> {
+        const fullPath = `${this.ROOT_PATH}/`;
+        const response = await this.http.post(fullPath, JSON.stringify(request));
+        if (response.ok) {
+            return response.json().then((body) => body as CreateAccessResponse);
         }
         const err = await response.json();
         throw new APIError(err.error, response.status);

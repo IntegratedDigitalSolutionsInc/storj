@@ -2,67 +2,93 @@
 // See LICENSE for copying information.
 
 import { defineStore } from 'pinia';
-import { computed, DeepReadonly, reactive, readonly } from 'vue';
+import { computed, reactive } from 'vue';
 
 import {
+    type AccountDeletionData,
+    type DisableMFARequest,
+    type SessionsOrderBy,
+    type SetUserSettingsData,
+    type UpdatedUser,
+    type UsersApi,
     ACCOUNT_SETUP_STEPS,
-    AccountDeletionData,
-    DisableMFARequest,
     OnboardingStep,
     SessionsCursor,
-    SessionsOrderBy,
     SessionsPage,
-    SetUserSettingsData,
-    UpdatedUser,
     User,
-    UsersApi,
     UserSettings,
 } from '@/types/users';
 import { AuthHttpApi } from '@/api/auth';
 import { useConfigStore } from '@/store/modules/configStore';
-import { ChangeEmailStep, DeleteAccountStep } from '@/types/accountActions';
-import { SortDirection } from '@/types/common';
+import type { ChangeEmailStep, DeleteAccountStep } from '@/types/accountActions';
+import type { SortDirection } from '@/types/common';
 import { DEFAULT_PAGE_LIMIT } from '@/types/pagination';
-
-export const DEFAULT_USER_SETTINGS = readonly(new UserSettings());
+import { AuthManagementHttpApiV1 } from '@/api/private.gen';
 
 export class UsersState {
     public user: User = new User();
-    public settings: DeepReadonly<UserSettings> = DEFAULT_USER_SETTINGS;
+    public settings: UserSettings = new UserSettings();
     public userMFASecret = '';
     public userMFARecoveryCodes: string[] = [];
     public sessionsCursor: SessionsCursor = new SessionsCursor();
     public sessionsPage: SessionsPage = new SessionsPage();
+    public badPasswords: Set<string> = new Set();
 }
 
 export const useUsersStore = defineStore('users', () => {
     const state = reactive<UsersState>(new UsersState());
 
+    const configStore = useConfigStore();
+    const csrfToken = computed<string>(() => configStore.state.config.csrfToken);
+    const useGeneratedAPI = computed<boolean>(() => configStore.state.config.useGeneratedPrivateAPI);
+
     const userName = computed(() => {
         return state.user.getFullName();
     });
 
-    const shouldOnboard = computed(() => {
-        return !state.settings.onboardingStart || (state.settings.onboardingStart && !state.settings.onboardingEnd);
-    });
-
     const noticeDismissal = computed(() => state.settings.noticeDismissal);
 
+    /**
+     * isLegacyPricingUserAgent reports whether the user's partner is in the legacy-pricing carve-out.
+     * This mirrors the agent-only backend isLegacyPricingUserAgent check for legacy minimum charge.
+     */
+    const isLegacyPricingUserAgent = computed<boolean>(() => {
+        const agents = configStore.state.config.legacyPricingUserAgents;
+        return !!state.user.partner && !!agents?.includes(state.user.partner);
+    });
+
+    /**
+     * isLegacyPricingUser reports whether the user keeps legacy placement pricing/details: their user
+     * agent matches AND they signed up before the new-pricing effective date. This mirrors the backend
+     * isLegacyPricingUser.
+     */
+    const isLegacyPricingUser = computed<boolean>(() => {
+        if (!isLegacyPricingUserAgent.value) return false;
+        const effective = configStore.state.config.newPricingEffectiveDate;
+        const createdAt = state.user.createdAt;
+        return !!effective && !!createdAt && createdAt < new Date(effective);
+    });
+
     const api: UsersApi = new AuthHttpApi();
+    const generatedAPI = new AuthManagementHttpApiV1();
 
     async function updateUser(userInfo: UpdatedUser): Promise<void> {
-        await api.update(userInfo);
+        await api.update(userInfo, csrfToken.value);
 
         state.user.fullName = userInfo.fullName;
         state.user.shortName = userInfo.shortName;
     }
 
     async function changeEmail(step: ChangeEmailStep, data: string): Promise<void> {
-        await api.changeEmail(step, data);
+        await api.changeEmail(step, data, csrfToken.value);
+    }
+
+    async function getBadPasswords(): Promise<void> {
+        state.badPasswords = await api.getBadPasswords();
     }
 
     async function deleteAccount(step: DeleteAccountStep, data: string): Promise<AccountDeletionData | null> {
-        return await api.deleteAccount(step, data);
+        return await api.deleteAccount(step, data, csrfToken.value);
     }
 
     async function getSessions(pageNumber: number, limit = DEFAULT_PAGE_LIMIT): Promise<SessionsPage> {
@@ -77,7 +103,7 @@ export const useUsersStore = defineStore('users', () => {
     }
 
     async function invalidateSession(sessionID: string): Promise<void> {
-        await api.invalidateSession(sessionID);
+        await api.invalidateSession(sessionID, csrfToken.value);
     }
 
     function setSessionsSortingBy(order: SessionsOrderBy): void {
@@ -88,19 +114,25 @@ export const useUsersStore = defineStore('users', () => {
         state.sessionsCursor.orderDirection = direction;
     }
 
-    async function getUser(): Promise<void> {
+    async function getUser(): Promise<User> {
         const configStore = useConfigStore();
 
-        const user = await api.get();
-        user.freezeStatus = await api.getFrozenStatus();
+        let user: User;
+        if (useGeneratedAPI.value) {
+            user = User.fromUserAccount(await generatedAPI.getUserAccount());
+        } else {
+            user = await api.get();
+        }
         user.projectLimit ||= configStore.state.config.defaultProjectLimit;
 
-        setUser(user);
+        state.user = user;
+
+        return user;
     }
 
     function getShouldPromptPassphrase(isProjectOwner: boolean): boolean {
         const settings = state.settings;
-        const step = settings.onboardingStep as OnboardingStep || OnboardingStep.AccountTypeSelection;
+        const step = settings.onboardingStep as OnboardingStep || OnboardingStep.AccountInfo;
         if (!settings.passphrasePrompt) {
             return false;
         }
@@ -114,22 +146,22 @@ export const useUsersStore = defineStore('users', () => {
     }
 
     async function disableUserMFA(request: DisableMFARequest): Promise<void> {
-        await api.disableUserMFA(request.passcode, request.recoveryCode);
+        await api.disableUserMFA(request.passcode, request.recoveryCode, csrfToken.value);
     }
 
     async function enableUserMFA(passcode: string): Promise<void> {
-        const recoveryCodes = await api.enableUserMFA(passcode);
+        const recoveryCodes = await api.enableUserMFA(passcode, csrfToken.value);
 
         state.userMFARecoveryCodes = recoveryCodes;
         state.user.mfaRecoveryCodeCount = recoveryCodes.length;
     }
 
     async function generateUserMFASecret(): Promise<void> {
-        state.userMFASecret = await api.generateUserMFASecret();
+        state.userMFASecret = await api.generateUserMFASecret(csrfToken.value);
     }
 
     async function regenerateUserMFARecoveryCodes(code: { recoveryCode?: string, passcode?: string }): Promise<void> {
-        const codes = await api.regenerateUserMFARecoveryCodes(code.passcode, code.recoveryCode);
+        const codes = await api.regenerateUserMFARecoveryCodes(csrfToken.value, code.passcode, code.recoveryCode);
 
         state.userMFARecoveryCodes = codes;
         state.user.mfaRecoveryCodeCount = codes.length;
@@ -144,11 +176,7 @@ export const useUsersStore = defineStore('users', () => {
     }
 
     async function updateSettings(update: SetUserSettingsData): Promise<void> {
-        state.settings = await api.updateSettings(update);
-    }
-
-    function setUser(user: User): void {
-        state.user = user;
+        state.settings = await api.updateSettings(update, csrfToken.value);
     }
 
     async function requestProjectLimitIncrease(limit: string): Promise<void> {
@@ -160,7 +188,7 @@ export const useUsersStore = defineStore('users', () => {
 
     function clear() {
         state.user = new User();
-        state.settings = DEFAULT_USER_SETTINGS;
+        state.settings = new UserSettings();
         state.userMFASecret = '';
         state.userMFARecoveryCodes = [];
     }
@@ -168,8 +196,9 @@ export const useUsersStore = defineStore('users', () => {
     return {
         state,
         userName,
-        shouldOnboard,
         noticeDismissal,
+        isLegacyPricingUserAgent,
+        isLegacyPricingUser,
         invalidateSession,
         getSessions,
         setSessionsSortingBy,
@@ -185,9 +214,9 @@ export const useUsersStore = defineStore('users', () => {
         getShouldPromptPassphrase,
         clear,
         login,
-        setUser,
         updateSettings,
         getSettings,
         requestProjectLimitIncrease,
+        getBadPasswords,
     };
 });

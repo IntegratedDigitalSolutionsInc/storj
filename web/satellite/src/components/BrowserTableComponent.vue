@@ -2,140 +2,121 @@
 // See LICENSE for copying information.
 
 <template>
-    <v-card>
-        <v-text-field
-            v-if="!isAltPagination"
-            v-model="search"
-            label="Search"
-            :prepend-inner-icon="Search"
-            single-line
-            variant="solo-filled"
-            flat
-            hide-details
-            clearable
-            density="comfortable"
-            rounded="lg"
-            class="mx-2 mt-2"
-            @update:modelValue="analyticsStore.eventTriggered(AnalyticsEvent.SEARCH_BUCKETS)"
-        />
+    <v-text-field
+        v-model="search"
+        label="Search"
+        :prepend-inner-icon="Search"
+        single-line
+        variant="solo-filled"
+        flat
+        hide-details
+        clearable
+        density="comfortable"
+        class="mb-5"
+    />
 
-        <v-data-table-server
-            v-model="selectedFiles"
-            v-model:options="options"
-            :sort-by="sortBy"
-            :headers="headers"
-            :items="isAltPagination ? allFiles : tableFiles"
-            :search="search"
-            :item-value="(item: BrowserObjectWrapper) => item.browserObject.path + item.browserObject.Key"
-            :page="cursor.page"
-            hover
-            :must-sort="!isAltPagination"
-            :disable-sort="isAltPagination"
-            select-strategy="page"
-            show-select
-            :loading="isFetching || loading"
-            :items-length="isAltPagination ? cursor.limit : totalObjectCount"
-            :items-per-page-options="isAltPagination ? [] : tableSizeOptions(totalObjectCount, true)"
-            @update:page="onPageChange"
-            @update:itemsPerPage="onLimitChange"
-        >
-            <template #no-data>
-                <p class="text-body-2 cursor-pointer py-14 rounded-xlg my-4" @click="emit('uploadClick')">
-                    {{ search ? 'No data found' : 'Drag and drop objects or folders here, or click to upload objects.' }}
-                </p>
-            </template>
-            <template #item="{ index, props: rowProps }">
-                <v-data-table-row v-bind="rowProps">
-                    <template #item.name="{ item }">
-                        <v-btn
-                            class="rounded-lg w-100 px-1 ml-n1 justify-start font-weight-bold"
-                            variant="text"
-                            height="40"
-                            color="default"
-                            block
-                            :disabled="filesBeingDeleted.has((item as BrowserObjectWrapper).browserObject.path + (item as BrowserObjectWrapper).browserObject.Key)"
-                            @click="onFileClick((item as BrowserObjectWrapper).browserObject)"
-                        >
-                            <img :src="(item as BrowserObjectWrapper).typeInfo.icon" :alt="(item as BrowserObjectWrapper).typeInfo.title + 'icon'" class="mr-3">
-                            <v-tooltip
-                                v-if="index === 0 && !fileGuideDismissed"
-                                :model-value="true"
-                                persistent
-                                no-click-animation
-                                location="bottom"
-                                class="browser-table__file-guide"
-                                content-class="py-2"
-                                @update:model-value="() => {}"
-                            >
-                                Click on the object name to preview.
-                                <template #activator="{ props: activatorProps }">
-                                    <span v-bind="activatorProps">{{ (item as BrowserObjectWrapper).browserObject.Key }}</span>
-                                </template>
-                            </v-tooltip>
-                            <template v-else>{{ (item as BrowserObjectWrapper).browserObject.Key }}</template>
-                        </v-btn>
-                    </template>
+    <v-data-table-server
+        v-model="selectedFiles"
+        v-model:options="options"
+        :sort-by="sortBy"
+        :headers="headers"
+        :items="filteredFiles"
+        :item-value="(item: BrowserObjectWrapper) => item.browserObject.path + item.browserObject.Key"
+        :page="cursor.page"
+        hover
+        select-strategy="page"
+        show-select
+        :loading="isFetching || loading"
+        :items-length="cursor.limit"
+        elevation="1"
+        @update:items-per-page="onLimitChange"
+        @update:sort-by="onSortByChange"
+    >
+        <template #no-data>
+            <p class="text-body-medium cursor-pointer py-14 rounded-xlg my-4" @click="emit('uploadClick')">
+                {{ search ? 'No data found' : 'Drag and drop files or folders here, or click to upload files.' }}
+            </p>
+        </template>
+        <template #item="{ props: rowProps }">
+            <v-data-table-row v-bind="rowProps">
+                <template #item.name="{ item }">
+                    <v-btn
+                        class="rounded-lg w-100 pl-1 pr-3 ml-n1 justify-start font-weight-bold"
+                        variant="text"
+                        height="40"
+                        color="default"
+                        block
+                        :disabled="filesBeingDeleted.has((item as BrowserObjectWrapper).browserObject.path + (item as BrowserObjectWrapper).browserObject.Key)"
+                        @click="onFileClick((item as BrowserObjectWrapper).browserObject)"
+                    >
+                        <img :src="(item as BrowserObjectWrapper).typeInfo.icon" :alt="(item as BrowserObjectWrapper).typeInfo.title + 'icon'" class="mr-3">
+                        {{ (item as BrowserObjectWrapper).browserObject.Key }}
+                    </v-btn>
+                </template>
 
-                    <template #item.type="{ item }">
-                        {{ (item as BrowserObjectWrapper).typeInfo.title }}
-                    </template>
+                <template #item.type="{ item }">
+                    {{ (item as BrowserObjectWrapper).typeInfo.title }}
+                </template>
 
-                    <template #item.size="{ item }">
-                        <span class="text-no-wrap">{{ getFormattedSize((item as BrowserObjectWrapper).browserObject) }}</span>
-                    </template>
+                <template #item.size="{ item }">
+                    <span class="text-no-wrap">{{ getFormattedSize((item as BrowserObjectWrapper).browserObject) }}</span>
+                </template>
 
-                    <template #item.date="{ item }">
-                        <span class="text-no-wrap">{{ getFormattedDate((item as BrowserObjectWrapper).browserObject) }}</span>
-                    </template>
+                <template #item.date="{ item }">
+                    <span class="text-no-wrap">{{ getFormattedDate((item as BrowserObjectWrapper).browserObject) }}</span>
+                </template>
 
-                    <template #item.actions="{ item }">
-                        <browser-row-actions
-                            :deleting="filesBeingDeleted.has((item as BrowserObjectWrapper).browserObject.path + (item as BrowserObjectWrapper).browserObject.Key)"
-                            :file="(item as BrowserObjectWrapper).browserObject"
-                            align="right"
-                            @preview-click="onFileClick((item as BrowserObjectWrapper).browserObject)"
-                            @delete-file-click="onDeleteFileClick((item as BrowserObjectWrapper).browserObject)"
-                            @share-click="onShareClick((item as BrowserObjectWrapper).browserObject)"
-                            @lock-object-click="onLockObjectClick((item as BrowserObjectWrapper).browserObject)"
-                            @legal-hold-click="onLegalHoldClick((item as BrowserObjectWrapper).browserObject)"
-                            @locked-object-delete="(fullObject) => onLockedObjectDelete(fullObject)"
+                <template #item.actions="{ item }">
+                    <browser-row-actions
+                        :deleting="filesBeingDeleted.has((item as BrowserObjectWrapper).browserObject.path + (item as BrowserObjectWrapper).browserObject.Key)"
+                        :file="(item as BrowserObjectWrapper).browserObject"
+                        align="right"
+                        @preview-click="onFileClick((item as BrowserObjectWrapper).browserObject)"
+                        @delete-file-click="onDeleteFileClick((item as BrowserObjectWrapper).browserObject)"
+                        @share-click="onShareClick((item as BrowserObjectWrapper).browserObject)"
+                        @lock-object-click="onLockObjectClick((item as BrowserObjectWrapper).browserObject)"
+                        @legal-hold-click="onLegalHoldClick((item as BrowserObjectWrapper).browserObject)"
+                        @locked-object-delete="(fullObject) => onLockedObjectDelete(fullObject)"
+                        @download-folder-click="onDownloadFolder((item as BrowserObjectWrapper).browserObject)"
+                    />
+                </template>
+            </v-data-table-row>
+        </template>
+
+        <template #bottom>
+            <div class="v-data-table-footer">
+                <v-row justify="end" align="center" class="pa-2">
+                    <v-col cols="auto">
+                        <span class="caption">Items per page:</span>
+                    </v-col>
+                    <v-col cols="auto">
+                        <v-select
+                            :model-value="cursor.limit"
+                            density="compact"
+                            :items="pageSizes"
+                            variant="outlined"
+                            hide-details
+                            @update:model-value="onLimitChange"
                         />
-                    </template>
-                </v-data-table-row>
-            </template>
+                    </v-col>
+                    <v-col cols="auto">
+                        <span class="text-body-medium">{{ pageDisplayText }}</span>
+                    </v-col>
+                    <v-col cols="auto">
+                        <v-btn-group density="compact">
+                            <v-btn :disabled="cursor.page <= 1" :icon="ChevronLeft" @click="onPreviousPageClick" />
+                            <v-btn :disabled="!hasNextPage" :icon="ChevronRight" @click="onNextPageClick" />
+                        </v-btn-group>
+                    </v-col>
+                </v-row>
+            </div>
+        </template>
+    </v-data-table-server>
 
-            <template v-if="isAltPagination" #bottom>
-                <div class="v-data-table-footer">
-                    <v-row justify="end" align="center" class="pa-2">
-                        <v-col cols="auto">
-                            <span class="caption">Items per page:</span>
-                        </v-col>
-                        <v-col cols="auto">
-                            <v-select
-                                :model-value="cursor.limit"
-                                density="compact"
-                                :items="pageSizes"
-                                variant="outlined"
-                                hide-details
-                                @update:model-value="onLimitChange"
-                            />
-                        </v-col>
-                        <v-col cols="auto">
-                            <v-btn-group density="compact">
-                                <v-btn :disabled="cursor.page <= 1" :icon="ChevronLeft" @click="onPreviousPageClick" />
-                                <v-btn :disabled="!hasNextPage" :icon="ChevronRight" @click="onNextPageClick" />
-                            </v-btn-group>
-                        </v-col>
-                    </v-row>
-                </div>
-            </template>
-        </v-data-table-server>
-
-        <file-preview-dialog
-            v-model="previewDialog"
-            v-model:current-file="fileToPreview"
-        />
-    </v-card>
+    <file-preview-dialog
+        v-model="previewDialog"
+        v-model:current-file="fileToPreview"
+    />
 
     <v-snackbar
         rounded="lg"
@@ -179,12 +160,6 @@
         :files="filesToDelete"
         @content-removed="fileToDelete = null"
     />
-    <share-dialog
-        v-model="isShareDialogShown"
-        :bucket-name="bucketName"
-        :file="fileToShare || undefined"
-        @content-removed="fileToShare = null"
-    />
     <lock-object-dialog
         v-model="isLockDialogShown"
         :file="lockActionFile"
@@ -200,15 +175,29 @@
         :file="lockActionFile"
         @content-removed="lockActionFile = null"
     />
+    <template v-if="configStore.isDefaultBrand">
+        <share-dialog
+            v-model="isShareDialogShown"
+            :bucket-name="bucketName"
+            :file="fileToShare || undefined"
+            @content-removed="fileToShare = null"
+        />
+        <download-prefix-dialog
+            v-if="downloadPrefixEnabled"
+            v-model="isDownloadPrefixDialogShown"
+            :prefix-type="DownloadPrefixType.Folder"
+            :bucket="bucketName"
+            :prefix="folderToDownload"
+        />
+    </template>
 </template>
 
 <script setup lang="ts">
-import { computed, ref, watch, WritableComputedRef } from 'vue';
+import { type WritableComputedRef, computed, ref, watch  } from 'vue';
 import { useRouter } from 'vue-router';
 import {
     VBtn,
     VBtnGroup,
-    VCard,
     VCol,
     VDataTableRow,
     VDataTableServer,
@@ -216,32 +205,38 @@ import {
     VSelect,
     VSnackbar,
     VTextField,
-    VTooltip,
 } from 'vuetify/components';
-import { ChevronLeft, ChevronRight, Search, Trash2 } from 'lucide-vue-next';
+import { ChevronLeft, ChevronRight, Search, Trash2 } from '@lucide/vue';
 
 import {
-    BrowserObject,
-    FullBrowserObject,
-    MAX_KEY_COUNT,
-    ObjectBrowserCursor,
+    type BrowserObject,
+    type FullBrowserObject,
+    type ObjectBrowserCursor,
     useObjectBrowserStore,
 } from '@/store/modules/objectBrowserStore';
 import { useProjectsStore } from '@/store/modules/projectsStore';
-import { useNotify } from '@/utils/hooks';
+import { useNotify } from '@/composables/useNotify';
 import { Size } from '@/utils/bytesSize';
 import { AnalyticsErrorEventSource, AnalyticsEvent } from '@/utils/constants/analyticsEventNames';
 import { useBucketsStore } from '@/store/modules/bucketsStore';
-import { DataTableHeader, SortItem, tableSizeOptions } from '@/types/common';
-import { BrowserObjectTypeInfo, BrowserObjectWrapper, EXTENSION_INFOS, FILE_INFO, FOLDER_INFO } from '@/types/browser';
+import type { DataTableHeader, SortItem } from '@/types/common';
+import {
+    type BrowserObjectTypeInfo,
+    type BrowserObjectWrapper,
+    DownloadPrefixType,
+    EXTENSION_INFOS,
+    FILE_INFO,
+    FOLDER_INFO,
+} from '@/types/browser';
 import { useAnalyticsStore } from '@/store/modules/analyticsStore';
-import { useUsersStore } from '@/store/modules/usersStore';
 import { ROUTES } from '@/router';
 import { Time } from '@/utils/time';
-import { BucketMetadata } from '@/types/buckets';
+import type { BucketMetadata } from '@/types/buckets';
 import { DEFAULT_PAGE_LIMIT } from '@/types/pagination';
 import { Versioning } from '@/types/versioning';
 import { usePreCheck } from '@/composables/usePreCheck';
+import { useConfigStore } from '@/store/modules/configStore';
+import { useLoading } from '@/composables/useLoading';
 
 import BrowserRowActions from '@/components/BrowserRowActions.vue';
 import FilePreviewDialog from '@/components/dialogs/FilePreviewDialog.vue';
@@ -251,8 +246,9 @@ import DeleteVersionedFileDialog from '@/components/dialogs/DeleteVersionedFileD
 import LockObjectDialog from '@/components/dialogs/LockObjectDialog.vue';
 import LockedDeleteErrorDialog from '@/components/dialogs/LockedDeleteErrorDialog.vue';
 import LegalHoldObjectDialog from '@/components/dialogs/LegalHoldObjectDialog.vue';
+import DownloadPrefixDialog from '@/components/dialogs/DownloadPrefixDialog.vue';
 
-type SortKey = 'name' | 'type' | 'size' | 'date';
+type SortKey = 'name' | 'size' | 'date';
 
 type TableOptions = {
     page: number;
@@ -277,11 +273,12 @@ const analyticsStore = useAnalyticsStore();
 const obStore = useObjectBrowserStore();
 const projectsStore = useProjectsStore();
 const bucketsStore = useBucketsStore();
-const userStore = useUsersStore();
+const configStore = useConfigStore();
 
 const notify = useNotify();
 const router = useRouter();
 const { withTrialCheck } = usePreCheck();
+const { withLoading } = useLoading();
 
 const isFetching = ref<boolean>(false);
 const search = ref<string>('');
@@ -296,26 +293,25 @@ const isShareDialogShown = ref<boolean>(false);
 const isLockDialogShown = ref<boolean>(false);
 const isLegalHoldDialogShown = ref<boolean>(false);
 const isLockedObjectDeleteDialogShown = ref<boolean>(false);
-const routePageCache = new Map<string, number>();
+const isDownloadPrefixDialogShown = ref<boolean>(false);
+const folderToDownload = ref<string>('');
+const searchTimer = ref<NodeJS.Timeout>();
 
-const pageSizes = [DEFAULT_PAGE_LIMIT, 25, 50, 100];
-const sortBy: SortItem[] = [{ key: 'name', order: 'asc' }];
-const collator = new Intl.Collator('en', { sensitivity: 'case' });
+const pageSizes = [DEFAULT_PAGE_LIMIT, 25, 50, 100, 500];
 
-/**
- * Indicates if alternative pagination should be used.
- */
-const isAltPagination = computed(() => obStore.isAltPagination);
+const sortBy = computed<SortItem[]>(() => [{ key: obStore.state.headingSorted, order: obStore.state.orderBy }]);
+
+const downloadPrefixEnabled = computed<boolean>(() => configStore.state.config.downloadPrefixEnabled);
 
 /**
  * Returns table headers.
  */
 const headers = computed<DataTableHeader[]>(() => {
     return [
-        { title: 'Name', align: 'start', key: 'name', sortable: !isAltPagination.value },
-        { title: 'Type', key: 'type', sortable: !isAltPagination.value },
-        { title: 'Size', key: 'size', sortable: !isAltPagination.value },
-        { title: 'Date', key: 'date', sortable: !isAltPagination.value },
+        { title: 'Name', align: 'start', key: 'name', sortable: true },
+        { title: 'Type', key: 'type', sortable: false },
+        { title: 'Size', key: 'size', sortable: true },
+        { title: 'Date', key: 'date', sortable: true },
         { title: '', key: 'actions', sortable: false, width: 0 },
     ];
 });
@@ -331,19 +327,9 @@ const bucketName = computed<string>(() => bucketsStore.state.fileComponentBucket
 const filePath = computed<string>(() => bucketsStore.state.fileComponentPath);
 
 /**
- * Returns whether the file guide is permanently dismissed.
- */
-const fileGuideDismissed = computed(() => userStore.noticeDismissal.fileGuide);
-
-/**
  * Returns files being deleted from store.
  */
 const filesBeingDeleted = computed((): Set<string> => obStore.state.filesToBeDeleted);
-
-/**
- * Returns total object count from store.
- */
-const totalObjectCount = computed<number>(() => obStore.state.totalObjectCount);
 
 /**
  * Returns table cursor from store.
@@ -351,12 +337,19 @@ const totalObjectCount = computed<number>(() => obStore.state.totalObjectCount);
 const cursor = computed<ObjectBrowserCursor>(() => obStore.state.cursor);
 
 /**
- * Indicates if alternative pagination has next page.
+ * Check if we have a token for the next page.
  */
-const hasNextPage = computed<boolean>(() => {
-    const nextToken = obStore.state.continuationTokens.get(cursor.value.page + 1);
+const hasNextPage = computed<boolean>(() => obStore.state.pageTokens[cursor.value.page] !== undefined);
 
-    return nextToken !== undefined;
+/**
+ * Returns the page display text for simplified pagination (e.g., "Page 2 of 2+").
+ */
+const pageDisplayText = computed<string>(() => {
+    const currentPage = cursor.value.page;
+    const knownPages = obStore.state.pageTokens.length;
+    const hasMore = hasNextPage.value;
+
+    return `Page ${currentPage} of ${knownPages}${hasMore ? '+' : ''}`;
 });
 
 /**
@@ -372,9 +365,7 @@ const isBucketVersioned = computed<boolean>(() => {
 const allFiles = computed<BrowserObjectWrapper[]>(() => {
     if (props.forceEmpty) return [];
 
-    const objects = isAltPagination.value ? obStore.sortedFiles : obStore.displayedObjects;
-
-    return objects.map<BrowserObjectWrapper>(file => {
+    return obStore.sortedFiles.map<BrowserObjectWrapper>(file => {
         const { name, ext, typeInfo } = getFileInfo(file);
         return {
             browserObject: file,
@@ -386,52 +377,15 @@ const allFiles = computed<BrowserObjectWrapper[]>(() => {
 });
 
 /**
- * Returns every file under the current path that matches the search query.
+ * Returns files filtered by the current search term.
  */
 const filteredFiles = computed<BrowserObjectWrapper[]>(() => {
-    if (isAltPagination.value) return [];
     if (!search.value) return allFiles.value;
-    const searchLower = search.value.toLowerCase();
-    return allFiles.value.filter(file => file.lowerName.includes(searchLower));
-});
-
-/**
- * Returns the files to be displayed in the table.
- */
-const tableFiles = computed<BrowserObjectWrapper[]>(() => {
-    const opts = options.value;
-    if (!opts || isAltPagination.value) return [];
-
-    const files = [...filteredFiles.value];
-
-    if (opts.sortBy.length) {
-        const sortBy = opts.sortBy[0];
-
-        type CompareFunc = (a: BrowserObjectWrapper, b: BrowserObjectWrapper) => number;
-        const compareFuncs: Record<SortKey, CompareFunc> = {
-            name: (a, b) => collator.compare(a.browserObject.Key, b.browserObject.Key),
-            type: (a, b) => collator.compare(a.typeInfo.title, b.typeInfo.title) || collator.compare(a.ext, b.ext),
-            size: (a, b) => a.browserObject.Size - b.browserObject.Size,
-            date: (a, b) => a.browserObject.LastModified.getTime() - b.browserObject.LastModified.getTime(),
-        };
-
-        files.sort((a, b) => {
-            const objA = a.browserObject, objB = b.browserObject;
-            if (sortBy.key !== 'type') {
-                if (objA.type === 'folder') {
-                    if (objB.type !== 'folder') return -1;
-                    if (sortBy.key === 'size' || sortBy.key === 'date') return 0;
-                } else if (objB.type === 'folder') {
-                    return 1;
-                }
-            }
-
-            const cmp = compareFuncs[sortBy.key](a, b);
-            return sortBy.order === 'asc' ? cmp : -cmp;
-        });
-    }
-
-    return files;
+    const query = search.value.toLowerCase();
+    return allFiles.value.filter(f =>
+        f.browserObject.Key.toLowerCase().includes(query) ||
+        f.typeInfo.title.toLowerCase().includes(query),
+    );
 });
 
 /**
@@ -461,6 +415,16 @@ const filesToDelete = computed<BrowserObject[]>(() => {
 });
 
 /**
+ * Handles download bucket action.
+ */
+function onDownloadFolder(object: BrowserObject): void {
+    withTrialCheck(() => {
+        folderToDownload.value = `${object.path ?? ''}${object.Key}`;
+        isDownloadPrefixDialogShown.value = true;
+    });
+}
+
+/**
  * Handles previous page click for alternative pagination.
  */
 function onPreviousPageClick(): void {
@@ -475,45 +439,21 @@ function onNextPageClick(): void {
 }
 
 /**
- * Handles page change event.
- */
-function onPageChange(page: number): void {
-    if (isAltPagination.value) return;
-
-    obStore.updateSelectedFiles([]);
-    const path = filePath.value ? filePath.value + '/' : '';
-    routePageCache.set(path, page);
-    obStore.setCursor({ page, limit: cursor.value.limit });
-
-    const lastObjectOnPage = page * cursor.value.limit;
-    const activeRange = obStore.state.activeObjectsRange;
-
-    if (lastObjectOnPage > activeRange.start && lastObjectOnPage <= activeRange.end) {
-        return;
-    }
-
-    const tokenKey = Math.ceil(lastObjectOnPage / MAX_KEY_COUNT) * MAX_KEY_COUNT;
-
-    const tokenToBeFetched = obStore.state.continuationTokens.get(tokenKey);
-    if (!tokenToBeFetched) {
-        obStore.initList(path);
-        return;
-    }
-
-    obStore.listByToken(path, tokenKey, tokenToBeFetched);
-}
-
-/**
  * Handles items per page change event.
  */
 function onLimitChange(newLimit: number): void {
-    if (isAltPagination.value) {
-        obStore.setCursor({ page: 1, limit: newLimit });
-        obStore.clearTokens();
-        fetchFiles();
-    } else {
-        obStore.setCursor({ page: options.value?.page ?? 1, limit: newLimit });
+    obStore.setCursor({ page: 1, limit: newLimit });
+    obStore.clearPageTokens();
+    fetchFiles();
+}
+
+function onSortByChange(val: SortItem[]): void {
+    if (!val.length) {
+        obStore.setSort('name', 'asc');
+        return;
     }
+
+    obStore.setSort(val[0].key as SortKey, val[0].order as 'asc' | 'desc');
 }
 
 /**
@@ -554,23 +494,28 @@ function getFileInfo(file: BrowserObject): { name: string; ext: string; typeInfo
  * Handles file click.
  */
 function onFileClick(file: BrowserObject): void {
+    if (props.loading || isFetching.value) return;
+
     withTrialCheck(() => {
-        if (!file.type) return;
+        withLoading(async () => {
+            if (!file.type) return;
 
-        if (file.type === 'folder') {
-            const uriParts = [file.Key];
-            if (filePath.value) {
-                uriParts.unshift(...filePath.value.split('/'));
+            if (file.type === 'folder') {
+                const uriParts = [file.Key];
+                if (filePath.value) {
+                    uriParts.unshift(...filePath.value.split('/'));
+                }
+                const pathAndKey = uriParts.map(part => encodeURIComponent(part)).join('/');
+                await router.push(`${ROUTES.Projects.path}/${projectsStore.state.selectedProject.urlId}/${ROUTES.Buckets.path}/${bucketName.value}/${pathAndKey}`);
+                return;
             }
-            const pathAndKey = uriParts.map(part => encodeURIComponent(part)).join('/');
-            router.push(`${ROUTES.Projects.path}/${projectsStore.state.selectedProject.urlId}/${ROUTES.Buckets.path}/${bucketName.value}/${pathAndKey}`);
-            return;
-        }
 
-        obStore.setObjectPathForModal((file.path ?? '') + file.Key);
-        fileToPreview.value = file;
-        previewDialog.value = true;
-        dismissFileGuide();
+            obStore.setObjectPathForModal((file.path ?? '') + file.Key);
+            fileToPreview.value = file;
+            previewDialog.value = true;
+
+            analyticsStore.eventTriggered(AnalyticsEvent.GALLERY_VIEW_CLICKED);
+        });
     });
 }
 
@@ -587,21 +532,8 @@ async function fetchFiles(page = 1, saveNextToken = true): Promise<void> {
     try {
         const path = filePath.value ? filePath.value + '/' : '';
 
-        if (isAltPagination.value) {
-            await obStore.listCustom(path, page, saveNextToken);
-            selectedFiles.value = [];
-        } else {
-            await obStore.initList(path);
-
-            selectedFiles.value = [];
-
-            const cachedPage = routePageCache.get(path);
-            if (cachedPage !== undefined) {
-                obStore.setCursor({ limit: cursor.value.limit, page: cachedPage });
-            } else {
-                obStore.setCursor({ limit: cursor.value.limit, page: 1 });
-            }
-        }
+        await obStore.listSimplified(path, page, saveNextToken);
+        selectedFiles.value = [];
     } catch (err) {
         err.message = `Error fetching objects. ${err.message}`;
         notify.notifyError(err, AnalyticsErrorEventSource.FILE_BROWSER_LIST_CALL);
@@ -656,16 +588,6 @@ function onLockedObjectDelete(file: FullBrowserObject): void {
     isLockedObjectDeleteDialogShown.value = true;
 }
 
-async function dismissFileGuide() {
-    try {
-        const noticeDismissal = { ...userStore.state.settings.noticeDismissal };
-        noticeDismissal.fileGuide = true;
-        await userStore.updateSettings({ noticeDismissal });
-    } catch (error) {
-        notify.notifyError(error, AnalyticsErrorEventSource.FILE_BROWSER);
-    }
-}
-
 obStore.$onAction(({ name, after }) => {
     if (name === 'filesDeleted') {
         after((_) => {
@@ -678,22 +600,23 @@ obStore.$onAction(({ name, after }) => {
 
 watch(filePath, () => {
     obStore.clearTokens();
+    obStore.clearPageTokens();
     fetchFiles();
 }, { immediate: true });
+
 watch(() => props.forceEmpty, v => !v && fetchFiles());
+
+watch(() => search.value, () => {
+    clearTimeout(searchTimer.value);
+
+    searchTimer.value = setTimeout(() => {
+        analyticsStore.eventTriggered(AnalyticsEvent.SEARCH_BUCKETS);
+    }, 500); // 500ms delay for every new call.
+});
+
+defineExpose({
+    refresh: async () => {
+        await fetchFiles(cursor.value.page);
+    },
+});
 </script>
-
-<style scoped lang="scss">
-.browser-table {
-
-    &__loader-overlay :deep(.v-overlay__scrim) {
-        opacity: 1;
-        bottom: 0.8px;
-    }
-
-    &__file-guide :deep(.v-overlay__content) {
-        color: var(--c-white) !important;
-        background-color: rgb(var(--v-theme-primary)) !important;
-    }
-}
-</style>

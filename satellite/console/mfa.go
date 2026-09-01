@@ -12,6 +12,8 @@ import (
 	"github.com/pquerna/otp"
 	"github.com/pquerna/otp/totp"
 	"github.com/zeebo/errs"
+
+	"storj.io/storj/private/post"
 )
 
 const (
@@ -89,6 +91,10 @@ func NewMFASecretKey() (string, error) {
 func (s *Service) EnableUserMFA(ctx context.Context, passcode string, t time.Time) (err error) {
 	defer mon.Task()(&ctx)(&err)
 
+	if s.config.AuthMigrationModeEnabled {
+		return ErrForbidden.New("this feature is temporarily unavailable during authentication system migration")
+	}
+
 	user, err := s.getUserAndAuditLog(ctx, "enable MFA")
 	if err != nil {
 		return Error.Wrap(err)
@@ -114,12 +120,22 @@ func (s *Service) EnableUserMFA(ctx context.Context, passcode string, t time.Tim
 		return Error.Wrap(err)
 	}
 
+	s.mailService.SendRenderedAsync(
+		ctx,
+		[]post.Address{{Address: user.Email, Name: user.FullName}},
+		&MFAActivatedEmail{},
+	)
+
 	return nil
 }
 
 // DisableUserMFA disables multi-factor authentication for the user if the given secret key and password are valid.
 func (s *Service) DisableUserMFA(ctx context.Context, passcode string, t time.Time, recoveryCode string) (err error) {
 	defer mon.Task()(&ctx)(&err)
+
+	if s.config.AuthMigrationModeEnabled {
+		return ErrForbidden.New("this feature is temporarily unavailable during authentication system migration")
+	}
 
 	user, err := s.getUserAndAuditLog(ctx, "disable MFA")
 	if err != nil {
@@ -172,6 +188,12 @@ func (s *Service) DisableUserMFA(ctx context.Context, passcode string, t time.Ti
 		return Error.Wrap(err)
 	}
 
+	s.mailService.SendRenderedAsync(
+		ctx,
+		[]post.Address{{Address: user.Email, Name: user.FullName}},
+		&MFADisabledEmail{},
+	)
+
 	return nil
 }
 
@@ -180,12 +202,12 @@ func (s *Service) DisableUserMFA(ctx context.Context, passcode string, t time.Ti
 func NewMFARecoveryCode() (string, error) {
 	const chars = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 	b := make([]byte, 14)
-	max := big.NewInt(int64(len(chars)))
+	maxVal := big.NewInt(int64(len(chars)))
 	for i := 0; i < 14; i++ {
 		if (i+1)%5 == 0 {
 			b[i] = '-'
 		} else {
-			num, err := rand.Int(rand.Reader, max)
+			num, err := rand.Int(rand.Reader, maxVal)
 			if err != nil {
 				return "", err
 			}
@@ -199,9 +221,17 @@ func NewMFARecoveryCode() (string, error) {
 func (s *Service) ResetMFASecretKey(ctx context.Context) (key string, err error) {
 	defer mon.Task()(&ctx)(&err)
 
+	if s.config.AuthMigrationModeEnabled {
+		return "", ErrForbidden.New("this feature is temporarily unavailable during authentication system migration")
+	}
+
 	user, err := s.getUserAndAuditLog(ctx, "reset MFA secret key")
 	if err != nil {
 		return "", Error.Wrap(err)
+	}
+
+	if user.MFAEnabled {
+		return "", ErrMFAEnabled.New("")
 	}
 
 	key, err = NewMFASecretKey()
@@ -225,6 +255,10 @@ func (s *Service) ResetMFASecretKey(ctx context.Context) (key string, err error)
 // ResetMFARecoveryCodes creates a new set of MFA recovery codes for the user.
 func (s *Service) ResetMFARecoveryCodes(ctx context.Context, requireCode bool, passcode string, recoveryCode string) (codes []string, err error) {
 	defer mon.Task()(&ctx)(&err)
+
+	if s.config.AuthMigrationModeEnabled {
+		return nil, ErrForbidden.New("this feature is temporarily unavailable during authentication system migration")
+	}
 
 	user, err := s.getUserAndAuditLog(ctx, "reset MFA recovery codes")
 	if err != nil {

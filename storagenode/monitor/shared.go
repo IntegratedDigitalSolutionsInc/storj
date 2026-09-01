@@ -5,46 +5,118 @@ package monitor
 
 import (
 	"context"
+	"os"
 
 	"go.uber.org/zap"
 
-	"storj.io/storj/storagenode/pieces"
+	"storj.io/storj/storagenode/blobstore"
+	"storj.io/storj/storagenode/blobstore/filestore"
 )
+
+// HashStoreBackend is an interface describing the methods needed by SharedDisk
+// to correctly compute the space usage of the hash store.
+type HashStoreBackend interface {
+	SpaceUsage() SpaceUsage
+	LogsPath() string
+}
+
+// SpaceUsage describes the amount of space used by a PieceBackend.
+type SpaceUsage struct {
+	UsedTotal       int64 // total space used including metadata and unreferenced data
+	UsedForPieces   int64 // total space used by live pieces
+	UsedForTrash    int64 // total space used by trash pieces
+	UsedForMetadata int64 // total space used by metadata (hash tables and stuff)
+	UsedReclaimable int64 // space used that can be reclaimed (e.g., unreferenced data)
+	Reserved        int64 // space that should always be free (for example: for temp files during compaction)
+}
+
+// StorageStatus contains information about the disk store is using.
+type StorageStatus struct {
+	// DiskTotal is the actual disk size (not just the allocated disk space), in bytes.
+	DiskTotal int64
+	DiskUsed  int64
+	// DiskFree is the actual amount of free space on the whole disk, not just allocated disk space, in bytes.
+	DiskFree int64
+}
+
+// DiskSpaceInfo is an interface for querying available disk space.
+type DiskSpaceInfo interface {
+	AvailableSpace(ctx context.Context) (blobstore.DiskInfo, error)
+}
+
+// PieceStoreSpaceUsage is an interface describing the methods needed by SharedDisk
+// to correctly compute the space usage of the piece store.
+type PieceStoreSpaceUsage interface {
+	StorageStatus(ctx context.Context) (StorageStatus, error)
+	SpaceUsedForPieces(ctx context.Context) (piecesTotal int64, piecesContentSize int64, err error)
+	SpaceUsedForTrash(ctx context.Context) (int64, error)
+	SpaceUsedForPiecesAndTrash(ctx context.Context) (int64, error)
+}
 
 // SharedDisk is the default way to check disk space (using usage-space walker).
 type SharedDisk struct {
-	store              *pieces.Store
-	allocatedDiskSpace int64
-	log                *zap.Logger
-	minimumDiskSpace   int64
+	store               PieceStoreSpaceUsage
+	hashStore           HashStoreBackend
+	allocatedDiskSpace  int64 // safety-checked; may be reduced by PreFlightCheck to fit available disk
+	configuredDiskSpace int64 // user-configured value; never modified after construction
+	log                 *zap.Logger
+	minimumDiskSpace    int64
+	dir                 DiskSpaceInfo
 }
 
 var _ SpaceReport = (*SharedDisk)(nil)
 
 // NewSharedDisk creates a new SharedDisk.
-func NewSharedDisk(log *zap.Logger, store *pieces.Store, minimumDiskSpace, allocatedDiskSpace int64) *SharedDisk {
-	return &SharedDisk{
-		log:                log,
-		store:              store,
-		allocatedDiskSpace: allocatedDiskSpace,
-		minimumDiskSpace:   minimumDiskSpace,
+func NewSharedDisk(ctx context.Context, log *zap.Logger, store PieceStoreSpaceUsage, hashStore HashStoreBackend, minimumDiskSpace, allocatedDiskSpace int64) (*SharedDisk, error) {
+	logsPath := hashStore.LogsPath()
+	if logsPath != "" {
+		if err := os.MkdirAll(logsPath, 0755); err != nil {
+			return nil, Error.Wrap(err)
+		}
 	}
+	s := &SharedDisk{
+		log:                 log,
+		dir:                 filestore.NewDirSpaceInfo(logsPath),
+		store:               store,
+		hashStore:           hashStore,
+		allocatedDiskSpace:  allocatedDiskSpace,
+		configuredDiskSpace: allocatedDiskSpace,
+		minimumDiskSpace:    minimumDiskSpace,
+	}
+	return s, s.PreFlightCheck(ctx)
 }
 
 // PreFlightCheck checks if the disk is ready to use.
 func (s *SharedDisk) PreFlightCheck(ctx context.Context) error {
-	// get the disk space details
-	// The returned path ends in a slash only if it represents a root directory, such as "/" on Unix or `C:\` on Windows.
-	storageStatus, err := s.store.StorageStatus(ctx)
-	if err != nil {
-		return Error.Wrap(err)
-	}
-	freeDiskSpace := storageStatus.DiskFree
+	var freeDiskSpace int64
+	var totalUsed int64
 
-	totalUsed, err := s.store.SpaceUsedForPiecesAndTrash(ctx)
-	if err != nil {
-		return Error.Wrap(err)
+	if s.store != nil {
+		// get the disk space details
+		// The returned path ends in a slash only if it represents a root directory, such as "/" on Unix or `C:\` on Windows.
+		storageStatus, err := s.store.StorageStatus(ctx)
+		if err != nil {
+			return Error.Wrap(err)
+		}
+		freeDiskSpace = storageStatus.DiskFree
+
+		blobUsed, err := s.store.SpaceUsedForPiecesAndTrash(ctx)
+		if err != nil {
+			return Error.Wrap(err)
+		}
+		totalUsed = blobUsed
+	} else {
+		as, err := s.dir.AvailableSpace(ctx)
+		if err != nil {
+			return Error.Wrap(err)
+		}
+		freeDiskSpace = as.AvailableSpace
 	}
+
+	// include hashstore usage in totalUsed, as the disk may be primarily
+	// occupied by hashstore data (not just blobstore pieces/trash).
+	hashUsage := s.hashStore.SpaceUsage()
+	totalUsed += hashUsage.UsedTotal
 
 	// check your hard drive is big enough
 	// first time setup as a piece node server
@@ -75,77 +147,83 @@ func (s *SharedDisk) PreFlightCheck(ctx context.Context) error {
 	return nil
 }
 
-// AvailableSpace returns available disk space for upload.
-func (s *SharedDisk) AvailableSpace(ctx context.Context) (_ int64, err error) {
-	defer mon.Task()(&ctx)(&err)
-
-	usedSpace, err := s.store.SpaceUsedForPiecesAndTrash(ctx)
-	if err != nil {
-		return 0, err
-	}
-
-	diskStatus, err := s.store.StorageStatus(ctx)
-	if err != nil {
-		return 0, Error.Wrap(err)
-	}
-
-	allocated := s.allocatedDiskSpace
-	if isLowerThanAllocated(diskStatus.DiskTotal, allocated) {
-		allocated = diskStatus.DiskTotal
-	}
-
-	freeSpaceForStorj := allocated - usedSpace
-	if diskStatus.DiskFree < freeSpaceForStorj {
-		freeSpaceForStorj = diskStatus.DiskFree
-	}
-
-	mon.IntVal("allocated_space").Observe(allocated)
-	mon.IntVal("used_space").Observe(usedSpace)
-	mon.IntVal("available_space").Observe(freeSpaceForStorj)
-
-	return freeSpaceForStorj, nil
-}
-
 // DiskSpace returns consolidated disk space state info.
 func (s *SharedDisk) DiskSpace(ctx context.Context) (_ DiskSpace, err error) {
 	defer mon.Task()(&ctx)(&err)
 
-	usedForPieces, _, err := s.store.SpaceUsedForPieces(ctx)
-	if err != nil {
-		return DiskSpace{}, Error.Wrap(err)
-	}
-	usedForTrash, err := s.store.SpaceUsedForTrash(ctx)
-	if err != nil {
-		return DiskSpace{}, Error.Wrap(err)
+	var usedForPieces, usedForTrash int64
+	var storageStatus StorageStatus
+
+	if s.store != nil {
+		usedForPieces, _, err = s.store.SpaceUsedForPieces(ctx)
+		if err != nil {
+			return DiskSpace{}, Error.Wrap(err)
+		}
+		usedForTrash, err = s.store.SpaceUsedForTrash(ctx)
+		if err != nil {
+			return DiskSpace{}, Error.Wrap(err)
+		}
+		storageStatus, err = s.store.StorageStatus(ctx)
+		if err != nil {
+			return DiskSpace{}, Error.Wrap(err)
+		}
+	} else {
+		as, err := s.dir.AvailableSpace(ctx)
+		if err != nil {
+			s.log.Warn("unable to get disk space info, using zeros", zap.Error(err), zap.String("dir", s.hashStore.LogsPath()))
+		} else {
+			storageStatus = StorageStatus{
+				DiskTotal: as.TotalSpace,
+				DiskFree:  as.AvailableSpace,
+			}
+		}
 	}
 
-	storageStatus, err := s.store.StorageStatus(ctx)
-	if err != nil {
-		return DiskSpace{}, Error.Wrap(err)
-	}
+	hashSpaceUsage := s.hashStore.SpaceUsage()
 
 	overused := int64(0)
 
-	allocated := s.allocatedDiskSpace
+	// allocated is what we report to the user — always the configured value (capped to
+	// actual disk size so we don't claim more than the hardware holds).
+	allocated := s.configuredDiskSpace
 	if isLowerThanAllocated(storageStatus.DiskTotal, allocated) {
 		allocated = storageStatus.DiskTotal
 	}
 
-	available := allocated - (usedForPieces + usedForTrash)
+	// effective is the safety-checked allocation used to compute available space;
+	// it may be lower than configured if PreFlightCheck found the disk was tight.
+	effective := s.allocatedDiskSpace
+	if isLowerThanAllocated(storageStatus.DiskTotal, effective) {
+		effective = storageStatus.DiskTotal
+	}
+
+	available := effective - (usedForPieces + usedForTrash) - hashSpaceUsage.UsedTotal - hashSpaceUsage.Reserved
 	if available < 0 {
 		overused = -available
+		available = 0
 	}
-	if storageStatus.DiskFree < available {
+	if storageStatus.DiskFree > 0 && storageStatus.DiskFree < available {
 		available = storageStatus.DiskFree
 	}
 
-	return DiskSpace{
-		Total:         storageStatus.DiskTotal,
-		Allocated:     allocated,
-		UsedForPieces: usedForPieces,
-		UsedForTrash:  usedForTrash,
-		Free:          storageStatus.DiskFree,
-		Available:     available,
-		Overused:      overused,
-	}, nil
+	diskSpace := DiskSpace{
+		Total:           storageStatus.DiskTotal,
+		Allocated:       allocated,
+		Effective:       effective,
+		UsedForPieces:   usedForPieces + hashSpaceUsage.UsedForPieces,
+		UsedForTrash:    usedForTrash + hashSpaceUsage.UsedForTrash,
+		Free:            storageStatus.DiskFree,
+		Available:       available,
+		Overused:        overused,
+		Used:            usedForPieces + usedForTrash + hashSpaceUsage.UsedTotal,
+		UsedReclaimable: hashSpaceUsage.UsedReclaimable,
+		Reserved:        hashSpaceUsage.Reserved,
+	}
+
+	mon.IntVal("allocated_space").Observe(diskSpace.Allocated)
+	mon.IntVal("used_space").Observe(diskSpace.Used)
+	mon.IntVal("available_space").Observe(diskSpace.Available)
+	mon.IntVal("reserved_space").Observe(diskSpace.Reserved)
+
+	return diskSpace, nil
 }

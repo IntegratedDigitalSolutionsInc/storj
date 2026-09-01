@@ -7,6 +7,7 @@ import (
 	"context"
 	"database/sql/driver"
 	"net/mail"
+	"strings"
 	"time"
 
 	"github.com/zeebo/errs"
@@ -23,11 +24,19 @@ import (
 type Users interface {
 	// Get is a method for querying user from the database by id.
 	Get(ctx context.Context, id uuid.UUID) (*User, error)
+	// Search searches for users by a search term in their name or email.
+	// Results are limited to 100 users.
+	// tenantID filters by tenant when non-nil;
+	// nil tenantID returns users across all tenants.
+	Search(ctx context.Context, term string, tenantID *string) ([]UserInfo, error)
+	// GetByCustomerID returns the user with the given customer ID.
+	GetByCustomerID(ctx context.Context, customerID string) (*UserInfo, error)
 	// GetExpiredFreeTrialsAfter is a method for querying users that are in free trial from the database with trial expiry (after)
-	// AND have not been frozen.
-	GetExpiredFreeTrialsAfter(ctx context.Context, after time.Time, limit int) ([]User, error)
-	// GetExpiresBeforeWithStatus returns users with a particular trial notification status and whose trial expires before 'expiresBefore'.
-	GetExpiresBeforeWithStatus(ctx context.Context, notificationStatus TrialNotificationStatus, expiresBefore time.Time) ([]*User, error)
+	// AND have not been frozen. tenantID filters by tenant: nil returns users with no tenant, non-nil returns users with that tenant.
+	GetExpiredFreeTrialsAfter(ctx context.Context, after time.Time, limit int, tenantID *string) ([]User, error)
+	// GetExpiresBeforeWithStatus returns active users with a particular trial notification status and whose trial expires before 'expiresBefore'.
+	// tenantID filters by tenant: nil returns users with no tenant, non-nil returns users with that tenant.
+	GetExpiresBeforeWithStatus(ctx context.Context, notificationStatus TrialNotificationStatus, expiresBefore time.Time, tenantID *string) ([]*User, error)
 	// GetUnverifiedNeedingReminder gets unverified users needing a reminder to verify their email.
 	GetUnverifiedNeedingReminder(ctx context.Context, firstReminder, secondReminder, cutoff time.Time) ([]*User, error)
 	// GetEmailsForDeletion is a method for querying user account emails which were requested for deletion by the user and can be deleted.
@@ -36,16 +45,17 @@ type Users interface {
 	UpdateVerificationReminders(ctx context.Context, id uuid.UUID) error
 	// UpdateFailedLoginCountAndExpiration increments failed_login_count and sets login_lockout_expiration appropriately.
 	UpdateFailedLoginCountAndExpiration(ctx context.Context, failedLoginPenalty *float64, id uuid.UUID, now time.Time) error
-	// GetByEmailWithUnverified is a method for querying users by email from the database.
-	GetByEmailWithUnverified(ctx context.Context, email string) (verified *User, unverified []User, err error)
+	// GetByEmailAndTenantWithUnverified is a method for querying users by email and tenantID from the database.
+	GetByEmailAndTenantWithUnverified(ctx context.Context, email string, tenantID *string) (verified *User, unverified []User, err error)
 	// GetByExternalID is a method for querying user by external ID from the database.
-	GetByExternalID(ctx context.Context, externalID string) (user *User, err error)
+	// If tenantID is non-nil and non-empty, only users with a matching tenantID are returned.
+	GetByExternalID(ctx context.Context, externalID string, tenantID *string) (user *User, err error)
 	// GetByStatus is a method for querying user by status from the database.
 	GetByStatus(ctx context.Context, status UserStatus, cursor UserCursor) (*UsersPage, error)
 	// GetUserInfoByProjectID gets the user info of the project (id) owner.
 	GetUserInfoByProjectID(ctx context.Context, id uuid.UUID) (*UserInfo, error)
-	// GetByEmail is a method for querying user by verified email from the database.
-	GetByEmail(ctx context.Context, email string) (*User, error)
+	// GetByEmailAndTenant is a method for querying user by email and tenantID from the database.
+	GetByEmailAndTenant(ctx context.Context, email string, tenantID *string) (*User, error)
 	// Insert is a method for inserting user into the database.
 	Insert(ctx context.Context, user *User) (*User, error)
 	// Delete is a method for deleting user by ID from the database.
@@ -54,6 +64,8 @@ type Users interface {
 	DeleteUnverifiedBefore(ctx context.Context, before time.Time, asOfSystemTimeInterval time.Duration, pageSize int) error
 	// Update is a method for updating user entity.
 	Update(ctx context.Context, userID uuid.UUID, request UpdateUserRequest) error
+	// UpdateExternalIDWithActivationCode updates external ID and clears activation code atomically.
+	UpdateExternalIDWithActivationCode(ctx context.Context, userID uuid.UUID, activationCode, externalID string) (rowsAffected int64, err error)
 	// UpdatePaidTier sets whether the user is in the paid tier.
 	UpdatePaidTier(ctx context.Context, id uuid.UUID, paidTier bool, projectBandwidthLimit, projectStorageLimit memory.Size, projectSegmentLimit int64, projectLimit int, upgradeTime *time.Time) error
 	// UpdateUserAgent is a method to update the user's user agent.
@@ -66,14 +78,51 @@ type Users interface {
 	GetProjectLimit(ctx context.Context, id uuid.UUID) (limit int, err error)
 	// GetUserProjectLimits is a method to get the users storage and bandwidth limits for new projects.
 	GetUserProjectLimits(ctx context.Context, id uuid.UUID) (limit *ProjectLimits, err error)
-	// GetUserPaidTier is a method to gather whether the specified user is on the Paid Tier or not.
-	GetUserPaidTier(ctx context.Context, id uuid.UUID) (isPaid bool, err error)
+	// GetUserKind returns the kind of user.
+	GetUserKind(ctx context.Context, id uuid.UUID) (kind UserKind, err error)
 	// GetSettings is a method for returning a user's set of configurations.
 	GetSettings(ctx context.Context, userID uuid.UUID) (*UserSettings, error)
 	// GetUpgradeTime is a method for returning a user's upgrade time.
 	GetUpgradeTime(ctx context.Context, userID uuid.UUID) (*time.Time, error)
 	// UpsertSettings is a method for updating a user's set of configurations if it exists and inserting it otherwise.
 	UpsertSettings(ctx context.Context, userID uuid.UUID, settings UpsertUserSettingsRequest) error
+	// GetCustomerID returns the customer ID for a given user ID.
+	GetCustomerID(ctx context.Context, id uuid.UUID) (_ string, err error)
+	// SetStatusPendingDeletion set the user to pending deletion status safely to potentially reduce
+	// mistakes the data deletion process of valid accounts. The method must automatically verify:
+	//
+	// 1. The account is currently in "active" status
+	///
+	// 2. The account is NOT in the paid tier
+	//
+	// 3. The account has an active "trial expiration freeze"
+	//
+	// 4. The active "trial expiration freeze" days until escalation must be over
+	//
+	// The function return an error on system failure and an sql.ErrNoRows if the account doesn't exist
+	// or doesn't fulfill the requirements.
+	SetStatusPendingDeletion(ctx context.Context, userID uuid.UUID, defaultDaysTillEscalation uint) error
+	// ListPendingDeletionBefore returns a page of user IDs that are pending deletion and were marked
+	// before the specified time, ordered by status_updated_at ascending and starting at the given offset.
+	// This does not include users that have been frozen.
+	// NB: callers that do not delete every returned user (e.g. because data is retained) must advance
+	// the offset past the retained users, otherwise the same users are returned on every call.
+	ListPendingDeletionBefore(ctx context.Context, offset int64, limit int, before time.Time) (page UserIDsPage, err error)
+	// ListUsersToOptOutFreeze returns active paid users who have not already been frozen. By default,
+	// it returns users whose OptInStatus is not OptedIn and not Excluded (including NoAction/unset);
+	// when opts.OptedOutOnly is true it returns only users whose OptInStatus is OptedOut.
+	ListUsersToOptOutFreeze(ctx context.Context, opts ListUsersToOptOutFreezeOptions) (page UserIDsPage, err error)
+	// ListUsersForInactivityCheck returns IDs of active paid users who do not have an
+	// InactivityWarning or InactivityFreeze event and are not inactivity-exempt.
+	// tenantID filters by tenant: nil returns users with no tenant, non-nil returns users with that tenant.
+	ListUsersForInactivityCheck(ctx context.Context, tenantID *string, limit int, cursor *uuid.UUID) (page UserIDsPage, err error)
+	// GetNowFn returns the current time function.
+	GetNowFn() func() time.Time
+	// TestSetNow is used to set the current time for testing purposes.
+	TestSetNow(func() time.Time)
+
+	// TestingGetAll returns all users in the database.
+	TestingGetAll(ctx context.Context) ([]*User, error)
 }
 
 // UserCursor holds info for user info cursor pagination.
@@ -94,32 +143,46 @@ type UsersPage struct {
 	TotalCount  uint64 `json:"totalCount"`
 }
 
+// UserIDsPage represents a page of user IDs.
+type UserIDsPage struct {
+	IDs     []uuid.UUID
+	HasNext bool
+}
+
 // UserInfo holds minimal user info.
 type UserInfo struct {
-	Status UserStatus
+	ID        uuid.UUID
+	Email     string
+	FullName  string
+	Kind      UserKind
+	CreatedAt time.Time
+	Status    UserStatus
+	TenantID  *string
 }
 
 // CreateUser struct holds info for User creation.
 type CreateUser struct {
-	ExternalId       *string `json:"-"`
-	FullName         string  `json:"fullName"`
-	ShortName        string  `json:"shortName"`
-	Email            string  `json:"email"`
-	UserAgent        []byte  `json:"userAgent"`
-	Password         string  `json:"password"`
-	IsProfessional   bool    `json:"isProfessional"`
-	Position         string  `json:"position"`
-	CompanyName      string  `json:"companyName"`
-	WorkingOn        string  `json:"workingOn"`
-	EmployeeCount    string  `json:"employeeCount"`
-	HaveSalesContact bool    `json:"haveSalesContact"`
-	CaptchaResponse  string  `json:"captchaResponse"`
-	IP               string  `json:"ip"`
-	SignupPromoCode  string  `json:"signupPromoCode"`
-	ActivationCode   string  `json:"-"`
-	SignupId         string  `json:"-"`
-	AllowNoName      bool    `json:"-"`
-	PaidTier         bool    `json:"-"`
+	ExternalId        *string  `json:"-"`
+	FullName          string   `json:"fullName"`
+	ShortName         string   `json:"shortName"`
+	Email             string   `json:"email"`
+	UserAgent         []byte   `json:"userAgent"`
+	Password          string   `json:"password"`
+	IsProfessional    bool     `json:"isProfessional"`
+	Position          string   `json:"position"`
+	CompanyName       string   `json:"companyName"`
+	WorkingOn         string   `json:"workingOn"`
+	EmployeeCount     string   `json:"employeeCount"`
+	HaveSalesContact  bool     `json:"haveSalesContact"`
+	CaptchaResponse   string   `json:"captchaResponse"`
+	IP                string   `json:"ip"`
+	SignupPromoCode   string   `json:"signupPromoCode"`
+	CaptchaScore      *float64 `json:"-"`
+	ActivationCode    string   `json:"-"`
+	SignupId          string   `json:"-"`
+	AllowNoName       bool     `json:"-"`
+	NoTrialExpiration bool     `json:"-"`
+	Kind              UserKind `json:"-"`
 }
 
 // CreateSsoUser struct holds info for SSO User creation.
@@ -129,6 +192,15 @@ type CreateSsoUser struct {
 	Email      string
 	UserAgent  []byte
 	IP         string
+}
+
+// MinimumChargeConfig contains information about minimum charge for a user.
+type MinimumChargeConfig struct {
+	Enabled      bool       `json:"enabled"`
+	Amount       int64      `json:"amount"`
+	LegacyAmount int64      `json:"legacyAmount"`
+	StartDate    *time.Time `json:"startDate"`
+	CleanupDate  *time.Time `json:"cleanupDate"`
 }
 
 // IsValid checks CreateUser validity and returns error describing whats wrong.
@@ -170,6 +242,7 @@ type AuthUser struct {
 	RememberForOneWeek bool   `json:"rememberForOneWeek"`
 	IP                 string `json:"-"`
 	UserAgent          string `json:"-"`
+	AnonymousID        string `json:"-"`
 }
 
 // TokenInfo holds info for user authentication token responses.
@@ -196,11 +269,69 @@ const (
 	PendingBotVerification UserStatus = 5
 	// UserRequestedDeletion is a status that user receives after account owner completed delete account flow.
 	UserRequestedDeletion UserStatus = 6
+
+	// UserStatusCount indicates how many user status are currently supported.
+	// It is mainly used as a control that some UserStatus tests are updated when when the UserStatus
+	// valid values defined in this const block are updated.
+	UserStatusCount = 7
 )
 
+// UserKind - is used to indicate kind of the user's account.
+type UserKind int
+
+const (
+	// FreeUser is a kind of user that has free account.
+	FreeUser UserKind = 0
+	// PaidUser is a kind of user that has paid account.
+	PaidUser UserKind = 1
+	// NFRUser - not-for-resale user is one that has paid privileges
+	// but is not paying for the account.
+	NFRUser UserKind = 2
+	// MemberUser is a kind of user that is a member of a project.
+	MemberUser UserKind = 3
+)
+
+// UserKinds holds all supported user kinds.
+var UserKinds = []UserKind{FreeUser, PaidUser, NFRUser, MemberUser}
+
+// String returns a string representation of the user kind.
+func (k UserKind) String() string {
+	switch k {
+	case FreeUser:
+		return "Free Trial"
+	case PaidUser:
+		return "Pro Account"
+	case NFRUser:
+		return "Not-For-Resale"
+	case MemberUser:
+		return "Member Account"
+	default:
+		return ""
+	}
+}
+
+// KindInfo holds info about user kind.
+type KindInfo struct {
+	Value             UserKind `json:"value"`
+	Name              string   `json:"name"`
+	HasPaidPrivileges bool     `json:"hasPaidPrivileges"`
+}
+
+// Info returns info about the user kind.
+func (k UserKind) Info() KindInfo {
+	return KindInfo{
+		Value:             k,
+		Name:              k.String(),
+		HasPaidPrivileges: k == PaidUser || k == NFRUser,
+	}
+}
+
+// UserStatuses holds all supported user statuses.
+var UserStatuses = []UserStatus{Inactive, Active, Deleted, PendingDeletion, LegalHold, PendingBotVerification, UserRequestedDeletion}
+
 // String returns a string representation of the user status.
-func (s UserStatus) String() string {
-	switch s {
+func (s *UserStatus) String() string {
+	switch *s {
 	case Inactive:
 		return "Inactive"
 	case Active:
@@ -213,20 +344,72 @@ func (s UserStatus) String() string {
 		return "Legal Hold"
 	case PendingBotVerification:
 		return "Pending Bot Verification"
+	case UserRequestedDeletion:
+		return "User Requested Deletion"
 	default:
 		return ""
 	}
 }
 
+// UserStatusInfo holds info about user status.
+type UserStatusInfo struct {
+	Name  string     `json:"name"`
+	Value UserStatus `json:"value"`
+}
+
+// Info returns info about the user status.
+func (s *UserStatus) Info() UserStatusInfo {
+	return UserStatusInfo{
+		Name:  s.String(),
+		Value: *s,
+	}
+}
+
 // Value implements database/sql/driver.Valuer for UserStatus.
-func (s UserStatus) Value() (driver.Value, error) {
-	return int64(s), nil
+func (s *UserStatus) Value() (driver.Value, error) {
+	return int64(*s), nil
+}
+
+// Valid checks if the user status is valid.
+func (s *UserStatus) Valid() bool {
+	return s.String() != ""
+}
+
+// Set the status value from a string.
+// It satisfies the pflag.Value interface.
+func (s *UserStatus) Set(status string) error {
+	statuses := make([]string, 0, UserStatusCount)
+	for i := 0; true; i++ {
+		uStatus := UserStatus(i)
+		strStatus := uStatus.String()
+		if strStatus == "" {
+			break
+		}
+
+		if strings.EqualFold(status, strStatus) {
+			*s = uStatus
+			return nil
+		}
+
+		statuses = append(statuses, strStatus)
+	}
+
+	return Error.New(
+		"invalid user status: %q. Valid statuses are: %s", status, strings.Join(statuses, ", "),
+	)
+}
+
+// Type returns the type's name.
+// It satisfies the pflag.Value interface.
+func (*UserStatus) Type() string {
+	return "UserStatus"
 }
 
 // User is a database object that describes User entity.
 type User struct {
 	ID         uuid.UUID `json:"id"`
 	ExternalID *string   `json:"-"`
+	TenantID   *string   `json:"-"`
 
 	FullName  string `json:"fullName"`
 	ShortName string `json:"shortName"`
@@ -240,11 +423,11 @@ type User struct {
 
 	CreatedAt time.Time `json:"createdAt"`
 
-	ProjectLimit          int   `json:"projectLimit"`
-	ProjectStorageLimit   int64 `json:"projectStorageLimit"`
-	ProjectBandwidthLimit int64 `json:"projectBandwidthLimit"`
-	ProjectSegmentLimit   int64 `json:"projectSegmentLimit"`
-	PaidTier              bool  `json:"paidTier"`
+	ProjectLimit          int      `json:"projectLimit"`
+	ProjectStorageLimit   int64    `json:"projectStorageLimit"`
+	ProjectBandwidthLimit int64    `json:"projectBandwidthLimit"`
+	ProjectSegmentLimit   int64    `json:"projectSegmentLimit"`
+	Kind                  UserKind `json:"kind"`
 
 	IsProfessional bool   `json:"isProfessional"`
 	Position       string `json:"position"`
@@ -280,6 +463,50 @@ type User struct {
 
 	NewUnverifiedEmail          *string `json:"-"`
 	EmailChangeVerificationStep int     `json:"-"`
+
+	HubspotObjectID *string `json:"-"`
+}
+
+// HasPaidPrivileges returns whether the user has paid privileges based on their Kind.
+// Note: for white-label users (non-empty TenantID), use Service.UserHasPaidPrivileges
+// which additionally considers whether billing is enabled on the satellite.
+func (u *User) HasPaidPrivileges() bool {
+	return u.IsNFR() || u.IsPaid()
+}
+
+// IsPaid returns whether it's a paid user.
+func (u *User) IsPaid() bool {
+	return u.Kind == PaidUser
+}
+
+// IsFree returns whether it's a free user.
+func (u *User) IsFree() bool {
+	return u.Kind == FreeUser
+}
+
+// IsNFR returns whether it's a NFR user.
+func (u *User) IsNFR() bool {
+	return u.Kind == NFRUser
+}
+
+// IsMember returns whether it's a member user.
+func (u *User) IsMember() bool {
+	return u.Kind == MemberUser
+}
+
+// IsFreeOrMember returns whether it's a free or member user.
+func (u *User) IsFreeOrMember() bool {
+	return u.IsFree() || u.IsMember()
+}
+
+// IsBillingExempt returns whether the user is exempt from billing.
+func (u *User) IsBillingExempt() bool {
+	return u.IsFree() || u.IsMember() || u.IsNFR() || (u.TenantID != nil && *u.TenantID != "")
+}
+
+// IsOptInExempt returns whether the user is exempt from pricing updates opt-in requirement.
+func (u *User) IsOptInExempt() bool {
+	return u.IsMember() || u.IsNFR() || (u.TenantID != nil && *u.TenantID != "")
 }
 
 // ResponseUser is an entity which describes db User and can be sent in response.
@@ -322,7 +549,8 @@ func GetUser(ctx context.Context) (*User, error) {
 
 // UpdateUserRequest contains all columns which are optionally updatable by users.Update.
 type UpdateUserRequest struct {
-	ExternalID *string
+	ExternalID **string
+	TenantID   **string
 
 	FullName  *string
 	ShortName **string
@@ -337,14 +565,13 @@ type UpdateUserRequest struct {
 	Email        *string
 	PasswordHash []byte
 
-	Status          *UserStatus
-	StatusUpdatedAt *time.Time
+	Status *UserStatus
 
 	ProjectLimit          *int
 	ProjectStorageLimit   *int64
 	ProjectBandwidthLimit *int64
 	ProjectSegmentLimit   *int64
-	PaidTier              *bool
+	Kind                  *UserKind
 
 	MFAEnabled       *bool
 	MFASecretKey     **string
@@ -358,7 +585,7 @@ type UpdateUserRequest struct {
 
 	LoginLockoutExpiration **time.Time
 
-	DefaultPlacement storj.PlacementConstraint
+	DefaultPlacement **storj.PlacementConstraint
 
 	ActivationCode  *string
 	SignupId        *string
@@ -368,10 +595,61 @@ type UpdateUserRequest struct {
 
 	TrialExpiration    **time.Time
 	TrialNotifications *TrialNotificationStatus
-	UpgradeTime        *time.Time
+	UpgradeTime        **time.Time
 
 	NewUnverifiedEmail          **string
 	EmailChangeVerificationStep *int
+
+	HubspotObjectID **string
+}
+
+// OptInStatus tracks whether a user has opted in or out of an account-level
+// change that requires explicit user acknowledgement (e.g. a pricing model change).
+type OptInStatus int
+
+const (
+	// NoAction is the status for users who have not opted in/out and have also not been excluded.
+	NoAction OptInStatus = 0
+	// OptedIn is the status for users who have opted in.
+	OptedIn OptInStatus = 1
+	// OptedOut is the status for users who have opted out.
+	OptedOut OptInStatus = 2
+	// Excluded is the status for users who are not required to opt in/out.
+	Excluded OptInStatus = 3
+)
+
+// AdminSettableOptInStatuses lists the OptInStatus values an admin is permitted to set.
+// Opting in/out is an explicit user action and must not be done via the admin API.
+var AdminSettableOptInStatuses = []OptInStatus{NoAction, Excluded}
+
+// OptInStatusInfo holds info about an opt-in status.
+type OptInStatusInfo struct {
+	Name  string      `json:"name"`
+	Value OptInStatus `json:"value"`
+}
+
+// String returns the human-readable name of the opt-in status.
+func (s OptInStatus) String() string {
+	switch s {
+	case NoAction:
+		return "No Action"
+	case OptedIn:
+		return "Opted In"
+	case OptedOut:
+		return "Opted Out"
+	case Excluded:
+		return "Excluded"
+	default:
+		return ""
+	}
+}
+
+// Info returns info about the opt-in status.
+func (s OptInStatus) Info() OptInStatusInfo {
+	return OptInStatusInfo{
+		Name:  s.String(),
+		Value: s,
+	}
 }
 
 // UserSettings contains configurations for a user.
@@ -382,6 +660,8 @@ type UserSettings struct {
 	PassphrasePrompt bool            `json:"passphrasePrompt"`
 	OnboardingStep   *string         `json:"onboardingStep"`
 	NoticeDismissal  NoticeDismissal `json:"noticeDismissal"`
+	OptInStatus      OptInStatus     `json:"optInStatus"`
+	InactivityExempt bool            `json:"inactivityExempt"`
 }
 
 // UpsertUserSettingsRequest contains all user settings which are configurable via Users.UpsertSettings.
@@ -393,16 +673,19 @@ type UpsertUserSettingsRequest struct {
 	PassphrasePrompt *bool
 	OnboardingStep   *string
 	NoticeDismissal  *NoticeDismissal
+	OptInStatus      *OptInStatus
+	InactivityExempt *bool
 }
 
 // NoticeDismissal contains whether notices should be shown to a user.
 type NoticeDismissal struct {
-	FileGuide                bool `json:"fileGuide"`
-	ServerSideEncryption     bool `json:"serverSideEncryption"`
-	PartnerUpgradeBanner     bool `json:"partnerUpgradeBanner"`
-	ProjectMembersPassphrase bool `json:"projectMembersPassphrase"`
-	UploadOverwriteWarning   bool `json:"uploadOverwriteWarning"`
-	VersioningBetaBanner     bool `json:"versioningBetaBanner"`
+	FileGuide                bool                        `json:"fileGuide"`
+	ServerSideEncryption     bool                        `json:"serverSideEncryption"`
+	PartnerUpgradeBanner     bool                        `json:"partnerUpgradeBanner"`
+	ProjectMembersPassphrase bool                        `json:"projectMembersPassphrase"`
+	UploadOverwriteWarning   bool                        `json:"uploadOverwriteWarning"`
+	PlacementWaitlistsJoined []storj.PlacementConstraint `json:"placementWaitlistsJoined"`
+	Announcements            map[string]bool             `json:"announcements"`
 }
 
 // SetUpAccountRequest holds data for completing account setup.
@@ -422,9 +705,32 @@ type SetUpAccountRequest struct {
 	InterestedInPartnering bool    `json:"interestedInPartnering"`
 }
 
+// ListUsersToOptOutFreezeOptions are filter parameters for ListUsersToOptOutFreeze.
+type ListUsersToOptOutFreezeOptions struct {
+	// TenantID filters by tenant: nil returns users with no tenant.
+	// Non-nil returns users with that tenant.
+	TenantID *string
+	// Cursor is the UUID the list should begin after.
+	Cursor *uuid.UUID
+	// Limit is the maximum number of users to return.
+	Limit int
+	// Cutoff, when is non-zero, excludes users who joined the new pricing on or after that time:
+	// that is, users created on or after the cutoff, as well as users who upgraded to the paid tier
+	// on or after the cutoff (the post-cutoff cohort that is exempt from opt-in).
+	// Users with a null upgrade_time remain eligible, as they are legacy paid accounts.
+	Cutoff time.Time
+	// ExcludedUserAgents, when non-empty, excludes users whose user_agent exactly matches one of
+	// these values.
+	ExcludedUserAgents [][]byte
+	// OptedOutOnly, when true, selects only users whose OptInStatus is OptedOut, instead of the
+	// all users whose status is not OptedIn and not Excluded, including NoAction/unset.
+	OptedOutOnly bool
+}
+
 // DeleteAccountResponse holds data for account deletion UI flow.
 type DeleteAccountResponse struct {
 	OwnedProjects       int   `json:"ownedProjects"`
+	LockEnabledBuckets  int   `json:"lockEnabledBuckets"`
 	Buckets             int   `json:"buckets"`
 	ApiKeys             int   `json:"apiKeys"`
 	UnpaidInvoices      int   `json:"unpaidInvoices"`
@@ -449,4 +755,43 @@ const (
 // Value implements database/sql/driver.Valuer for TrialNotificationStatus.
 func (t TrialNotificationStatus) Value() (driver.Value, error) {
 	return int64(t), nil
+}
+
+// FreezeStat holds information about the freeze status of the user account.
+type FreezeStat struct {
+	Frozen                     bool `json:"frozen"`
+	Warned                     bool `json:"warned"`
+	TrialExpiredFrozen         bool `json:"trialExpiredFrozen"`
+	TrialExpirationGracePeriod int  `json:"trialExpirationGracePeriod"`
+	OptOutFrozen               bool `json:"optOutFrozen"`
+	OptOutGracePeriod          int  `json:"optOutGracePeriod"`
+}
+
+// UserAccount holds information about the user account.
+type UserAccount struct {
+	ID                    uuid.UUID                 `json:"id"`
+	ExternalID            string                    `json:"externalID"`
+	FullName              string                    `json:"fullName"`
+	ShortName             string                    `json:"shortName"`
+	Email                 string                    `json:"email"`
+	Partner               string                    `json:"partner"`
+	ProjectLimit          int                       `json:"projectLimit"`
+	ProjectStorageLimit   int64                     `json:"projectStorageLimit"`
+	ProjectBandwidthLimit int64                     `json:"projectBandwidthLimit"`
+	ProjectSegmentLimit   int64                     `json:"projectSegmentLimit"`
+	IsProfessional        bool                      `json:"isProfessional"`
+	Position              string                    `json:"position"`
+	CompanyName           string                    `json:"companyName"`
+	EmployeeCount         string                    `json:"employeeCount"`
+	HaveSalesContact      bool                      `json:"haveSalesContact"`
+	PaidTier              bool                      `json:"paidTier"`
+	Kind                  KindInfo                  `json:"kindInfo"`
+	MFAEnabled            bool                      `json:"isMFAEnabled"`
+	MFARecoveryCodeCount  int                       `json:"mfaRecoveryCodeCount"`
+	CreatedAt             time.Time                 `json:"createdAt"`
+	PendingVerification   bool                      `json:"pendingVerification"`
+	TrialExpiration       *time.Time                `json:"trialExpiration"`
+	HasVarPartner         bool                      `json:"hasVarPartner"`
+	FreezeStatus          FreezeStat                `json:"freezeStatus"`
+	DefaultPlacement      storj.PlacementConstraint `json:"defaultPlacement"`
 }

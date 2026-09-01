@@ -16,9 +16,12 @@ import (
 	"go.uber.org/zap"
 	"golang.org/x/sync/semaphore"
 
+	"storj.io/common/context2"
 	"storj.io/common/memory"
 	"storj.io/common/storj"
 	"storj.io/common/sync2"
+	"storj.io/storj/satellite/nodeselection"
+	"storj.io/storj/satellite/overlay"
 	"storj.io/storj/satellite/repair/queue"
 )
 
@@ -28,6 +31,14 @@ var (
 	mon   = monkit.Package()
 )
 
+// ConnectionPoolConfig contains configuration for RPC connection pools.
+type ConnectionPoolConfig struct {
+	Capacity       int           `help:"RPC connection pool capacity (0 disables connection pool)" default:"100"`
+	KeyCapacity    int           `help:"RPC connection pool limit per key" default:"5"`
+	IdleExpiration time.Duration `help:"RPC connection pool idle expiration" default:"2m0s"`
+	MaxLifetime    time.Duration `help:"RPC connection pool max lifetime of a connection" default:"0"`
+}
+
 // Config contains configurable values for repairer.
 type Config struct {
 	MaxRepair                     int           `help:"maximum segments that can be repaired concurrently" releaseDefault:"5" devDefault:"1" testDefault:"10"`
@@ -36,8 +47,9 @@ type Config struct {
 	DialTimeout                   time.Duration `help:"time limit for dialing storage node" default:"5s"`
 	Timeout                       time.Duration `help:"time limit for uploading repaired pieces to new storage nodes" default:"5m0s" testDefault:"1m"`
 	DownloadTimeout               time.Duration `help:"time limit for downloading pieces from a node for repair" default:"5m0s" testDefault:"1m"`
+	DownloadChunkSize             memory.Size   `help:"chunk size used when downloading pieces from storage nodes for repair, larger values reduce disk IOPS at the cost of memory" default:"16KiB"`
+	DownloadLongTail              int           `help:"number of extra concurrent downloads beyond required count for faster repairs" default:"0" testDefault:"3"`
 	TotalTimeout                  time.Duration `help:"time limit for an entire repair job, from queue pop to upload completion" default:"45m" testDefault:"10m"`
-	MaxBufferMem                  memory.Size   `help:"maximum buffer memory (in bytes) to be allocated for read buffers" default:"4.0 MiB"`
 	MaxExcessRateOptimalThreshold float64       `help:"ratio applied to the optimal threshold to calculate the excess of the maximum number of repaired pieces to upload" default:"0.05"`
 	InMemoryRepair                bool          `help:"whether to download pieces for repair in memory (true) or download to disk (false)" default:"false"`
 	InMemoryUpload                bool          `help:"whether to upload pieces for repair using memory (true) or disk (false)" default:"false"`
@@ -46,9 +58,46 @@ type Config struct {
 	RepairExcludedCountryCodes    []string      `help:"list of country codes to treat node from this country as offline" default:"" hidden:"true"`
 	DoDeclumping                  bool          `help:"repair pieces on the same network to other nodes" default:"true"`
 	DoPlacementCheck              bool          `help:"repair pieces out of segment placement" default:"true"`
+	OnlineWindow                  time.Duration `help:"the amount of time without seeing a node before its considered offline" default:"4h" testDefault:"5m"`
+
+	ParticipatingNodeCacheEnabled  bool          `help:"enable cache for participating nodes" default:"false" testDefault:"true"`
+	ParticipatingNodeCacheInterval time.Duration `help:"how often participating nodes cache should be refreshed" default:"5m"`
+	ParticipatingNodeCacheStale    time.Duration `help:"when does participating nodes cache start blocking" default:"10m"`
+
+	NodesForRepairCacheEnabled  bool          `help:"enable cache for nodes to upload repaired pieces" default:"false" testDefault:"true"`
+	NodesForRepairCacheInterval time.Duration `help:"how often nodes for repaired pieces cache should be refreshed" default:"5m"`
+	NodesForRepairCacheStale    time.Duration `help:"when does nodes for repaired pieces cache start blocking" default:"10m"`
 
 	IncludedPlacements PlacementList `help:"comma separated placement IDs (numbers), which should checked by the repairer (other placements are ignored)" default:""`
 	ExcludedPlacements PlacementList `help:"comma separated placement IDs (numbers), placements which should be ignored by the repairer" default:""`
+
+	ConnectionPool ConnectionPoolConfig
+}
+
+// Overlay is used to fetch information about nodes for repairing segments.
+type Overlay interface {
+	// GetOnlineNodesForRepair returns a map of nodes for the supplied nodeIDs.
+	// The passed onlineWindow is used to determine whether each node is marked as Online.
+	GetOnlineNodesForRepair(
+		_ context.Context, _ []storj.NodeID, onlineWindow time.Duration,
+	) (map[storj.NodeID]*overlay.NodeReputation, error)
+	// FindStorageNodesForUpload searches the for nodes in the cache that meet the provided requirements for upload.
+	FindStorageNodesForUpload(context.Context, overlay.FindStorageNodesRequest) ([]*nodeselection.SelectedNode, error)
+	// GetParticipatingNodesForRepair returns all known participating nodes (this includes all known
+	// nodes excluding nodes that have been disqualified or gracefully exited).
+	// The passed onlineWindow is used to determine whether each node is marked as Online.
+	// The results are returned in a slice of the same length as the input nodeIDs,
+	// and each index of the returned list corresponds to the same index in nodeIDs.
+	// If a node is not known, or is disqualified or exited, the corresponding returned SelectedNode
+	// will have a zero value.
+	GetParticipatingNodesForRepair(
+		_ context.Context, _ storj.NodeIDList, onlineWindow time.Duration,
+	) ([]nodeselection.SelectedNode, error)
+	// GetAllParticipatingNodesForRepair returns all known participating nodes (this includes all known
+	// nodes excluding nodes that have been disqualified or gracefully exited).
+	// The passed onlineWindow is used to determine whether each node is marked as Online.
+	GetAllParticipatingNodesForRepair(
+		_ context.Context, onlineWindow time.Duration) ([]nodeselection.SelectedNode, error)
 }
 
 // PlacementList is a configurable, comma separated list of PlacementConstraint IDs.
@@ -125,13 +174,17 @@ func (service *Service) Close() error { return nil }
 // NB: this assumes that service.config.MaxRepair will never be changed once this Service instance
 // is initialized. If that is not a valid assumption, we should keep a copy of its initial value to
 // use here instead.
-func (service *Service) WaitForPendingRepairs() {
+func (service *Service) WaitForPendingRepairs(ctx context.Context) error {
 	// Acquire and then release the entire capacity of the semaphore, ensuring that
 	// it is completely empty (or, at least it was empty at some point).
 	//
 	// No error return is possible here; context.Background() can't be canceled
-	_ = service.JobLimiter.Acquire(context.Background(), int64(service.config.MaxRepair))
+	err := service.JobLimiter.Acquire(ctx, int64(service.config.MaxRepair))
+	if err != nil {
+		return err
+	}
 	service.JobLimiter.Release(int64(service.config.MaxRepair))
+	return nil
 }
 
 // TestingSetMinFailures sets the minFailures attribute, which tells the Repair machinery that we _expect_
@@ -145,7 +198,9 @@ func (service *Service) Run(ctx context.Context) (err error) {
 	defer mon.Task()(&ctx)(&err)
 
 	// Wait for all repairs to complete
-	defer service.WaitForPendingRepairs()
+	defer func() {
+		_ = service.WaitForPendingRepairs(context2.WithoutCancellation(ctx))
+	}()
 
 	return service.Loop.Run(ctx, service.processWhileQueueHasItems)
 }
@@ -196,7 +251,7 @@ func (service *Service) process(ctx context.Context) (err error) {
 		// return from service.Run when queue fetch fails.
 		ctx, cancel := context.WithTimeout(ctx, service.config.TotalTimeout)
 
-		log := service.log.With(zap.Stringer("Stream ID", seg.StreamID), zap.Uint64("Position", seg.Position.Encode()))
+		log := service.log.With(zap.Stringer("stream_id", seg.StreamID), zap.Uint64("position", seg.Position.Encode()))
 		log.Debug("Retrieved segment from repair queue")
 
 		// this goroutine inherits the JobLimiter semaphore acquisition and is now responsible
@@ -205,7 +260,7 @@ func (service *Service) process(ctx context.Context) (err error) {
 			defer service.JobLimiter.Release(1)
 			defer cancel()
 			if err := service.worker(ctx, seg); err != nil {
-				log.Error("repair worker failed", zap.Error(err))
+				log.Error("repair worker failed", zap.Uint16("placement", uint16(seg.Placement)), zap.Error(err))
 			}
 		}()
 	}
@@ -218,8 +273,8 @@ func (service *Service) worker(ctx context.Context, seg queue.InjuredSegment) (e
 	workerStartTime := service.nowFn().UTC()
 
 	log := service.log.With(
-		zap.Stringer("Stream ID", seg.StreamID),
-		zap.Uint64("Position", seg.Position.Encode()))
+		zap.Stringer("stream_id", seg.StreamID),
+		zap.Uint64("position", seg.Position.Encode()))
 	log.Debug("Limiter running repair on segment")
 
 	// note that shouldDelete is used even in the case where err is not null
@@ -231,24 +286,30 @@ func (service *Service) worker(ctx context.Context, seg queue.InjuredSegment) (e
 			log.Debug("removing repaired segment from repair queue")
 		}
 
-		delErr := service.queue.Delete(ctx, seg)
+		delErr := service.queue.Release(ctx, seg, true)
 		if delErr != nil {
 			err = errs.Combine(err, Error.New("failed to remove segment from queue: %v", delErr))
+		}
+	} else {
+		doneErr := service.queue.Release(ctx, seg, false)
+		if doneErr != nil {
+			err = errs.Combine(err, Error.New("failed to update segment in queue: %v", doneErr))
 		}
 	}
 	if err != nil {
 		return Error.Wrap(err)
 	}
 
+	placementTag := monkit.NewSeriesTag("placement", strconv.Itoa(int(seg.Placement)))
 	repairedTime := service.nowFn().UTC()
 	timeForRepair := repairedTime.Sub(workerStartTime)
-	mon.FloatVal("time_for_repair").Observe(timeForRepair.Seconds()) //mon:locked
+	mon.FloatVal("time_for_repair", placementTag).Observe(timeForRepair.Seconds())
 
 	insertedTime := seg.InsertedAt
 	// do not send metrics if segment was added before the InsertedTime field was added
 	if !insertedTime.IsZero() {
 		timeSinceQueued := workerStartTime.Sub(insertedTime)
-		mon.FloatVal("time_since_checker_queue").Observe(timeSinceQueued.Seconds()) //mon:locked
+		mon.FloatVal("time_since_checker_queue", placementTag).Observe(timeSinceQueued.Seconds())
 	}
 
 	return nil

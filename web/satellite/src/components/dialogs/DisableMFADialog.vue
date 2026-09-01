@@ -24,7 +24,7 @@
                 <v-card-title class="font-weight-bold">Disable Two-Factor</v-card-title>
                 <template #append>
                     <v-btn
-                        icon="$close"
+                        :icon="X"
                         variant="text"
                         size="small"
                         color="default"
@@ -49,7 +49,7 @@
                     type="number"
                     autofocus
                     maxlength="6"
-                    @update:modelValue="value => onValueChange(value)"
+                    @update:model-value="value => onValueChange(value)"
                 />
                 <v-form v-else v-model="formValid" class="pt-2" @submit.prevent="disable">
                     <v-text-field
@@ -116,13 +116,13 @@ import {
     VTextField,
     VSheet,
 } from 'vuetify/components';
-import { RectangleEllipsis } from 'lucide-vue-next';
+import { RectangleEllipsis, X } from '@lucide/vue';
 
 import { useLoading } from '@/composables/useLoading';
 import { useUsersStore } from '@/store/modules/usersStore';
 import { DisableMFARequest } from '@/types/users';
 import { AnalyticsErrorEventSource } from '@/utils/constants/analyticsEventNames';
-import { useNotify } from '@/utils/hooks';
+import { useNotify } from '@/composables/useNotify';
 
 const usersStore = useUsersStore();
 const { isLoading, withLoading } = useLoading();

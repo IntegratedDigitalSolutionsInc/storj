@@ -36,38 +36,20 @@
     </section>
 </template>
 
-<script lang="ts">
-import { Component, Vue } from 'vue-property-decorator';
+<script setup lang="ts">
+import { ref } from 'vue';
 
 import HeldHistoryAllStatsTable from '@/app/components/payments/HeldHistoryAllStatsTable.vue';
 import HeldHistoryMonthlyBreakdownTable from '@/app/components/payments/HeldHistoryMonthlyBreakdownTable.vue';
 
-// @vue/component
-@Component({
-    components: {
-        HeldHistoryAllStatsTable,
-        HeldHistoryMonthlyBreakdownTable,
-    },
-})
-export default class HeldHistoryArea extends Vue {
-    /**
-     * Indicates if All Stats state is active.
-     */
-    public isAllStatsShown = true;
+const isAllStatsShown = ref(true);
 
-    /**
-     * Sets held history table state to All Stats.
-     */
-    public showAllStats(): void {
-        this.isAllStatsShown = true;
-    }
+function showAllStats(): void {
+    isAllStatsShown.value = true;
+}
 
-    /**
-     * Sets held history table state to Monthly Breakdown.
-     */
-    public showMonthlyBreakdown(): void {
-        this.isAllStatsShown = false;
-    }
+function showMonthlyBreakdown(): void {
+    isAllStatsShown.value = false;
 }
 </script>
 
@@ -136,7 +118,7 @@ export default class HeldHistoryArea extends Vue {
         }
     }
 
-    @media screen and (max-width: 870px) {
+    @media screen and (width <= 870px) {
 
         .held-history-container {
 
@@ -163,7 +145,7 @@ export default class HeldHistoryArea extends Vue {
         }
     }
 
-    @media screen and (max-width: 600px) {
+    @media screen and (width <= 600px) {
 
         .held-history-container {
             padding: 28px 20px 10px;

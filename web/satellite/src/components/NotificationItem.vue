@@ -6,8 +6,7 @@
         closable
         variant="elevated"
         :title="item.title || item.type"
-        :type="item.type.toLowerCase() as 'error' | 'success' | 'warning' | 'info'"
-        rounded="lg"
+        :type="(item.type.toLowerCase() as 'error' | 'success' | 'warning' | 'info')"
         class="my-2"
         border
         @mouseover="() => onMouseOver(item.id)"
@@ -18,7 +17,7 @@
             <p ref="messageArea">
                 <component :is="item.messageNode" />
             </p>
-            <a v-if="isSupportLinkMentioned" class="d-inline-block mt-2 white-link" :href="requestURL" target="_blank" rel="noopener noreferrer">
+            <a v-if="isSupportLinkMentioned" class="d-inline-block mt-2" :href="configStore.supportUrl" target="_blank" rel="noopener noreferrer">
                 Contact Support
             </a>
         </template>
@@ -26,11 +25,11 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue';
+import { onMounted, ref } from 'vue';
 import { VAlert } from 'vuetify/components';
 
 import { useNotificationsStore } from '@/store/modules/notificationsStore';
-import { DelayedNotification } from '@/types/DelayedNotification';
+import type { DelayedNotification } from '@/types/DelayedNotification';
 import { useConfigStore } from '@/store/modules/configStore';
 
 const notificationsStore = useNotificationsStore();
@@ -42,13 +41,6 @@ defineProps<{
 
 const isSupportLinkMentioned = ref<boolean>(false);
 const messageArea = ref<HTMLParagraphElement>();
-
-/**
- * Returns the URL for the general request page from the store.
- */
-const requestURL = computed((): string => {
-    return configStore.state.config.generalRequestURL;
-});
 
 /**
  * Forces notification to stay on page on mouse over it.

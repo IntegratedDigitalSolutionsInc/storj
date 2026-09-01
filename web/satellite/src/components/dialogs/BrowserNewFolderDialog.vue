@@ -28,7 +28,7 @@
 
                     <template #append>
                         <v-btn
-                            icon="$close"
+                            :icon="X"
                             variant="text"
                             size="small"
                             color="default"
@@ -94,7 +94,7 @@
 </template>
 
 <script setup lang="ts">
-import { Component, computed, ref, watch } from 'vue';
+import { type Component, computed, ref, watch  } from 'vue';
 import {
     VDialog,
     VCard,
@@ -109,9 +109,10 @@ import {
     VDivider,
     VCardActions,
 } from 'vuetify/components';
+import { X } from '@lucide/vue';
 
-import { BrowserObject, useObjectBrowserStore } from '@/store/modules/objectBrowserStore';
-import { useNotify } from '@/utils/hooks';
+import { type BrowserObject, useObjectBrowserStore  } from '@/store/modules/objectBrowserStore';
+import { useNotify } from '@/composables/useNotify';
 import { AnalyticsErrorEventSource } from '@/utils/constants/analyticsEventNames';
 import { useLoading } from '@/composables/useLoading';
 
@@ -148,7 +149,7 @@ function createFolder(): void {
         try {
             await obStore.createFolder(folder.value.trim());
         } catch (error) {
-            notify.error(error.message, AnalyticsErrorEventSource.CREATE_FOLDER_MODAL);
+            notify.notifyError(error, AnalyticsErrorEventSource.CREATE_FOLDER_MODAL);
         }
         model.value = false;
     });

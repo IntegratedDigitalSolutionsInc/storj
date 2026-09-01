@@ -26,7 +26,7 @@
                 </button>
             </div>
             <div class="header__content-holder__right-area">
-                <div v-clipboard="nodeId" role="button" tabindex="0" class="header__content-holder__right-area__node-id-container">
+                <div role="button" tabindex="0" class="header__content-holder__right-area__node-id-container" @click="copyNodeId">
                     <b class="header__content-holder__right-area__node-id-container__title">Node ID:</b>
                     <p class="header__content-holder__right-area__node-id-container__id">{{ nodeId }}</p>
                     <CopyIcon />
@@ -37,7 +37,7 @@
                 <OptionsDropdown
                     v-show="isOptionsShown"
                     class="options-dropdown"
-                    @closeDropdown="closeOptionsDropdown"
+                    @close-dropdown="closeOptionsDropdown"
                 />
                 <button name="Notifications" aria-pressed="false" class="header__content-holder__right-area__bell-area" type="button" @click.stop.prevent="toggleNotificationsPopup">
                     <BellIcon />
@@ -56,18 +56,15 @@
     </div>
 </template>
 
-<script lang="ts">
-import { Component, Vue } from 'vue-property-decorator';
+<script setup lang="ts">
+import { computed, onBeforeMount, ref } from 'vue';
+import { useRoute, useRouter } from 'vue-router';
 
 import { RouteConfig } from '@/app/router';
-import { APPSTATE_ACTIONS } from '@/app/store/modules/appState';
-import { NODE_ACTIONS } from '@/app/store/modules/node';
-import { NOTIFICATIONS_ACTIONS } from '@/app/store/modules/notifications';
-import { PAYOUT_ACTIONS } from '@/app/store/modules/payout';
-
-import OptionsDropdown from '@/app/components/OptionsDropdown.vue';
-import NotificationsPopup from '@/app/components/notifications/NotificationsPopup.vue';
-
+import { usePayoutStore } from '@/app/store/modules/payoutStore';
+import { useNodeStore } from '@/app/store/modules/nodeStore';
+import { useAppStore } from '@/app/store/modules/appStore';
+import { useNotificationsStore } from '@/app/store/modules/notificationsStore';
 import CopyIcon from '@/../static/images/Copy.svg';
 import StorjIconWithoutText from '@/../static/images/LogoWithoutText.svg';
 import BellIcon from '@/../static/images/notifications/bell.svg';
@@ -76,165 +73,134 @@ import SettingsIcon from '@/../static/images/SettingsDots.svg';
 import StorjIconLight from '@/../static/images/storjIcon.svg';
 import StorjIconDark from '@/../static/images/storjIconDark.svg';
 
-const {
-    GET_NODE_INFO,
-    SELECT_SATELLITE,
-} = NODE_ACTIONS;
+import NotificationsPopup from '@/app/components/notifications/NotificationsPopup.vue';
+import OptionsDropdown from '@/app/components/OptionsDropdown.vue';
 
-// @vue/component
-@Component({
-    components: {
-        OptionsDropdown,
-        NotificationsPopup,
-        SettingsIcon,
-        StorjIconLight,
-        StorjIconDark,
-        RefreshIcon,
-        BellIcon,
-        StorjIconWithoutText,
-        CopyIcon,
-    },
-})
-export default class SNOHeader extends Vue {
-    public isNotificationPopupShown = false;
-    public isOptionsShown = false;
-    private readonly FIRST_PAGE: number = 1;
+const route = useRoute();
+const router = useRouter();
 
-    /**
-     * Lifecycle hook before render.
-     * Fetches first page of notifications.
-     */
-    public async beforeMount(): Promise<void> {
-        await this.$store.dispatch(APPSTATE_ACTIONS.SET_LOADING, true);
+const payoutStore = usePayoutStore();
+const nodeStore = useNodeStore();
+const appStore = useAppStore();
+const notificationsStore = useNotificationsStore();
 
-        try {
-            await this.$store.dispatch(NODE_ACTIONS.GET_NODE_INFO);
-            await this.$store.dispatch(NOTIFICATIONS_ACTIONS.GET_NOTIFICATIONS, this.FIRST_PAGE);
-        } catch (error) {
-            console.error(error);
-        }
+const FIRST_PAGE = 1;
 
-        await this.$store.dispatch(APPSTATE_ACTIONS.SET_LOADING, false);
+const isNotificationPopupShown = ref<boolean>(false);
+const isOptionsShown = ref<boolean>(false);
+
+const nodeId = computed<string>(() => nodeStore.state.info.id);
+const hasNewNotifications = computed<boolean>(() => notificationsStore.state.unreadCount > 0);
+const isDarkMode = computed<boolean>(() => appStore.state.isDarkMode);
+
+function openOptionsDropdown(): void {
+    setTimeout(() => isOptionsShown.value = true, 0);
+}
+
+function closeOptionsDropdown(): void {
+    isOptionsShown.value = false;
+}
+
+function toggleNotificationsPopup(): void {
+    if (route.name === RouteConfig.Notifications.name) {
+        return;
     }
 
-    public get nodeId(): string {
-        return this.$store.state.node.info.id;
+    isNotificationPopupShown.value = !isNotificationPopupShown.value;
+}
+
+function closeNotificationPopup(): void {
+    isNotificationPopupShown.value = false;
+}
+
+function copyNodeId(): void {
+    navigator.clipboard.writeText(nodeId.value);
+}
+
+async function onHeaderLogoClick(): Promise<void> {
+    const isCurrentLocationIsHomePage = route.name === RouteConfig.Root.name;
+
+    if (isCurrentLocationIsHomePage) {
+        location.reload();
     }
 
-    public get hasNewNotifications(): boolean {
-        return this.$store.state.notificationsModule.unreadCount > 0;
+    await router.replace('/');
+}
+
+async function onRefresh(): Promise<void> {
+    appStore.setLoading(true);
+
+    const selectedSatelliteId = nodeStore.state.selectedSatellite.id;
+
+    appStore.setNoPayoutData(false);
+
+    try {
+        await nodeStore.fetchNodeInfo();
+        await nodeStore.selectSatellite(selectedSatelliteId);
+    } catch (error) {
+        console.error('fetching satellite data', error);
     }
 
-    public openOptionsDropdown(): void {
-        setTimeout(() => this.isOptionsShown = true, 0);
+    try {
+        await payoutStore.fetchPayoutHistory();
+    } catch (error) {
+        console.error(error);
     }
 
-    public closeOptionsDropdown(): void {
-        this.isOptionsShown = false;
+    try {
+        await payoutStore.fetchEstimation(selectedSatelliteId);
+    } catch (error) {
+        console.error(error);
     }
 
-    /**
-     * toggleNotificationPopup toggles NotificationPopup visibility.
-     */
-    public toggleNotificationsPopup(): void {
-        /**
-         * Blocks opening popup in current route is /notifications.
-         */
-        if (this.$route.name === RouteConfig.Notifications.name) {
-            return;
-        }
-
-        this.isNotificationPopupShown = !this.isNotificationPopupShown;
+    try {
+        await payoutStore.fetchPricingModel(selectedSatelliteId);
+    } catch (error) {
+        console.error(error);
     }
 
-    /**
-     * closeNotificationPopup when clicking outside popup.
-     */
-    public closeNotificationPopup(): void {
-        this.isNotificationPopupShown = false;
+    appStore.setLoading(false);
+
+    try {
+        await payoutStore.fetchPayoutInfo(selectedSatelliteId);
+        await payoutStore.fetchTotalPayments(selectedSatelliteId);
+    } catch (error) {
+        console.error(error);
     }
 
-    /**
-     * Refreshes page when on home page or relocates to home page from other location.
-     */
-    public async onHeaderLogoClick(): Promise<void> {
-        const isCurrentLocationIsHomePage = this.$route.name === RouteConfig.Root.name;
-
-        if (isCurrentLocationIsHomePage) {
-            location.reload();
-        }
-
-        await this.$router.replace('/');
+    try {
+        await notificationsStore.fetchNotifications(FIRST_PAGE);
+    } catch (error) {
+        console.error(error);
     }
 
-    /**
-     * Refreshes all needed data from server.
-     */
-    public async onRefresh(): Promise<void> {
-        await this.$store.dispatch(APPSTATE_ACTIONS.SET_LOADING, true);
-
-        const selectedSatelliteId = this.$store.state.node.selectedSatellite.id;
-        await this.$store.dispatch(APPSTATE_ACTIONS.SET_NO_PAYOUT_DATA, false);
-
-        try {
-            await this.$store.dispatch(GET_NODE_INFO);
-            await this.$store.dispatch(SELECT_SATELLITE, selectedSatelliteId);
-        } catch (error) {
-            console.error('fetching satellite data', error);
-        }
-
-        try {
-            await this.$store.dispatch(PAYOUT_ACTIONS.GET_PAYOUT_HISTORY);
-        } catch (error) {
-            console.error(error);
-        }
-
-        try {
-            await this.$store.dispatch(PAYOUT_ACTIONS.GET_ESTIMATION, selectedSatelliteId);
-        } catch (error) {
-            console.error(error);
-        }
-
-        try {
-            await this.$store.dispatch(PAYOUT_ACTIONS.GET_PRICING_MODEL, selectedSatelliteId);
-        } catch (error) {
-            console.error(error);
-        }
-
-        await this.$store.dispatch(APPSTATE_ACTIONS.SET_LOADING, false);
-
-        try {
-            await this.$store.dispatch(PAYOUT_ACTIONS.GET_PAYOUT_INFO, selectedSatelliteId);
-            await this.$store.dispatch(PAYOUT_ACTIONS.GET_TOTAL, selectedSatelliteId);
-        } catch (error) {
-            console.error(error);
-        }
-
-        try {
-            await this.$store.dispatch(NOTIFICATIONS_ACTIONS.GET_NOTIFICATIONS, this.FIRST_PAGE);
-        } catch (error) {
-            console.error(error);
-        }
-
-        try {
-            await this.$store.dispatch(PAYOUT_ACTIONS.GET_HELD_HISTORY);
-        } catch (error) {
-            console.error(error);
-        }
-    }
-
-    public get isDarkMode(): boolean {
-        return this.$store.state.appStateModule.isDarkMode;
+    try {
+        await payoutStore.fetchHeldHistory();
+    } catch (error) {
+        console.error(error);
     }
 }
+
+onBeforeMount(async () => {
+    appStore.setLoading(true);
+
+    try {
+        await nodeStore.fetchNodeInfo();
+        await notificationsStore.fetchNotifications(FIRST_PAGE);
+    } catch (error) {
+        console.error(error);
+    }
+
+    appStore.setLoading(false);
+});
 </script>
 
 <style scoped lang="scss">
-    .svg ::v-deep path {
+    .svg :deep(path) {
         fill: var(--node-id-copy-icon-color);
     }
 
-    .storj-logo ::v-deep path {
+    .storj-logo :deep(path) {
         fill: var(--icon-color) !important;
     }
 
@@ -245,7 +211,7 @@ export default class SNOHeader extends Vue {
         }
     }
 
-    .notifications-bell-icon ::v-deep path {
+    .notifications-bell-icon :deep(path) {
         fill: var(--regular-icon-color) !important;
     }
 
@@ -338,7 +304,7 @@ export default class SNOHeader extends Vue {
                         border-color: var(--node-id-border-hover-color);
                         color: var(--node-id-hover-text-color);
 
-                        .svg ::v-deep path {
+                        .svg :deep(path) {
                             fill: var(--node-id-border-hover-color) !important;
                         }
                     }
@@ -390,7 +356,7 @@ export default class SNOHeader extends Vue {
         right: 55px;
     }
 
-    @media screen and (max-width: 780px) {
+    @media screen and (width <= 780px) {
 
         .header__content-holder {
 
@@ -417,7 +383,7 @@ export default class SNOHeader extends Vue {
         }
     }
 
-    @media screen and (max-width: 600px) {
+    @media screen and (width <= 600px) {
 
         .header__content-holder {
 
@@ -436,7 +402,7 @@ export default class SNOHeader extends Vue {
         }
     }
 
-    @media screen and (max-width: 600px) {
+    @media screen and (width <= 600px) {
 
         .header__content-holder__right-area__bell-area__popup {
             position: fixed;

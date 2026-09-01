@@ -7,7 +7,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"net/http"
 	"strconv"
@@ -18,12 +17,12 @@ import (
 	"github.com/zeebo/errs"
 	"go.uber.org/zap"
 
+	"storj.io/common/storj"
+	"storj.io/common/uuid"
 	"storj.io/storj/private/web"
 	"storj.io/storj/satellite/console"
 	"storj.io/storj/satellite/payments"
 	"storj.io/storj/satellite/payments/billing"
-	"storj.io/storj/satellite/payments/paymentsconfig"
-	"storj.io/storj/satellite/payments/stripe"
 )
 
 var (
@@ -37,16 +36,14 @@ type Payments struct {
 	log                  *zap.Logger
 	service              *console.Service
 	accountFreezeService *console.AccountFreezeService
-	packagePlans         paymentsconfig.PackagePlans
 }
 
 // NewPayments is a constructor for api payments controller.
-func NewPayments(log *zap.Logger, service *console.Service, accountFreezeService *console.AccountFreezeService, packagePlans paymentsconfig.PackagePlans) *Payments {
+func NewPayments(log *zap.Logger, service *console.Service, accountFreezeService *console.AccountFreezeService) *Payments {
 	return &Payments{
 		log:                  log,
 		service:              service,
 		accountFreezeService: accountFreezeService,
-		packagePlans:         packagePlans,
 	}
 }
 
@@ -71,6 +68,23 @@ func (p *Payments) SetupAccount(w http.ResponseWriter, r *http.Request) {
 	err = json.NewEncoder(w).Encode(couponType)
 	if err != nil {
 		p.log.Error("failed to write json token deposit response", zap.Error(ErrPaymentsAPI.Wrap(err)))
+	}
+}
+
+// StartFreeTrial starts a free trial for the Member user.
+func (p *Payments) StartFreeTrial(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	var err error
+	defer mon.Task()(&ctx)(&err)
+
+	err = p.service.Payments().StartFreeTrial(ctx)
+	if err != nil {
+		if console.ErrUnauthorized.Has(err) {
+			p.serveJSONError(ctx, w, http.StatusUnauthorized, err)
+			return
+		}
+
+		p.serveJSONError(ctx, w, http.StatusInternalServerError, err)
 	}
 }
 
@@ -99,16 +113,11 @@ func (p *Payments) AccountBalance(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// ProjectsCharges returns how much money current user will be charged for each project which he owns.
-func (p *Payments) ProjectsCharges(w http.ResponseWriter, r *http.Request) {
+// ProductCharges returns how much money current user will be charged for each project which he owns split by product.
+func (p *Payments) ProductCharges(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	var err error
 	defer mon.Task()(&ctx)(&err)
-
-	var response struct {
-		PriceModels map[string]payments.ProjectUsagePriceModel `json:"priceModels"`
-		Charges     payments.ProjectChargesResponse            `json:"charges"`
-	}
 
 	w.Header().Set("Content-Type", "application/json")
 
@@ -126,34 +135,37 @@ func (p *Payments) ProjectsCharges(w http.ResponseWriter, r *http.Request) {
 	since := time.Unix(sinceStamp, 0).UTC()
 	before := time.Unix(beforeStamp, 0).UTC()
 
-	charges, err := p.service.Payments().ProjectsCharges(ctx, since, before)
+	shouldApplyMinimumCharge, err := p.service.Payments().ShouldApplyMinimumCharge(ctx)
 	if err != nil {
-		if console.ErrUnauthorized.Has(err) {
-			p.serveJSONError(ctx, w, http.StatusUnauthorized, err)
-			return
-		}
-
-		p.serveJSONError(ctx, w, http.StatusInternalServerError, err)
+		p.handleServiceError(ctx, w, err)
 		return
 	}
 
-	response.Charges = charges
-	response.PriceModels = make(map[string]payments.ProjectUsagePriceModel)
-
-	seen := make(map[string]struct{})
-	for _, partnerCharges := range charges {
-		for partner := range partnerCharges {
-			if _, ok := seen[partner]; ok {
-				continue
-			}
-			response.PriceModels[partner] = *p.service.Payments().GetProjectUsagePriceModel(partner)
-			seen[partner] = struct{}{}
-		}
+	charges, err := p.service.Payments().ProductCharges(ctx, since, before)
+	if err != nil {
+		p.handleServiceError(ctx, w, err)
+		return
 	}
+
+	var response struct {
+		Charges            payments.ProductChargesResponse `json:"charges"`
+		ApplyMinimumCharge bool                            `json:"applyMinimumCharge"`
+	}
+
+	response.Charges = charges
+	response.ApplyMinimumCharge = shouldApplyMinimumCharge
 
 	err = json.NewEncoder(w).Encode(response)
 	if err != nil {
-		p.log.Error("failed to write json project usage and charges response", zap.Error(ErrPaymentsAPI.Wrap(err)))
+		p.log.Error("failed to write json product usage and charges response", zap.Error(ErrPaymentsAPI.Wrap(err)))
+	}
+}
+
+func (p *Payments) handleServiceError(ctx context.Context, w http.ResponseWriter, err error) {
+	if console.ErrUnauthorized.Has(err) {
+		p.serveJSONError(ctx, w, http.StatusUnauthorized, err)
+	} else {
+		p.serveJSONError(ctx, w, http.StatusInternalServerError, err)
 	}
 }
 
@@ -179,13 +191,9 @@ func (p *Payments) TriggerAttemptPayment(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	if freezes.BillingFreeze == nil && freezes.BillingWarning == nil && freezes.TrialExpirationFreeze == nil {
-		return
-	}
-
 	err = p.service.Payments().AttemptPayOverdueInvoices(ctx)
 	if err != nil {
-		web.ServeCustomJSONError(ctx, p.log, w, http.StatusInternalServerError, err, rootError(err).Error())
+		web.ServeCustomJSONError(ctx, p.log, w, http.StatusInternalServerError, err, "Failed to attempt payment of overdue invoices")
 		return
 	}
 
@@ -224,9 +232,36 @@ func (p *Payments) AddCreditCard(w http.ResponseWriter, r *http.Request) {
 			web.ServeCustomJSONError(ctx, p.log, w, http.StatusUnauthorized, err, rootError(err).Error())
 			return
 		}
-
-		if stripe.ErrDuplicateCard.Has(err) {
+		if payments.ErrDuplicateCard.Has(err) {
 			web.ServeCustomJSONError(ctx, p.log, w, http.StatusBadRequest, err, rootError(err).Error())
+			return
+		}
+		if payments.ErrMaxCreditCards.Has(err) {
+			web.ServeCustomJSONError(ctx, p.log, w, http.StatusForbidden, err, rootError(err).Error())
+			return
+		}
+
+		web.ServeCustomJSONError(ctx, p.log, w, http.StatusInternalServerError, err, rootError(err).Error())
+		return
+	}
+}
+
+// UpdateCreditCard is used to update the credit card details.
+func (p *Payments) UpdateCreditCard(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	var err error
+	defer mon.Task()(&ctx)(&err)
+
+	var params payments.CardUpdateParams
+	if err = json.NewDecoder(r.Body).Decode(&params); err != nil {
+		p.serveJSONError(ctx, w, http.StatusBadRequest, err)
+		return
+	}
+
+	err = p.service.Payments().UpdateCreditCard(ctx, params)
+	if err != nil {
+		if console.ErrUnauthorized.Has(err) {
+			web.ServeCustomJSONError(ctx, p.log, w, http.StatusUnauthorized, err, rootError(err).Error())
 			return
 		}
 
@@ -242,23 +277,32 @@ func (p *Payments) AddCardByPaymentMethodID(w http.ResponseWriter, r *http.Reque
 	var err error
 	defer mon.Task()(&ctx)(&err)
 
-	bodyBytes, err := io.ReadAll(r.Body)
-	if err != nil {
+	w.Header().Set("Content-Type", "application/json")
+
+	var params payments.AddCardParams
+
+	if err = json.NewDecoder(r.Body).Decode(&params); err != nil {
 		p.serveJSONError(ctx, w, http.StatusBadRequest, err)
 		return
 	}
 
-	pmID := string(bodyBytes)
+	if params.Token == "" {
+		p.serveJSONError(ctx, w, http.StatusBadRequest, errs.New("credit card ID is required"))
+		return
+	}
 
-	_, err = p.service.Payments().AddCardByPaymentMethodID(ctx, pmID)
+	_, err = p.service.Payments().AddCardByPaymentMethodID(ctx, &params, false)
 	if err != nil {
 		if console.ErrUnauthorized.Has(err) {
 			web.ServeCustomJSONError(ctx, p.log, w, http.StatusUnauthorized, err, rootError(err).Error())
 			return
 		}
-
-		if stripe.ErrDuplicateCard.Has(err) {
+		if payments.ErrDuplicateCard.Has(err) {
 			web.ServeCustomJSONError(ctx, p.log, w, http.StatusBadRequest, err, rootError(err).Error())
+			return
+		}
+		if payments.ErrMaxCreditCards.Has(err) {
+			web.ServeCustomJSONError(ctx, p.log, w, http.StatusForbidden, err, rootError(err).Error())
 			return
 		}
 
@@ -311,11 +355,10 @@ func (p *Payments) MakeCreditCardDefault(w http.ResponseWriter, r *http.Request)
 
 	err = p.service.Payments().MakeCreditCardDefault(ctx, string(cardID))
 	if err != nil {
-		if stripe.ErrCardNotFound.Has(err) {
+		if payments.ErrCardNotFound.Has(err) {
 			p.serveJSONError(ctx, w, http.StatusNotFound, err)
 			return
 		}
-
 		if console.ErrUnauthorized.Has(err) {
 			p.serveJSONError(ctx, w, http.StatusUnauthorized, err)
 			return
@@ -342,7 +385,7 @@ func (p *Payments) RemoveCreditCard(w http.ResponseWriter, r *http.Request) {
 
 	err = p.service.Payments().RemoveCreditCard(ctx, cardID)
 	if err != nil {
-		if stripe.ErrCardNotFound.Has(err) {
+		if payments.ErrCardNotFound.Has(err) {
 			p.serveJSONError(ctx, w, http.StatusNotFound, err)
 			return
 		}
@@ -429,6 +472,31 @@ func (p *Payments) InvoiceHistory(w http.ResponseWriter, r *http.Request) {
 	err = json.NewEncoder(w).Encode(history)
 	if err != nil {
 		p.log.Error("failed to write json history response", zap.Error(ErrPaymentsAPI.Wrap(err)))
+	}
+}
+
+// GetFailedInvoice returns a list of failed invoices for the user.
+func (p *Payments) GetFailedInvoice(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	var err error
+	defer mon.Task()(&ctx)(&err)
+
+	w.Header().Set("Content-Type", "application/json")
+
+	invoice, err := p.service.Payments().GetFailedInvoice(ctx)
+	if err != nil {
+		if console.ErrUnauthorized.Has(err) {
+			p.serveJSONError(ctx, w, http.StatusUnauthorized, err)
+			return
+		}
+
+		p.serveJSONError(ctx, w, http.StatusInternalServerError, err)
+		return
+	}
+
+	err = json.NewEncoder(w).Encode(invoice)
+	if err != nil {
+		p.log.Error("failed to write json failed invoice response", zap.Error(ErrPaymentsAPI.Wrap(err)))
 	}
 }
 
@@ -569,7 +637,7 @@ func (p *Payments) WalletPayments(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// WalletPaymentsWithConfirmations returns with the list of storjscan transactions (including confirmations count) for user`s wallet.
+// WalletPaymentsWithConfirmations returns with the list of storjscan transactions (including confirmations count) for user's wallet.
 func (p *Payments) WalletPaymentsWithConfirmations(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	var err error
@@ -607,84 +675,108 @@ func (p *Payments) GetProjectUsagePriceModel(w http.ResponseWriter, r *http.Requ
 
 	w.Header().Set("Content-Type", "application/json")
 
-	user, err := console.GetUser(ctx)
+	_, err = console.GetUser(ctx)
 	if err != nil {
 		p.serveJSONError(ctx, w, http.StatusInternalServerError, err)
 		return
 	}
 
-	pricing := p.service.Payments().GetProjectUsagePriceModel(string(user.UserAgent))
+	pricing := p.service.Payments().GetProjectUsagePriceModel()
 
 	if err = json.NewEncoder(w).Encode(pricing); err != nil {
 		p.log.Error("failed to encode project usage price model", zap.Error(ErrPaymentsAPI.Wrap(err)))
 	}
 }
 
-// PurchasePackage purchases one of the configured paymentsconfig.PackagePlans.
-func (p *Payments) PurchasePackage(w http.ResponseWriter, r *http.Request) {
+// GetPlacementPriceModel returns the bucket usage price model for the placement.
+func (p *Payments) GetPlacementPriceModel(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	var err error
 	defer mon.Task()(&ctx)(&err)
 
-	// whether to use payment method id instead of token for adding card.
-	usePmID := r.URL.Query().Get("pmID") == "true"
+	w.Header().Set("Content-Type", "application/json")
 
-	bodyBytes, err := io.ReadAll(r.Body)
+	var placement storj.PlacementConstraint
+	placementStr := r.URL.Query().Get("placement")
+	if placementStr == "" {
+		placementStr = r.URL.Query().Get("placementName")
+		placement, err = p.service.GetPlacementByName(placementStr)
+		if err != nil {
+			p.serveJSONError(ctx, w, http.StatusNotFound, err)
+			return
+		}
+	} else {
+		pl, err := strconv.ParseInt(placementStr, 10, 64)
+		if err != nil {
+			p.serveJSONError(ctx, w, http.StatusBadRequest, errs.New("invalid placement"))
+			return
+		}
+		placement = storj.PlacementConstraint(pl)
+	}
+
+	projectIDStr := r.URL.Query().Get("projectID")
+	if projectIDStr == "" {
+		p.serveJSONError(ctx, w, http.StatusBadRequest, errs.New("projectID is required"))
+		return
+	}
+
+	projectID, err := uuid.FromString(projectIDStr)
 	if err != nil {
+		p.serveJSONError(ctx, w, http.StatusBadRequest, errs.New("invalid project id: %v", err))
+		return
+	}
+
+	_, pricing, err := p.service.Payments().GetPlacementPriceModel(ctx, projectID, placement)
+	if err != nil {
+		p.serveJSONError(ctx, w, http.StatusInternalServerError, err)
+		return
+	}
+
+	if err = json.NewEncoder(w).Encode(pricing); err != nil {
+		p.log.Error("failed to encode project usage price model", zap.Error(ErrPaymentsAPI.Wrap(err)))
+	}
+}
+
+// Purchase makes a purchase action using an invoice.
+// Is used for purchasing package plan or upgraded account.
+func (p *Payments) Purchase(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	var err error
+	defer mon.Task()(&ctx)(&err)
+
+	w.Header().Set("Content-Type", "application/json")
+
+	var params payments.PurchaseParams
+
+	if err = json.NewDecoder(r.Body).Decode(&params); err != nil {
 		p.serveJSONError(ctx, w, http.StatusBadRequest, err)
 		return
 	}
 
-	token := string(bodyBytes)
-
-	u, err := console.GetUser(ctx)
-	if err != nil {
-		p.serveJSONError(ctx, w, http.StatusUnauthorized, err)
+	if params.Token == "" {
+		p.serveJSONError(ctx, w, http.StatusBadRequest, errs.New("credit card ID is required"))
+		return
+	}
+	if params.Intent != payments.PurchasePackageIntent && params.Intent != payments.PurchaseUpgradedAccountIntent {
+		p.serveJSONError(ctx, w, http.StatusForbidden, errs.New("invalid intent: %d", params.Intent))
 		return
 	}
 
-	pkg, err := p.packagePlans.Get(u.UserAgent)
-	if err != nil {
-		p.serveJSONError(ctx, w, http.StatusNotFound, err)
-		return
-	}
-
-	var addCardFunc func(context.Context, string) (payments.CreditCard, error)
-	if usePmID {
-		addCardFunc = p.service.Payments().AddCardByPaymentMethodID
-	} else {
-		addCardFunc = p.service.Payments().AddCreditCard
-	}
-
-	card, err := addCardFunc(ctx, token)
-	if err != nil {
-		switch {
-		case console.ErrUnauthorized.Has(err):
+	if err = p.service.Payments().Purchase(ctx, &params); err != nil {
+		if console.ErrUnauthorized.Has(err) {
 			p.serveJSONError(ctx, w, http.StatusUnauthorized, err)
-		default:
-			p.serveJSONError(ctx, w, http.StatusInternalServerError, err)
-		}
-		return
-	}
-
-	description := fmt.Sprintf("%s package plan", string(u.UserAgent))
-	err = p.service.Payments().UpdatePackage(ctx, description, time.Now())
-	if err != nil {
-		if !console.ErrAlreadyHasPackage.Has(err) {
-			p.serveJSONError(ctx, w, http.StatusInternalServerError, err)
 			return
 		}
-	}
+		if console.ErrForbidden.Has(err) || payments.ErrMaxCreditCards.Has(err) {
+			p.serveJSONError(ctx, w, http.StatusForbidden, err)
+			return
+		}
+		if console.ErrNotFound.Has(err) {
+			p.serveJSONError(ctx, w, http.StatusNotFound, err)
+			return
+		}
 
-	err = p.service.Payments().Purchase(ctx, pkg.Price, description, card.ID)
-	if err != nil {
-		p.serveJSONError(ctx, w, http.StatusInternalServerError, err)
-		return
-	}
-
-	if err = p.service.Payments().ApplyCredit(ctx, pkg.Credit, description); err != nil {
-		p.serveJSONError(ctx, w, http.StatusInternalServerError, err)
-		return
+		web.ServeCustomJSONError(ctx, p.log, w, http.StatusInternalServerError, err, rootError(err).Error())
 	}
 }
 
@@ -700,7 +792,7 @@ func (p *Payments) PackageAvailable(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	pkg, err := p.packagePlans.Get(u.UserAgent)
+	pkg, err := p.service.Payments().GetPackagePlanByUserAgent(u.UserAgent)
 	hasPkg := err == nil && pkg != payments.PackagePlan{}
 
 	if err = json.NewEncoder(w).Encode(hasPkg); err != nil {
@@ -719,6 +811,143 @@ func (p *Payments) GetTaxCountries(w http.ResponseWriter, r *http.Request) {
 	if err = json.NewEncoder(w).Encode(payments.TaxCountries); err != nil {
 		p.log.Error("failed to encode project usage price model", zap.Error(ErrPaymentsAPI.Wrap(err)))
 	}
+}
+
+// AddFunds starts the process of adding funds to the user's account.
+func (p *Payments) AddFunds(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	var err error
+	defer mon.Task()(&ctx)(&err)
+
+	w.Header().Set("Content-Type", "application/json")
+
+	var params payments.AddFundsParams
+	if err = json.NewDecoder(r.Body).Decode(&params); err != nil {
+		p.serveJSONError(ctx, w, http.StatusBadRequest, err)
+		return
+	}
+
+	if params.Intent != payments.AddFundsIntent {
+		p.serveJSONError(ctx, w, http.StatusForbidden, errs.New("invalid intent: %s", params.Intent))
+		return
+	}
+	if params.CardID == "" {
+		p.serveJSONError(ctx, w, http.StatusBadRequest, errs.New("card id is required"))
+		return
+	}
+
+	resp, err := p.service.Payments().AddFunds(ctx, params)
+	if err != nil {
+		if console.ErrUnauthorized.Has(err) {
+			p.serveJSONError(ctx, w, http.StatusUnauthorized, err)
+			return
+		}
+		if console.ErrValidation.Has(err) {
+			p.serveJSONError(ctx, w, http.StatusBadRequest, err)
+			return
+		}
+
+		p.serveJSONError(ctx, w, http.StatusInternalServerError, err)
+		return
+	}
+
+	if err = json.NewEncoder(w).Encode(resp); err != nil {
+		p.log.Error("failed to encode add funds response", zap.Error(ErrPaymentsAPI.Wrap(err)))
+	}
+}
+
+// CreateIntent creates a payment intent for adding funds to the user's account.
+func (p *Payments) CreateIntent(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	var err error
+	defer mon.Task()(&ctx)(&err)
+
+	w.Header().Set("Content-Type", "application/json")
+
+	var params struct {
+		Amount         int  `json:"amount"` // Amount in cents
+		WithCustomCard bool `json:"withCustomCard"`
+	}
+	if err = json.NewDecoder(r.Body).Decode(&params); err != nil {
+		p.serveJSONError(ctx, w, http.StatusBadRequest, err)
+		return
+	}
+
+	clientSecret, err := p.service.Payments().CreateIntent(ctx, params.Amount, params.WithCustomCard)
+	if err != nil {
+		if console.ErrUnauthorized.Has(err) {
+			p.serveJSONError(ctx, w, http.StatusUnauthorized, err)
+			return
+		}
+		if console.ErrValidation.Has(err) {
+			p.serveJSONError(ctx, w, http.StatusBadRequest, err)
+			return
+		}
+
+		p.serveJSONError(ctx, w, http.StatusInternalServerError, err)
+		return
+	}
+
+	if err = json.NewEncoder(w).Encode(struct {
+		ClientSecret string `json:"clientSecret"`
+	}{clientSecret}); err != nil {
+		p.log.Error("failed to encode client secret response", zap.Error(ErrPaymentsAPI.Wrap(err)))
+	}
+}
+
+// GetCardSetupSecret returns a secret to be used by the front end
+// to begin card authorization flow.
+func (p *Payments) GetCardSetupSecret(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	var err error
+	defer mon.Task()(&ctx)(&err)
+
+	w.Header().Set("Content-Type", "application/json")
+
+	secret, err := p.service.Payments().GetCardSetupSecret(ctx)
+	if err != nil {
+		if console.ErrUnauthorized.Has(err) {
+			p.serveJSONError(ctx, w, http.StatusUnauthorized, err)
+			return
+		}
+
+		p.serveJSONError(ctx, w, http.StatusInternalServerError, err)
+		return
+	}
+
+	if err = json.NewEncoder(w).Encode(secret); err != nil {
+		p.log.Error("failed to encode add funds response", zap.Error(ErrPaymentsAPI.Wrap(err)))
+	}
+}
+
+// HandleWebhookEvent handles a webhook event from the payments provider.
+func (p *Payments) HandleWebhookEvent(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	var err error
+	defer mon.Task()(&ctx)(&err)
+
+	signature := r.Header.Get("Stripe-Signature")
+	if signature == "" {
+		p.log.Error("missing stripe signature")
+		return
+	}
+
+	payload, err := io.ReadAll(r.Body)
+	if err != nil {
+		p.log.Error("failed reading payments webhook body", zap.Error(ErrPaymentsAPI.Wrap(err)))
+		return
+	}
+
+	err = p.service.Payments().HandleWebhookEvent(ctx, signature, payload)
+	if err != nil {
+		p.log.Error("failed to process webhook event", zap.Error(ErrPaymentsAPI.Wrap(err)))
+
+		// We return error to stripe to retry sending this event.
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
 }
 
 // GetCountryTaxes returns a list of taxes supported for a country.
@@ -785,9 +1014,8 @@ func (p *Payments) SaveBillingAddress(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if address.Name == "" || address.Line1 == "" ||
-		address.City == "" || address.Country.Code == "" {
-		p.serveJSONError(ctx, w, http.StatusBadRequest, errs.New("missing required address fields"))
+	if err = address.Validate(); err != nil {
+		p.serveJSONError(ctx, w, http.StatusBadRequest, err)
 		return
 	}
 
@@ -848,18 +1076,18 @@ func (p *Payments) AddTaxID(w http.ResponseWriter, r *http.Request) {
 	var err error
 	defer mon.Task()(&ctx)(&err)
 
-	var taxID payments.TaxID
-	if err = json.NewDecoder(r.Body).Decode(&taxID); err != nil {
+	var params payments.AddTaxParams
+	if err = json.NewDecoder(r.Body).Decode(&params); err != nil {
 		p.serveJSONError(ctx, w, http.StatusBadRequest, err)
 		return
 	}
 
-	if taxID.Tax.Code == "" || taxID.Value == "" {
+	if params.Type == "" || params.Value == "" {
 		p.serveJSONError(ctx, w, http.StatusBadRequest, errs.New("missing required tax ID fields"))
 		return
 	}
 
-	newInfo, err := p.service.Payments().AddTaxID(ctx, taxID)
+	newInfo, err := p.service.Payments().AddTaxID(ctx, params)
 	if err != nil {
 		if console.ErrUnauthorized.Has(err) {
 			p.serveJSONError(ctx, w, http.StatusUnauthorized, err)

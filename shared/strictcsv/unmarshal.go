@@ -16,8 +16,8 @@ import (
 )
 
 var (
-	unmarshalCSVType  = reflect.TypeOf((*Unmarshaler)(nil)).Elem()
-	unmarshalTextType = reflect.TypeOf((*encoding.TextUnmarshaler)(nil)).Elem()
+	unmarshalCSVType  = reflect.TypeFor[Unmarshaler]()
+	unmarshalTextType = reflect.TypeFor[encoding.TextUnmarshaler]()
 )
 
 // Unmarshaler is used to implement customized CSV field unmarshaling.
@@ -25,23 +25,41 @@ type Unmarshaler interface {
 	UnmarshalCSV(s string) error
 }
 
+// ReadOption customizes the behavior of Read/Unmarshal/UnmarshalString.
+type ReadOption func(*readOptions)
+
+type readOptions struct {
+	allowExtraColumns bool
+}
+
+// AllowExtraColumns tells Read to silently ignore CSV columns that are
+// not mapped to any struct field, rather than failing. Useful for
+// reading older files that carry columns since removed from the schema.
+func AllowExtraColumns() ReadOption {
+	return func(o *readOptions) { o.allowExtraColumns = true }
+}
+
 // Unmarshal unmarshals an object from CSV bytes.
-func Unmarshal(b []byte, obj interface{}) error {
-	return Read(bytes.NewReader(b), obj)
+func Unmarshal(b []byte, obj any, opts ...ReadOption) error {
+	return Read(bytes.NewReader(b), obj, opts...)
 }
 
 // UnmarshalString unmarshals an object from a CSV string.
-func UnmarshalString(s string, obj interface{}) error {
-	return Read(strings.NewReader(s), obj)
+func UnmarshalString(s string, obj any, opts ...ReadOption) error {
+	return Read(strings.NewReader(s), obj, opts...)
 }
 
 // Read unmarshals an object from a CSV reader.
-func Read(r io.Reader, obj interface{}) error {
+func Read(r io.Reader, obj any, opts ...ReadOption) error {
+	var options readOptions
+	for _, opt := range opts {
+		opt(&options)
+	}
 	pv := reflect.ValueOf(obj)
 	switch {
 	case pv == reflect.Value{}:
 		return Error.New("destination (%T) cannot be nil", obj)
-	case pv.Kind() != reflect.Ptr:
+	case pv.Kind() != reflect.Pointer:
 		return Error.New("destination (%T) must be a non-nil pointer to a struct or slice of structs", obj)
 	case pv.IsNil():
 		return Error.New("destination (%T) cannot be nil", obj)
@@ -56,7 +74,7 @@ func Read(r io.Reader, obj interface{}) error {
 		isSlice = true
 		t = t.Elem()
 	}
-	if t.Kind() == reflect.Ptr {
+	if t.Kind() == reflect.Pointer {
 		isPtr = true
 		t = t.Elem()
 	}
@@ -77,19 +95,27 @@ func Read(r io.Reader, obj interface{}) error {
 	}
 
 	unmatchedFields := make(map[string]struct{}, len(settableFields))
-	for header := range settableFields {
-		unmatchedFields[header] = struct{}{}
+	for header, field := range settableFields {
+		if !field.Optional {
+			unmatchedFields[header] = struct{}{}
+		}
 	}
+	seenHeaders := make(map[string]struct{}, len(headers))
 
 	fields := make([]settableField, 0, len(headers))
 	for _, header := range headers {
 		field, ok := settableFields[header]
 		if !ok {
+			if options.allowExtraColumns {
+				fields = append(fields, settableField{Skip: true})
+				continue
+			}
 			return Error.New("CSV header %q is not mapped to struct field", header)
 		}
-		if _, ok := unmatchedFields[header]; !ok {
+		if _, ok := seenHeaders[header]; ok {
 			return Error.New("CSV header %q is duplicated", header)
 		}
+		seenHeaders[header] = struct{}{}
 		delete(unmatchedFields, header)
 		fields = append(fields, field)
 	}
@@ -142,8 +168,13 @@ func Read(r io.Reader, obj interface{}) error {
 }
 
 type settableField struct {
-	Name   string
-	Index  []int
+	Name     string
+	Index    []int
+	Optional bool
+	// Skip marks a CSV column that is not mapped to any struct field and
+	// should be ignored while unmarshaling the record. Only set when the
+	// AllowExtraColumns read option is in effect.
+	Skip   bool
 	Setter func(v reflect.Value, s string) error
 }
 
@@ -153,27 +184,31 @@ func getSettableFields(t reflect.Type) (settableFields, error) {
 	fields := make(settableFields)
 	for i := 0; i < t.NumField(); i++ {
 		field := t.Field(i)
-		header := field.Tag.Get("csv")
-		if header == "" {
+		tag := field.Tag.Get("csv")
+		if tag == "" {
 			return nil, Error.New("field %q missing csv tag", field.Name)
 		}
-		if header == "-" {
+		if tag == "-" {
 			continue
+		}
+		header, optional, err := parseCSVTag(tag, field.Name)
+		if err != nil {
+			return nil, err
 		}
 
 		var setter func(reflect.Value, string) error
 		switch {
 		case field.Type.Implements(unmarshalCSVType):
 			setter = setUnmarshalCSVValue
-		case reflect.PtrTo(field.Type).Implements(unmarshalCSVType):
+		case reflect.PointerTo(field.Type).Implements(unmarshalCSVType):
 			setter = setUnmarshalCSVValue
 		case field.Type.Implements(unmarshalTextType):
 			setter = setUnmarshalTextValue
-		case reflect.PtrTo(field.Type).Implements(unmarshalTextType):
+		case reflect.PointerTo(field.Type).Implements(unmarshalTextType):
 			setter = setUnmarshalTextValue
 		default:
 			ft := field.Type
-			if ft.Kind() == reflect.Ptr {
+			if ft.Kind() == reflect.Pointer {
 				ft = ft.Elem()
 			}
 			switch ft.Kind() {
@@ -191,13 +226,14 @@ func getSettableFields(t reflect.Type) (settableFields, error) {
 				return nil, Error.New("field %q has unsupported type %s", field.Name, field.Type.String())
 			}
 		}
-		if field.Type.Kind() == reflect.Ptr {
+		if field.Type.Kind() == reflect.Pointer {
 			setter = setPointerValue(setter)
 		}
 		fields[header] = settableField{
-			Name:   field.Name,
-			Index:  field.Index,
-			Setter: setter,
+			Name:     field.Name,
+			Index:    field.Index,
+			Optional: optional,
+			Setter:   setter,
 		}
 	}
 	return fields, nil
@@ -205,6 +241,9 @@ func getSettableFields(t reflect.Type) (settableFields, error) {
 
 func setFields(fields []settableField, record []string, v reflect.Value) error {
 	for i, field := range fields {
+		if field.Skip {
+			continue
+		}
 		if err := field.Setter(v.FieldByIndex(field.Index), record[i]); err != nil {
 			return Error.New("unable to unmarshal field %q: %v", field.Name, err)
 		}

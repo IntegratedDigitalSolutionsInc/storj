@@ -25,7 +25,7 @@ type LiveCountObserver struct {
 	suspiciousProcessedRatio float64
 	asOfSystemInterval       time.Duration
 
-	segmentsProcessed int64
+	segmentsProcessed atomic.Int64
 	segmentsBefore    int64
 }
 
@@ -47,7 +47,7 @@ func NewLiveCountObserver(metabase *metabase.DB, suspiciousProcessedRatio float6
 func (o *LiveCountObserver) Start(ctx context.Context, startTime time.Time) (err error) {
 	defer mon.Task()(&ctx)(&err)
 
-	atomic.StoreInt64(&o.segmentsProcessed, 0)
+	o.segmentsProcessed.Store(0)
 
 	stats, err := o.metabase.GetTableStats(ctx, metabase.GetTableStats{
 		AsOfSystemInterval: o.asOfSystemInterval,
@@ -72,7 +72,7 @@ func (o *LiveCountObserver) Join(ctx context.Context, partial Partial) error {
 
 // Process increments the counter.
 func (o *LiveCountObserver) Process(ctx context.Context, segments []Segment) error {
-	processed := atomic.AddInt64(&o.segmentsProcessed, int64(len(segments)))
+	processed := o.segmentsProcessed.Add(int64(len(segments)))
 
 	mon.IntVal("segmentsProcessed").Observe(processed)
 	return nil
@@ -90,19 +90,28 @@ func (o *LiveCountObserver) Finish(ctx context.Context) (err error) {
 		return err
 	}
 
-	segmentsProcessed := atomic.LoadInt64(&o.segmentsProcessed)
+	segmentsProcessed := o.segmentsProcessed.Load()
 	return o.verifyCount(o.segmentsBefore, stats.SegmentCount, segmentsProcessed)
 }
 
 // Stats implements monkit.StatSource to report the number of segments.
 func (o *LiveCountObserver) Stats(cb func(key monkit.SeriesKey, field string, val float64)) {
-	cb(monkit.NewSeriesKey("rangedloop_live"), "num_segments", float64(atomic.LoadInt64(&o.segmentsProcessed)))
+	cb(monkit.NewSeriesKey("rangedloop_live"), "num_segments", float64(o.segmentsProcessed.Load()))
 }
 
 func (o *LiveCountObserver) verifyCount(before, after, processed int64) error {
 	low, high := before, after
 	if low > high {
 		low, high = high, low
+	}
+
+	mon.IntVal("segmentloop_verify_before").Observe(before)
+	mon.IntVal("segmentloop_verify_after").Observe(after)
+	mon.IntVal("segmentloop_verify_processed").Observe(processed)
+
+	// Skip verification when table stats are not available.
+	if before == 0 && after == 0 {
+		return nil
 	}
 
 	var deltaFromBounds int64
@@ -117,9 +126,6 @@ func (o *LiveCountObserver) verifyCount(before, after, processed int64) error {
 		ratio = float64(deltaFromBounds) / float64(high+1)
 	}
 
-	mon.IntVal("segmentloop_verify_before").Observe(before)
-	mon.IntVal("segmentloop_verify_after").Observe(after)
-	mon.IntVal("segmentloop_verify_processed").Observe(processed)
 	mon.IntVal("segmentloop_verify_outside").Observe(deltaFromBounds)
 	mon.FloatVal("segmentloop_verify_outside_ratio").Observe(ratio)
 

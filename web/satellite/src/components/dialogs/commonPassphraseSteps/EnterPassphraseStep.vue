@@ -25,7 +25,7 @@
                         <password-input-eye-icons
                             :is-visible="isPassphraseVisible"
                             type="passphrase"
-                            @toggleVisibility="isPassphraseVisible = !isPassphraseVisible"
+                            @toggle-visibility="isPassphraseVisible = !isPassphraseVisible"
                         />
                     </template>
                 </v-text-field>
@@ -47,10 +47,10 @@
 import { ref, watch } from 'vue';
 import { VForm, VRow, VCol, VTextField, VCheckbox } from 'vuetify/components';
 
-import { RequiredRule, DialogStepComponent } from '@/types/common';
+import { type DialogStepComponent, RequiredRule  } from '@/types/common';
 import { useBucketsStore } from '@/store/modules/bucketsStore';
 import { EdgeCredentials } from '@/types/accessGrants';
-import { useNotify } from '@/utils/hooks';
+import { useNotify } from '@/composables/useNotify';
 
 import PasswordInputEyeIcons from '@/components/PasswordInputEyeIcons.vue';
 
@@ -85,6 +85,7 @@ defineExpose<DialogStepComponent>({
         form.value?.validate();
         return !!form.value?.isValid;
     },
+    onEnter: () => emit('passphraseChanged', passphrase.value),
     onExit: to => {
         if (!props.setOnNext || to !== 'next') return;
 

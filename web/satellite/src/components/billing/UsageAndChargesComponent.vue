@@ -4,13 +4,11 @@
 <template>
     <v-row>
         <v-col>
-            <h4>Costs per project</h4>
-        </v-col>
-    </v-row>
-
-    <v-row>
-        <v-col>
-            <usage-and-charges-item-component v-for="projectID of projectIds" :key="projectID" :project-id="projectID" />
+            <v-card title="Costs per project" :subtitle class="pa-2">
+                <v-card-item v-if="projectIds.length">
+                    <product-usage-and-charges-item-component v-for="projectID of projectIds" :key="projectID" :project-i-d="projectID" />
+                </v-card-item>
+            </v-card>
         </v-col>
     </v-row>
 </template>
@@ -19,11 +17,22 @@
 import {
     VRow,
     VCol,
+    VCard,
+    VCardItem,
 } from 'vuetify/components';
+import { computed } from 'vue';
 
-import UsageAndChargesItemComponent from '@/components/billing/UsageAndChargesItemComponent.vue';
+import ProductUsageAndChargesItemComponent from '@/components/billing/ProductUsageAndChargesItemComponent.vue';
 
-defineProps<{
+const props = defineProps<{
     projectIds: string[],
 }>();
+
+const subtitle = computed(() => {
+    if (props.projectIds.length) {
+        return 'View usage and download detailed report for every project.';
+    }
+
+    return 'No usage data available.';
+});
 </script>

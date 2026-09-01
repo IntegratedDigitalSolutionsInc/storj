@@ -38,7 +38,7 @@ var (
 // package for backwards compatibility. (It is no longer activated from inside this
 // package.)
 func MonFileInTrash(namespace []byte) *monkit.Meter {
-	return monStorage.Meter("open_file_in_trash", monkit.NewSeriesTag("namespace", hex.EncodeToString(namespace))) //mon:locked
+	return monStorage.Meter("open_file_in_trash", monkit.NewSeriesTag("namespace", hex.EncodeToString(namespace)))
 }
 
 // Config is configuration for the blob store.
@@ -217,6 +217,12 @@ func (store *blobStore) TryRestoreTrashBlob(ctx context.Context, ref blobstore.B
 		return err
 	}
 	return Error.Wrap(err)
+}
+
+// EmptyTrashWithoutStat removes files in trash that have been there since before trashedBefore.
+func (store *blobStore) EmptyTrashWithoutStat(ctx context.Context, namespace []byte, trashedBefore time.Time) (err error) {
+	defer mon.Task()(&ctx)(&err)
+	return store.dir.EmptyTrashWithoutStat(ctx, namespace, trashedBefore)
 }
 
 // EmptyTrash removes files in trash that have been there since before trashedBefore.

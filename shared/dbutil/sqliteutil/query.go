@@ -6,6 +6,7 @@ package sqliteutil
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"regexp"
 	"sort"
 	"strings"
@@ -129,6 +130,9 @@ func discoverTable(ctx context.Context, db dbschema.Queryer, schema *dbschema.Sc
 		return errs.Wrap(err)
 	}
 
+	// Map to accumulate foreign keys (SQLite returns one row per column)
+	fkMap := make(map[int]*dbschema.ForeignKey)
+
 	for keysRows.Next() {
 		var id, sec int
 		var tableName, from, to, onUpdate, onDelete, match string
@@ -137,21 +141,36 @@ func discoverTable(ctx context.Context, db dbschema.Queryer, schema *dbschema.Sc
 			return errs.Wrap(errs.Combine(keysRows.Err(), keysRows.Close(), err))
 		}
 
-		column, found := table.FindColumn(from)
-		if found {
-			if onDelete == "NO ACTION" {
-				onDelete = ""
-			}
-			if onUpdate == "NO ACTION" {
-				onUpdate = ""
-			}
-			column.Reference = &dbschema.Reference{
-				Table:    tableName,
-				Column:   to,
-				OnUpdate: onUpdate,
-				OnDelete: onDelete,
-			}
+		// Normalize "NO ACTION" to empty string
+		if onDelete == "NO ACTION" {
+			onDelete = ""
 		}
+		if onUpdate == "NO ACTION" {
+			onUpdate = ""
+		}
+
+		// Get or create FK for this id
+		fk, exists := fkMap[id]
+		if !exists {
+			fk = &dbschema.ForeignKey{
+				Name:           fmt.Sprintf("fk_%d", id), // SQLite doesn't name FKs
+				LocalColumns:   make([]string, 0),
+				ForeignTable:   tableName,
+				ForeignColumns: make([]string, 0),
+				OnUpdate:       onUpdate,
+				OnDelete:       onDelete,
+			}
+			fkMap[id] = fk
+		}
+
+		// Add this column to the FK
+		fk.LocalColumns = append(fk.LocalColumns, from)
+		fk.ForeignColumns = append(fk.ForeignColumns, to)
+	}
+
+	// Add all FKs to table
+	for _, fk := range fkMap {
+		table.ForeignKeys = append(table.ForeignKeys, fk)
 	}
 	err = errs.Combine(keysRows.Err(), keysRows.Close())
 	if err != nil {
@@ -164,79 +183,87 @@ func discoverTable(ctx context.Context, db dbschema.Queryer, schema *dbschema.Sc
 func discoverIndexes(ctx context.Context, db dbschema.Queryer, schema *dbschema.Schema, indexDefinitions []*definition) (err error) {
 	// TODO improve indexes discovery
 	for _, definition := range indexDefinitions {
-		index := &dbschema.Index{
-			Name:  definition.name,
-			Table: definition.table,
-		}
-
-		schema.Indexes = append(schema.Indexes, index)
-
-		indexRows, err := db.QueryContext(ctx, `PRAGMA index_info(`+definition.name+`)`)
+		index, err := discoverIndex(ctx, db, definition)
 		if err != nil {
 			return errs.Wrap(err)
 		}
-		defer func() { err = errs.Combine(err, indexRows.Close()) }()
+		schema.Indexes = append(schema.Indexes, index)
+	}
+	return errs.Wrap(err)
+}
 
-		type indexInfo struct {
-			name  *string
-			seqno int
-			cid   int
+func discoverIndex(ctx context.Context, db dbschema.Queryer, definition *definition) (index *dbschema.Index, err error) {
+	index = &dbschema.Index{
+		Name:  definition.name,
+		Table: definition.table,
+	}
+
+	indexRows, err := db.QueryContext(ctx, `PRAGMA index_info(`+definition.name+`)`)
+	if err != nil {
+		return index, errs.Wrap(err)
+	}
+	defer func() { err = errs.Combine(err, indexRows.Err(), indexRows.Close()) }()
+
+	type indexInfo struct {
+		name  *string
+		seqno int
+		cid   int
+	}
+
+	var indexInfos []indexInfo
+	for indexRows.Next() {
+		var info indexInfo
+		err := indexRows.Scan(&info.seqno, &info.cid, &info.name)
+		if err != nil {
+			return index, errs.Wrap(err)
 		}
+		indexInfos = append(indexInfos, info)
+	}
 
-		var indexInfos []indexInfo
-		for indexRows.Next() {
-			var info indexInfo
-			err := indexRows.Scan(&info.seqno, &info.cid, &info.name)
-			if err != nil {
-				return errs.Wrap(err)
-			}
-			indexInfos = append(indexInfos, info)
-		}
+	sort.SliceStable(indexInfos, func(i, j int) bool {
+		return indexInfos[i].seqno < indexInfos[j].seqno
+	})
 
-		sort.SliceStable(indexInfos, func(i, j int) bool {
-			return indexInfos[i].seqno < indexInfos[j].seqno
-		})
+	sqlDef := definition.sql
 
-		sqlDef := definition.sql
-
-		var parsedColumns []string
-		parseColumns := func() []string {
-			if parsedColumns != nil {
-				return parsedColumns
-			}
-
-			var base string
-			if matches := rxIndexExpr.FindStringSubmatchIndex(strings.ToUpper(sqlDef)); len(matches) > 0 {
-				base = sqlDef[matches[2]:matches[3]]
-			}
-
-			parsedColumns = strings.Split(base, ",")
+	var parsedColumns []string
+	parseColumns := func() []string {
+		if parsedColumns != nil {
 			return parsedColumns
 		}
 
-		for _, info := range indexInfos {
-			if info.name != nil {
-				index.Columns = append(index.Columns, *info.name)
-				continue
-			}
-
-			if info.cid == -1 {
-				index.Columns = append(index.Columns, "rowid")
-			} else if info.cid == -2 {
-				index.Columns = append(index.Columns, parseColumns()[info.seqno])
-			}
+		var base string
+		if matches := rxIndexExpr.FindStringSubmatchIndex(strings.ToUpper(sqlDef)); len(matches) > 0 {
+			base = sqlDef[matches[2]:matches[3]]
 		}
 
-		// unique
-		if strings.Contains(definition.sql, "CREATE UNIQUE INDEX") {
-			index.Unique = true
+		parsedColumns = strings.Split(base, ",")
+		return parsedColumns
+	}
+
+	for _, info := range indexInfos {
+		if info.name != nil {
+			index.Columns = append(index.Columns, *info.name)
+			continue
 		}
-		// partial
-		if matches := rxIndexPartial.FindStringSubmatch(definition.sql); len(matches) > 0 {
-			index.Partial = strings.TrimSpace(matches[1])
+
+		if info.cid == -1 {
+			index.Columns = append(index.Columns, "rowid")
+		} else if info.cid == -2 {
+			index.Columns = append(index.Columns, parseColumns()[info.seqno])
 		}
 	}
-	return errs.Wrap(err)
+
+	// unique
+	if strings.Contains(definition.sql, "CREATE UNIQUE INDEX") {
+		index.Unique = true
+	}
+	// partial
+	if matches := rxIndexPartial.FindStringSubmatch(definition.sql); len(matches) > 0 {
+		index.Partial = strings.TrimSpace(matches[1])
+	}
+
+	return index, nil
 }
 
 var (

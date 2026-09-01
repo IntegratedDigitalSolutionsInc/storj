@@ -3,7 +3,7 @@
 
 <template>
     <transition name="fade" mode="in-out">
-        <div class="loading-screen">
+        <div v-show="true" class="loading-screen">
             <StorjLogo class="logo" />
             <svg height="100" width="100" class="loader">
                 <circle cx="50" cy="50" r="40" class="background" />
@@ -13,18 +13,8 @@
     </transition>
 </template>
 
-<script lang="ts">
-import { Component, Vue } from 'vue-property-decorator';
-
+<script setup lang="ts">
 import StorjLogo from '@/../static/images/LogoWithoutText.svg';
-
-// @vue/component
-@Component({
-    components: {
-        StorjLogo,
-    },
-})
-export default class LoadingScreen extends Vue {}
 </script>
 
 <style scoped lang="scss">
@@ -49,7 +39,7 @@ export default class LoadingScreen extends Vue {}
         }
     }
 
-    .storj-logo ::v-deep path {
+    .storj-logo :deep(path) {
         fill: var(--loader-logo-color);
     }
 

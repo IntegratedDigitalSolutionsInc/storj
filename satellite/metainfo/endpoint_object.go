@@ -6,34 +6,36 @@ package metainfo
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"math/rand"
+	"reflect"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gogo/protobuf/types"
 	"github.com/spacemonkeygo/monkit/v3"
-	"github.com/zeebo/errs"
 	"go.uber.org/zap"
 	"golang.org/x/sync/errgroup"
 
 	"storj.io/common/encryption"
-	"storj.io/common/errs2"
-	"storj.io/common/identity"
 	"storj.io/common/macaroon"
 	"storj.io/common/pb"
 	"storj.io/common/rpc/rpcstatus"
 	"storj.io/common/storj"
 	"storj.io/common/uuid"
 	"storj.io/eventkit"
+	"storj.io/storj/satellite/accounting"
 	"storj.io/storj/satellite/buckets"
 	"storj.io/storj/satellite/console"
 	"storj.io/storj/satellite/internalpb"
 	"storj.io/storj/satellite/metabase"
 	"storj.io/storj/satellite/orders"
+	"storj.io/storj/shared/s3event"
 )
 
 const (
-	projectNoLockErrMsg      = "Object Lock is not enabled for this project"
-	objectLockDisabledErrMsg = "Object Lock feature is not enabled"
 	bucketNoLockErrMsg       = "Object Lock is not enabled for this bucket"
 	methodNotAllowedErrMsg   = "method not allowed"
 	objectInvalidStateErrMsg = "The operation is not permitted for this object"
@@ -41,6 +43,10 @@ const (
 
 // BeginObject begins object.
 func (endpoint *Endpoint) BeginObject(ctx context.Context, req *pb.ObjectBeginRequest) (resp *pb.ObjectBeginResponse, err error) {
+	return endpoint.beginObject(ctx, req, true)
+}
+
+func (endpoint *Endpoint) beginObject(ctx context.Context, req *pb.ObjectBeginRequest, multipartUpload bool) (resp *pb.ObjectBeginResponse, err error) {
 	defer mon.Task()(&ctx)(&err)
 
 	endpoint.versionCollector.collect(req.Header.UserAgent, mon.Func().ShortName())
@@ -99,10 +105,6 @@ func (endpoint *Endpoint) BeginObject(ctx context.Context, req *pb.ObjectBeginRe
 	}
 	endpoint.usageTracking(keyInfo, req.Header, fmt.Sprintf("%T", req))
 
-	if (retention.Enabled() || req.LegalHold) && !endpoint.config.ObjectLockEnabled {
-		return nil, rpcstatus.Error(rpcstatus.ObjectLockEndpointsDisabled, objectLockDisabledErrMsg)
-	}
-
 	maxObjectTTL, err := endpoint.getMaxObjectTTL(ctx, req.Header)
 	if err != nil {
 		return nil, err
@@ -141,60 +143,63 @@ func (endpoint *Endpoint) BeginObject(ctx context.Context, req *pb.ObjectBeginRe
 		return nil, rpcstatus.Errorf(rpcstatus.InvalidArgument, "key length is too big, got %v, maximum allowed is %v", objectKeyLength, endpoint.config.MaxEncryptedObjectKeyLength)
 	}
 
+	if err := endpoint.validateChecksumOptionsForBegin(req.ChecksumAlgorithm, req.IsChecksumComposite, req.EncryptedChecksum); err != nil {
+		return nil, err
+	}
+
+	encryptedUserData := metabase.EncryptedUserData{
+		EncryptedMetadata:             req.EncryptedMetadata,
+		EncryptedMetadataEncryptedKey: req.EncryptedMetadataEncryptedKey,
+		EncryptedMetadataNonce:        nonceBytes(req.EncryptedMetadataNonce),
+		EncryptedETag:                 req.EncryptedEtag,
+		Checksum: metabase.Checksum{
+			Algorithm:      storj.ObjectChecksumAlgorithm(req.ChecksumAlgorithm),
+			IsComposite:    req.IsChecksumComposite,
+			EncryptedValue: req.EncryptedChecksum,
+		},
+	}
+	if err := endpoint.checkEncryptedMetadataSize(encryptedUserData); err != nil {
+		return nil, err
+	}
+
 	err = endpoint.checkUploadLimits(ctx, keyInfo)
 	if err != nil {
 		return nil, err
 	}
 
-	if err := endpoint.checkObjectUploadRate(ctx, keyInfo.ProjectID, req.Bucket, req.EncryptedObjectKey); err != nil {
+	if err := endpoint.checkObjectUploadRate(ctx, keyInfo.ProjectPublicID, req.Bucket, req.EncryptedObjectKey); err != nil {
 		return nil, err
 	}
 
 	// TODO this needs to be optimized to avoid DB call on each request
-	bucket, err := endpoint.buckets.GetBucket(ctx, req.Bucket, keyInfo.ProjectID)
+	bucket, err := endpoint.buckets.GetBucketForUpload(ctx, req.Bucket, keyInfo.ProjectID)
 	if err != nil {
 		if buckets.ErrBucketNotFound.Has(err) {
 			return nil, rpcstatus.Errorf(rpcstatus.NotFound, "bucket not found: %s", req.Bucket)
 		}
-		endpoint.log.Error("unable to check bucket", zap.Error(err))
-		return nil, rpcstatus.Error(rpcstatus.Internal, "unable to get bucket placement")
+		return nil, endpoint.ConvertKnownErrWithMessage(err, "unable to get bucket placement")
 	}
 
-	if retention.Enabled() || req.LegalHold {
-		if bucket.Versioning != buckets.VersioningEnabled {
-			return nil, rpcstatus.Errorf(rpcstatus.ObjectLockInvalidBucketState, "cannot specify Object Lock settings when uploading into a bucket without Versioning enabled")
-		} else if !bucket.ObjectLock.Enabled {
-			return nil, rpcstatus.Errorf(rpcstatus.ObjectLockBucketRetentionConfigurationMissing, "cannot specify Object Lock settings when uploading into a bucket without Object Lock enabled")
-		}
+	if err = validateBucketObjectLockStatus(bucket, retention, req.LegalHold); err != nil {
+		return nil, err
 	}
 
 	if bucket.ObjectLock.Enabled && bucket.ObjectLock.DefaultRetentionMode != storj.NoRetention && !retention.Enabled() {
-		switch {
-		case maxObjectTTL != nil:
-			return nil, rpcstatus.Error(rpcstatus.ObjectLockUploadWithTTLAPIKeyAndDefaultRetention,
-				"cannot upload into a bucket with default retention settings using an API key that enforces an object expiration time")
-		case !req.ExpiresAt.IsZero():
-			return nil, rpcstatus.Error(rpcstatus.ObjectLockUploadWithTTLAndDefaultRetention,
-				"cannot specify an object expiration time when uploading into a bucket with default retention settings")
+		err = validateObjectRetentionWithTTL(maxObjectTTL, req.ExpiresAt)
+		if err != nil {
+			return nil, err
 		}
 
-		retention.Mode = bucket.ObjectLock.DefaultRetentionMode
-		switch {
-		case bucket.ObjectLock.DefaultRetentionDays != 0:
-			retention.RetainUntil = now.AddDate(0, 0, bucket.ObjectLock.DefaultRetentionDays)
-		case bucket.ObjectLock.DefaultRetentionYears != 0:
-			retention.RetainUntil = now.AddDate(bucket.ObjectLock.DefaultRetentionYears, 0, 0)
-		}
+		retention = useDefaultBucketRetention(bucket.ObjectLock, now)
 	}
 
-	if err := endpoint.ensureAttribution(ctx, req.Header, keyInfo, req.Bucket, nil, false); err != nil {
+	if err := endpoint.ensureAttribution(ctx, req.Header, keyInfo, req.Bucket, nil, bucket.Placement, false, false); err != nil {
 		return nil, err
 	}
 
 	streamID, err := uuid.New()
 	if err != nil {
-		endpoint.log.Error("internal", zap.Error(err))
-		return nil, rpcstatus.Error(rpcstatus.Internal, "unable to create stream id")
+		return nil, endpoint.ConvertKnownErrWithMessage(err, "unable to create stream id")
 	}
 
 	// TODO this will work only with newest uplink
@@ -204,56 +209,92 @@ func (endpoint *Endpoint) BeginObject(ctx context.Context, req *pb.ObjectBeginRe
 		BlockSize:   int32(req.EncryptionParameters.BlockSize), // TODO check conversion
 	}
 
-	var nonce []byte
-	if !req.EncryptedMetadataNonce.IsZero() {
-		nonce = req.EncryptedMetadataNonce[:]
-	}
+	maxCommitDelay := endpoint.config.MaxCommitDelay.ForBeginObject(keyInfo.ProjectID)
 
-	opts := metabase.BeginObjectNextVersion{
-		ObjectStream: metabase.ObjectStream{
+	var object metabase.Object
+	{
+		objectStream := metabase.ObjectStream{
 			ProjectID:  keyInfo.ProjectID,
 			BucketName: metabase.BucketName(req.Bucket),
 			ObjectKey:  metabase.ObjectKey(req.EncryptedObjectKey),
 			StreamID:   streamID,
 			Version:    metabase.NextVersion,
-		},
-		Encryption: encryptionParameters,
+		}
 
-		EncryptedMetadata:             req.EncryptedMetadata,
-		EncryptedMetadataEncryptedKey: req.EncryptedMetadataEncryptedKey,
-		EncryptedMetadataNonce:        nonce,
+		if _, ok := endpoint.config.TestingAlternativeBeginObjectProjects[keyInfo.ProjectID]; ok || endpoint.config.TestingAlternativeBeginObject {
+			opts := metabase.BeginObjectExactVersion{
+				ObjectStream: objectStream,
+				Encryption:   encryptionParameters,
 
-		Retention: retention,
-		LegalHold: req.LegalHold,
-	}
-	if !expiresAt.IsZero() {
-		opts.ExpiresAt = &expiresAt
-	}
+				EncryptedUserData: encryptedUserData,
 
-	object, err := endpoint.metabase.BeginObjectNextVersion(ctx, opts)
-	if err != nil {
-		return nil, endpoint.ConvertMetabaseErr(err)
+				Retention: retention,
+				LegalHold: req.LegalHold,
+
+				MaxCommitDelay: maxCommitDelay,
+			}
+			if !expiresAt.IsZero() {
+				opts.ExpiresAt = &expiresAt
+			}
+
+			const maxRetries = 5
+
+			for i := range maxRetries {
+				rng := rand.New(rand.NewSource(time.Now().UnixNano()))
+				opts.Version = metabase.Version(-1 * rng.Int63())
+
+				object, err = endpoint.metabase.BeginObjectExactVersion(ctx, opts)
+				if err != nil {
+					if metabase.ErrObjectAlreadyExists.Has(err) && i < maxRetries-1 {
+						continue
+					}
+					return nil, endpoint.ConvertMetabaseErr(err)
+				}
+				break
+			}
+		} else {
+			opts := metabase.BeginObjectNextVersion{
+				ObjectStream: objectStream,
+				Encryption:   encryptionParameters,
+
+				EncryptedUserData: encryptedUserData,
+
+				Retention: retention,
+				LegalHold: req.LegalHold,
+
+				MaxCommitDelay: maxCommitDelay,
+			}
+			if !expiresAt.IsZero() {
+				opts.ExpiresAt = &expiresAt
+			}
+
+			object, err = endpoint.metabase.BeginObjectNextVersion(ctx, opts)
+			if err != nil {
+				return nil, endpoint.ConvertMetabaseErr(err)
+			}
+		}
 	}
 
 	satStreamID, err := endpoint.packStreamID(ctx, &internalpb.StreamID{
-		Bucket:               []byte(object.BucketName),
-		EncryptedObjectKey:   []byte(object.ObjectKey),
+		Bucket:               req.Bucket,
+		EncryptedObjectKey:   req.EncryptedObjectKey,
 		Version:              int64(object.Version),
 		CreationDate:         object.CreatedAt,
 		ExpirationDate:       expiresAt, // TODO make ExpirationDate nullable
-		StreamId:             object.StreamID[:],
-		MultipartObject:      object.FixedSegmentSize <= 0,
+		StreamId:             streamID.Bytes(),
+		MultipartObject:      multipartUpload,
 		EncryptionParameters: req.EncryptionParameters,
 		Placement:            int32(bucket.Placement),
 		Versioned:            bucket.Versioning == buckets.VersioningEnabled,
+		Retention:            req.Retention,
+		LegalHold:            req.LegalHold,
 	})
 	if err != nil {
-		endpoint.log.Error("internal", zap.Error(err))
-		return nil, rpcstatus.Error(rpcstatus.Internal, "unable to create stream id")
+		return nil, endpoint.ConvertKnownErrWithMessage(err, "unable to create stream id")
 	}
 
-	endpoint.log.Debug("Object Upload", zap.Stringer("Project ID", keyInfo.ProjectID), zap.String("operation", "put"), zap.String("type", "object"))
-	mon.Meter("req_put_object").Mark(1)
+	endpoint.log.Debug("Object Upload", zap.Stringer("public_id", keyInfo.ProjectPublicID), zap.String("operation", "put"), zap.String("type", "object"))
+	mon.Meter("req_put_object", monkit.NewSeriesTag("multipart", strconv.FormatBool(multipartUpload)), placementSeriesTag(bucket.Placement)).Mark(1)
 
 	return &pb.ObjectBeginResponse{
 		Bucket:             req.Bucket,
@@ -271,8 +312,7 @@ func (endpoint *Endpoint) getMaxObjectTTL(ctx context.Context, header *pb.Reques
 
 	ttl, err := key.GetMaxObjectTTL(ctx)
 	if err != nil {
-		endpoint.log.Error("unable to get max object TTL", zap.Error(err))
-		return nil, rpcstatus.Error(rpcstatus.Internal, "unable to get max object TTL")
+		return nil, endpoint.ConvertKnownErrWithMessage(err, "unable to get max object TTL")
 	}
 
 	if ttl != nil && *ttl <= 0 {
@@ -290,7 +330,7 @@ func (endpoint *Endpoint) CommitObject(ctx context.Context, req *pb.ObjectCommit
 
 	streamID, err := endpoint.unmarshalSatStreamID(ctx, req.StreamId)
 	if err != nil {
-		return nil, rpcstatus.Error(rpcstatus.InvalidArgument, err.Error())
+		return nil, rpcstatus.Wrap(rpcstatus.InvalidArgument, err)
 	}
 
 	now := time.Now()
@@ -355,8 +395,7 @@ func (endpoint *Endpoint) CommitObject(ctx context.Context, req *pb.ObjectCommit
 
 	id, err := uuid.FromBytes(streamID.StreamId)
 	if err != nil {
-		endpoint.log.Error("internal", zap.Error(err))
-		return nil, rpcstatus.Error(rpcstatus.Internal, "unable to parse stream id")
+		return nil, endpoint.ConvertKnownErrWithMessage(err, "unable to parse stream id")
 	}
 
 	// for old uplinks get Encryption from StreamMeta
@@ -369,6 +408,17 @@ func (endpoint *Endpoint) CommitObject(ctx context.Context, req *pb.ObjectCommit
 		encryption.CipherSuite = storj.CipherSuite(streamMeta.EncryptionType)
 		encryption.BlockSize = streamMeta.EncryptionBlockSize
 	}
+	if encryption.IsZero() {
+		encryption = storj.EncryptionParameters{
+			CipherSuite: storj.CipherSuite(streamID.EncryptionParameters.CipherSuite),
+			BlockSize:   int32(streamID.EncryptionParameters.BlockSize), // TODO unsafe conversion
+		}
+	}
+
+	var expiresAt *time.Time
+	if !streamID.ExpirationDate.IsZero() {
+		expiresAt = &streamID.ExpirationDate
+	}
 
 	request := metabase.CommitObject{
 		ObjectStream: metabase.ObjectStream{
@@ -379,18 +429,61 @@ func (endpoint *Endpoint) CommitObject(ctx context.Context, req *pb.ObjectCommit
 			Version:    metabase.Version(streamID.Version),
 		},
 		Encryption: encryption,
+		ExpiresAt:  expiresAt,
+
+		EncryptedUserData: metabase.EncryptedUserData{
+			EncryptedMetadataEncryptedKey: req.EncryptedMetadataEncryptedKey,
+			EncryptedMetadataNonce:        nonceBytes(req.EncryptedMetadataNonce),
+			EncryptedMetadata:             req.EncryptedMetadata,
+			EncryptedETag:                 req.EncryptedEtag,
+			Checksum: metabase.Checksum{
+				Algorithm:      storj.ObjectChecksumAlgorithm(req.ChecksumAlgorithm),
+				IsComposite:    req.IsChecksumComposite,
+				EncryptedValue: req.EncryptedChecksum,
+			},
+		},
+
+		Retention: protobufRetentionToMetabase(streamID.Retention),
+		LegalHold: streamID.LegalHold,
 
 		DisallowDelete: !allowDelete,
 
 		Versioned: streamID.Versioned,
+
+		MaxCommitDelay: endpoint.config.MaxCommitDelay.ForCommitObject(keyInfo.ProjectID),
+
+		IfNoneMatch: req.IfNoneMatch,
+
+		TransmitEvent: endpoint.shouldTransmitEvent(ctx, keyInfo.ProjectID, string(streamID.Bucket), streamID.EncryptedObjectKey, s3event.ObjectCreatedPut.S3Name()),
 	}
-	// uplink can send empty metadata with not empty key/nonce
-	// we need to fix it on uplink side but that part will be
-	// needed for backward compatibility
-	if len(req.EncryptedMetadata) != 0 {
-		request.OverrideEncryptedMetadata = true
+
+	// Old uplinks may send an empty EncryptedMetadata with non-empty metadata encryption
+	// parameters (EncryptedMetadataNonce and EncryptedMetadataEncryptedKey). To remain
+	// compatible with them, we should not request that the object be committed with the
+	// provided metadata if only metadata encryption parameters were provided. Otherwise,
+	// metabase will return an error because encryption parameters are not allowed to be
+	// included in a set of metadata that lacks any encrypted data.
+	userDataWithoutEncParams := request.EncryptedUserData
+	userDataWithoutEncParams.EncryptedMetadataNonce = nil
+	userDataWithoutEncParams.EncryptedMetadataEncryptedKey = nil
+	if !reflect.ValueOf(userDataWithoutEncParams).IsZero() {
+		err = endpoint.validateChecksumOptions(req.ChecksumAlgorithm, req.IsChecksumComposite, req.EncryptedChecksum)
+		if err != nil {
+			return nil, err
+		}
+		request.SetEncryptedMetadata = true
+	}
+
+	if len(req.EncryptedMetadata) != 0 || len(req.EncryptedEtag) != 0 {
+		request.SetEncryptedMetadata = true
 		request.EncryptedMetadata = req.EncryptedMetadata
-		request.EncryptedMetadataNonce = req.EncryptedMetadataNonce[:]
+		request.EncryptedETag = req.EncryptedEtag
+		request.Checksum = metabase.Checksum{
+			Algorithm:      storj.ObjectChecksumAlgorithm(req.ChecksumAlgorithm),
+			IsComposite:    req.IsChecksumComposite,
+			EncryptedValue: req.EncryptedChecksum,
+		}
+		request.EncryptedMetadataNonce = nonceBytes(req.EncryptedMetadataNonce)
 		request.EncryptedMetadataEncryptedKey = req.EncryptedMetadataEncryptedKey
 
 		// older uplinks might send EncryptedMetadata directly with request but
@@ -402,8 +495,25 @@ func (endpoint *Endpoint) CommitObject(ctx context.Context, req *pb.ObjectCommit
 		}
 	}
 
-	if err := endpoint.checkEncryptedMetadataSize(request.EncryptedMetadata, request.EncryptedMetadataEncryptedKey); err != nil {
+	if err := endpoint.checkEncryptedMetadataSize(request.EncryptedUserData); err != nil {
 		return nil, err
+	}
+
+	if endpoint.remainderChargeRecorder != nil {
+		recorder := endpoint.remainderChargeRecorder
+		bucket, placement := string(streamID.Bucket), storj.PlacementConstraint(streamID.Placement)
+		request.OnReplaced = func(replaced metabase.DeleteObjectsInfo) {
+			recorder.Record(ctx, accounting.RecordRemainderChargesParams{
+				ProjectID:       keyInfo.ProjectID,
+				ProjectPublicID: keyInfo.ProjectPublicID,
+				BucketName:      bucket,
+				Placement:       placement,
+				ObjectsFunc: func() []metabase.DeleteObjectsInfo {
+					return []metabase.DeleteObjectsInfo{replaced}
+				},
+				DeletedAt: time.Now(),
+			})
+		}
 	}
 
 	object, err := endpoint.metabase.CommitObject(ctx, request)
@@ -412,10 +522,14 @@ func (endpoint *Endpoint) CommitObject(ctx context.Context, req *pb.ObjectCommit
 	}
 	committedObject = &object
 
+	if endpoint.config.LimitEmailNotificationsEnabled {
+		thresholds, resets := endpoint.projectUsage.DetectStorageThresholds(ctx, keyInfo.ProjectID, object.TotalEncryptedSize, keyInfoToLimits(keyInfo))
+		endpoint.enqueueThresholdEvents(ctx, keyInfo, thresholds, resets)
+	}
+
 	pbObject, err := endpoint.objectToProto(ctx, object)
 	if err != nil {
-		endpoint.log.Error("unable to convert metabase object", zap.Error(err))
-		return nil, rpcstatus.Error(rpcstatus.Internal, "internal error")
+		return nil, endpoint.ConvertKnownErrWithMessage(err, "internal error")
 	}
 	if !canGetRetention {
 		pbObject.Retention = nil
@@ -424,7 +538,7 @@ func (endpoint *Endpoint) CommitObject(ctx context.Context, req *pb.ObjectCommit
 		pbObject.LegalHold = nil
 	}
 
-	mon.Meter("req_commit_object").Mark(1)
+	mon.Meter("req_commit_object", placementSeriesTag(storj.PlacementConstraint(streamID.Placement))).Mark(1)
 
 	return &pb.ObjectCommitResponse{
 		Object: pbObject,
@@ -517,10 +631,6 @@ func (endpoint *Endpoint) CommitInlineObject(ctx context.Context, beginObjectReq
 	endpoint.usageTracking(keyInfo, makeInlineSegReq.Header, fmt.Sprintf("%T", makeInlineSegReq))
 	endpoint.usageTracking(keyInfo, commitObjectReq.Header, fmt.Sprintf("%T", commitObjectReq))
 
-	if (retention.Enabled() || beginObjectReq.LegalHold) && !endpoint.config.ObjectLockEnabled {
-		return nil, nil, nil, rpcstatus.Error(rpcstatus.ObjectLockEndpointsDisabled, objectLockDisabledErrMsg)
-	}
-
 	maxObjectTTL, err := endpoint.getMaxObjectTTL(ctx, beginObjectReq.Header)
 	if err != nil {
 		return nil, nil, nil, err
@@ -561,30 +671,43 @@ func (endpoint *Endpoint) CommitInlineObject(ctx context.Context, beginObjectReq
 		return nil, nil, nil, rpcstatus.Errorf(rpcstatus.InvalidArgument, "key length is too big, got %v, maximum allowed is %v", objectKeyLength, endpoint.config.MaxEncryptedObjectKeyLength)
 	}
 
+	err = endpoint.validateChecksumOptions(commitObjectReq.ChecksumAlgorithm, commitObjectReq.IsChecksumComposite, commitObjectReq.EncryptedChecksum)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
 	err = endpoint.checkUploadLimits(ctx, keyInfo)
 	if err != nil {
 		return nil, nil, nil, err
 	}
 
-	if err := endpoint.checkObjectUploadRate(ctx, keyInfo.ProjectID, beginObjectReq.Bucket, beginObjectReq.EncryptedObjectKey); err != nil {
+	if err := endpoint.checkObjectUploadRate(ctx, keyInfo.ProjectPublicID, beginObjectReq.Bucket, beginObjectReq.EncryptedObjectKey); err != nil {
 		return nil, nil, nil, err
 	}
 
 	// TODO this needs to be optimized to avoid DB call on each request
-	bucket, err := endpoint.buckets.GetBucket(ctx, beginObjectReq.Bucket, keyInfo.ProjectID)
+	bucket, err := endpoint.buckets.GetBucketForUpload(ctx, beginObjectReq.Bucket, keyInfo.ProjectID)
 	if err != nil {
 		if buckets.ErrBucketNotFound.Has(err) {
 			return nil, nil, nil, rpcstatus.Errorf(rpcstatus.NotFound, "bucket not found: %s", beginObjectReq.Bucket)
 		}
-		endpoint.log.Error("unable to check bucket", zap.Error(err))
-		return nil, nil, nil, rpcstatus.Error(rpcstatus.Internal, "unable to get bucket placement")
+		return nil, nil, nil, endpoint.ConvertKnownErrWithMessage(err, "unable to get bucket placement")
 	}
 
-	if (retention.Enabled() || beginObjectReq.LegalHold) && !bucket.ObjectLock.Enabled {
-		return nil, nil, nil, rpcstatus.Errorf(rpcstatus.ObjectLockBucketRetentionConfigurationMissing, "cannot specify Object Lock settings when uploading into a bucket without Object Lock enabled")
+	if err = validateBucketObjectLockStatus(bucket, retention, beginObjectReq.LegalHold); err != nil {
+		return nil, nil, nil, err
 	}
 
-	if err := endpoint.ensureAttribution(ctx, beginObjectReq.Header, keyInfo, beginObjectReq.Bucket, nil, false); err != nil {
+	if bucket.ObjectLock.Enabled && bucket.ObjectLock.DefaultRetentionMode != storj.NoRetention && !retention.Enabled() {
+		err = validateObjectRetentionWithTTL(maxObjectTTL, beginObjectReq.ExpiresAt)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+
+		retention = useDefaultBucketRetention(bucket.ObjectLock, now)
+	}
+
+	if err := endpoint.ensureAttribution(ctx, beginObjectReq.Header, keyInfo, beginObjectReq.Bucket, nil, bucket.Placement, false, false); err != nil {
 		return nil, nil, nil, err
 	}
 
@@ -613,8 +736,7 @@ func (endpoint *Endpoint) CommitInlineObject(ctx context.Context, beginObjectReq
 
 	streamID, err := uuid.New()
 	if err != nil {
-		endpoint.log.Error("internal", zap.Error(err))
-		return nil, nil, nil, rpcstatus.Error(rpcstatus.Internal, "unable to create stream id")
+		return nil, nil, nil, endpoint.ConvertKnownErrWithMessage(err, "unable to create stream id")
 	}
 
 	encryptionParameters := storj.EncryptionParameters{
@@ -622,19 +744,14 @@ func (endpoint *Endpoint) CommitInlineObject(ctx context.Context, beginObjectReq
 		BlockSize:   int32(beginObjectReq.EncryptionParameters.BlockSize), // TODO check conversion
 	}
 
-	var metadataNonce []byte
-	if !commitObjectReq.EncryptedMetadataNonce.IsZero() {
-		metadataNonce = commitObjectReq.EncryptedMetadataNonce[:]
-	}
-
 	objectStream := metabase.ObjectStream{
 		ProjectID:  keyInfo.ProjectID,
-		BucketName: metabase.BucketName(bucket.Name),
+		BucketName: metabase.BucketName(beginObjectReq.Bucket),
 		ObjectKey:  metabase.ObjectKey(beginObjectReq.EncryptedObjectKey),
 		StreamID:   streamID,
 	}
 
-	object, err := endpoint.metabase.CommitInlineObject(ctx, metabase.CommitInlineObject{
+	inlineOpts := metabase.CommitInlineObject{
 		ObjectStream: objectStream,
 		CommitInlineSegment: metabase.CommitInlineSegment{
 			ObjectStream: objectStream,
@@ -649,15 +766,23 @@ func (endpoint *Endpoint) CommitInlineObject(ctx context.Context, beginObjectReq
 			PlainSize:  int32(makeInlineSegReq.PlainSize), // TODO incompatible types int32 vs int64
 			InlineData: makeInlineSegReq.EncryptedInlineData,
 
-			// don't set EncryptedETag as this method won't be used with multipart upload
+			// don't set EncryptedETag or EncryptedChecksum as this method won't be used with multipart upload
 		},
 
 		ExpiresAt:  expiresAt,
 		Encryption: encryptionParameters,
 
-		EncryptedMetadata:             commitObjectReq.EncryptedMetadata,
-		EncryptedMetadataEncryptedKey: commitObjectReq.EncryptedMetadataEncryptedKey,
-		EncryptedMetadataNonce:        metadataNonce,
+		EncryptedUserData: metabase.EncryptedUserData{
+			EncryptedMetadata:             commitObjectReq.EncryptedMetadata,
+			EncryptedMetadataEncryptedKey: commitObjectReq.EncryptedMetadataEncryptedKey,
+			EncryptedMetadataNonce:        nonceBytes(commitObjectReq.EncryptedMetadataNonce),
+			EncryptedETag:                 commitObjectReq.EncryptedEtag,
+			Checksum: metabase.Checksum{
+				Algorithm:      storj.ObjectChecksumAlgorithm(commitObjectReq.ChecksumAlgorithm),
+				IsComposite:    commitObjectReq.IsChecksumComposite,
+				EncryptedValue: commitObjectReq.EncryptedChecksum,
+			},
+		},
 
 		Retention: retention,
 		LegalHold: beginObjectReq.LegalHold,
@@ -665,27 +790,52 @@ func (endpoint *Endpoint) CommitInlineObject(ctx context.Context, beginObjectReq
 		DisallowDelete: !allowDelete,
 
 		Versioned: bucket.Versioning == buckets.VersioningEnabled,
-	})
+
+		IfNoneMatch: commitObjectReq.IfNoneMatch,
+
+		TransmitEvent: endpoint.shouldTransmitEvent(ctx, keyInfo.ProjectID, string(beginObjectReq.Bucket), beginObjectReq.EncryptedObjectKey, s3event.ObjectCreatedPut.S3Name()),
+	}
+
+	if endpoint.remainderChargeRecorder != nil {
+		recorder := endpoint.remainderChargeRecorder
+		bucketName, placement := string(beginObjectReq.Bucket), bucket.Placement
+		inlineOpts.OnReplaced = func(replaced metabase.DeleteObjectsInfo) {
+			recorder.Record(ctx, accounting.RecordRemainderChargesParams{
+				ProjectID:       keyInfo.ProjectID,
+				ProjectPublicID: keyInfo.ProjectPublicID,
+				BucketName:      bucketName,
+				Placement:       placement,
+				ObjectsFunc: func() []metabase.DeleteObjectsInfo {
+					return []metabase.DeleteObjectsInfo{replaced}
+				},
+				DeletedAt: time.Now(),
+			})
+		}
+	}
+
+	object, err := endpoint.metabase.CommitInlineObject(ctx, inlineOpts)
 	if err != nil {
 		return nil, nil, nil, endpoint.ConvertMetabaseErr(err)
 	}
+	committedObject = &object
 
 	err = endpoint.orders.UpdatePutInlineOrder(ctx, metabase.BucketLocation{
 		ProjectID: keyInfo.ProjectID, BucketName: metabase.BucketName(beginObjectReq.Bucket),
 	}, inlineUsed)
 	if err != nil {
-		endpoint.log.Error("internal", zap.Error(err))
-		return nil, nil, nil, rpcstatus.Error(rpcstatus.Internal, "unable to update PUT inline order")
+		return nil, nil, nil, endpoint.ConvertKnownErrWithMessage(err, "unable to update PUT inline order")
 	}
 
-	if err := endpoint.addSegmentToUploadLimits(ctx, keyInfo, inlineUsed); err != nil {
-		return nil, nil, nil, err
+	endpoint.addSegmentToUploadLimits(ctx, keyInfo, inlineUsed)
+
+	if endpoint.config.LimitEmailNotificationsEnabled {
+		thresholds, resets := endpoint.projectUsage.DetectStorageThresholds(ctx, keyInfo.ProjectID, inlineUsed, keyInfoToLimits(keyInfo))
+		endpoint.enqueueThresholdEvents(ctx, keyInfo, thresholds, resets)
 	}
 
 	pbObject, err := endpoint.objectToProto(ctx, object)
 	if err != nil {
-		endpoint.log.Error("unable to convert metabase object", zap.Error(err))
-		return nil, nil, nil, rpcstatus.Error(rpcstatus.Internal, "internal error")
+		return nil, nil, nil, endpoint.ConvertKnownErrWithMessage(err, "unable to convert metabase object")
 	}
 	if !canGetRetention {
 		pbObject.Retention = nil
@@ -694,14 +844,14 @@ func (endpoint *Endpoint) CommitInlineObject(ctx context.Context, beginObjectReq
 		pbObject.LegalHold = nil
 	}
 
-	endpoint.log.Debug("Object Inline Upload", zap.Stringer("Project ID", keyInfo.ProjectID), zap.String("operation", "put"), zap.String("type", "object"))
-	mon.Meter("req_put_inline_object").Mark(1)
+	endpoint.log.Debug("Object Inline Upload", zap.Stringer("public_id", keyInfo.ProjectPublicID), zap.String("operation", "put"), zap.String("type", "object"))
+	mon.Meter("req_put_inline_object", placementSeriesTag(bucket.Placement)).Mark(1)
 
 	return &pb.ObjectBeginResponse{
-			StreamId: storj.StreamID{1}, // return dummy stream id as it won't be really used later
-		}, &pb.SegmentMakeInlineResponse{}, &pb.ObjectCommitResponse{
-			Object: pbObject,
-		}, nil
+		StreamId: storj.StreamID{1}, // return dummy stream id as it won't be really used later
+	}, &pb.SegmentMakeInlineResponse{}, &pb.ObjectCommitResponse{
+		Object: pbObject,
+	}, nil
 }
 
 // GetObject gets single object metadata.
@@ -767,6 +917,13 @@ func (endpoint *Endpoint) GetObject(ctx context.Context, req *pb.ObjectGetReques
 		ObjectKey:  metabase.ObjectKey(req.EncryptedObjectKey),
 	}
 
+	if endpoint.config.DownloadLimiter.Enabled {
+		if !endpoint.singleObjectDownloadLimitCache.Allow(time.Now(),
+			bytes.Join([][]byte{keyInfo.ProjectID[:], req.Bucket, req.EncryptedObjectKey}, []byte{'/'})) {
+			return nil, rpcstatus.Error(rpcstatus.ResourceExhausted, "Too Many Requests")
+		}
+	}
+
 	var mbObject metabase.Object
 	if len(req.ObjectVersion) == 0 {
 		mbObject, err = endpoint.metabase.GetObjectLastCommitted(ctx, metabase.GetObjectLastCommitted{
@@ -803,6 +960,9 @@ func (endpoint *Endpoint) GetObject(ctx context.Context, req *pb.ObjectGetReques
 	}
 
 	object, err := endpoint.objectToProto(ctx, mbObject)
+	if err != nil {
+		return nil, endpoint.ConvertKnownErrWithMessage(err, "internal error")
+	}
 
 	// TODO this code is triggered only by very old uplink library (<1.4.2) and we will remove it eventually.
 	// note: for non-default RS schema it
@@ -822,9 +982,9 @@ func (endpoint *Endpoint) GetObject(ctx context.Context, req *pb.ObjectGetReques
 
 			// don't fail because its possible that its multipart object
 			endpoint.log.Warn("unable to get segment metadata to get object redundancy",
-				zap.Stringer("StreamID", mbObject.StreamID),
-				zap.Stringer("ProjectID", keyInfo.ProjectID),
-				zap.String("User Agent", userAgent),
+				zap.Stringer("stream_id", mbObject.StreamID),
+				zap.Stringer("public_id", keyInfo.ProjectPublicID),
+				zap.String("user_agent", userAgent),
 				zap.Error(err),
 			)
 		} else {
@@ -843,11 +1003,6 @@ func (endpoint *Endpoint) GetObject(ctx context.Context, req *pb.ObjectGetReques
 		mon.Meter("req_get_object_rs_per_object").Mark(1)
 	}
 
-	if err != nil {
-		endpoint.log.Error("internal", zap.Error(err))
-		return nil, rpcstatus.Error(rpcstatus.Internal, "internal error")
-	}
-
 	if !canGetRetention {
 		object.Retention = nil
 	}
@@ -855,7 +1010,7 @@ func (endpoint *Endpoint) GetObject(ctx context.Context, req *pb.ObjectGetReques
 		object.LegalHold = nil
 	}
 
-	endpoint.log.Debug("Object Get", zap.Stringer("Project ID", keyInfo.ProjectID), zap.String("operation", "get"), zap.String("type", "object"))
+	endpoint.log.Debug("Object Get", zap.Stringer("public_id", keyInfo.ProjectPublicID), zap.String("operation", "get"), zap.String("type", "object"))
 	mon.Meter("req_get_object").Mark(1)
 
 	return &pb.ObjectGetResponse{Object: object}, nil
@@ -875,10 +1030,10 @@ func (endpoint *Endpoint) DownloadObject(ctx context.Context, req *pb.ObjectDown
 		return nil, err
 	}
 
-	peer, err := identity.PeerIdentityFromContext(ctx)
+	peer, trusted, err := endpoint.uplinkPeer(ctx)
 	if err != nil {
 		// N.B. jeff thinks this is a bad idea but jt convinced him
-		return nil, rpcstatus.Errorf(rpcstatus.Unauthenticated, "unable to get peer identity: %w", err)
+		return nil, err
 	}
 
 	var canGetRetention bool
@@ -919,8 +1074,18 @@ func (endpoint *Endpoint) DownloadObject(ctx context.Context, req *pb.ObjectDown
 		return nil, err
 	}
 
+	if err := validateServerSideCopyFlag(req.ServerSideCopy, trusted); err != nil {
+		return nil, err
+	}
+
 	if err := endpoint.checkDownloadLimits(ctx, keyInfo); err != nil {
 		return nil, err
+	}
+	if endpoint.config.DownloadLimiter.Enabled {
+		if !endpoint.singleObjectDownloadLimitCache.Allow(endpoint.rateLimiterTime(),
+			bytes.Join([][]byte{keyInfo.ProjectID[:], req.Bucket, req.EncryptedObjectKey}, []byte{'/'})) {
+			return nil, rpcstatus.Error(rpcstatus.ResourceExhausted, "Too Many Requests")
+		}
 	}
 
 	var object metabase.Object
@@ -958,10 +1123,10 @@ func (endpoint *Endpoint) DownloadObject(ctx context.Context, req *pb.ObjectDown
 	// get the range segments
 	streamRange, err := calculateStreamRange(object, req.Range)
 	if err != nil {
-		return nil, rpcstatus.Error(rpcstatus.InvalidArgument, err.Error())
+		return nil, rpcstatus.Wrap(rpcstatus.InvalidArgument, err)
 	}
 
-	{
+	defer func() {
 		tags := []eventkit.Tag{
 			eventkit.Bool("expires", object.ExpiresAt != nil),
 			eventkit.Int64("segment_count", int64(object.SegmentCount)),
@@ -974,8 +1139,11 @@ func (endpoint *Endpoint) DownloadObject(ctx context.Context, req *pb.ObjectDown
 				eventkit.Int64("range_start", streamRange.PlainStart),
 				eventkit.Int64("range_end", streamRange.PlainLimit))
 		}
+		if resp != nil {
+			tags = append(tags, eventkit.Int64("proto_response_size", int64(pb.Size(resp))))
+		}
 		endpoint.usageTracking(keyInfo, req.Header, fmt.Sprintf("%T", req), tags...)
-	}
+	}()
 
 	segments, err := endpoint.metabase.ListSegments(ctx, metabase.ListSegments{
 		ProjectID: keyInfo.ProjectID,
@@ -1002,7 +1170,8 @@ func (endpoint *Endpoint) DownloadObject(ctx context.Context, req *pb.ObjectDown
 		// Update the current bandwidth cache value incrementing the SegmentSize.
 		err = endpoint.projectUsage.UpdateProjectBandwidthUsage(ctx, keyInfoToLimits(keyInfo), downloadSizes.encryptedSize)
 		if err != nil {
-			if errs2.IsCanceled(err) {
+			// don't log errors if it was user cancellation
+			if errors.Is(ctx.Err(), context.Canceled) {
 				return nil, rpcstatus.Wrap(rpcstatus.Canceled, err)
 			}
 
@@ -1011,22 +1180,22 @@ func (endpoint *Endpoint) DownloadObject(ctx context.Context, req *pb.ObjectDown
 			// bandwidth limits.
 			endpoint.log.Error(
 				"Could not track the new project's bandwidth usage when downloading an object",
-				zap.Stringer("Project ID", keyInfo.ProjectID),
+				zap.Stringer("public_id", keyInfo.ProjectPublicID),
 				zap.Error(err),
 			)
 		}
 
 		encryptedKeyNonce, err := storj.NonceFromBytes(segment.EncryptedKeyNonce)
 		if err != nil {
-			endpoint.log.Error("unable to get encryption key nonce from metadata", zap.Error(err))
-			return nil, rpcstatus.Error(rpcstatus.Internal, "unable to get encryption key nonce from metadata")
+			return nil, endpoint.ConvertKnownErrWithMessage(err, "unable to get encryption key nonce from metadata")
 		}
 
 		if segment.Inline() {
-			err := endpoint.orders.UpdateGetInlineOrder(ctx, object.Location().Bucket(), downloadSizes.plainSize)
-			if err != nil {
-				endpoint.log.Error("internal", zap.Error(err))
-				return nil, rpcstatus.Error(rpcstatus.Internal, "unable to update GET inline order")
+			// skip egress tracking for server-side copy operation
+			if !req.ServerSideCopy {
+				if err := endpoint.orders.UpdateGetInlineOrder(ctx, object.Location().Bucket(), keyInfo.ProjectPublicID, downloadSizes.plainSize); err != nil {
+					return nil, endpoint.ConvertKnownErrWithMessage(err, "unable to update GET inline order")
+				}
 			}
 
 			// TODO we may think about fallback to encrypted size
@@ -1037,8 +1206,9 @@ func (endpoint *Endpoint) DownloadObject(ctx context.Context, req *pb.ObjectDown
 			}
 			endpoint.versionCollector.collectTransferStats(req.Header.UserAgent, download, int(downloaded))
 
-			endpoint.log.Debug("Inline Segment Download", zap.Stringer("Project ID", keyInfo.ProjectID), zap.String("operation", "get"), zap.String("type", "inline"))
-			mon.Meter("req_get_inline").Mark(1)
+			endpoint.log.Debug("Inline Segment Download", zap.Stringer("public_id", keyInfo.ProjectPublicID), zap.String("operation", "get"), zap.String("type", "inline"))
+			mon.Meter("req_get_inline", placementSeriesTag(segment.Placement)).Mark(1)
+
 			mon.Counter("req_get_inline_bytes").Inc(int64(len(segment.InlineData)))
 
 			return []*pb.SegmentDownloadResponse{{
@@ -1057,17 +1227,46 @@ func (endpoint *Endpoint) DownloadObject(ctx context.Context, req *pb.ObjectDown
 			}}, nil
 		}
 
-		limits, privateKey, err := endpoint.orders.CreateGetOrderLimits(ctx, peer, object.Location().Bucket(), segment, req.GetDesiredNodes(), downloadSizes.orderLimit)
+		var (
+			limits []*pb.AddressedOrderLimit
+			// Only needed for lite requests.
+			encodedSegmentID []byte
+		)
+
+		bucketLocation := object.Location().Bucket()
+		if req.ServerSideCopy {
+			// skip egress tracking for server-side copy operation, empty bucket location will
+			// be skipped while orders settlement
+			bucketLocation = metabase.BucketLocation{}
+		}
+
+		var privateKey storj.PiecePrivateKey
+		if req.LiteRequest {
+			// Lite responses don't have signed orders limits and the piece ID because the lite request are
+			// only accepted by trusted clients. Clients will add the signature and reconstruct the piece ID,
+			// however, they need the root piece ID, which is provided through the segment ID.
+			// Because they don't need anything else from the segment ID, we only set the root piece ID.
+			segmentID := internalpb.SegmentID{
+				RootPieceId: segment.RootPieceID,
+			}
+			encodedSegmentID, err = endpoint.packSegmentID(ctx, &segmentID)
+			if err != nil {
+				return nil, endpoint.ConvertKnownErrWithMessage(err, "unable to create segment id")
+			}
+
+			limits, privateKey, err = endpoint.orders.CreateLiteGetOrderLimits(ctx, peer, bucketLocation, segment, req.GetDesiredNodes(), downloadSizes.orderLimit)
+		} else {
+			limits, privateKey, err = endpoint.orders.CreateGetOrderLimits(ctx, peer, bucketLocation, segment, req.GetDesiredNodes(), downloadSizes.orderLimit)
+		}
 		if err != nil {
 			if orders.ErrDownloadFailedNotEnoughPieces.Has(err) {
 				endpoint.log.Error("Unable to create order limits.",
-					zap.Stringer("Project ID", keyInfo.ProjectID),
-					zap.Stringer("API Key ID", keyInfo.ID),
+					zap.Stringer("public_id", keyInfo.ProjectPublicID),
+					zap.Stringer("api_key_id", keyInfo.ID),
 					zap.Error(err),
 				)
 			}
-			endpoint.log.Error("internal", zap.Error(err))
-			return nil, rpcstatus.Error(rpcstatus.Internal, "unable to create order limits")
+			return nil, endpoint.ConvertKnownErrWithMessage(err, "unable to create order limits")
 		}
 
 		// TODO we may think about fallback to encrypted size
@@ -1078,8 +1277,8 @@ func (endpoint *Endpoint) DownloadObject(ctx context.Context, req *pb.ObjectDown
 		}
 		endpoint.versionCollector.collectTransferStats(req.Header.UserAgent, download, int(downloaded))
 
-		endpoint.log.Debug("Segment Download", zap.Stringer("Project ID", keyInfo.ProjectID), zap.String("operation", "get"), zap.String("type", "remote"))
-		mon.Meter("req_get_remote").Mark(1)
+		endpoint.log.Debug("Segment Download", zap.Stringer("public_id", keyInfo.ProjectPublicID), zap.String("operation", "get"), zap.String("type", "remote"))
+		mon.Meter("req_get_remote", placementSeriesTag(segment.Placement)).Mark(1)
 
 		return []*pb.SegmentDownloadResponse{{
 			AddressedLimits: limits,
@@ -1104,6 +1303,8 @@ func (endpoint *Endpoint) DownloadObject(ctx context.Context, req *pb.ObjectDown
 				PartNumber: int32(segment.Position.Part),
 				Index:      int32(segment.Position.Index),
 			},
+
+			SegmentId: encodedSegmentID,
 		}}, nil
 	}()
 	if err != nil {
@@ -1113,8 +1314,7 @@ func (endpoint *Endpoint) DownloadObject(ctx context.Context, req *pb.ObjectDown
 	// convert to response
 	protoObject, err := endpoint.objectToProto(ctx, object)
 	if err != nil {
-		endpoint.log.Error("unable to convert object to proto", zap.Error(err))
-		return nil, rpcstatus.Error(rpcstatus.Internal, "internal error")
+		return nil, endpoint.ConvertKnownErrWithMessage(err, "unable to convert object to proto")
 	}
 	if !canGetRetention {
 		protoObject.Retention = nil
@@ -1125,12 +1325,15 @@ func (endpoint *Endpoint) DownloadObject(ctx context.Context, req *pb.ObjectDown
 
 	segmentList, err := convertSegmentListResults(segments)
 	if err != nil {
-		endpoint.log.Error("unable to convert stream list", zap.Error(err))
-		return nil, rpcstatus.Error(rpcstatus.Internal, "unable to convert stream list")
+		return nil, endpoint.ConvertKnownErrWithMessage(err, "unable to convert stream list")
 	}
 
-	endpoint.log.Debug("Object Download", zap.Stringer("Project ID", keyInfo.ProjectID), zap.String("operation", "download"), zap.String("type", "object"))
-	mon.Meter("req_download_object").Mark(1)
+	endpoint.log.Debug("Object Download", zap.Stringer("public_id", keyInfo.ProjectPublicID), zap.String("operation", "download"), zap.String("type", "object"))
+	var downloadPlacement storj.PlacementConstraint
+	if len(segments.Segments) > 0 {
+		downloadPlacement = segments.Segments[0].Placement
+	}
+	mon.Meter("req_download_object", placementSeriesTag(downloadPlacement)).Mark(1)
 
 	return &pb.ObjectDownloadResponse{
 		Object: protoObject,
@@ -1304,9 +1507,22 @@ func calculateStreamRange(object metabase.Object, req *pb.Range) (*metabase.Stre
 	return nil, nil
 }
 
+// ListObjectsFlags contains flags for tuning the ListObjects query.
+type ListObjectsFlags struct {
+	VersionSkipRequery        int `default:"1000" help:"versions to skip before requerying"`
+	PrefixSkipRequery         int `default:"1000" help:"prefixes to skip before requerying"`
+	QueryExtraForNonRecursive int `default:"10" help:"extra items to list for non-recursive queries"`
+	MinBatchSize              int `default:"100" help:"minimum number of items to query at a time"`
+}
+
+// ensure that ListObjectsParams and ListObjectsFlags are exactly compatible.
+var _ = metabase.ListObjectsParams(ListObjectsFlags{})
+
 // ListObjects list objects according to specific parameters.
 func (endpoint *Endpoint) ListObjects(ctx context.Context, req *pb.ObjectListRequest) (resp *pb.ObjectListResponse, err error) {
 	defer mon.Task()(&ctx)(&err)
+
+	defer func() { err = endpoint.ConvertMetabaseErr(err) }()
 
 	endpoint.versionCollector.collect(req.Header.UserAgent, mon.Func().ShortName())
 
@@ -1323,7 +1539,17 @@ func (endpoint *Endpoint) ListObjects(ctx context.Context, req *pb.ObjectListReq
 	if err != nil {
 		return nil, err
 	}
-	endpoint.usageTracking(keyInfo, req.Header, fmt.Sprintf("%T", req))
+
+	defer func() {
+		var tags []eventkit.Tag
+		if resp != nil {
+			tags = []eventkit.Tag{
+				eventkit.Int64("listed_rows", int64(len(resp.Items))),
+				eventkit.Int64("proto_response_size", int64(pb.Size(resp))),
+			}
+		}
+		endpoint.usageTracking(keyInfo, req.Header, fmt.Sprintf("%T", req), tags...)
+	}()
 
 	// TODO this needs to be optimized to avoid DB call on each request
 	bucket, err := endpoint.buckets.GetBucket(ctx, req.Bucket, keyInfo.ProjectID)
@@ -1331,8 +1557,7 @@ func (endpoint *Endpoint) ListObjects(ctx context.Context, req *pb.ObjectListReq
 		if buckets.ErrBucketNotFound.Has(err) {
 			return nil, rpcstatus.Errorf(rpcstatus.NotFound, "bucket not found: %s", req.Bucket)
 		}
-		endpoint.log.Error("unable to check bucket", zap.Error(err))
-		return nil, rpcstatus.Error(rpcstatus.Internal, "unable to get bucket placement")
+		return nil, endpoint.ConvertKnownErrWithMessage(err, "unable to get bucket placement")
 	}
 
 	limit := int(req.Limit)
@@ -1341,11 +1566,16 @@ func (endpoint *Endpoint) ListObjects(ctx context.Context, req *pb.ObjectListReq
 	}
 	metabase.ListLimit.Ensure(&limit)
 
+	delimiter := metabase.ObjectKey(metabase.Delimiter)
+	if len(req.Delimiter) > 0 {
+		delimiter = metabase.ObjectKey(req.Delimiter)
+	}
+
 	var prefix metabase.ObjectKey
 	if len(req.EncryptedPrefix) != 0 {
 		prefix = metabase.ObjectKey(req.EncryptedPrefix)
-		if prefix[len(prefix)-1] != metabase.Delimiter {
-			prefix += metabase.ObjectKey(metabase.Delimiter)
+		if !req.ArbitraryPrefix && !strings.HasSuffix(string(prefix), string(delimiter)) {
+			prefix += delimiter
 		}
 	}
 
@@ -1360,14 +1590,31 @@ func (endpoint *Endpoint) ListObjects(ctx context.Context, req *pb.ObjectListReq
 	if len(cursorKey) != 0 {
 		cursorKey = prefix + cursorKey
 
-		// TODO this is a workaround to avoid duplicates while listing objects by libuplink.
-		// because version is not part of cursor yet and we can have object with version higher
-		// than 1 we cannot use hardcoded version 1 as default.
-		// This workaround should be in place for a longer time even if metainfo protocol will be
-		// fix as we still want to avoid this problem for older libuplink versions.
+		// This is a workaround to avoid duplicates while listing objects by libuplink.
+		// Because version is not part of cursor yet we need to specify a version that lists the next
+		// version from a given key.
 		//
-		// it should be set in case of pending and committed objects
-		cursorVersion = metabase.MaxVersion
+		// The meaning of the cursor is to start iterating from the next item.
+		// For pending objects we sort items version ascending, for all others descending.
+		//
+		// So, to skip a given cursorKey we need to select either the last version (depending on the sorting order)
+		// Or create a cursor key that's one higher and the first version (depending on the sorting order)
+
+		if endpoint.config.UseListObjectsForListing {
+			if status == metabase.Pending || bucket.Versioning.IsUnversioned() {
+				// For pending objects it's the maximum version.
+				cursorVersion = metabase.MaxVersion
+			} else {
+				// For non-pending objects it's 0. (Because they are sorted in descending order)
+				cursorVersion = 0
+			}
+		} else {
+			// TODO: for some reason the old codepath always set it to MaxVersion.
+			// Let's keep it as such.
+			//
+			// I'm guessing IterateObjectsAllVersionsWithStatusAscending handles this logic internally.
+			cursorVersion = metabase.MaxVersion
+		}
 	}
 
 	if len(req.VersionCursor) != 0 {
@@ -1378,14 +1625,31 @@ func (endpoint *Endpoint) ListObjects(ctx context.Context, req *pb.ObjectListReq
 		cursorVersion = sv.Version()
 	}
 
-	includeCustomMetadata := true
-	includeSystemMetadata := true
+	allVersions := req.IncludeAllVersions || status == metabase.Pending
+
+	var include = includeForObjectEntry{
+		SystemMetadata:       true,
+		CustomMetadata:       true,
+		ETag:                 true,
+		ETagOrCustomMetadata: false,
+		Checksum:             true,
+		LegacyStreamMeta:     true,
+		ObjectVersion:        allVersions,
+	}
+
 	if req.UseObjectIncludes {
-		includeCustomMetadata = req.ObjectIncludes.Metadata
+		include.CustomMetadata = req.ObjectIncludes.Metadata
 		// because multipart upload UploadID depends on some System metadata fields we need
 		// to force reading it for listing pending object when its not included in options.
 		// This is used by libuplink ListUploads method.
-		includeSystemMetadata = status == metabase.Pending || !req.ObjectIncludes.ExcludeSystemMetadata
+		include.SystemMetadata = status == metabase.Pending || !req.ObjectIncludes.ExcludeSystemMetadata
+		include.ETag = req.ObjectIncludes.IncludeEtag
+		include.ETagOrCustomMetadata = req.ObjectIncludes.IncludeEtagOrCustomMetadata
+		include.Checksum = req.ObjectIncludes.IncludeChecksum
+		// Modern uplinks (those that set use_object_includes) use the top-level
+		// encrypted_metadata_nonce / encrypted_metadata_encrypted_key fields directly,
+		// so there is no need to duplicate the same bytes in StreamMeta.LastSegmentMeta.
+		include.LegacyStreamMeta = false
 	}
 
 	resp = &pb.ObjectListResponse{}
@@ -1397,62 +1661,72 @@ func (endpoint *Endpoint) ListObjects(ctx context.Context, req *pb.ObjectListReq
 	// they do not have the necessary cursor logic to iterate over versions.
 	//
 	// New clients specify what they need.
-
-	// For pending objects, we always need to list the versions.
-	if status == metabase.Pending {
-		// handles listing pending objects for all types of buckets
-		err = endpoint.metabase.IterateObjectsAllVersionsWithStatusAscending(ctx,
-			metabase.IterateObjectsWithStatus{
+	if endpoint.config.UseListObjectsForListing {
+		result, err := endpoint.metabase.ListObjects(ctx,
+			metabase.ListObjects{
 				ProjectID:  keyInfo.ProjectID,
 				BucketName: metabase.BucketName(req.Bucket),
 				Prefix:     prefix,
-				Cursor: metabase.IterateCursor{
+				Delimiter:  delimiter,
+				Cursor: metabase.ListObjectsCursor{
 					Key:     cursorKey,
 					Version: cursorVersion,
 				},
-				Recursive:             req.Recursive,
-				BatchSize:             limit + 1,
-				Pending:               true,
-				IncludeCustomMetadata: includeCustomMetadata,
-				IncludeSystemMetadata: includeSystemMetadata,
-			}, func(ctx context.Context, it metabase.ObjectsIterator) error {
-				entry := metabase.ObjectEntry{}
-				for len(resp.Items) < limit && it.Next(ctx, &entry) {
-					item, err := endpoint.objectEntryToProtoListItem(ctx, req.Bucket, entry, prefix, includeSystemMetadata, includeCustomMetadata, bucket.Placement, bucket.Versioning == buckets.VersioningEnabled)
-					if err != nil {
-						return err
-					}
-					resp.Items = append(resp.Items, item)
-				}
+				Pending: status == metabase.Pending,
+				// for pending, we always need all versions
+				// when bucket is unversioned, then requesting all versions is slightly faster
+				AllVersions: allVersions,
+				Recursive:   req.Recursive,
+				Limit:       limit,
 
-				resp.More = it.Next(ctx, &entry)
-				return nil
-			},
-		)
+				IncludeCustomMetadata:       include.CustomMetadata,
+				IncludeSystemMetadata:       include.SystemMetadata,
+				IncludeETag:                 include.ETag,
+				IncludeETagOrCustomMetadata: include.ETagOrCustomMetadata,
+				IncludeChecksum:             include.Checksum,
+
+				Unversioned: bucket.Versioning.IsUnversioned(),
+				Params:      metabase.ListObjectsParams(endpoint.config.ListObjects),
+			})
 		if err != nil {
 			return nil, endpoint.ConvertMetabaseErr(err)
 		}
-	} else if !req.IncludeAllVersions {
-		if bucket.Versioning.IsUnversioned() {
-			// handles listing for VersioningUnsupported and Unversioned buckets
+
+		for _, entry := range result.Objects {
+			item, err := endpoint.objectEntryToProtoListItem(ctx, req.Bucket, entry, prefix, include, bucket.Placement, bucket.Versioning == buckets.VersioningEnabled)
+			if err != nil {
+				return nil, endpoint.ConvertMetabaseErr(err)
+			}
+			resp.Items = append(resp.Items, item)
+		}
+		resp.More = result.More
+	} else {
+		// For pending objects, we always need to list the versions.
+		if status == metabase.Pending {
+			// handles listing pending objects for all types of buckets
 			err = endpoint.metabase.IterateObjectsAllVersionsWithStatusAscending(ctx,
 				metabase.IterateObjectsWithStatus{
 					ProjectID:  keyInfo.ProjectID,
 					BucketName: metabase.BucketName(req.Bucket),
 					Prefix:     prefix,
+					Delimiter:  delimiter,
 					Cursor: metabase.IterateCursor{
 						Key:     cursorKey,
 						Version: cursorVersion,
 					},
-					Recursive:             req.Recursive,
-					BatchSize:             limit + 1,
-					Pending:               false,
-					IncludeCustomMetadata: includeCustomMetadata,
-					IncludeSystemMetadata: includeSystemMetadata,
+					Recursive: req.Recursive,
+					BatchSize: limit + 1,
+					Pending:   true,
+
+					IncludeCustomMetadata:       include.CustomMetadata,
+					IncludeSystemMetadata:       include.SystemMetadata,
+					IncludeETag:                 include.ETag,
+					IncludeETagOrCustomMetadata: include.ETagOrCustomMetadata,
+					IncludeChecksum:             include.Checksum,
 				}, func(ctx context.Context, it metabase.ObjectsIterator) error {
 					entry := metabase.ObjectEntry{}
 					for len(resp.Items) < limit && it.Next(ctx, &entry) {
-						item, err := endpoint.objectEntryToProtoListItem(ctx, req.Bucket, entry, prefix, includeSystemMetadata, includeCustomMetadata, bucket.Placement, bucket.Versioning == buckets.VersioningEnabled)
+						item, err := endpoint.objectEntryToProtoListItem(ctx, req.Bucket, entry, prefix, include, bucket.Placement, bucket.Versioning == buckets.VersioningEnabled)
 						if err != nil {
 							return err
 						}
@@ -1466,73 +1740,123 @@ func (endpoint *Endpoint) ListObjects(ctx context.Context, req *pb.ObjectListReq
 			if err != nil {
 				return nil, endpoint.ConvertMetabaseErr(err)
 			}
-		} else {
-			result, err := endpoint.metabase.ListObjects(ctx,
-				metabase.ListObjects{
-					ProjectID:  keyInfo.ProjectID,
-					BucketName: metabase.BucketName(req.Bucket),
-					Prefix:     prefix,
-					Cursor: metabase.ListObjectsCursor{
-						Key:     cursorKey,
-						Version: cursorVersion,
+		} else if !req.IncludeAllVersions {
+			if bucket.Versioning.IsUnversioned() {
+				// handles listing for VersioningUnsupported and Unversioned buckets
+				err = endpoint.metabase.IterateObjectsAllVersionsWithStatusAscending(ctx,
+					metabase.IterateObjectsWithStatus{
+						ProjectID:  keyInfo.ProjectID,
+						BucketName: metabase.BucketName(req.Bucket),
+						Prefix:     prefix,
+						Delimiter:  delimiter,
+						Cursor: metabase.IterateCursor{
+							Key:     cursorKey,
+							Version: cursorVersion,
+						},
+						Recursive: req.Recursive,
+						BatchSize: limit + 1,
+						Pending:   false,
+
+						IncludeCustomMetadata:       include.CustomMetadata,
+						IncludeSystemMetadata:       include.SystemMetadata,
+						IncludeETag:                 include.ETag,
+						IncludeETagOrCustomMetadata: include.ETagOrCustomMetadata,
+						IncludeChecksum:             include.Checksum,
+					}, func(ctx context.Context, it metabase.ObjectsIterator) error {
+						entry := metabase.ObjectEntry{}
+						for len(resp.Items) < limit && it.Next(ctx, &entry) {
+							item, err := endpoint.objectEntryToProtoListItem(ctx, req.Bucket, entry, prefix, include, bucket.Placement, bucket.Versioning == buckets.VersioningEnabled)
+							if err != nil {
+								return err
+							}
+							resp.Items = append(resp.Items, item)
+						}
+
+						resp.More = it.Next(ctx, &entry)
+						return nil
 					},
-					Pending:     false,
-					AllVersions: false,
-					Recursive:   req.Recursive,
-					Limit:       limit,
-
-					IncludeCustomMetadata: includeCustomMetadata,
-					IncludeSystemMetadata: includeSystemMetadata,
-				})
-			if err != nil {
-				return nil, endpoint.ConvertMetabaseErr(err)
-			}
-
-			for _, entry := range result.Objects {
-				item, err := endpoint.objectEntryToProtoListItem(ctx, req.Bucket, entry, prefix, includeSystemMetadata, includeCustomMetadata, bucket.Placement, bucket.Versioning == buckets.VersioningEnabled)
+				)
 				if err != nil {
 					return nil, endpoint.ConvertMetabaseErr(err)
 				}
-				resp.Items = append(resp.Items, item)
-			}
-			resp.More = result.More
-		}
-	} else {
-		// handles listing all versions
-		err = endpoint.metabase.IterateObjectsAllVersionsWithStatus(ctx,
-			metabase.IterateObjectsWithStatus{
-				ProjectID:  keyInfo.ProjectID,
-				BucketName: metabase.BucketName(req.Bucket),
-				Prefix:     prefix,
-				Cursor: metabase.IterateCursor{
-					Key:     cursorKey,
-					Version: cursorVersion,
-				},
-				Recursive:             req.Recursive,
-				BatchSize:             limit + 1,
-				Pending:               false,
-				IncludeCustomMetadata: includeCustomMetadata,
-				IncludeSystemMetadata: includeSystemMetadata,
-			}, func(ctx context.Context, it metabase.ObjectsIterator) error {
-				entry := metabase.ObjectEntry{}
-				for len(resp.Items) < limit && it.Next(ctx, &entry) {
-					item, err := endpoint.objectEntryToProtoListItem(ctx, req.Bucket, entry, prefix, includeSystemMetadata, includeCustomMetadata, bucket.Placement, bucket.Versioning == buckets.VersioningEnabled)
+			} else {
+				result, err := endpoint.metabase.ListObjects(ctx,
+					metabase.ListObjects{
+						ProjectID:  keyInfo.ProjectID,
+						BucketName: metabase.BucketName(req.Bucket),
+						Prefix:     prefix,
+						Delimiter:  delimiter,
+						Cursor: metabase.ListObjectsCursor{
+							Key:     cursorKey,
+							Version: cursorVersion,
+						},
+						Pending:     false,
+						AllVersions: false,
+						Recursive:   req.Recursive,
+						Limit:       limit,
+
+						IncludeCustomMetadata:       include.CustomMetadata,
+						IncludeSystemMetadata:       include.SystemMetadata,
+						IncludeETag:                 include.ETag,
+						IncludeETagOrCustomMetadata: include.ETagOrCustomMetadata,
+						IncludeChecksum:             include.Checksum,
+					})
+				if err != nil {
+					return nil, endpoint.ConvertMetabaseErr(err)
+				}
+
+				for _, entry := range result.Objects {
+					item, err := endpoint.objectEntryToProtoListItem(ctx, req.Bucket, entry, prefix, include, bucket.Placement, bucket.Versioning == buckets.VersioningEnabled)
 					if err != nil {
-						return err
+						return nil, endpoint.ConvertMetabaseErr(err)
 					}
 					resp.Items = append(resp.Items, item)
 				}
+				resp.More = result.More
+			}
+		} else {
+			// handles listing all versions
+			err = endpoint.metabase.IterateObjectsAllVersionsWithStatus(ctx,
+				metabase.IterateObjectsWithStatus{
+					ProjectID:  keyInfo.ProjectID,
+					BucketName: metabase.BucketName(req.Bucket),
+					Prefix:     prefix,
+					Delimiter:  delimiter,
+					Cursor: metabase.IterateCursor{
+						Key:     cursorKey,
+						Version: cursorVersion,
+					},
+					Recursive: req.Recursive,
+					BatchSize: limit + 1,
+					Pending:   false,
 
-				resp.More = it.Next(ctx, &entry)
-				return nil
-			},
-		)
-		if err != nil {
-			return nil, endpoint.ConvertMetabaseErr(err)
+					IncludeCustomMetadata:       include.CustomMetadata,
+					IncludeSystemMetadata:       include.SystemMetadata,
+					IncludeETag:                 include.ETag,
+					IncludeETagOrCustomMetadata: include.ETagOrCustomMetadata,
+					IncludeChecksum:             include.Checksum,
+				}, func(ctx context.Context, it metabase.ObjectsIterator) error {
+					entry := metabase.ObjectEntry{}
+					for len(resp.Items) < limit && it.Next(ctx, &entry) {
+						item, err := endpoint.objectEntryToProtoListItem(ctx, req.Bucket, entry, prefix, include, bucket.Placement, bucket.Versioning == buckets.VersioningEnabled)
+						if err != nil {
+							return err
+						}
+						resp.Items = append(resp.Items, item)
+					}
+
+					resp.More = it.Next(ctx, &entry)
+					return nil
+				},
+			)
+			if err != nil {
+				return nil, endpoint.ConvertMetabaseErr(err)
+			}
 		}
 	}
-	endpoint.log.Debug("Object List", zap.Stringer("Project ID", keyInfo.ProjectID), zap.String("operation", "list"), zap.String("type", "object"))
-	mon.Meter("req_list_object").Mark(1)
+
+	endpoint.log.Debug("Object List", zap.Stringer("public_id", keyInfo.ProjectPublicID), zap.String("operation", "list"), zap.String("type", "object"))
+	mon.Meter("req_list_object", placementSeriesTag(bucket.Placement)).Mark(1)
 
 	return resp, nil
 }
@@ -1563,20 +1887,18 @@ func (endpoint *Endpoint) ListPendingObjectStreams(ctx context.Context, req *pb.
 		if buckets.ErrBucketNotFound.Has(err) {
 			return nil, rpcstatus.Errorf(rpcstatus.NotFound, "bucket not found: %s", req.Bucket)
 		}
-		endpoint.log.Error("unable to check bucket", zap.Error(err))
-		return nil, rpcstatus.Error(rpcstatus.Internal, "unable to get bucket placement")
+		return nil, endpoint.ConvertKnownErrWithMessage(err, "unable to get bucket placement")
 	}
 
 	cursor := metabase.StreamIDCursor{}
 	if req.StreamIdCursor != nil {
 		streamID, err := endpoint.unmarshalSatStreamID(ctx, req.StreamIdCursor)
 		if err != nil {
-			return nil, rpcstatus.Error(rpcstatus.InvalidArgument, err.Error())
+			return nil, rpcstatus.Wrap(rpcstatus.InvalidArgument, err)
 		}
 		cursor.StreamID, err = uuid.FromBytes(streamID.StreamId)
 		if err != nil {
-			endpoint.log.Error("internal", zap.Error(err))
-			return nil, rpcstatus.Error(rpcstatus.Internal, "unable to parse stream id")
+			return nil, endpoint.ConvertKnownErrWithMessage(err, "unable to parse stream id")
 		}
 	}
 
@@ -1601,7 +1923,7 @@ func (endpoint *Endpoint) ListPendingObjectStreams(ctx context.Context, req *pb.
 		options, func(ctx context.Context, it metabase.ObjectsIterator) error {
 			entry := metabase.ObjectEntry{}
 			for it.Next(ctx, &entry) {
-				item, err := endpoint.objectEntryToProtoListItem(ctx, req.Bucket, entry, "", true, true, bucket.Placement, bucket.Versioning == buckets.VersioningEnabled)
+				item, err := endpoint.objectEntryToProtoListItem(ctx, req.Bucket, entry, "", includeAllForObjectEntry(), bucket.Placement, bucket.Versioning == buckets.VersioningEnabled)
 				if err != nil {
 					return err
 				}
@@ -1627,148 +1949,11 @@ func (endpoint *Endpoint) ListPendingObjectStreams(ctx context.Context, req *pb.
 		resp.Items = resp.Items[:limit]
 	}
 
-	endpoint.log.Debug("List pending object streams", zap.Stringer("Project ID", keyInfo.ProjectID), zap.String("operation", "list"), zap.String("type", "object"))
+	endpoint.log.Debug("List pending object streams", zap.Stringer("public_id", keyInfo.ProjectPublicID), zap.String("operation", "list"), zap.String("type", "object"))
 
-	mon.Meter("req_list_pending_object_streams").Mark(1)
+	mon.Meter("req_list_pending_object_streams", placementSeriesTag(bucket.Placement)).Mark(1)
 
 	return resp, nil
-}
-
-// BeginDeleteObject begins object deletion process.
-func (endpoint *Endpoint) BeginDeleteObject(ctx context.Context, req *pb.ObjectBeginDeleteRequest) (resp *pb.ObjectBeginDeleteResponse, err error) {
-	defer mon.Task()(&ctx)(&err)
-
-	endpoint.versionCollector.collect(req.Header.UserAgent, mon.Func().ShortName())
-
-	if err = validateRequestSimple(req); err != nil {
-		return nil, err
-	}
-
-	now := time.Now()
-
-	var canRead, canList, canGetRetention bool
-
-	actions := []VerifyPermission{
-		{
-			Action: macaroon.Action{
-				Op:            macaroon.ActionDelete,
-				Bucket:        req.Bucket,
-				EncryptedPath: req.EncryptedObjectKey,
-				Time:          now,
-			},
-		}, {
-			Action: macaroon.Action{
-				Op:            macaroon.ActionRead,
-				Bucket:        req.Bucket,
-				EncryptedPath: req.EncryptedObjectKey,
-				Time:          now,
-			},
-			ActionPermitted: &canRead,
-			Optional:        true,
-		}, {
-			Action: macaroon.Action{
-				Op:            macaroon.ActionList,
-				Bucket:        req.Bucket,
-				EncryptedPath: req.EncryptedObjectKey,
-				Time:          now,
-			},
-			ActionPermitted: &canList,
-			Optional:        true,
-		}, {
-			Action: macaroon.Action{
-				Op:            macaroon.ActionGetObjectRetention,
-				Bucket:        req.Bucket,
-				EncryptedPath: req.EncryptedObjectKey,
-				Time:          now,
-			},
-			ActionPermitted: &canGetRetention,
-			Optional:        true,
-		},
-	}
-
-	if req.BypassGovernanceRetention {
-		actions = append(actions, VerifyPermission{
-			Action: macaroon.Action{
-				Op:            macaroon.ActionBypassGovernanceRetention,
-				Bucket:        req.Bucket,
-				EncryptedPath: req.EncryptedObjectKey,
-				Time:          now,
-			},
-		})
-	}
-
-	keyInfo, err := endpoint.ValidateAuthN(ctx, req.Header, console.RateLimitDelete, actions...)
-	if err != nil {
-		return nil, err
-	}
-	endpoint.usageTracking(keyInfo, req.Header, fmt.Sprintf("%T", req))
-
-	var deletedObjects []*pb.Object
-
-	if req.GetStatus() == int32(metabase.Pending) {
-		if req.StreamId == nil {
-			return nil, rpcstatus.Error(rpcstatus.InvalidArgument, "StreamID missing")
-		}
-		var pbStreamID *internalpb.StreamID
-		pbStreamID, err = endpoint.unmarshalSatStreamID(ctx, *(req.StreamId))
-		if err == nil {
-			var streamID uuid.UUID
-			streamID, err = uuid.FromBytes(pbStreamID.StreamId)
-			if err == nil {
-				deletedObjects, err = endpoint.DeletePendingObject(ctx,
-					metabase.ObjectStream{
-						ProjectID:  keyInfo.ProjectID,
-						BucketName: metabase.BucketName(pbStreamID.Bucket),
-						ObjectKey:  metabase.ObjectKey(pbStreamID.EncryptedObjectKey),
-						Version:    metabase.Version(pbStreamID.Version),
-						StreamID:   streamID,
-					})
-			}
-		}
-	} else {
-		deletedObjects, err = endpoint.DeleteCommittedObject(ctx, DeleteCommittedObject{
-			ObjectLocation: metabase.ObjectLocation{
-				ProjectID:  keyInfo.ProjectID,
-				BucketName: metabase.BucketName(req.Bucket),
-				ObjectKey:  metabase.ObjectKey(req.EncryptedObjectKey),
-			},
-			Version:          req.ObjectVersion,
-			BypassGovernance: req.BypassGovernanceRetention,
-		})
-	}
-	if err != nil {
-		if !canRead && !canList {
-			// No error info is returned if neither Read, nor List permission is granted
-			return &pb.ObjectBeginDeleteResponse{}, nil
-		}
-		return nil, endpoint.ConvertMetabaseErr(err)
-	}
-
-	var object *pb.Object
-	if canRead || canList {
-		// Info about deleted object is returned only if either Read, or List permission is granted
-		if err != nil {
-			endpoint.log.Error("failed to construct deleted object information",
-				zap.Stringer("Project ID", keyInfo.ProjectID),
-				zap.Stringer("Bucket", metabase.BucketName(req.Bucket)),
-				zap.String("Encrypted Path", string(req.EncryptedObjectKey)),
-				zap.Error(err),
-			)
-		}
-		if len(deletedObjects) > 0 {
-			object = deletedObjects[0]
-			if !canGetRetention {
-				object.Retention = nil
-			}
-		}
-	}
-
-	endpoint.log.Debug("Object Delete", zap.Stringer("Project ID", keyInfo.ProjectID), zap.String("operation", "delete"), zap.String("type", "object"))
-	mon.Meter("req_delete_object").Mark(1)
-
-	return &pb.ObjectBeginDeleteResponse{
-		Object: object,
-	}, nil
 }
 
 // GetObjectIPs returns the IP addresses of the nodes holding the pieces for
@@ -1848,8 +2033,7 @@ func (endpoint *Endpoint) GetObjectIPs(ctx context.Context, req *pb.ObjectGetIPs
 
 	nodeIPMap, err := endpoint.overlay.GetNodeIPsFromPlacement(ctx, nodeIDs, placement)
 	if err != nil {
-		endpoint.log.Error("internal", zap.Error(err))
-		return nil, rpcstatus.Error(rpcstatus.Internal, "unable to get node IPs from placement")
+		return nil, endpoint.ConvertKnownErrWithMessage(err, "unable to get node IPs from placement")
 	}
 
 	nodeIPs := make([][]byte, 0, len(nodeIPMap))
@@ -1866,7 +2050,7 @@ func (endpoint *Endpoint) GetObjectIPs(ctx context.Context, req *pb.ObjectGetIPs
 		reliablePieceCount += count
 	}
 
-	mon.Meter("req_get_object_ips").Mark(1)
+	mon.Meter("req_get_object_ips", placementSeriesTag(placement)).Mark(1)
 
 	return &pb.ObjectGetIPsResponse{
 		Ips:                 nodeIPs,
@@ -1874,6 +2058,100 @@ func (endpoint *Endpoint) GetObjectIPs(ctx context.Context, req *pb.ObjectGetIPs
 		ReliablePieceCount:  reliablePieceCount,
 		PieceCount:          pieceCount,
 		PlacementConstraint: uint32(placement),
+	}, nil
+}
+
+// GetPendingObjectMetadata returns the metadata of a pending object.
+func (endpoint *Endpoint) GetPendingObjectMetadata(ctx context.Context, req *pb.GetPendingObjectMetadataRequest) (resp *pb.GetPendingObjectMetadataResponse, err error) {
+	defer mon.Task()(&ctx)(&err)
+
+	endpoint.versionCollector.collect(req.Header.UserAgent, mon.Func().ShortName())
+
+	if err = validateRequestSimple(req); err != nil {
+		return nil, err
+	}
+
+	now := time.Now()
+	keyInfo, err := endpoint.ValidateAuthAny(ctx, req.Header, console.RateLimitHead,
+		VerifyPermission{
+			Action: macaroon.Action{
+				Op:            macaroon.ActionRead,
+				Bucket:        req.Bucket,
+				EncryptedPath: req.EncryptedObjectKey,
+				Time:          now,
+			},
+		},
+		VerifyPermission{
+			Action: macaroon.Action{
+				Op:            macaroon.ActionList,
+				Bucket:        req.Bucket,
+				EncryptedPath: req.EncryptedObjectKey,
+				Time:          now,
+			},
+		},
+	)
+	if err != nil {
+		return nil, err
+	}
+	endpoint.usageTracking(keyInfo, req.Header, fmt.Sprintf("%T", req))
+
+	streamID, err := endpoint.unmarshalSatStreamID(ctx, req.StreamId)
+	if err != nil {
+		return nil, rpcstatus.Wrap(rpcstatus.StreamIDInvalid, err)
+	}
+
+	id, err := uuid.FromBytes(streamID.StreamId)
+	if err != nil {
+		return nil, endpoint.ConvertKnownErrWithMessage(err, "unable to parse stream id")
+	}
+
+	userData, err := endpoint.metabase.GetPendingObjectMetadata(ctx, metabase.GetPendingObjectMetadata{
+		ObjectStream: metabase.ObjectStream{
+			ProjectID:  keyInfo.ProjectID,
+			BucketName: metabase.BucketName(req.Bucket),
+			ObjectKey:  metabase.ObjectKey(req.EncryptedObjectKey),
+			Version:    metabase.Version(streamID.Version),
+			StreamID:   id,
+		},
+	})
+	if err != nil {
+		return nil, endpoint.ConvertMetabaseErr(err)
+	}
+
+	var nonce storj.Nonce
+	if len(userData.EncryptedUserData.EncryptedMetadataNonce) > 0 {
+		nonce, err = storj.NonceFromBytes(userData.EncryptedUserData.EncryptedMetadataNonce)
+		if err != nil {
+			return nil, endpoint.ConvertKnownErrWithMessage(err, "error converting metadata nonce")
+		}
+	}
+
+	streamMeta := &pb.StreamMeta{}
+	err = pb.Unmarshal(userData.EncryptedUserData.EncryptedMetadata, streamMeta)
+	if err != nil {
+		return nil, err
+	}
+
+	if streamMeta.EncryptionType == 0 {
+		streamMeta.EncryptionType = int32(userData.Encryption.CipherSuite)
+	}
+
+	metadataBytes, err := pb.Marshal(streamMeta)
+	if err != nil {
+		return nil, err
+	}
+
+	mon.Meter("req_get_pending_object_metadata").Mark(1)
+
+	return &pb.GetPendingObjectMetadataResponse{
+		EncryptedMetadata:             metadataBytes,
+		EncryptedMetadataNonce:        nonce,
+		EncryptedMetadataEncryptedKey: userData.EncryptedUserData.EncryptedMetadataEncryptedKey,
+		EncryptedEtag:                 userData.EncryptedUserData.EncryptedETag,
+
+		ChecksumAlgorithm:   pb.ObjectChecksumAlgorithm(userData.EncryptedUserData.Checksum.Algorithm),
+		IsChecksumComposite: userData.EncryptedUserData.Checksum.IsComposite,
+		EncryptedChecksum:   userData.EncryptedUserData.Checksum.EncryptedValue,
 	}, nil
 }
 
@@ -1898,24 +2176,51 @@ func (endpoint *Endpoint) UpdateObjectMetadata(ctx context.Context, req *pb.Obje
 	}
 	endpoint.usageTracking(keyInfo, req.Header, fmt.Sprintf("%T", req))
 
-	if err := endpoint.checkEncryptedMetadataSize(req.EncryptedMetadata, req.EncryptedMetadataEncryptedKey); err != nil {
+	if err = endpoint.validateChecksumOptions(req.ChecksumAlgorithm, req.IsChecksumComposite, req.EncryptedChecksum); err != nil {
+		return nil, err
+	}
+
+	var includes metabase.EncryptedUserDataIncludes
+	if req.Includes != nil {
+		includes = metabase.EncryptedUserDataIncludes{
+			Metadata: req.Includes.Custom,
+			ETag:     req.Includes.Etag,
+			Checksum: req.Includes.Checksum,
+		}
+		if includes == (metabase.EncryptedUserDataIncludes{}) {
+			return nil, rpcstatus.Error(rpcstatus.ObjectMetadataIncludesInvalid, "Includes must not be empty")
+		}
+	} else {
+		includes = metabase.EncryptedUserDataIncludes{
+			Metadata: true,
+			ETag:     req.SetEncryptedEtag,
+		}
+	}
+
+	encryptedUserData := metabase.EncryptedUserData{
+		EncryptedMetadata:             req.EncryptedMetadata,
+		EncryptedMetadataNonce:        nonceBytes(req.EncryptedMetadataNonce),
+		EncryptedMetadataEncryptedKey: req.EncryptedMetadataEncryptedKey,
+		EncryptedETag:                 req.EncryptedEtag,
+		Checksum: metabase.Checksum{
+			Algorithm:      storj.ObjectChecksumAlgorithm(req.ChecksumAlgorithm),
+			IsComposite:    req.IsChecksumComposite,
+			EncryptedValue: req.EncryptedChecksum,
+		},
+	}
+
+	if err := endpoint.checkEncryptedMetadataSize(encryptedUserData); err != nil {
 		return nil, err
 	}
 
 	streamID, err := endpoint.unmarshalSatStreamID(ctx, req.StreamId)
 	if err != nil {
-		return nil, rpcstatus.Error(rpcstatus.InvalidArgument, err.Error())
+		return nil, rpcstatus.Wrap(rpcstatus.InvalidArgument, err)
 	}
 
 	id, err := uuid.FromBytes(streamID.StreamId)
 	if err != nil {
-		endpoint.log.Error("internal", zap.Error(err))
-		return nil, rpcstatus.Error(rpcstatus.Internal, "unable to parse stream id")
-	}
-
-	var encryptedMetadataNonce []byte
-	if !req.EncryptedMetadataNonce.IsZero() {
-		encryptedMetadataNonce = req.EncryptedMetadataNonce[:]
+		return nil, endpoint.ConvertKnownErrWithMessage(err, "unable to parse stream id")
 	}
 
 	err = endpoint.metabase.UpdateObjectLastCommittedMetadata(ctx, metabase.UpdateObjectLastCommittedMetadata{
@@ -1924,16 +2229,20 @@ func (endpoint *Endpoint) UpdateObjectMetadata(ctx context.Context, req *pb.Obje
 			BucketName: metabase.BucketName(req.Bucket),
 			ObjectKey:  metabase.ObjectKey(req.EncryptedObjectKey),
 		},
-		StreamID:                      id,
-		EncryptedMetadata:             req.EncryptedMetadata,
-		EncryptedMetadataNonce:        encryptedMetadataNonce,
-		EncryptedMetadataEncryptedKey: req.EncryptedMetadataEncryptedKey,
+		StreamID:          id,
+		EncryptedUserData: encryptedUserData,
+		Includes:          includes,
 	})
 	if err != nil {
+		// Old uplinks neither set req.Includes nor know how to translate the RPC status code
+		// for metabase.ErrInsufficientMetadataIncludes.
+		if req.Includes == nil && metabase.ErrInsufficientMetadataIncludes.Has(err) {
+			err = metabase.ErrObjectNotFound.New("")
+		}
 		return nil, endpoint.ConvertMetabaseErr(err)
 	}
 
-	mon.Meter("req_update_object_metadata").Mark(1)
+	mon.Meter("req_update_object_metadata", placementSeriesTag(storj.PlacementConstraint(streamID.Placement))).Mark(1)
 
 	return &pb.ObjectUpdateMetadataResponse{}, nil
 }
@@ -1960,17 +2269,12 @@ func (endpoint *Endpoint) GetObjectLegalHold(ctx context.Context, req *pb.GetObj
 	}
 	endpoint.usageTracking(keyInfo, req.Header, fmt.Sprintf("%T", req))
 
-	if !endpoint.config.ObjectLockEnabled {
-		return nil, rpcstatus.Error(rpcstatus.ObjectLockEndpointsDisabled, objectLockDisabledErrMsg)
-	}
-
 	bucketLockEnabled, err := endpoint.buckets.GetBucketObjectLockEnabled(ctx, req.Bucket, keyInfo.ProjectID)
 	if err != nil {
 		if buckets.ErrBucketNotFound.Has(err) {
 			return nil, rpcstatus.Errorf(rpcstatus.NotFound, "bucket not found: %s", string(req.Bucket))
 		}
-		endpoint.log.Error("unable to get bucket's Object Lock configuration", zap.Error(err))
-		return nil, rpcstatus.Error(rpcstatus.Internal, "unable to get bucket's Object Lock configuration")
+		return nil, endpoint.ConvertKnownErrWithMessage(err, "unable to get bucket's Object Lock configuration")
 	}
 	if !bucketLockEnabled {
 		return nil, rpcstatus.Error(rpcstatus.ObjectLockBucketRetentionConfigurationMissing, bucketNoLockErrMsg)
@@ -2032,17 +2336,12 @@ func (endpoint *Endpoint) SetObjectLegalHold(ctx context.Context, req *pb.SetObj
 	}
 	endpoint.usageTracking(keyInfo, req.Header, fmt.Sprintf("%T", req))
 
-	if !endpoint.config.ObjectLockEnabled {
-		return nil, rpcstatus.Error(rpcstatus.ObjectLockEndpointsDisabled, objectLockDisabledErrMsg)
-	}
-
 	bucketLockEnabled, err := endpoint.buckets.GetBucketObjectLockEnabled(ctx, req.Bucket, keyInfo.ProjectID)
 	if err != nil {
 		if buckets.ErrBucketNotFound.Has(err) {
 			return nil, rpcstatus.Errorf(rpcstatus.NotFound, "bucket not found: %s", string(req.Bucket))
 		}
-		endpoint.log.Error("unable to get bucket's Object Lock configuration", zap.Error(err))
-		return nil, rpcstatus.Error(rpcstatus.Internal, "unable to get bucket's Object Lock configuration")
+		return nil, endpoint.ConvertKnownErrWithMessage(err, "unable to get bucket's Object Lock configuration")
 	}
 	if !bucketLockEnabled {
 		return nil, rpcstatus.Error(rpcstatus.ObjectLockBucketRetentionConfigurationMissing, bucketNoLockErrMsg)
@@ -2103,17 +2402,12 @@ func (endpoint *Endpoint) GetObjectRetention(ctx context.Context, req *pb.GetObj
 	}
 	endpoint.usageTracking(keyInfo, req.Header, fmt.Sprintf("%T", req))
 
-	if !endpoint.config.ObjectLockEnabled {
-		return nil, rpcstatus.Error(rpcstatus.ObjectLockEndpointsDisabled, objectLockDisabledErrMsg)
-	}
-
 	bucketLockEnabled, err := endpoint.buckets.GetBucketObjectLockEnabled(ctx, req.Bucket, keyInfo.ProjectID)
 	if err != nil {
 		if buckets.ErrBucketNotFound.Has(err) {
 			return nil, rpcstatus.Errorf(rpcstatus.NotFound, "bucket not found: %s", string(req.Bucket))
 		}
-		endpoint.log.Error("unable to get bucket's Object Lock configuration", zap.Error(err))
-		return nil, rpcstatus.Error(rpcstatus.Internal, "unable to get bucket's Object Lock configuration")
+		return nil, endpoint.ConvertKnownErrWithMessage(err, "unable to get bucket's Object Lock configuration")
 	}
 	if !bucketLockEnabled {
 		return nil, rpcstatus.Error(rpcstatus.ObjectLockBucketRetentionConfigurationMissing, bucketNoLockErrMsg)
@@ -2198,10 +2492,6 @@ func (endpoint *Endpoint) SetObjectRetention(ctx context.Context, req *pb.SetObj
 	}
 	endpoint.usageTracking(keyInfo, req.Header, fmt.Sprintf("%T", req))
 
-	if !endpoint.config.ObjectLockEnabled {
-		return nil, rpcstatus.Error(rpcstatus.ObjectLockEndpointsDisabled, objectLockDisabledErrMsg)
-	}
-
 	retention := protobufRetentionToMetabase(req.Retention)
 
 	bucketLockEnabled, err := endpoint.buckets.GetBucketObjectLockEnabled(ctx, req.Bucket, keyInfo.ProjectID)
@@ -2209,8 +2499,7 @@ func (endpoint *Endpoint) SetObjectRetention(ctx context.Context, req *pb.SetObj
 		if buckets.ErrBucketNotFound.Has(err) {
 			return nil, rpcstatus.Errorf(rpcstatus.NotFound, "bucket not found: %s", string(req.Bucket))
 		}
-		endpoint.log.Error("unable to get bucket's Object Lock configuration", zap.Error(err))
-		return nil, rpcstatus.Error(rpcstatus.Internal, "unable to get bucket's Object Lock configuration")
+		return nil, endpoint.ConvertKnownErrWithMessage(err, "unable to get bucket's Object Lock configuration")
 	}
 	if !bucketLockEnabled {
 		return nil, rpcstatus.Error(rpcstatus.ObjectLockBucketRetentionConfigurationMissing, bucketNoLockErrMsg)
@@ -2271,6 +2560,11 @@ func (endpoint *Endpoint) objectToProto(ctx context.Context, object metabase.Obj
 			CipherSuite: pb.CipherSuite(object.Encryption.CipherSuite),
 			BlockSize:   int64(object.Encryption.BlockSize),
 		},
+		Retention: &pb.Retention{
+			Mode:        pb.Retention_Mode(object.Retention.Mode),
+			RetainUntil: object.Retention.RetainUntil,
+		},
+		LegalHold: object.LegalHold,
 		// TODO: this is the only one place where placement is not added to the StreamID
 		// bucket info  would be required to add placement here
 	})
@@ -2314,10 +2608,6 @@ func (endpoint *Endpoint) objectToProto(ctx context.Context, object metabase.Obj
 		return nil, err
 	}
 
-	if metabase.Version(int32(object.Version)) != object.Version {
-		return nil, errs.New("unable to convert version for protobuf object")
-	}
-
 	var retention *pb.Retention
 	if object.Retention.Enabled() {
 		retention = &pb.Retention{
@@ -2341,6 +2631,12 @@ func (endpoint *Endpoint) objectToProto(ctx context.Context, object metabase.Obj
 		EncryptedMetadata:             metadataBytes,
 		EncryptedMetadataNonce:        nonce,
 		EncryptedMetadataEncryptedKey: object.EncryptedMetadataEncryptedKey,
+		EncryptedEtag:                 object.EncryptedETag,
+
+		ChecksumAlgorithm:   pb.ObjectChecksumAlgorithm(object.Checksum.Algorithm),
+		IsChecksumComposite: object.Checksum.IsComposite,
+		EncryptedChecksum:   object.Checksum.EncryptedValue,
+
 		EncryptionParameters: &pb.EncryptionParameters{
 			CipherSuite: pb.CipherSuite(object.Encryption.CipherSuite),
 			BlockSize:   int64(object.Encryption.BlockSize),
@@ -2355,14 +2651,69 @@ func (endpoint *Endpoint) objectToProto(ctx context.Context, object metabase.Obj
 	return result, nil
 }
 
+type includeForObjectEntry struct {
+	SystemMetadata       bool
+	CustomMetadata       bool
+	ETag                 bool
+	ETagOrCustomMetadata bool
+	Checksum             bool
+	// LegacyStreamMeta controls whether the encryption key and nonce are duplicated inside
+	// StreamMeta.LastSegmentMeta. Old uplinks that predate the top-level
+	// encrypted_metadata_nonce / encrypted_metadata_encrypted_key fields need this duplication
+	// to decrypt object metadata. Modern uplinks (those that set use_object_includes) use the
+	// top-level fields directly, so the duplication is unnecessary.
+	LegacyStreamMeta bool
+	// ObjectVersion controls whether the ObjectVersion and IsLatest fields are included.
+	// These are only needed when listing all versions, where clients use ObjectVersion
+	// as a pagination cursor (VersionCursor) and IsLatest to identify the current version.
+	ObjectVersion bool
+}
+
+func includeAllForObjectEntry() includeForObjectEntry {
+	return includeForObjectEntry{
+		SystemMetadata:       true,
+		CustomMetadata:       true,
+		ETag:                 true,
+		ETagOrCustomMetadata: false, // implied by CustomMetadata and ETag
+		Checksum:             true,
+		LegacyStreamMeta:     true,
+		ObjectVersion:        true,
+	}
+}
+
+// keyAndNonce returns whether we should include information related to encryption key
+// and cipher format (e.g. encryption type, block size, number of segments).
+func (include *includeForObjectEntry) keyAndNonce(entry *metabase.ObjectEntry) bool {
+	// When there's an explicit request for CustomMetadata it's not quite clear whether the client
+	// wants the stream metadata, so we'll ensure it's always included in that scenario.
+	return include.CustomMetadata || include.customMetadata(entry) || include.etag(entry) || include.Checksum
+}
+
+// customMetadata checks whether we should include user defined custom metadata.
+func (include *includeForObjectEntry) customMetadata(entry *metabase.ObjectEntry) bool {
+	// We should only include custom metadata when it has been requested and it exists.
+	// this affects when we should also include key and nonce.
+	return (include.CustomMetadata || include.ETagOrCustomMetadata) && len(entry.EncryptedMetadata) > 0
+}
+
+func (include *includeForObjectEntry) etag(entry *metabase.ObjectEntry) bool {
+	// We should only include etag when it has been requested and it exists.
+	// this affects when we should also include key and nonce.
+	return (include.ETag || include.ETagOrCustomMetadata) && len(entry.EncryptedETag) > 0
+}
+
 func (endpoint *Endpoint) objectEntryToProtoListItem(ctx context.Context, bucket []byte,
 	entry metabase.ObjectEntry, prefixToPrependInSatStreamID metabase.ObjectKey,
-	includeSystem, includeMetadata bool, placement storj.PlacementConstraint, versioned bool) (item *pb.ObjectListItem, err error) {
+	include includeForObjectEntry, placement storj.PlacementConstraint, versioned bool) (item *pb.ObjectListItem, err error) {
 
 	item = &pb.ObjectListItem{
 		EncryptedObjectKey: []byte(entry.ObjectKey),
 		Status:             pb.Object_Status(entry.Status),
-		ObjectVersion:      entry.StreamVersionID().Bytes(),
+	}
+
+	if include.ObjectVersion {
+		item.ObjectVersion = entry.StreamVersionID().Bytes()
+		item.IsLatest = entry.IsLatest
 	}
 
 	expiresAt := time.Time{}
@@ -2370,13 +2721,13 @@ func (endpoint *Endpoint) objectEntryToProtoListItem(ctx context.Context, bucket
 		expiresAt = *entry.ExpiresAt
 	}
 
-	if includeSystem {
+	if include.SystemMetadata {
 		item.ExpiresAt = expiresAt
 		item.CreatedAt = entry.CreatedAt
 		item.PlainSize = entry.TotalPlainSize
 	}
 
-	if includeMetadata {
+	if include.keyAndNonce(&entry) {
 		var nonce storj.Nonce
 		if len(entry.EncryptedMetadataNonce) > 0 {
 			nonce, err = storj.NonceFromBytes(entry.EncryptedMetadataNonce)
@@ -2384,11 +2735,16 @@ func (endpoint *Endpoint) objectEntryToProtoListItem(ctx context.Context, bucket
 				return nil, err
 			}
 		}
+		item.EncryptedMetadataNonce = nonce
+		item.EncryptedMetadataEncryptedKey = entry.EncryptedMetadataEncryptedKey
 
 		streamMeta := &pb.StreamMeta{}
-		err = pb.Unmarshal(entry.EncryptedMetadata, streamMeta)
-		if err != nil {
-			return nil, err
+
+		if include.customMetadata(&entry) {
+			err = pb.Unmarshal(entry.EncryptedMetadata, streamMeta)
+			if err != nil {
+				return nil, err
+			}
 		}
 
 		if entry.Encryption != (storj.EncryptionParameters{}) {
@@ -2400,7 +2756,11 @@ func (endpoint *Endpoint) objectEntryToProtoListItem(ctx context.Context, bucket
 			streamMeta.NumberOfSegments = int64(entry.SegmentCount)
 		}
 
-		if entry.EncryptedMetadataEncryptedKey != nil {
+		// For old uplinks that do not support top-level encrypted_metadata_nonce /
+		// encrypted_metadata_encrypted_key fields, duplicate the key and nonce inside
+		// StreamMeta.LastSegmentMeta so they can decrypt object metadata.
+		// Modern uplinks (use_object_includes = true) read the top-level fields directly.
+		if entry.EncryptedMetadataEncryptedKey != nil && include.LegacyStreamMeta {
 			streamMeta.LastSegmentMeta = &pb.SegmentMeta{
 				EncryptedKey: entry.EncryptedMetadataEncryptedKey,
 				KeyNonce:     entry.EncryptedMetadataNonce,
@@ -2411,10 +2771,17 @@ func (endpoint *Endpoint) objectEntryToProtoListItem(ctx context.Context, bucket
 		if err != nil {
 			return nil, err
 		}
-
 		item.EncryptedMetadata = metadataBytes
-		item.EncryptedMetadataNonce = nonce
-		item.EncryptedMetadataEncryptedKey = entry.EncryptedMetadataEncryptedKey
+	}
+
+	if include.etag(&entry) {
+		item.EncryptedEtag = entry.EncryptedETag
+	}
+
+	if include.Checksum {
+		item.ChecksumAlgorithm = pb.ObjectChecksumAlgorithm(entry.Checksum.Algorithm)
+		item.IsChecksumComposite = entry.Checksum.IsComposite
+		item.EncryptedChecksum = entry.Checksum.EncryptedValue
 	}
 
 	// Add Stream ID to list items if listing is for pending objects.
@@ -2444,128 +2811,6 @@ func (endpoint *Endpoint) objectEntryToProtoListItem(ctx context.Context, bucket
 	return item, nil
 }
 
-// DeleteCommittedObject contains arguments necessary for deleting a committed version
-// of an object via the (*Endpoint).DeleteCommittedObject method.
-type DeleteCommittedObject struct {
-	metabase.ObjectLocation
-	Version          []byte
-	BypassGovernance bool
-}
-
-// DeleteCommittedObject deletes all the pieces of the storage nodes that belongs
-// to the specified object.
-//
-// NOTE: this method is exported for being able to individually test it without
-// having import cycles.
-func (endpoint *Endpoint) DeleteCommittedObject(ctx context.Context, opts DeleteCommittedObject) (deletedObjects []*pb.Object, err error) {
-	defer mon.Task()(&ctx, opts.ProjectID.String(), opts.BucketName, opts.ObjectKey)(&err)
-
-	req := metabase.ObjectLocation{
-		ProjectID:  opts.ProjectID,
-		BucketName: opts.BucketName,
-		ObjectKey:  opts.ObjectKey,
-	}
-
-	// TODO(ver): for production we need to avoid somehow additional GetBucket call
-	bucketData, err := endpoint.buckets.GetBucket(ctx, []byte(opts.BucketName), opts.ProjectID)
-	if err != nil {
-		if buckets.ErrBucketNotFound.Has(err) {
-			return nil, nil
-		}
-		endpoint.log.Error("unable to check bucket", zap.Error(err))
-		return nil, rpcstatus.Error(rpcstatus.Internal, "unable to get bucket state")
-	}
-
-	var result metabase.DeleteObjectResult
-	if len(opts.Version) == 0 {
-		versioned := bucketData.Versioning == buckets.VersioningEnabled
-		suspended := bucketData.Versioning == buckets.VersioningSuspended
-
-		result, err = endpoint.metabase.DeleteObjectLastCommitted(ctx, metabase.DeleteObjectLastCommitted{
-			ObjectLocation: req,
-			Versioned:      versioned,
-			Suspended:      suspended,
-
-			ObjectLock: metabase.ObjectLockDeleteOptions{
-				Enabled:          bucketData.ObjectLock.Enabled,
-				BypassGovernance: opts.BypassGovernance,
-			},
-		})
-		if err != nil {
-			return nil, Error.Wrap(err)
-		}
-	} else {
-		var sv metabase.StreamVersionID
-		sv, err = metabase.StreamVersionIDFromBytes(opts.Version)
-		if err != nil {
-			return nil, err
-		}
-		result, err = endpoint.metabase.DeleteObjectExactVersion(ctx, metabase.DeleteObjectExactVersion{
-			ObjectLocation: req,
-			Version:        sv.Version(),
-
-			ObjectLock: metabase.ObjectLockDeleteOptions{
-				Enabled:          bucketData.ObjectLock.Enabled,
-				BypassGovernance: opts.BypassGovernance,
-			},
-		})
-	}
-	if err != nil {
-		return nil, Error.Wrap(err)
-	}
-
-	deletedObjects, err = endpoint.deleteObjectResultToProto(ctx, result)
-	if err != nil {
-		endpoint.log.Error("failed to convert delete object result",
-			zap.Stringer("project", opts.ProjectID),
-			zap.String("bucket", opts.BucketName.String()),
-			zap.Binary("object", []byte(opts.ObjectKey)),
-			zap.Error(err),
-		)
-		return nil, Error.Wrap(err)
-	}
-
-	return deletedObjects, nil
-}
-
-// DeletePendingObject deletes all the pieces of the storage nodes that belongs
-// to the specified pending object.
-//
-// NOTE: this method is exported for being able to individually test it without
-// having import cycles.
-func (endpoint *Endpoint) DeletePendingObject(ctx context.Context, stream metabase.ObjectStream) (deletedObjects []*pb.Object, err error) {
-	req := metabase.DeletePendingObject{
-		ObjectStream: stream,
-	}
-
-	result, err := endpoint.metabase.DeletePendingObject(ctx, req)
-	if err != nil {
-		return nil, err
-	}
-
-	return endpoint.deleteObjectResultToProto(ctx, result)
-}
-
-func (endpoint *Endpoint) deleteObjectResultToProto(ctx context.Context, result metabase.DeleteObjectResult) (deletedObjects []*pb.Object, err error) {
-	deletedObjects = make([]*pb.Object, 0, len(result.Removed)+len(result.Markers))
-	for _, object := range result.Removed {
-		deletedObject, err := endpoint.objectToProto(ctx, object)
-		if err != nil {
-			return nil, err
-		}
-		deletedObjects = append(deletedObjects, deletedObject)
-	}
-	for _, object := range result.Markers {
-		deletedObject, err := endpoint.objectToProto(ctx, object)
-		if err != nil {
-			return nil, err
-		}
-		deletedObjects = append(deletedObjects, deletedObject)
-	}
-
-	return deletedObjects, nil
-}
-
 // Server side move.
 
 // BeginMoveObject begins moving object to different key.
@@ -2583,6 +2828,14 @@ func (endpoint *Endpoint) BeginMoveObject(ctx context.Context, req *pb.ObjectBeg
 		VerifyPermission{
 			Action: macaroon.Action{
 				Op:            macaroon.ActionRead,
+				Bucket:        req.Bucket,
+				EncryptedPath: req.EncryptedObjectKey,
+				Time:          now,
+			},
+		},
+		VerifyPermission{
+			Action: macaroon.Action{
+				Op:            macaroon.ActionDelete,
 				Bucket:        req.Bucket,
 				EncryptedPath: req.EncryptedObjectKey,
 				Time:          now,
@@ -2610,16 +2863,14 @@ func (endpoint *Endpoint) BeginMoveObject(ctx context.Context, req *pb.ObjectBeg
 			if buckets.ErrBucketNotFound.Has(err) {
 				return nil, rpcstatus.Errorf(rpcstatus.NotFound, "bucket not found: %s", req.Bucket)
 			}
-			endpoint.log.Error("unable to check bucket", zap.Error(err))
-			return nil, rpcstatus.Error(rpcstatus.Internal, "unable to get bucket placement")
+			return nil, endpoint.ConvertKnownErrWithMessage(err, "unable to get bucket placement")
 		}
 		newBucketPlacement, err := endpoint.buckets.GetBucketPlacement(ctx, req.NewBucket, keyInfo.ProjectID)
 		if err != nil {
 			if buckets.ErrBucketNotFound.Has(err) {
 				return nil, rpcstatus.Errorf(rpcstatus.NotFound, "bucket not found: %s", req.NewBucket)
 			}
-			endpoint.log.Error("unable to check bucket", zap.Error(err))
-			return nil, rpcstatus.Error(rpcstatus.Internal, "unable to get bucket placement")
+			return nil, endpoint.ConvertKnownErrWithMessage(err, "unable to get bucket placement")
 		}
 		if oldBucketPlacement != newBucketPlacement {
 			return nil, rpcstatus.Error(rpcstatus.InvalidArgument, "copying object to bucket with different placement policy is not (yet) supported")
@@ -2632,6 +2883,8 @@ func (endpoint *Endpoint) BeginMoveObject(ctx context.Context, req *pb.ObjectBeg
 			BucketName: metabase.BucketName(req.Bucket),
 			ObjectKey:  metabase.ObjectKey(req.EncryptedObjectKey),
 		},
+
+		SegmentLimit: endpoint.config.CopyMoveSegmentLimit,
 	})
 	if err != nil {
 		return nil, endpoint.ConvertMetabaseErr(err)
@@ -2639,8 +2892,7 @@ func (endpoint *Endpoint) BeginMoveObject(ctx context.Context, req *pb.ObjectBeg
 
 	response, err := convertBeginMoveObjectResults(result)
 	if err != nil {
-		endpoint.log.Error("internal", zap.Error(err))
-		return nil, rpcstatus.Error(rpcstatus.Internal, "internal error")
+		return nil, endpoint.ConvertKnownErrWithMessage(err, "internal error")
 	}
 
 	satStreamID, err := endpoint.packStreamID(ctx, &internalpb.StreamID{
@@ -2654,11 +2906,10 @@ func (endpoint *Endpoint) BeginMoveObject(ctx context.Context, req *pb.ObjectBeg
 		},
 	})
 	if err != nil {
-		endpoint.log.Error("internal", zap.Error(err))
-		return nil, rpcstatus.Error(rpcstatus.Internal, "unable to create stream id")
+		return nil, endpoint.ConvertKnownErrWithMessage(err, "unable to create stream id")
 	}
 
-	endpoint.log.Debug("Object Move Begins", zap.Stringer("Project ID", keyInfo.ProjectID), zap.String("operation", "move"), zap.String("type", "object"))
+	endpoint.log.Debug("Object Move Begins", zap.Stringer("public_id", keyInfo.ProjectPublicID), zap.String("operation", "move"), zap.String("type", "object"))
 	mon.Meter("req_move_object_begins").Mark(1)
 
 	response.StreamId = satStreamID
@@ -2688,29 +2939,29 @@ func convertBeginMoveObjectResults(result metabase.BeginMoveObjectResult) (*pb.O
 	}
 
 	// TODO we need this because of an uplink issue with how we are storing key and nonce
-	if result.EncryptedMetadataKey == nil {
+	if result.EncryptedMetadataEncryptedKey == nil {
 		streamMeta := &pb.StreamMeta{}
 		err := pb.Unmarshal(result.EncryptedMetadata, streamMeta)
 		if err != nil {
 			return nil, err
 		}
 		if streamMeta.LastSegmentMeta != nil {
-			result.EncryptedMetadataKey = streamMeta.LastSegmentMeta.EncryptedKey
-			result.EncryptedMetadataKeyNonce = streamMeta.LastSegmentMeta.KeyNonce
+			result.EncryptedMetadataEncryptedKey = streamMeta.LastSegmentMeta.EncryptedKey
+			result.EncryptedMetadataNonce = streamMeta.LastSegmentMeta.KeyNonce
 		}
 	}
 
 	var metadataNonce storj.Nonce
 	var err error
-	if len(result.EncryptedMetadataKeyNonce) != 0 {
-		metadataNonce, err = storj.NonceFromBytes(result.EncryptedMetadataKeyNonce)
+	if len(result.EncryptedMetadataNonce) != 0 {
+		metadataNonce, err = storj.NonceFromBytes(result.EncryptedMetadataNonce)
 		if err != nil {
 			return nil, err
 		}
 	}
 
 	return &pb.ObjectBeginMoveResponse{
-		EncryptedMetadataKey:      result.EncryptedMetadataKey,
+		EncryptedMetadataKey:      result.EncryptedMetadataEncryptedKey,
 		EncryptedMetadataKeyNonce: metadataNonce,
 		EncryptionParameters: &pb.EncryptionParameters{
 			CipherSuite: pb.CipherSuite(result.EncryptionParameters.CipherSuite),
@@ -2742,7 +2993,7 @@ func (endpoint *Endpoint) FinishMoveObject(ctx context.Context, req *pb.ObjectFi
 			Action: macaroon.Action{
 				Op:            macaroon.ActionWrite,
 				Bucket:        req.NewBucket,
-				EncryptedPath: req.NewEncryptedMetadataKey,
+				EncryptedPath: req.NewEncryptedObjectKey,
 				Time:          now,
 			},
 		},
@@ -2750,7 +3001,7 @@ func (endpoint *Endpoint) FinishMoveObject(ctx context.Context, req *pb.ObjectFi
 			Action: macaroon.Action{
 				Op:            macaroon.ActionDelete,
 				Bucket:        req.NewBucket,
-				EncryptedPath: req.NewEncryptedMetadataKey,
+				EncryptedPath: req.NewEncryptedObjectKey,
 				Time:          now,
 			},
 			ActionPermitted: &canDelete,
@@ -2764,7 +3015,7 @@ func (endpoint *Endpoint) FinishMoveObject(ctx context.Context, req *pb.ObjectFi
 			Action: macaroon.Action{
 				Op:            macaroon.ActionPutObjectRetention,
 				Bucket:        req.NewBucket,
-				EncryptedPath: req.NewEncryptedMetadataKey,
+				EncryptedPath: req.NewEncryptedObjectKey,
 				Time:          now,
 			},
 		})
@@ -2774,7 +3025,7 @@ func (endpoint *Endpoint) FinishMoveObject(ctx context.Context, req *pb.ObjectFi
 			Action: macaroon.Action{
 				Op:            macaroon.ActionPutObjectLegalHold,
 				Bucket:        req.NewBucket,
-				EncryptedPath: req.NewEncryptedMetadataKey,
+				EncryptedPath: req.NewEncryptedObjectKey,
 				Time:          now,
 			},
 		})
@@ -2786,46 +3037,31 @@ func (endpoint *Endpoint) FinishMoveObject(ctx context.Context, req *pb.ObjectFi
 	}
 	endpoint.usageTracking(keyInfo, req.Header, fmt.Sprintf("%T", req))
 
-	objectLockRequested := retention.Enabled() || req.LegalHold
-	if objectLockRequested && !endpoint.config.ObjectLockEnabled {
-		return nil, rpcstatus.Error(rpcstatus.ObjectLockEndpointsDisabled, objectLockDisabledErrMsg)
+	// TODO this needs to be optimized to avoid DB call on each request
+	bucket, err := endpoint.buckets.GetBucketForUpload(ctx, req.NewBucket, keyInfo.ProjectID)
+	if err != nil {
+		if buckets.ErrBucketNotFound.Has(err) {
+			return nil, rpcstatus.Errorf(rpcstatus.NotFound, "bucket not found: %s", req.NewBucket)
+		}
+		return nil, endpoint.ConvertKnownErrWithMessage(err, "unable to get bucket state")
 	}
 
-	var versioningEnabled bool
+	if err = validateBucketObjectLockStatus(bucket, retention, req.LegalHold); err != nil {
+		return nil, err
+	}
 
-	if objectLockRequested {
-		enabled, err := endpoint.buckets.GetBucketObjectLockEnabled(ctx, req.NewBucket, keyInfo.ProjectID)
-		if err != nil {
-			if buckets.ErrBucketNotFound.Has(err) {
-				return nil, rpcstatus.Errorf(rpcstatus.NotFound, "bucket not found: %s", req.NewBucket)
-			}
-			endpoint.log.Error("unable to check whether bucket has Object Lock enabled", zap.Error(err))
-			return nil, rpcstatus.Error(rpcstatus.Internal, "unable to copy object")
-		}
-		if !enabled {
-			return nil, rpcstatus.Errorf(rpcstatus.ObjectLockBucketRetentionConfigurationMissing, "cannot specify Object Lock settings when uploading into a bucket without Object Lock enabled")
-		}
-		versioningEnabled = true
-	} else {
-		state, err := endpoint.buckets.GetBucketVersioningState(ctx, req.NewBucket, keyInfo.ProjectID)
-		if err != nil {
-			if buckets.ErrBucketNotFound.Has(err) {
-				return nil, rpcstatus.Errorf(rpcstatus.NotFound, "bucket not found: %s", req.NewBucket)
-			}
-			endpoint.log.Error("unable to check bucket versioning state", zap.Error(err))
-			return nil, rpcstatus.Error(rpcstatus.Internal, "unable to copy object")
-		}
-		versioningEnabled = state == buckets.VersioningEnabled
+	if bucket.ObjectLock.Enabled && bucket.ObjectLock.DefaultRetentionMode != storj.NoRetention && !retention.Enabled() {
+		retention = useDefaultBucketRetention(bucket.ObjectLock, now)
 	}
 
 	streamID, err := endpoint.unmarshalSatStreamID(ctx, req.StreamId)
 	if err != nil {
-		return nil, rpcstatus.Error(rpcstatus.InvalidArgument, err.Error())
+		return nil, rpcstatus.Wrap(rpcstatus.InvalidArgument, err)
 	}
 
 	streamUUID, err := uuid.FromBytes(streamID.StreamId)
 	if err != nil {
-		return nil, rpcstatus.Error(rpcstatus.InvalidArgument, err.Error())
+		return nil, rpcstatus.Wrap(rpcstatus.InvalidArgument, err)
 	}
 
 	err = endpoint.metabase.FinishMoveObject(ctx, metabase.FinishMoveObject{
@@ -2836,24 +3072,27 @@ func (endpoint *Endpoint) FinishMoveObject(ctx context.Context, req *pb.ObjectFi
 			Version:    metabase.Version(streamID.Version),
 			StreamID:   streamUUID,
 		},
-		NewSegmentKeys:               protobufkeysToMetabase(req.NewSegmentKeys),
-		NewBucket:                    metabase.BucketName(req.NewBucket),
-		NewEncryptedObjectKey:        metabase.ObjectKey(req.NewEncryptedObjectKey),
-		NewEncryptedMetadataKeyNonce: req.NewEncryptedMetadataKeyNonce,
-		NewEncryptedMetadataKey:      req.NewEncryptedMetadataKey,
+		NewSegmentKeys:                   protobufkeysToMetabase(req.NewSegmentKeys),
+		NewBucket:                        metabase.BucketName(req.NewBucket),
+		NewEncryptedObjectKey:            metabase.ObjectKey(req.NewEncryptedObjectKey),
+		NewEncryptedMetadataNonce:        req.NewEncryptedMetadataKeyNonce,
+		NewEncryptedMetadataEncryptedKey: req.NewEncryptedMetadataKey,
 
 		NewDisallowDelete: !canDelete,
 
-		NewVersioned: versioningEnabled,
+		NewVersioned: bucket.Versioning == buckets.VersioningEnabled,
 
 		Retention: retention,
 		LegalHold: req.LegalHold,
+
+		TransmitEvent: endpoint.shouldTransmitEvent(ctx, keyInfo.ProjectID, string(streamID.Bucket), streamID.EncryptedObjectKey, s3event.ObjectRemovedDelete.S3Name()) ||
+			endpoint.shouldTransmitEvent(ctx, keyInfo.ProjectID, string(req.NewBucket), req.NewEncryptedObjectKey, s3event.ObjectCreatedCopy.S3Name()),
 	})
 	if err != nil {
 		return nil, endpoint.ConvertMetabaseErr(err)
 	}
 
-	endpoint.log.Debug("Object Move Finished", zap.Stringer("Project ID", keyInfo.ProjectID), zap.String("operation", "move"), zap.String("type", "object"))
+	endpoint.log.Debug("Object Move Finished", zap.Stringer("public_id", keyInfo.ProjectPublicID), zap.String("operation", "move"), zap.String("type", "object"))
 	mon.Meter("req_move_object_finished").Mark(1)
 
 	return &pb.ObjectFinishMoveResponse{}, nil
@@ -2907,16 +3146,14 @@ func (endpoint *Endpoint) BeginCopyObject(ctx context.Context, req *pb.ObjectBeg
 			if buckets.ErrBucketNotFound.Has(err) {
 				return nil, rpcstatus.Errorf(rpcstatus.NotFound, "bucket not found: %s", req.Bucket)
 			}
-			endpoint.log.Error("unable to check bucket", zap.Error(err))
-			return nil, rpcstatus.Error(rpcstatus.Internal, "unable to get bucket placement")
+			return nil, endpoint.ConvertKnownErrWithMessage(err, "unable to get bucket placement")
 		}
 		newBucketPlacement, err := endpoint.buckets.GetBucketPlacement(ctx, req.NewBucket, keyInfo.ProjectID)
 		if err != nil {
 			if buckets.ErrBucketNotFound.Has(err) {
 				return nil, rpcstatus.Errorf(rpcstatus.NotFound, "bucket not found: %s", req.NewBucket)
 			}
-			endpoint.log.Error("unable to check bucket", zap.Error(err))
-			return nil, rpcstatus.Error(rpcstatus.Internal, "unable to get bucket placement")
+			return nil, endpoint.ConvertKnownErrWithMessage(err, "unable to get bucket placement")
 		}
 		if oldBucketPlacement != newBucketPlacement {
 			return nil, rpcstatus.Error(rpcstatus.InvalidArgument, "copying object to bucket with different placement policy is not (yet) supported")
@@ -2939,7 +3176,8 @@ func (endpoint *Endpoint) BeginCopyObject(ctx context.Context, req *pb.ObjectBeg
 			BucketName: metabase.BucketName(req.Bucket),
 			ObjectKey:  metabase.ObjectKey(req.EncryptedObjectKey),
 		},
-		Version: version,
+		Version:      version,
+		SegmentLimit: endpoint.config.CopyMoveSegmentLimit,
 		VerifyLimits: func(encryptedObjectSize int64, nSegments int64) error {
 			return endpoint.checkUploadLimitsForNewObject(ctx, keyInfo, encryptedObjectSize, nSegments)
 		},
@@ -2950,8 +3188,7 @@ func (endpoint *Endpoint) BeginCopyObject(ctx context.Context, req *pb.ObjectBeg
 
 	response, err := convertBeginCopyObjectResults(result)
 	if err != nil {
-		endpoint.log.Error("internal", zap.Error(err))
-		return nil, rpcstatus.Error(rpcstatus.Internal, "internal error")
+		return nil, endpoint.ConvertKnownErrWithMessage(err, "internal error")
 	}
 
 	satStreamID, err := endpoint.packStreamID(ctx, &internalpb.StreamID{
@@ -2965,11 +3202,10 @@ func (endpoint *Endpoint) BeginCopyObject(ctx context.Context, req *pb.ObjectBeg
 		},
 	})
 	if err != nil {
-		endpoint.log.Error("internal", zap.Error(err))
-		return nil, rpcstatus.Error(rpcstatus.Internal, "unable to create stream ID")
+		return nil, endpoint.ConvertKnownErrWithMessage(err, "unable to create stream ID")
 	}
 
-	endpoint.log.Debug("Object Copy Begins", zap.Stringer("Project ID", keyInfo.ProjectID), zap.String("operation", "copy"), zap.String("type", "object"))
+	endpoint.log.Debug("Object Copy Begins", zap.Stringer("public_id", keyInfo.ProjectPublicID), zap.String("operation", "copy"), zap.String("type", "object"))
 	mon.Meter("req_copy_object_begins").Mark(1)
 
 	response.StreamId = satStreamID
@@ -2987,7 +3223,32 @@ func convertBeginCopyObjectResults(result metabase.BeginCopyObjectResult) (*pb.O
 		EncryptedMetadataKey:      beginMoveObjectResult.EncryptedMetadataKey,
 		SegmentKeys:               beginMoveObjectResult.SegmentKeys,
 		EncryptionParameters:      beginMoveObjectResult.EncryptionParameters,
+		ChecksumAlgorithm:         pb.ObjectChecksumAlgorithm(result.Checksum.Algorithm),
 	}, nil
+}
+
+func useDefaultBucketRetention(bucketConfig buckets.ObjectLockSettings, timeNow time.Time) (retention metabase.Retention) {
+	retention.Mode = bucketConfig.DefaultRetentionMode
+	switch {
+	case bucketConfig.DefaultRetentionDays != 0:
+		retention.RetainUntil = timeNow.AddDate(0, 0, bucketConfig.DefaultRetentionDays)
+	case bucketConfig.DefaultRetentionYears != 0:
+		retention.RetainUntil = timeNow.AddDate(bucketConfig.DefaultRetentionYears, 0, 0)
+	}
+
+	return retention
+}
+
+func validateObjectRetentionWithTTL(maxObjectTTL *time.Duration, expiresAt time.Time) error {
+	switch {
+	case maxObjectTTL != nil:
+		return rpcstatus.Error(rpcstatus.ObjectLockUploadWithTTLAPIKeyAndDefaultRetention,
+			"cannot upload into a bucket with default retention settings using an API key that enforces an object expiration time")
+	case !expiresAt.IsZero():
+		return rpcstatus.Error(rpcstatus.ObjectLockUploadWithTTLAndDefaultRetention,
+			"cannot specify an object expiration time when uploading into a bucket with default retention settings")
+	}
+	return nil
 }
 
 // FinishCopyObject accepts new encryption keys for object copy and
@@ -3013,7 +3274,7 @@ func (endpoint *Endpoint) FinishCopyObject(ctx context.Context, req *pb.ObjectFi
 			Action: macaroon.Action{
 				Op:            macaroon.ActionWrite,
 				Bucket:        req.NewBucket,
-				EncryptedPath: req.NewEncryptedMetadataKey,
+				EncryptedPath: req.NewEncryptedObjectKey,
 				Time:          now,
 			},
 		},
@@ -3025,7 +3286,7 @@ func (endpoint *Endpoint) FinishCopyObject(ctx context.Context, req *pb.ObjectFi
 			Action: macaroon.Action{
 				Op:            macaroon.ActionPutObjectRetention,
 				Bucket:        req.NewBucket,
-				EncryptedPath: req.NewEncryptedMetadataKey,
+				EncryptedPath: req.NewEncryptedObjectKey,
 				Time:          now,
 			},
 		})
@@ -3035,7 +3296,7 @@ func (endpoint *Endpoint) FinishCopyObject(ctx context.Context, req *pb.ObjectFi
 			Action: macaroon.Action{
 				Op:            macaroon.ActionPutObjectLegalHold,
 				Bucket:        req.NewBucket,
-				EncryptedPath: req.NewEncryptedMetadataKey,
+				EncryptedPath: req.NewEncryptedObjectKey,
 				Time:          now,
 			},
 		})
@@ -3047,55 +3308,56 @@ func (endpoint *Endpoint) FinishCopyObject(ctx context.Context, req *pb.ObjectFi
 	}
 	endpoint.usageTracking(keyInfo, req.Header, fmt.Sprintf("%T", req))
 
-	objectLockRequested := retention.Enabled() || req.LegalHold
-	if objectLockRequested && !endpoint.config.ObjectLockEnabled {
-		return nil, rpcstatus.Error(rpcstatus.FailedPrecondition, objectLockDisabledErrMsg)
-	}
-
-	if err := endpoint.checkEncryptedMetadataSize(req.NewEncryptedMetadata, req.NewEncryptedMetadataKey); err != nil {
+	err = endpoint.validateChecksumOptions(req.NewChecksumAlgorithm, req.NewIsChecksumComposite, req.NewEncryptedChecksum)
+	if err != nil {
 		return nil, err
 	}
 
-	var versioningEnabled bool
+	encryptedUserData := metabase.EncryptedUserData{
+		EncryptedMetadata:             req.NewEncryptedMetadata,
+		EncryptedMetadataNonce:        nonceBytes(req.NewEncryptedMetadataKeyNonce),
+		EncryptedMetadataEncryptedKey: req.NewEncryptedMetadataKey,
+		EncryptedETag:                 req.NewEncryptedEtag,
+		Checksum: metabase.Checksum{
+			Algorithm:      storj.ObjectChecksumAlgorithm(req.NewChecksumAlgorithm),
+			IsComposite:    req.NewIsChecksumComposite,
+			EncryptedValue: req.NewEncryptedChecksum,
+		},
+	}
+	if err := endpoint.checkEncryptedMetadataSize(encryptedUserData); err != nil {
+		return nil, err
+	}
 
-	if objectLockRequested {
-		enabled, err := endpoint.buckets.GetBucketObjectLockEnabled(ctx, req.NewBucket, keyInfo.ProjectID)
-		if err != nil {
-			if buckets.ErrBucketNotFound.Has(err) {
-				return nil, rpcstatus.Errorf(rpcstatus.NotFound, "bucket not found: %s", req.NewBucket)
-			}
-			endpoint.log.Error("unable to check whether bucket has Object Lock enabled", zap.Error(err))
-			return nil, rpcstatus.Error(rpcstatus.Internal, "unable to copy object")
+	// TODO this needs to be optimized to avoid DB call on each request
+	bucket, err := endpoint.buckets.GetBucketForUpload(ctx, req.NewBucket, keyInfo.ProjectID)
+	if err != nil {
+		if buckets.ErrBucketNotFound.Has(err) {
+			return nil, rpcstatus.Errorf(rpcstatus.NotFound, "bucket not found: %s", req.NewBucket)
 		}
-		if !enabled {
-			return nil, rpcstatus.Errorf(rpcstatus.ObjectLockBucketRetentionConfigurationMissing, "cannot specify Object Lock settings when uploading into a bucket without Object Lock enabled")
-		}
-		versioningEnabled = true
-	} else {
-		state, err := endpoint.buckets.GetBucketVersioningState(ctx, req.NewBucket, keyInfo.ProjectID)
-		if err != nil {
-			if buckets.ErrBucketNotFound.Has(err) {
-				return nil, rpcstatus.Errorf(rpcstatus.NotFound, "bucket not found: %s", req.NewBucket)
-			}
-			endpoint.log.Error("unable to check bucket versioning state", zap.Error(err))
-			return nil, rpcstatus.Error(rpcstatus.Internal, "unable to copy object")
-		}
-		versioningEnabled = state == buckets.VersioningEnabled
+		return nil, endpoint.ConvertKnownErrWithMessage(err, "unable to get bucket state")
+	}
+
+	if err = validateBucketObjectLockStatus(bucket, retention, req.LegalHold); err != nil {
+		return nil, err
+	}
+
+	if bucket.ObjectLock.Enabled && bucket.ObjectLock.DefaultRetentionMode != storj.NoRetention && !retention.Enabled() {
+		retention = useDefaultBucketRetention(bucket.ObjectLock, now)
 	}
 
 	streamID, err := endpoint.unmarshalSatStreamID(ctx, req.StreamId)
 	if err != nil {
-		return nil, rpcstatus.Error(rpcstatus.InvalidArgument, err.Error())
+		return nil, rpcstatus.Wrap(rpcstatus.InvalidArgument, err)
 	}
 
 	streamUUID, err := uuid.FromBytes(streamID.StreamId)
 	if err != nil {
-		return nil, rpcstatus.Error(rpcstatus.InvalidArgument, err.Error())
+		return nil, rpcstatus.Wrap(rpcstatus.InvalidArgument, err)
 	}
 
 	newStreamID, err := uuid.New()
 	if err != nil {
-		return nil, rpcstatus.Error(rpcstatus.InvalidArgument, err.Error())
+		return nil, rpcstatus.Wrap(rpcstatus.InvalidArgument, err)
 	}
 
 	object, err := endpoint.metabase.FinishCopyObject(ctx, metabase.FinishCopyObject{
@@ -3106,19 +3368,18 @@ func (endpoint *Endpoint) FinishCopyObject(ctx context.Context, req *pb.ObjectFi
 			Version:    metabase.Version(streamID.Version),
 			StreamID:   streamUUID,
 		},
-		NewStreamID:                  newStreamID,
-		NewSegmentKeys:               protobufkeysToMetabase(req.NewSegmentKeys),
-		NewBucket:                    metabase.BucketName(req.NewBucket),
-		NewEncryptedObjectKey:        metabase.ObjectKey(req.NewEncryptedObjectKey),
-		OverrideMetadata:             req.OverrideMetadata,
-		NewEncryptedMetadata:         req.NewEncryptedMetadata,
-		NewEncryptedMetadataKeyNonce: req.NewEncryptedMetadataKeyNonce,
-		NewEncryptedMetadataKey:      req.NewEncryptedMetadataKey,
+		NewStreamID:           newStreamID,
+		NewSegmentKeys:        protobufkeysToMetabase(req.NewSegmentKeys),
+		NewBucket:             metabase.BucketName(req.NewBucket),
+		NewEncryptedObjectKey: metabase.ObjectKey(req.NewEncryptedObjectKey),
+		OverrideMetadata:      req.OverrideMetadata,
+
+		NewEncryptedUserData: encryptedUserData,
 
 		// TODO(ver): currently we always allow deletion, to not change behaviour.
 		NewDisallowDelete: false,
 
-		NewVersioned: versioningEnabled,
+		NewVersioned: bucket.Versioning == buckets.VersioningEnabled,
 
 		Retention: retention,
 		LegalHold: req.LegalHold,
@@ -3126,6 +3387,10 @@ func (endpoint *Endpoint) FinishCopyObject(ctx context.Context, req *pb.ObjectFi
 		VerifyLimits: func(encryptedObjectSize int64, nSegments int64) error {
 			return endpoint.addStorageUsageUpToLimit(ctx, keyInfo, encryptedObjectSize, nSegments)
 		},
+
+		IfNoneMatch: req.IfNoneMatch,
+
+		TransmitEvent: endpoint.shouldTransmitEvent(ctx, keyInfo.ProjectID, string(req.NewBucket), req.NewEncryptedObjectKey, s3event.ObjectCreatedCopy.S3Name()),
 	})
 	if err != nil {
 		return nil, endpoint.ConvertMetabaseErr(err)
@@ -3134,16 +3399,22 @@ func (endpoint *Endpoint) FinishCopyObject(ctx context.Context, req *pb.ObjectFi
 	// we can return nil redundancy because this request won't be used for downloading
 	protoObject, err := endpoint.objectToProto(ctx, object)
 	if err != nil {
-		endpoint.log.Error("internal", zap.Error(err))
-		return nil, rpcstatus.Error(rpcstatus.Internal, "internal error")
+		return nil, endpoint.ConvertKnownErrWithMessage(err, "internal error")
 	}
 
-	endpoint.log.Debug("Object Copy Finished", zap.Stringer("Project ID", keyInfo.ProjectID), zap.String("operation", "copy"), zap.String("type", "object"))
-	mon.Meter("req_copy_object_finished").Mark(1)
+	endpoint.log.Debug("Object Copy Finished", zap.Stringer("public_id", keyInfo.ProjectPublicID), zap.String("operation", "copy"), zap.String("type", "object"))
+	mon.Meter("req_copy_object_finished", placementSeriesTag(bucket.Placement)).Mark(1)
 
 	return &pb.ObjectFinishCopyResponse{
 		Object: protoObject,
 	}, nil
+}
+
+func nonceBytes(nonce storj.Nonce) []byte {
+	if nonce.IsZero() {
+		return nil
+	}
+	return nonce.Bytes()
 }
 
 // protobufkeysToMetabase converts []*pb.EncryptedKeyAndNonce to []metabase.EncryptedKeyAndNonce.

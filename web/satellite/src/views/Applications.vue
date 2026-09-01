@@ -11,18 +11,15 @@
                 <PageSubtitleComponent subtitle="Connect Storj with third-party applications." link="https://www.storj.io/integrations" />
                 <v-chip-group
                     v-model="selectedChip"
-                    class="border rounded-xlg px-2 mt-4 bg-surface"
+                    class="border rounded-lg py-3 px-4 mt-4 bg-surface"
                     selected-class="font-weight-bold v-chip--variant-tonal"
-                    color="info"
                     mandatory
                     :max="1"
-                    column
                 >
                     <v-chip
                         v-for="category in categories"
                         :key="category"
                         :value="category"
-                        color="info"
                         variant="text"
                         class="font-weight-medium"
                         filter
@@ -33,9 +30,9 @@
             </v-col>
         </v-row>
 
-        <v-card class="pa-2 mt-2 mb-6" variant="flat">
+        <v-card class="pa-4 mt-4 mb-4" variant="flat">
             <v-row align="center">
-                <v-col>
+                <v-col cols="12" sm class="flex-grow-1 flex-sm-grow-1">
                     <v-text-field
                         v-model="search"
                         label="Search"
@@ -49,7 +46,7 @@
                         rounded="md"
                     />
                 </v-col>
-                <v-col cols="auto">
+                <v-col cols="12" sm="auto" class="d-flex align-center">
                     <v-menu>
                         <template #activator="{ props }">
                             <v-btn
@@ -61,7 +58,7 @@
                                 class="mr-0 mr-sm-2 ml-n2"
                                 title="Sort by"
                             >
-                                <span class="text-body-2 hidden-xs">Sort by</span> <span class="ml-1 text-capitalize">{{ sortKey }}</span>
+                                <span class="text-body-medium hidden-xs">Sort by</span> <span class="ml-1 text-capitalize">{{ sortKey }}</span>
                             </v-btn>
                         </template>
                         <v-list class="pa-1">
@@ -75,17 +72,16 @@
                     </v-menu>
                     <v-btn-toggle
                         v-model="sortOrder"
-                        density="comfortable"
                         variant="outlined"
                         color="default"
-                        rounded="xl"
+                        rounded="md"
                         class="pa-1"
                         mandatory
                     >
-                        <v-btn size="x-small" value="asc" title="Ascending" variant="text" rounded="xl">
+                        <v-btn value="asc" title="Ascending" variant="text" rounded="md">
                             <v-icon :icon="ArrowDownNarrowWide" />
                         </v-btn>
-                        <v-btn size="x-small" value="desc" title="Descending" variant="text" rounded="xl">
+                        <v-btn value="desc" title="Descending" variant="text" rounded="md">
                             <v-icon :icon="ArrowUpNarrowWide" />
                         </v-btn>
                     </v-btn-toggle>
@@ -97,17 +93,14 @@
             :items="filteredApps"
             :items-per-page="-1"
             :search="search"
-            :sort-by="sortBy"
         >
             <template #no-data>
-                <div class="d-flex justify-center">
-                    <p class="text-body-2">No data found</p>
-                </div>
+                <ApplicationItem />
             </template>
             <template #default="{ items }">
                 <v-row>
-                    <ApplicationItem v-if="showUplinkItem" :app="UplinkApp" />
                     <ApplicationItem v-for="app in items" :key="app.raw.name" :app="app.raw" />
+                    <ApplicationItem />
                 </v-row>
             </template>
         </v-data-iterator>
@@ -115,7 +108,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, ref } from 'vue';
+import { computed, onBeforeMount, ref } from 'vue';
 import {
     VBtn,
     VBtnToggle,
@@ -132,11 +125,13 @@ import {
     VRow,
     VTextField,
 } from 'vuetify/components';
-import { ArrowDownNarrowWide, ArrowUpDown, ArrowUpNarrowWide, ChevronDown, Search } from 'lucide-vue-next';
+import { ArrowDownNarrowWide, ArrowUpDown, ArrowUpNarrowWide, ChevronDown, Search } from '@lucide/vue';
+import { useRouter } from 'vue-router';
 
-import { AppCategory, Application, applications, UplinkApp } from '@/types/applications';
+import { type Application, AppCategory, applications, ObjectMountApp, UplinkApp  } from '@/types/applications';
 import { usePreCheck } from '@/composables/usePreCheck';
-import { SortItem } from '@/types/common';
+import { useConfigStore } from '@/store/modules/configStore';
+import { ROUTES } from '@/router';
 
 import PageTitleComponent from '@/components/PageTitleComponent.vue';
 import PageSubtitleComponent from '@/components/PageSubtitleComponent.vue';
@@ -144,22 +139,15 @@ import ApplicationItem from '@/components/ApplicationItem.vue';
 import TrialExpirationBanner from '@/components/TrialExpirationBanner.vue';
 
 const { isTrialExpirationBanner, isUserProjectOwner, isExpired } = usePreCheck();
+const router = useRouter();
+
+const configStore = useConfigStore();
 
 const selectedChip = ref<AppCategory>(AppCategory.All);
 const search = ref<string>('');
 const sortKey = ref<string>('name');
 const sortOrder = ref<'asc' | 'desc'>('asc');
 const sortKeys = ['Name', 'Category'];
-
-/**
- * Indicates if uplink item should be shown.
- */
-const showUplinkItem = computed<boolean>(() => !search.value && selectedChip.value === AppCategory.All);
-
-/**
- * The sorting criteria to be used for the file list.
- */
-const sortBy = computed<SortItem[]>(() => [{ key: sortKey.value, order: sortOrder.value }]);
 
 /**
  * Returns all application categories.
@@ -174,8 +162,44 @@ const categories = computed<string[]>(() => {
  * Returns filtered apps based on selected category.
  */
 const filteredApps = computed<Application[]>(() => {
-    if (selectedChip.value === AppCategory.All) return applications;
+    let result: Application[];
+    if (selectedChip.value === AppCategory.All) {
+        result = [...applications];
+    } else {
+        result = applications.filter(app => app.categories.includes(selectedChip.value));
+    }
 
-    return applications.filter(app => selectedChip.value === app.category);
+    result.sort((a, b) => {
+        const aValue = (a[sortKey.value] || '').toLowerCase();
+        const bValue = (b[sortKey.value] || '').toLowerCase();
+        if (aValue < bValue) return sortOrder.value === 'asc' ? -1 : 1;
+        if (aValue > bValue) return sortOrder.value === 'asc' ? 1 : -1;
+        return 0;
+    });
+
+    const showAll = selectedChip.value === AppCategory.All && !search.value;
+    if (showAll) {
+        const index = result.findIndex(app => app.name === UplinkApp.name);
+        if (index > -1) {
+            const [uplink] = result.splice(index, 1);
+            result.unshift(uplink);
+        }
+    }
+
+    if (ObjectMountApp.categories.includes(selectedChip.value) || showAll) {
+        const index = result.findIndex(app => app.name === ObjectMountApp.name);
+        if (index > -1) {
+            const [mount] = result.splice(index, 1);
+            result.unshift(mount);
+        }
+    }
+
+    return result;
+});
+
+onBeforeMount(() => {
+    if (!configStore.isDefaultBrand) {
+        router.replace({ name: ROUTES.Dashboard.name });
+    }
 });
 </script>

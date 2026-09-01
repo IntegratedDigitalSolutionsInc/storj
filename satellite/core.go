@@ -6,8 +6,10 @@ package satellite
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"runtime/pprof"
+	"time"
 
 	"github.com/spacemonkeygo/monkit/v3"
 	"github.com/zeebo/errs"
@@ -23,6 +25,7 @@ import (
 	"storj.io/common/version"
 	"storj.io/storj/private/lifecycle"
 	version_checker "storj.io/storj/private/version/checker"
+	"storj.io/storj/satellite/accountfreeze"
 	"storj.io/storj/satellite/accounting"
 	"storj.io/storj/satellite/accounting/projectbwcleanup"
 	"storj.io/storj/satellite/accounting/rollup"
@@ -33,10 +36,13 @@ import (
 	"storj.io/storj/satellite/console"
 	"storj.io/storj/satellite/console/consoleauth"
 	"storj.io/storj/satellite/console/dbcleanup"
+	"storj.io/storj/satellite/console/dbcleanup/pendingdelete"
 	"storj.io/storj/satellite/console/emailreminders"
 	"storj.io/storj/satellite/emission"
+	"storj.io/storj/satellite/entitlements"
 	"storj.io/storj/satellite/gc/sender"
 	"storj.io/storj/satellite/mailservice"
+	"storj.io/storj/satellite/mailservice/hubspotmails"
 	"storj.io/storj/satellite/metabase"
 	"storj.io/storj/satellite/metabase/zombiedeletion"
 	"storj.io/storj/satellite/metainfo/expireddeletion"
@@ -45,10 +51,11 @@ import (
 	"storj.io/storj/satellite/overlay/offlinenodes"
 	"storj.io/storj/satellite/overlay/straynodes"
 	"storj.io/storj/satellite/payments"
-	"storj.io/storj/satellite/payments/accountfreeze"
 	"storj.io/storj/satellite/payments/billing"
 	"storj.io/storj/satellite/payments/storjscan"
 	"storj.io/storj/satellite/payments/stripe"
+	"storj.io/storj/satellite/projectlimitevents"
+	"storj.io/storj/satellite/repair/queue"
 	"storj.io/storj/satellite/repair/repairer"
 	"storj.io/storj/satellite/reputation"
 )
@@ -76,8 +83,13 @@ type Core struct {
 		Service *analytics.Service
 	}
 
+	Entitlements struct {
+		Service *entitlements.Service
+	}
+
 	Mail struct {
 		Service        *mailservice.Service
+		HubspotService *hubspotmails.Service
 		EmailReminders *emailreminders.Chore
 	}
 
@@ -88,16 +100,23 @@ type Core struct {
 
 	// services and endpoints
 	Overlay struct {
-		DB                overlay.DB
-		Service           *overlay.Service
-		OfflineNodeEmails *offlinenodes.Chore
-		DQStrayNodes      *straynodes.Chore
+		DB                     overlay.DB
+		Service                *overlay.Service
+		UploadSelectionCache   *overlay.UploadSelectionCache
+		DownloadSelectionCache *overlay.DownloadSelectionCache
+		OfflineNodeEmails      *offlinenodes.Chore
+		DQStrayNodes           *straynodes.Chore
 	}
 
 	NodeEvents struct {
 		DB       nodeevents.DB
 		Notifier nodeevents.Notifier
 		Chore    *nodeevents.Chore
+	}
+
+	ProjectLimitEvents struct {
+		DB    projectlimitevents.DB
+		Chore *projectlimitevents.Chore
 	}
 
 	Metainfo struct {
@@ -109,7 +128,6 @@ type Core struct {
 	}
 
 	Audit struct {
-		VerifyQueue          audit.VerifyQueue
 		ReverifyQueue        audit.ReverifyQueue
 		ContainmentSyncChore *audit.ContainmentSyncChore
 	}
@@ -133,8 +151,15 @@ type Core struct {
 		Cache accounting.Cache
 	}
 
+	AccountFreeze struct {
+		BillingFreezeChore    *accountfreeze.Chore
+		BotFreezeChore        *accountfreeze.BotFreezeChore
+		TrialFreezeChore      *accountfreeze.TrialFreezeChore
+		OptOutFreezeChore     *accountfreeze.OptOutFreezeChore
+		InactivityFreezeChore *accountfreeze.InactivityFreezeChore
+	}
+
 	Payments struct {
-		AccountFreeze    *accountfreeze.Chore
 		Accounts         payments.Accounts
 		BillingChore     *billing.Chore
 		StorjscanClient  *storjscan.Client
@@ -143,7 +168,8 @@ type Core struct {
 	}
 
 	ConsoleDBCleanup struct {
-		Chore *dbcleanup.Chore
+		Chore              *dbcleanup.Chore
+		PendingDeleteChore *pendingdelete.Chore
 	}
 
 	GarbageCollection struct {
@@ -151,13 +177,14 @@ type Core struct {
 	}
 
 	RepairQueueStat struct {
+		Queue queue.RepairQueue
 		Chore *repairer.QueueStat
 	}
 }
 
 // New creates a new satellite.
-func New(log *zap.Logger, full *identity.FullIdentity, db DB,
-	metabaseDB *metabase.DB, revocationDB extensions.RevocationDB,
+func New(log *zap.Logger, full *identity.FullIdentity, db DB, metabaseDB *metabase.DB,
+	revocationDB extensions.RevocationDB, repairQueue queue.RepairQueue,
 	liveAccounting accounting.Cache, versionInfo version.Info, config *Config,
 	atomicLogLevel *zap.AtomicLevel) (*Core, error) {
 	peer := &Core{
@@ -192,10 +219,10 @@ func New(log *zap.Logger, full *identity.FullIdentity, db DB,
 
 	{ // setup version control
 		peer.Log.Info("Version info",
-			zap.Stringer("Version", versionInfo.Version.Version),
-			zap.String("Commit Hash", versionInfo.CommitHash),
-			zap.Stringer("Build Timestamp", versionInfo.Timestamp),
-			zap.Bool("Release Build", versionInfo.Release),
+			zap.String("version", versionInfo.Version.VString()),
+			zap.String("commit_hash", versionInfo.CommitHash),
+			zap.Stringer("build_timestamp", versionInfo.Timestamp),
+			zap.Bool("release_build", versionInfo.Release),
 		)
 		peer.Version.Service = version_checker.NewService(log.Named("version"), config.Version, versionInfo, "Satellite")
 		peer.Version.Chore = version_checker.NewChore(peer.Version.Service, config.Version.CheckInterval)
@@ -217,8 +244,18 @@ func New(log *zap.Logger, full *identity.FullIdentity, db DB,
 		peer.Dialer = rpc.NewDefaultDialer(tlsOptions)
 	}
 
-	{ // setup mailservice
-		peer.Mail.Service, err = setupMailService(peer.Log, *config)
+	{ // setup analytics service
+		peer.Analytics.Service = analytics.NewService(peer.Log.Named("analytics:service"), config.Analytics, config.Console.SatelliteName, config.Console.ExternalAddress)
+
+		peer.Services.Add(lifecycle.Item{
+			Name:  "analytics:service",
+			Run:   peer.Analytics.Service.Run,
+			Close: peer.Analytics.Service.Close,
+		})
+	}
+
+	{ // setup legacy and hubspot mail services
+		peer.Mail.Service, err = setupMailService(peer.Log, config.Mail, config.Console)
 		if err != nil {
 			return nil, errs.Combine(err, peer.Close())
 		}
@@ -227,11 +264,23 @@ func New(log *zap.Logger, full *identity.FullIdentity, db DB,
 			Name:  "mail:service",
 			Close: peer.Mail.Service.Close,
 		})
+
+		peer.Mail.HubspotService = hubspotmails.NewService(peer.Log.Named("mail:hubspotservice"), peer.Analytics.Service, config.HubspotMails)
+
+		peer.Services.Add(lifecycle.Item{
+			Name:  "hubspotmails:service",
+			Close: peer.Mail.HubspotService.Close,
+		})
 	}
 
 	{ // setup email reminders
 		if config.EmailReminders.Enable {
 			authTokens := consoleauth.NewService(config.ConsoleAuth, &consoleauth.Hmac{Secret: []byte(config.Console.AuthTokenSecret)})
+
+			var tenantID *string
+			if config.Console.SingleWhiteLabel.TenantID != "" {
+				tenantID = &config.Console.SingleWhiteLabel.TenantID
+			}
 
 			peer.Mail.EmailReminders = emailreminders.NewChore(
 				peer.Log.Named("console:chore"),
@@ -242,6 +291,7 @@ func New(log *zap.Logger, full *identity.FullIdentity, db DB,
 				config.Console.ExternalAddress,
 				config.Console.GeneralRequestURL,
 				config.Console.ScheduleMeetingURL,
+				tenantID,
 			)
 
 			peer.Services.Add(lifecycle.Item{
@@ -260,18 +310,33 @@ func New(log *zap.Logger, full *identity.FullIdentity, db DB,
 	{ // setup overlay
 
 		peer.Overlay.DB = peer.DB.OverlayCache()
-		peer.Overlay.Service, err = overlay.NewService(peer.Log.Named("overlay"), peer.Overlay.DB, peer.DB.NodeEvents(), placement, config.Console.ExternalAddress, config.Console.SatelliteName, config.Overlay)
+		peer.Overlay.UploadSelectionCache, err = overlay.NewUploadSelectionCacheFromConfig(peer.Log.Named("overlay"), peer.Overlay.DB, config.Overlay, placement)
+		if err != nil {
+			return nil, errs.Combine(err, peer.Close())
+		}
+		peer.Overlay.DownloadSelectionCache, err = overlay.NewDownloadSelectionCacheFromConfig(peer.Log.Named("overlay"), peer.Overlay.DB, config.Overlay, placement)
+		if err != nil {
+			return nil, errs.Combine(err, peer.Close())
+		}
+		peer.Overlay.Service, err = overlay.NewService(peer.Log.Named("overlay"), peer.Overlay.DB, peer.DB.NodeEvents(), peer.Overlay.UploadSelectionCache, peer.Overlay.DownloadSelectionCache, placement, config.Console.ExternalAddress, config.Console.SatelliteName, config.Overlay, config.NodeEvents)
 		if err != nil {
 			return nil, errs.Combine(err, peer.Close())
 		}
 		peer.Services.Add(lifecycle.Item{
 			Name:  "overlay",
-			Run:   peer.Overlay.Service.Run,
 			Close: peer.Overlay.Service.Close,
 		})
+		peer.Services.Add(lifecycle.Item{
+			Name: "upload-selection-cache",
+			Run:  peer.Overlay.UploadSelectionCache.Run,
+		})
+		peer.Services.Add(lifecycle.Item{
+			Name: "download-selection-cache",
+			Run:  peer.Overlay.DownloadSelectionCache.Run,
+		})
 
-		if config.Overlay.SendNodeEmails {
-			peer.Overlay.OfflineNodeEmails = offlinenodes.NewChore(log.Named("overlay:offline-node-emails"), peer.Mail.Service, peer.Overlay.Service, config.OfflineNodes)
+		if config.NodeEvents.SendNodeEmails {
+			peer.Overlay.OfflineNodeEmails = offlinenodes.NewChore(log.Named("overlay:offline-node-emails"), peer.Mail.Service, peer.Overlay.Service, config.OfflineNodes, config.NodeEvents)
 			peer.Services.Add(lifecycle.Item{
 				Name:  "overlay:offline-node-emails",
 				Run:   peer.Overlay.OfflineNodeEmails.Run,
@@ -294,7 +359,7 @@ func New(log *zap.Logger, full *identity.FullIdentity, db DB,
 	}
 
 	{ // setup node events
-		if config.Overlay.SendNodeEmails {
+		if config.NodeEvents.SendNodeEmails {
 			var notifier nodeevents.Notifier
 			switch config.NodeEvents.Notifier {
 			case "customer.io":
@@ -348,13 +413,12 @@ func New(log *zap.Logger, full *identity.FullIdentity, db DB,
 	{ // setup audit
 		config := config.Audit
 
-		peer.Audit.VerifyQueue = db.VerifyQueue()
 		peer.Audit.ReverifyQueue = db.ReverifyQueue()
 
 		peer.Audit.ContainmentSyncChore = audit.NewContainmentSyncChore(peer.Log.Named("audit:containment-sync-chore"),
 			peer.Audit.ReverifyQueue,
 			peer.Overlay.DB,
-			config.ContainmentSyncChoreInterval,
+			config,
 		)
 		peer.Services.Add(lifecycle.Item{
 			Name: "audit:containment-sync-chore",
@@ -394,8 +458,59 @@ func New(log *zap.Logger, full *identity.FullIdentity, db DB,
 			debug.Cycle("Zombie Objects Chore", peer.ZombieDeletion.Chore.Loop))
 	}
 
+	{ // setup project limit events chore
+		peer.ProjectLimitEvents.DB = peer.DB.ProjectLimitEvents()
+		peer.ProjectLimitEvents.Chore = projectlimitevents.NewChore(
+			peer.Log.Named("project-limit-events:chore"),
+			peer.ProjectLimitEvents.DB,
+			peer.DB.Console().Projects(),
+			peer.DB.Console().Users(),
+			peer.LiveAccounting.Cache,
+			peer.Mail.Service,
+			config.ProjectLimitEvents,
+		)
+		peer.Services.Add(lifecycle.Item{
+			Name:  "project-limit-events:chore",
+			Run:   peer.ProjectLimitEvents.Chore.Run,
+			Close: peer.ProjectLimitEvents.Chore.Close,
+		})
+		peer.Debug.Server.Panel.Add(
+			debug.Cycle("Project Limit Events", peer.ProjectLimitEvents.Chore.Loop))
+	}
+
+	// Parse product prices early for use in tally service
+	productPrices, err := config.Payments.Products.ToModels()
+	if err != nil {
+		return nil, errs.Combine(err, peer.Close())
+	}
+
 	{ // setup accounting
-		peer.Accounting.Tally = tally.New(peer.Log.Named("accounting:tally"), peer.DB.StoragenodeAccounting(), peer.DB.ProjectAccounting(), peer.LiveAccounting.Cache, peer.Metainfo.Metabase, peer.DB.Buckets(), config.Tally)
+		// Convert product prices to tally-compatible format.
+		tallyProductPrices := make(map[int32]tally.ProductUsagePriceModel)
+		for id, price := range productPrices {
+			tallyProductPrices[id] = tally.ProductUsagePriceModel{
+				ProductID:             price.ProductID,
+				StorageRemainderBytes: price.StorageRemainderBytes,
+			}
+		}
+
+		// Convert global placement map.
+		globalPlacementMap := make(tally.PlacementProductMap)
+		for placement, productID := range config.Payments.PlacementPriceOverrides.ToMap() {
+			globalPlacementMap[placement] = productID
+		}
+
+		peer.Accounting.Tally = tally.New(
+			peer.Log.Named("accounting:tally"),
+			peer.DB.StoragenodeAccounting(),
+			peer.DB.ProjectAccounting(),
+			peer.LiveAccounting.Cache,
+			peer.Metainfo.Metabase,
+			peer.DB.Buckets(),
+			config.Tally,
+			tallyProductPrices,
+			globalPlacementMap,
+		)
 		peer.Services.Add(lifecycle.Item{
 			Name:  "accounting:tally",
 			Run:   peer.Accounting.Tally.Run,
@@ -404,9 +519,7 @@ func New(log *zap.Logger, full *identity.FullIdentity, db DB,
 		peer.Debug.Server.Panel.Add(
 			debug.Cycle("Accounting Tally", peer.Accounting.Tally.Loop))
 
-		// Lets add 1 more day so we catch any off by one errors when deleting tallies
-		orderExpirationPlusDay := config.Orders.Expiration + config.Rollup.Interval
-		peer.Accounting.Rollup = rollup.New(peer.Log.Named("accounting:rollup"), peer.DB.StoragenodeAccounting(), config.Rollup, orderExpirationPlusDay)
+		peer.Accounting.Rollup = rollup.New(peer.Log.Named("accounting:rollup"), peer.DB.StoragenodeAccounting(), config.Rollup, config.Orders)
 		peer.Services.Add(lifecycle.Item{
 			Name:  "accounting:rollup",
 			Run:   peer.Accounting.Rollup.Run,
@@ -438,14 +551,11 @@ func New(log *zap.Logger, full *identity.FullIdentity, db DB,
 		}
 	}
 
-	{ // setup analytics service
-		peer.Analytics.Service = analytics.NewService(peer.Log.Named("analytics:service"), config.Analytics, config.Console.SatelliteName)
-
-		peer.Services.Add(lifecycle.Item{
-			Name:  "analytics:service",
-			Run:   peer.Analytics.Service.Run,
-			Close: peer.Analytics.Service.Close,
-		})
+	{ // setup entitlements
+		peer.Entitlements.Service = entitlements.NewService(
+			peer.Log.Named("entitlements:service"),
+			db.Console().Entitlements(),
+		)
 	}
 
 	// TODO: remove in future, should be in API
@@ -477,23 +587,47 @@ func New(log *zap.Logger, full *identity.FullIdentity, db DB,
 			return nil, errs.Combine(err, peer.Close())
 		}
 
+		// productPrices already parsed earlier for tally service
+
+		minimumChargeDate, err := pc.MinimumCharge.GetEffectiveDate()
+		if err != nil {
+			return nil, errs.Combine(err, peer.Close())
+		}
+
 		service, err := stripe.NewService(
 			peer.Log.Named("payments.stripe:service"),
 			stripeClient,
+			stripe.ServiceDependencies{
+				DB:                   peer.DB.StripeCoinPayments(),
+				WalletsDB:            peer.DB.Wallets(),
+				BillingDB:            peer.DB.Billing(),
+				ProjectsDB:           peer.DB.Console().Projects(),
+				UsersDB:              peer.DB.Console().Users(),
+				FreezeEventsDB:       peer.DB.Console().AccountFreezeEvents(),
+				UsageDB:              peer.DB.ProjectAccounting(),
+				RetentionRemainderDB: peer.DB.RetentionRemainderCharges(),
+				Analytics:            peer.Analytics.Service,
+				Emission:             emission.NewService(config.Emission),
+				Entitlements:         peer.Entitlements.Service,
+			},
+			stripe.ServiceConfig{
+				DeleteAccountEnabled:       config.Console.SelfServeAccountDeleteEnabled,
+				DeleteProjectCostThreshold: pc.DeleteProjectCostThreshold,
+				EntitlementsEnabled:        config.Entitlements.Enabled,
+			},
 			pc.StripeCoinPayments,
-			peer.DB.StripeCoinPayments(),
-			peer.DB.Wallets(),
-			peer.DB.Billing(),
-			peer.DB.Console().Projects(),
-			peer.DB.Console().Users(),
-			peer.DB.ProjectAccounting(),
-			prices,
-			priceOverrides,
-			pc.PackagePlans.Packages,
-			pc.BonusRate,
-			peer.Analytics.Service,
-			emission.NewService(config.Emission),
-			config.Console.SelfServeAccountDeleteEnabled,
+			stripe.PricingConfig{
+				UsagePrices:               prices,
+				UsagePriceOverrides:       priceOverrides,
+				ProductPriceMap:           productPrices,
+				PlacementProductMap:       pc.PlacementPriceOverrides.ToMap(),
+				PackagePlans:              pc.PackagePlans.Packages,
+				BonusRate:                 pc.BonusRate,
+				MinimumChargeAmount:       pc.MinimumCharge.Amount,
+				MinimumChargeDate:         minimumChargeDate,
+				LegacyMinimumChargeAmount: pc.MinimumCharge.LegacyAmount,
+				LegacyPricingUserAgents:   pc.LegacyPricingUserAgents,
+			},
 		)
 		if err != nil {
 			return nil, errs.Combine(err, peer.Close())
@@ -512,17 +646,12 @@ func New(log *zap.Logger, full *identity.FullIdentity, db DB,
 			peer.Payments.StorjscanClient,
 			pc.Storjscan.Confirmations,
 			pc.BonusRate)
-		if err != nil {
-			return nil, errs.Combine(err, peer.Close())
-		}
 
 		peer.Payments.StorjscanChore = storjscan.NewChore(
 			peer.Log.Named("payments.storjscan:chore"),
 			peer.Payments.StorjscanClient,
 			peer.DB.StorjscanPayments(),
-			config.Payments.Storjscan.Confirmations,
-			config.Payments.Storjscan.Interval,
-			config.Payments.Storjscan.DisableLoop,
+			config.Payments.Storjscan,
 		)
 		peer.Services.Add(lifecycle.Item{
 			Name: "payments.storjscan:chore",
@@ -534,7 +663,7 @@ func New(log *zap.Logger, full *identity.FullIdentity, db DB,
 
 		freezeService := console.NewAccountFreezeService(peer.DB.Console(), peer.Analytics.Service, config.Console.AccountFreeze)
 		choreObservers := billing.ChoreObservers{
-			UpgradeUser: console.NewUpgradeUserObserver(peer.DB.Console(), peer.DB.Billing(), config.Console.UsageLimits, config.Console.UserBalanceForUpgrade, freezeService, peer.Analytics.Service),
+			UpgradeUser: console.NewUpgradeUserObserver(peer.DB.Console(), peer.DB.Billing(), config.Console.UsageLimits, config.Console.UserBalanceForUpgrade, config.Console.ExternalAddress, freezeService, peer.Analytics.Service, peer.Mail.Service),
 			PayInvoices: console.NewInvoiceTokenPaymentObserver(
 				peer.DB.Console(), peer.Payments.Accounts.Invoices(),
 				freezeService,
@@ -559,27 +688,53 @@ func New(log *zap.Logger, full *identity.FullIdentity, db DB,
 
 	{ // setup account freeze
 		if config.AccountFreeze.Enabled {
-			peer.Payments.AccountFreeze = accountfreeze.NewChore(
-				peer.Log.Named("payments.accountfreeze:chore"),
-				peer.DB.StripeCoinPayments(),
-				peer.Payments.Accounts,
-				peer.DB.Console().Users(),
-				peer.DB.Wallets(),
-				peer.DB.StorjscanPayments(),
-				console.NewAccountFreezeService(db.Console(), peer.Analytics.Service, config.Console.AccountFreeze),
-				peer.Analytics.Service,
-				peer.Mail.Service,
-				config.Console.AccountFreeze,
-				config.AccountFreeze,
-				config.Console.Captcha.FlagBotsEnabled,
-				config.Console.ExternalAddress,
-				config.Console.GeneralRequestURL,
-			)
+			consoleCfg := accountfreeze.ConsoleConfig{
+				ExternalAddress:         config.Console.ExternalAddress,
+				GeneralRequestURL:       config.Console.GeneralRequestURL,
+				FlagBots:                config.Console.Captcha.FlagBotsEnabled,
+				LegacyPricingUserAgents: config.Payments.LegacyPricingUserAgents,
+			}
+			if config.Console.NewPricingEffectiveDate != "" {
+				if t, err := time.Parse(time.RFC3339, config.Console.NewPricingEffectiveDate); err != nil {
+					return nil, errs.Combine(fmt.Errorf("invalid Console.NewPricingEffectiveDate. %w", err), peer.Close())
+				} else {
+					consoleCfg.NewPricingEffectiveDate = t
+				}
+			}
+			peer.AccountFreeze.BillingFreezeChore = accountfreeze.NewChore(peer.Log.Named("payments.accountfreeze:chore"), peer.DB.StripeCoinPayments(), peer.Payments.Accounts, peer.DB.Console().Users(), peer.DB.Wallets(), peer.DB.StorjscanPayments(), console.NewAccountFreezeService(db.Console(), peer.Analytics.Service, config.Console.AccountFreeze), peer.Analytics.Service, peer.Mail.Service, config.Console.AccountFreeze, config.AccountFreeze, consoleCfg)
+			peer.AccountFreeze.BotFreezeChore = accountfreeze.NewBotFreezeChore(peer.Log.Named("payments.accountfreeze:chore"), peer.DB.Console().Users(), console.NewAccountFreezeService(db.Console(), peer.Analytics.Service, config.Console.AccountFreeze), config.AccountFreeze, consoleCfg)
+			peer.AccountFreeze.TrialFreezeChore = accountfreeze.NewTrialFreezeChore(peer.Log.Named("payments.accountfreeze:chore"), peer.DB.Console().Users(), console.NewAccountFreezeService(db.Console(), peer.Analytics.Service, config.Console.AccountFreeze), peer.Mail.Service, config.Console.AccountFreeze, config.AccountFreeze, consoleCfg)
+			peer.AccountFreeze.OptOutFreezeChore = accountfreeze.NewOptOutFreezeChore(peer.Log.Named("payments.accountfreeze:chore"), peer.DB.Console().Users(), console.NewAccountFreezeService(db.Console(), peer.Analytics.Service, config.Console.AccountFreeze), peer.Mail.Service, config.Console.AccountFreeze, config.AccountFreeze, consoleCfg)
+			peer.AccountFreeze.InactivityFreezeChore = accountfreeze.NewInactivityFreezeChore(peer.Log.Named("payments.accountfreeze:inactivity"), peer.DB.Console().Users(), peer.DB.Console().Projects(), peer.DB.ProjectAccounting(), peer.Payments.Accounts, peer.DB.StripeCoinPayments(), console.NewAccountFreezeService(db.Console(), peer.Analytics.Service, config.Console.AccountFreeze), peer.Mail.Service, config.Console.AccountFreeze, config.AccountFreeze, consoleCfg)
 
 			peer.Services.Add(lifecycle.Item{
-				Name:  "accountfreeze:chore",
-				Run:   peer.Payments.AccountFreeze.Run,
-				Close: peer.Payments.AccountFreeze.Close,
+				Name:  "accountfreeze:billingfreezechore",
+				Run:   peer.AccountFreeze.BillingFreezeChore.Run,
+				Close: peer.AccountFreeze.BillingFreezeChore.Close,
+			})
+
+			peer.Services.Add(lifecycle.Item{
+				Name:  "accountfreeze:botfreezechore",
+				Run:   peer.AccountFreeze.BotFreezeChore.Run,
+				Close: peer.AccountFreeze.BotFreezeChore.Close,
+			})
+
+			peer.Services.Add(lifecycle.Item{
+				Name:  "accountfreeze:trialfreezechore",
+				Run:   peer.AccountFreeze.TrialFreezeChore.Run,
+				Close: peer.AccountFreeze.TrialFreezeChore.Close,
+			})
+
+			peer.Services.Add(lifecycle.Item{
+				Name:  "accountfreeze:optoutfreezechore",
+				Run:   peer.AccountFreeze.OptOutFreezeChore.Run,
+				Close: peer.AccountFreeze.OptOutFreezeChore.Close,
+			})
+
+			peer.Services.Add(lifecycle.Item{
+				Name:  "accountfreeze:inactivityfreezechore",
+				Run:   peer.AccountFreeze.InactivityFreezeChore.Run,
+				Close: peer.AccountFreeze.InactivityFreezeChore.Close,
 			})
 		}
 	}
@@ -600,9 +755,56 @@ func New(log *zap.Logger, full *identity.FullIdentity, db DB,
 		})
 	}
 
+	{ // setup pending delete escalator
+		if config.PendingDeleteCleanup.Enabled {
+			var pendingDeleteRemainderRecorder *accounting.RemainderChargeRecorder
+			if config.Metainfo.CreateRemainderChargeOnObjectDelete {
+				placementOverrideMap := config.Payments.PlacementPriceOverrides.ToMap()
+
+				remainderProductPrices := make(map[int32]accounting.RemainderProductInfo, len(productPrices))
+				for id, price := range productPrices {
+					remainderProductPrices[id] = accounting.RemainderProductInfo{
+						ProductID:                price.ProductID,
+						MinimumRetentionDuration: price.MinimumRetentionDuration,
+					}
+				}
+
+				pendingDeleteRemainderRecorder = accounting.NewRemainderChargeRecorder(
+					peer.Log.Named("remainder-charge-recorder"),
+					peer.DB.RetentionRemainderCharges(),
+					accounting.PricingConfig{
+						ProductPrices:       remainderProductPrices,
+						PlacementProductMap: placementOverrideMap,
+					},
+					peer.Entitlements.Service,
+					config.Accounting.RetentionRemainderRecorder,
+				)
+			}
+
+			peer.ConsoleDBCleanup.PendingDeleteChore = pendingdelete.NewChore(
+				peer.Log.Named("console.dbcleanup.pendingdelete:chore"),
+				peer.Payments.Accounts,
+				console.NewAccountFreezeService(db.Console(), peer.Analytics.Service, config.Console.AccountFreeze),
+				peer.DB.Buckets(),
+				peer.DB.Console(),
+				peer.Metainfo.Metabase,
+				pendingDeleteRemainderRecorder,
+				config.PendingDeleteCleanup,
+			)
+
+			peer.Services.Add(lifecycle.Item{
+				Name:  "dbcleanup.pendingdelete:chore",
+				Run:   peer.ConsoleDBCleanup.PendingDeleteChore.Run,
+				Close: peer.ConsoleDBCleanup.PendingDeleteChore.Close,
+			})
+		}
+	}
+
 	{
+		peer.RepairQueueStat.Queue = repairQueue
+
 		if config.RepairQueueCheck.Interval.Seconds() > 0 {
-			peer.RepairQueueStat.Chore = repairer.NewQueueStat(log, monkit.Default, placement.SupportedPlacements(), db.RepairQueue(), config.RepairQueueCheck.Interval)
+			peer.RepairQueueStat.Chore = repairer.NewQueueStat(log, monkit.Default, placement, repairQueue, config.RepairQueueCheck)
 
 			peer.Services.Add(lifecycle.Item{
 				Name: "queue-stat",

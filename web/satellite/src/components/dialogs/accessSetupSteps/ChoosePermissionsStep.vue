@@ -7,16 +7,16 @@
             <v-col cols="12">
                 <p>Select the permissions you want to allow.</p>
                 <v-btn
-                    :color="permissions.length === 4 ? 'info' : 'secondary'"
+                    :color="permissions.length === 4 ? 'primary' : ''"
                     variant="outlined"
                     density="compact"
                     size="default"
-                    class="mt-4 text-body-2"
+                    class="mt-4 text-body-medium"
                     rounded="md"
                     @click="onAllClick"
                 >
                     <template v-if="permissions.length === 4" #prepend>
-                        <v-icon><Check :stroke-width="4" /></v-icon>
+                        <v-icon><Check /></v-icon>
                     </template>
                     All Permissions
                 </v-btn>
@@ -25,7 +25,7 @@
                     variant="outlined"
                     filter
                     multiple
-                    selected-class="text-info font-weight-bold"
+                    selected-class="font-weight-bold"
                     class="mt-2"
                     :class="{ 'mb-3': !invalid }"
                 >
@@ -61,12 +61,12 @@
                         Delete
                     </v-chip>
                 </v-chip-group>
-                <span v-if="invalid" class="text-caption d-block text-error mb-3">No permission selected</span>
+                <span v-if="invalid" class="text-body-small d-block text-error mb-3">No permission selected</span>
                 <v-alert variant="tonal" width="auto">
-                    <p class="text-subtitle-2 font-weight-bold">
+                    <p class="text-title-small font-weight-bold">
                         Important
                     </p>
-                    <p class="text-subtitle-2">
+                    <p class="text-title-small">
                         If you don't select the correct permissions, your application might not connect properly.
                     </p>
                 </v-alert>
@@ -78,7 +78,7 @@
 <script setup lang="ts">
 import { ref, watch } from 'vue';
 import { VAlert, VChip, VChipGroup, VCol, VForm, VRow, VBtn, VIcon } from 'vuetify/components';
-import { Check } from 'lucide-vue-next';
+import { Check } from '@lucide/vue';
 
 import { Permission } from '@/types/setupAccess';
 
@@ -87,7 +87,12 @@ const emit = defineEmits<{
 }>();
 
 const invalid = ref<boolean>(false);
-const permissions = ref<Permission[]>([]);
+const permissions = ref<Permission[]>([
+    Permission.Read,
+    Permission.Write,
+    Permission.List,
+    Permission.Delete,
+]);
 
 /**
  * Selects or deselects all the permissions.

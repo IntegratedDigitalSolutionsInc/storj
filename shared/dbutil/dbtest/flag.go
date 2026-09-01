@@ -4,6 +4,7 @@
 package dbtest
 
 import (
+	"context"
 	"flag"
 	"os"
 	"strings"
@@ -22,8 +23,8 @@ var postgres = flag.String("postgres-test-db", os.Getenv("STORJ_TEST_POSTGRES"),
 var cockroach = flag.String("cockroach-test-db", os.Getenv("STORJ_TEST_COCKROACH"), "CockroachDB test database connection string (semicolon delimited for multiple), \"omit\" is used to omit the tests from output")
 var cockroachAlt = flag.String("cockroach-test-alt-db", os.Getenv("STORJ_TEST_COCKROACH_ALT"), "CockroachDB test database connection alternate string (semicolon delimited for multiple), \"omit\" is used to omit the tests from output")
 
-// spanner is the test database connection string.
-var spanner = flag.String("spanner-test-db", os.Getenv("STORJ_TEST_SPANNER"), "Spanner test database connection string (semicolon delimited for multiple), \"omit\" (or empty!) is used to omit the tests from output")
+// tidb is the test database connection string for TiDB.
+var tidb = flag.String("tidb-test-db", os.Getenv("STORJ_TEST_TIDB"), "TiDB test database connection string (semicolon delimited for multiple), \"omit\" is used to omit the tests from output")
 
 // DefaultPostgres is expected to work under the storj-test docker-compose instance.
 const DefaultPostgres = "postgres://storj:storj-pass@test-postgres/teststorj?sslmode=disable"
@@ -31,8 +32,8 @@ const DefaultPostgres = "postgres://storj:storj-pass@test-postgres/teststorj?ssl
 // DefaultCockroach is expected to work when a local cockroachDB instance is running.
 const DefaultCockroach = "cockroach://root@localhost:26257/master?sslmode=disable"
 
-// DefaultSpanner is expected to work when a local spanner emulator is running.
-const DefaultSpanner = "spanner://projects/storj-test/instances/test-instance/databases/metainfo"
+// DefaultTiDB is expected to work when a local TiDB instance is running.
+const DefaultTiDB = "tidb://root@localhost:4000/teststorj?parseTime=true!!master=postgres://storj:storj-pass@test-postgres/teststorj?sslmode=disable"
 
 // Database defines a postgres compatible database.
 type Database struct {
@@ -44,7 +45,13 @@ type Database struct {
 
 // TB defines minimal interface required for Pick.
 type TB interface {
-	Skip(...interface{})
+	Cleanup(func())
+	Context() context.Context
+	Fatal(...any)
+	Fatalf(format string, args ...any)
+	Log(...any)
+	Logf(string, ...any)
+	Skip(...any)
 }
 
 // Databases returns list of postgres compatible databases.
@@ -57,6 +64,7 @@ func Databases() []Database {
 
 // Run runs tests with all postgres compatible databases.
 func Run(t *testing.T, test func(ctx *testcontext.Context, t *testing.T, connstr string)) {
+	t.Parallel()
 	for _, db := range Databases() {
 		db := db
 		if strings.EqualFold(*db.Flag, "omit") {
@@ -100,17 +108,17 @@ func PickCockroachNoSkip() string {
 	return pickNext(*cockroach, &pickCockroach)
 }
 
-// PickSpanner picks one spanner database from flag.
-func PickSpanner(t TB) string {
-	if *spanner == "" || strings.EqualFold(*spanner, "omit") {
-		t.Skip("Spanner flag missing, example: -spanner-test-db=" + DefaultSpanner)
+// PickTiDB picks one TiDB database from flag.
+func PickTiDB(t TB) string {
+	if *tidb == "" || strings.EqualFold(*tidb, "omit") {
+		t.Skip("TiDB flag missing, example: -tidb-test-db=" + DefaultTiDB)
 	}
-	return PickSpannerNoSkip()
+	return PickTiDBNoSkip()
 }
 
-// PickSpannerNoSkip picks one spanner database from flag, but doesn't autoskip.
-func PickSpannerNoSkip() string {
-	return pickNext(*spanner, &pickSpanner)
+// PickTiDBNoSkip picks one TiDB database from flag, but doesn't autoskip.
+func PickTiDBNoSkip() string {
+	return pickNext(*tidb, &pickTiDB)
 }
 
 // PickCockroachAlt picks an alternate cockroach database from flag.
@@ -129,7 +137,7 @@ func PickCockroachAlt(t TB) string {
 
 var pickPostgres uint64
 var pickCockroach uint64
-var pickSpanner uint64
+var pickTiDB uint64
 
 func pickNext(dbstr string, counter *uint64) string {
 	values := strings.Split(dbstr, "|")

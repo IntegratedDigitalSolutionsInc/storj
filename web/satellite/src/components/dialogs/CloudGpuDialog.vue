@@ -27,7 +27,7 @@
                     </v-card-title>
                     <template #append>
                         <v-btn
-                            icon="$close"
+                            :icon="X"
                             variant="text"
                             size="small"
                             color="default"
@@ -53,7 +53,7 @@
             </v-card-item>
             <v-card-item>
                 <p>
-                    Please note that your Storj account is not currently connected
+                    Please note that your {{ configStore.brandName }} account is not currently connected
                     to Valdi, and you will need to create a separate Valdi account
                     to access the service.
                 </p>
@@ -108,7 +108,7 @@ import {
     VRow,
     VSheet,
 } from 'vuetify/components';
-import { ExternalLink, Microchip } from 'lucide-vue-next';
+import { ExternalLink, Microchip, X } from '@lucide/vue';
 
 import { AnalyticsEvent, PageVisitSource } from '@/utils/constants/analyticsEventNames';
 import { useAnalyticsStore } from '@/store/modules/analyticsStore';

@@ -17,13 +17,13 @@
                         height="40"
                         rounded="lg"
                     >
-                        <component :is="Box" :size="18" />
+                        <component :is="iconComponent" :size="18" />
                     </v-sheet>
                 </template>
                 <v-card-title class="font-weight-bold">Project {{ field }}</v-card-title>
                 <template #append>
                     <v-btn
-                        icon="$close"
+                        :icon="X"
                         variant="text"
                         size="small"
                         color="default"
@@ -86,14 +86,14 @@ import {
     VTextField,
     VSheet,
 } from 'vuetify/components';
-import { Box } from 'lucide-vue-next';
+import { Pencil, NotebookPen, X } from '@lucide/vue';
 
 import { useLoading } from '@/composables/useLoading';
 import { AnalyticsErrorEventSource, AnalyticsEvent } from '@/utils/constants/analyticsEventNames';
 import { useAnalyticsStore } from '@/store/modules/analyticsStore';
-import { useNotify } from '@/utils/hooks';
+import { useNotify } from '@/composables/useNotify';
 import { useProjectsStore } from '@/store/modules/projectsStore';
-import { ValidationRule } from '@/types/common';
+import type { ValidationRule } from '@/types/common';
 import { FieldToChange, ProjectFields, MAX_NAME_LENGTH, MAX_DESCRIPTION_LENGTH } from '@/types/projects';
 
 const props = defineProps<{
@@ -142,10 +142,8 @@ async function onSaveClick(): Promise<void> {
                 await projectsStore.updateProjectDescription(new ProjectFields('', input.value));
             }
         } catch (error) {
-            notify.error(
-                `Error updating project ${props.field.toLowerCase()}. ${error.message}`,
-                AnalyticsErrorEventSource.EDIT_PROJECT_DETAILS,
-            );
+            error.message = `Error updating project ${props.field.toLowerCase()}. ${error.message}`;
+            notify.notifyError(error, AnalyticsErrorEventSource.EDIT_PROJECT_DETAILS);
             return;
         }
 
@@ -153,6 +151,7 @@ async function onSaveClick(): Promise<void> {
             props.field === FieldToChange.Name
                 ? AnalyticsEvent.PROJECT_NAME_UPDATED
                 : AnalyticsEvent.PROJECT_DESCRIPTION_UPDATED,
+            { project_id: projectsStore.state.selectedProject.id },
         );
         notify.success(`Project ${props.field.toLowerCase()} updated.`);
 
@@ -165,4 +164,12 @@ watch(() => model.value, shown => {
     const project = projectsStore.state.selectedProject;
     input.value = props.field === FieldToChange.Name ? project.name : project.description;
 }, { immediate: true });
+
+const iconComponent = computed(() => {
+    if (props.field === FieldToChange.Name) {
+        return Pencil;
+    } else {
+        return NotebookPen;
+    }
+});
 </script>

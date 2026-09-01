@@ -5,6 +5,7 @@ package buckets
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/zeebo/errs"
@@ -38,23 +39,33 @@ var (
 
 	// ErrLocked is used when an operation fails because a bucket has Object Lock enabled.
 	ErrLocked = errs.Class("bucket has Object Lock enabled")
+
+	// ErrAttributionPlacementMismatch is returned when attempting to create a bucket
+	// that was previously attributed to a different placement than the one provided.
+	ErrAttributionPlacementMismatch = errs.Class("bucket attribution placement mismatch")
 )
 
 // Bucket contains information about a specific bucket.
 type Bucket struct {
-	ID                          uuid.UUID
-	Name                        string
-	ProjectID                   uuid.UUID
-	CreatedBy                   uuid.UUID
-	UserAgent                   []byte
-	Created                     time.Time
-	PathCipher                  storj.CipherSuite
-	DefaultSegmentsSize         int64
-	DefaultRedundancyScheme     storj.RedundancyScheme
-	DefaultEncryptionParameters storj.EncryptionParameters
-	Placement                   storj.PlacementConstraint
-	Versioning                  Versioning
-	ObjectLock                  ObjectLockSettings
+	ID         uuid.UUID
+	Name       string
+	ProjectID  uuid.UUID
+	CreatedBy  uuid.UUID
+	UserAgent  []byte
+	Created    time.Time
+	Placement  storj.PlacementConstraint
+	Versioning Versioning
+	ObjectLock ObjectLockSettings
+}
+
+// PlacementMigrations maps sunset placements to their replacements.
+type PlacementMigrations map[storj.PlacementConstraint]storj.PlacementConstraint
+
+// Allows returns whether a formally existing bucket whose placement is being sunset
+// can be recreated with another placement.
+func (m PlacementMigrations) Allows(existing, requested storj.PlacementConstraint) bool {
+	replacement, ok := m[existing]
+	return ok && replacement == requested
 }
 
 // UpdateBucketObjectLockParams contains the parameters for updating bucket object lock settings.
@@ -104,12 +115,58 @@ func (v Versioning) IsUnversioned() bool {
 	return v == VersioningUnsupported || v == Unversioned
 }
 
+// IsVersioned returns true if bucket is either in a versioned or suspended state.
+func (v Versioning) IsVersioned() bool {
+	return !v.IsUnversioned()
+}
+
+// String returns the name.
+func (v Versioning) String() string {
+	switch v {
+	case VersioningUnsupported:
+		return "unsupported"
+	case Unversioned:
+		return "unversioned"
+	case VersioningEnabled:
+		return "enabled"
+	case VersioningSuspended:
+		return "suspended"
+	default:
+		return fmt.Sprintf("unknown Versioning(%d)", v)
+	}
+}
+
+// Tag represents a single bucket tag.
+type Tag struct {
+	Key   string
+	Value string
+}
+
 // MinimalBucket contains minimal bucket fields for metainfo protocol.
 type MinimalBucket struct {
 	Name      []byte
 	CreatedBy uuid.UUID
 	CreatedAt time.Time
 	Placement storj.PlacementConstraint
+}
+
+// UploadBucket contains the bucket fields required by the upload path
+// to validate the request and pack the StreamID.
+type UploadBucket struct {
+	Placement  storj.PlacementConstraint
+	Versioning Versioning
+	ObjectLock ObjectLockSettings
+}
+
+// NotificationConfig contains bucket event notification configuration.
+type NotificationConfig struct {
+	ConfigID     string
+	TopicName    string
+	Events       []string
+	FilterPrefix []byte
+	FilterSuffix []byte
+	CreatedAt    time.Time
+	UpdatedAt    time.Time
 }
 
 // ListOptions lists objects.
@@ -144,8 +201,12 @@ type List struct {
 type DB interface {
 	// CreateBucket creates a new bucket
 	CreateBucket(ctx context.Context, bucket Bucket) (_ Bucket, err error)
+	// CreateBucketWithAttribution atomically creates a new bucket and associated attribution data.
+	CreateBucketWithAttribution(ctx context.Context, bucket Bucket, sunsetPlacements PlacementMigrations) (_ Bucket, err error)
 	// GetBucket returns an existing bucket
 	GetBucket(ctx context.Context, bucketName []byte, projectID uuid.UUID) (bucket Bucket, err error)
+	// GetBucketForUpload returns the minimal bucket fields needed by the upload path.
+	GetBucketForUpload(ctx context.Context, bucketName []byte, projectID uuid.UUID) (bucket UploadBucket, err error)
 	// GetBucketPlacement returns with the placement constraint identifier.
 	GetBucketPlacement(ctx context.Context, bucketName []byte, projectID uuid.UUID) (placement storj.PlacementConstraint, err error)
 	// GetBucketVersioningState returns with the versioning state of the bucket.
@@ -172,8 +233,21 @@ type DB interface {
 	ListBuckets(ctx context.Context, projectID uuid.UUID, listOpts ListOptions, allowedBuckets macaroon.AllowedBuckets) (bucketList List, err error)
 	// CountBuckets returns the number of buckets a project currently has
 	CountBuckets(ctx context.Context, projectID uuid.UUID) (int, error)
+	// CountObjectLockBuckets returns the number of buckets a project currently has with object lock enabled.
+	CountObjectLockBuckets(ctx context.Context, projectID uuid.UUID) (count int, err error)
 	// IterateBucketLocations iterates through all buckets with specific page size.
 	IterateBucketLocations(ctx context.Context, pageSize int, fn func([]metabase.BucketLocation) error) (err error)
 	// GetBucketObjectLockEnabled returns whether a bucket has Object Lock enabled.
 	GetBucketObjectLockEnabled(ctx context.Context, bucketName []byte, projectID uuid.UUID) (enabled bool, err error)
+	// GetBucketTagging returns the set of tags placed on a bucket.
+	GetBucketTagging(ctx context.Context, bucketName []byte, projectID uuid.UUID) (tags []Tag, err error)
+	// SetBucketTagging places a set of tags on a bucket.
+	SetBucketTagging(ctx context.Context, bucketName []byte, projectID uuid.UUID, tags []Tag) (err error)
+	// UpdateBucketNotificationConfig updates the bucket notification configuration for a bucket.
+	UpdateBucketNotificationConfig(ctx context.Context, bucketName []byte, projectID uuid.UUID, config NotificationConfig) error
+	// GetBucketNotificationConfig retrieves the notification configuration for a bucket.
+	// Returns nil if no configuration exists.
+	GetBucketNotificationConfig(ctx context.Context, bucketName []byte, projectID uuid.UUID) (*NotificationConfig, error)
+	// DeleteBucketNotificationConfig removes the notification configuration for a bucket.
+	DeleteBucketNotificationConfig(ctx context.Context, bucketName []byte, projectID uuid.UUID) error
 }

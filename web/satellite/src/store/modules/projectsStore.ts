@@ -2,27 +2,26 @@
 // See LICENSE for copying information.
 
 import { defineStore } from 'pinia';
-import { computed, ComputedRef, reactive, readonly } from 'vue';
+import { type ComputedRef, computed, reactive, readonly  } from 'vue';
 
 import {
-    DataStamp,
+    type DataStamp,
+    type ProjectFields,
+    type ProjectsApi,
+    type ProjectsStorageBandwidthDaily,
+    type ProjectUsageDateRange,
+    type ProjectInvitationResponse,
+    type ProjectDeletionData,
+    type UpdateProjectLimitNotificationsFields,
+    type TierMigrationOption,
     LimitToChange,
     Project,
-    ProjectFields,
     ProjectLimits,
-    ProjectsApi,
-    ProjectsCursor,
-    ProjectsPage,
-    ProjectsStorageBandwidthDaily,
-    ProjectUsageDateRange,
     ProjectInvitation,
-    ProjectInvitationResponse,
     Emission,
     ProjectConfig,
-    ProjectDeletionData,
 } from '@/types/projects';
 import { ProjectsHttpApi } from '@/api/projects';
-import { DEFAULT_PAGE_LIMIT } from '@/types/pagination';
 import { hexToBase64 } from '@/utils/strings';
 import { Duration, Time } from '@/utils/time';
 import { useConfigStore } from '@/store/modules/configStore';
@@ -41,9 +40,7 @@ export class ProjectsState {
     public selectedProjectConfig: ProjectConfig = new ProjectConfig();
     public currentLimits: Readonly<ProjectLimits> = DEFAULT_PROJECT_LIMITS;
     public totalLimits: Readonly<ProjectLimits> = DEFAULT_PROJECT_LIMITS;
-    public cursor: ProjectsCursor = new ProjectsCursor();
-    public page: ProjectsPage = new ProjectsPage();
-    public allocatedBandwidthChartData: DataStamp[] = [];
+    public settledBandwidthChartData: DataStamp[] = [];
     public storageChartData: DataStamp[] = [];
     public chartDataSince: Date = new Date();
     public chartDataBefore: Date = new Date();
@@ -57,18 +54,10 @@ export const useProjectsStore = defineStore('projects', () => {
 
     const api: ProjectsApi = new ProjectsHttpApi();
 
+    const configStore = useConfigStore();
+    const csrfToken = computed<string>(() => configStore.state.config.csrfToken);
+
     const selectedProjectConfig: ComputedRef<ProjectConfig> = computed(() => state.selectedProjectConfig);
-    const versioningUIEnabled: ComputedRef<boolean> = computed(() => selectedProjectConfig.value.versioningUIEnabled);
-
-    /**
-     * This indicates whether a project has object lock enabled for it.
-     * In the background (satellite), it is dependent on whether the object
-     * lock feature is enabled for the satellite (metainfo) and whether
-     * the project has opted in for versioning (versioningUIEnabled).
-     */
-    const objectLockUIEnabledForProject: ComputedRef<boolean> = computed(() => state.selectedProjectConfig.objectLockUIEnabled);
-
-    const promptForVersioningBeta: ComputedRef<boolean> = computed(() => selectedProjectConfig.value.promptForVersioningBeta);
 
     const usersFirstProject = computed<Project>(() => {
         return state.projects.reduce((earliest, current) => {
@@ -76,7 +65,7 @@ export const useProjectsStore = defineStore('projects', () => {
         }, state.projects[0]);
     });
 
-    function getUsageReportLink(startUTC: Date, endUTC: Date, projectID = ''): string {
+    function getUsageReportLink(startUTC: Date, endUTC: Date, includeCost: boolean, projectSummary: boolean, projectID = ''): string {
         const since = Time.toUnixTimestamp(startUTC);
         const before = Time.toUnixTimestamp(endUTC);
 
@@ -86,7 +75,7 @@ export const useProjectsStore = defineStore('projects', () => {
             throw new Error(`Date range must be less than ${allowedDuration.shortString}`);
         }
 
-        return api.getTotalUsageReportLink(since, before, projectID);
+        return api.getTotalUsageReportLink(since, before, includeCost, projectSummary, projectID);
     }
 
     async function getProjects(): Promise<Project[]> {
@@ -98,7 +87,7 @@ export const useProjectsStore = defineStore('projects', () => {
     }
 
     async function deleteProject(projectId: string, step: DeleteProjectStep, data: string): Promise<ProjectDeletionData | null> {
-        const resp = await api.delete(projectId, step, data);
+        const resp = await api.delete(projectId, step, data, csrfToken.value);
         if (!resp && step === DeleteProjectStep.ConfirmDeleteStep) {
             state.projects = state.projects.filter((p) => p.id !== projectId);
         }
@@ -168,24 +157,17 @@ export const useProjectsStore = defineStore('projects', () => {
         state.selectedProject = DEFAULT_PROJECT;
     }
 
-    async function getOwnedProjects(pageNumber: number, limit = DEFAULT_PAGE_LIMIT): Promise<void> {
-        state.cursor.page = pageNumber;
-        state.cursor.limit = limit;
-
-        state.page = await api.getOwnedProjects(state.cursor);
-    }
-
     async function getDailyProjectData(payload: ProjectUsageDateRange): Promise<void> {
         const usage: ProjectsStorageBandwidthDaily = await api.getDailyUsage(state.selectedProject.id, payload.since, payload.before);
 
-        state.allocatedBandwidthChartData = usage.allocatedBandwidth;
+        state.settledBandwidthChartData = usage.settledBandwidth;
         state.storageChartData = usage.storage;
         state.chartDataSince = payload.since;
         state.chartDataBefore = payload.before;
     }
 
     async function createProject(createProjectFields: ProjectFields): Promise<Project> {
-        const createdProject = await api.create(createProjectFields);
+        const createdProject = await api.create(createProjectFields, csrfToken.value);
 
         state.projects.push(createdProject);
         calculateURLIds();
@@ -193,25 +175,8 @@ export const useProjectsStore = defineStore('projects', () => {
         return createdProject;
     }
 
-    async function createDefaultProject(userID: string, managePassphrase = false): Promise<void> {
-        const UNTITLED_PROJECT_NAME = 'My Storj Project';
-        const UNTITLED_PROJECT_DESCRIPTION = '___';
-
-        const project = new ProjectFields(
-            UNTITLED_PROJECT_NAME,
-            UNTITLED_PROJECT_DESCRIPTION,
-            userID,
-            managePassphrase,
-        );
-
-        const createdProject = await createProject(project);
-
-        selectProject(createdProject.id);
-    }
-
     function selectProject(projectID: string): void {
         const selected = state.projects.find((project: Project) => project.id === projectID);
-
         if (!selected) {
             return;
         }
@@ -228,15 +193,11 @@ export const useProjectsStore = defineStore('projects', () => {
         return state.selectedProjectConfig;
     }
 
-    async function setVersioningOptInStatus(status: 'in' | 'out'): Promise<void> {
-        await api.setVersioningOptInStatus(state.selectedProject.id, status);
-    }
-
     async function updateProjectName(fieldsToUpdate: ProjectFields): Promise<void> {
         await api.update(state.selectedProject.id, {
             name: fieldsToUpdate.name,
             description: state.selectedProject.description,
-        });
+        }, csrfToken.value);
 
         state.selectedProject.name = fieldsToUpdate.name;
     }
@@ -245,7 +206,7 @@ export const useProjectsStore = defineStore('projects', () => {
         await api.update(state.selectedProject.id, {
             name: state.selectedProject.name,
             description: fieldsToUpdate.description,
-        });
+        }, csrfToken.value);
 
         state.selectedProject.description = fieldsToUpdate.description;
     }
@@ -253,7 +214,7 @@ export const useProjectsStore = defineStore('projects', () => {
     async function updateProjectStorageLimit(newLimit: number): Promise<void> {
         await api.updateLimits(state.selectedProject.id, {
             storageLimit: newLimit.toString(),
-        });
+        }, csrfToken.value);
 
         state.currentLimits = readonly({
             ...state.currentLimits,
@@ -264,7 +225,7 @@ export const useProjectsStore = defineStore('projects', () => {
     async function updateProjectBandwidthLimit(newLimit: number): Promise<void> {
         await api.updateLimits(state.selectedProject.id, {
             bandwidthLimit: newLimit.toString(),
-        });
+        }, csrfToken.value);
 
         state.currentLimits = readonly({
             ...state.currentLimits,
@@ -272,16 +233,29 @@ export const useProjectsStore = defineStore('projects', () => {
         });
     }
 
+    async function updateLimitNotifications(fields: UpdateProjectLimitNotificationsFields): Promise<void> {
+        await api.updateLimitNotifications(state.selectedProject.id, fields, csrfToken.value);
+
+        if (fields.egressNotificationsEnabled !== undefined)
+            state.selectedProject.egressLimitNotificationsEnabled = fields.egressNotificationsEnabled;
+        if (fields.storageNotificationsEnabled !== undefined)
+            state.selectedProject.storageLimitNotificationsEnabled = fields.storageNotificationsEnabled;
+    }
+
     async function requestLimitIncrease(limitToRequest: LimitToChange, limit: number): Promise<void> {
         let curLimit = state.currentLimits.bandwidthLimit.toString();
         if (limitToRequest === LimitToChange.Storage) {
             curLimit = state.currentLimits.storageLimit.toString();
         }
-        await api.requestLimitIncrease(state.selectedProject.id, {
+        return api.requestLimitIncrease(state.selectedProject.id, {
             limitType: limitToRequest,
             currentLimit: curLimit,
             desiredLimit: limit.toString(),
         });
+    }
+
+    async function migratePricing(projectID: string, targetTier: TierMigrationOption): Promise<void> {
+        return api.migratePricing(projectID, targetTier, csrfToken.value);
     }
 
     async function getProjectLimits(projectID: string): Promise<void> {
@@ -293,7 +267,7 @@ export const useProjectsStore = defineStore('projects', () => {
     }
 
     async function getProjectSalt(projectID: string): Promise<string> {
-        return await api.getSalt(projectID);
+        return state.selectedProjectConfig.salt || await api.getSalt(projectID);
     }
 
     async function getEmissionImpact(projectID: string): Promise<void> {
@@ -309,11 +283,7 @@ export const useProjectsStore = defineStore('projects', () => {
     }
 
     async function respondToInvitation(projectID: string, response: ProjectInvitationResponse): Promise<void> {
-        await api.respondToInvitation(projectID, response);
-    }
-
-    function selectInvitation(invite: ProjectInvitation): void {
-        state.selectedInvitation = invite;
+        await api.respondToInvitation(projectID, response, csrfToken.value);
     }
 
     function clear(): void {
@@ -322,23 +292,11 @@ export const useProjectsStore = defineStore('projects', () => {
         state.currentLimits = DEFAULT_PROJECT_LIMITS;
         state.totalLimits = new ProjectLimits();
         state.storageChartData = [];
-        state.allocatedBandwidthChartData = [];
+        state.settledBandwidthChartData = [];
         state.chartDataSince = new Date();
         state.chartDataBefore = new Date();
         state.invitations = [];
         state.selectedInvitation = DEFAULT_INVITATION;
-    }
-
-    function projectsCount(userID: string): number {
-        let projectsCount = 0;
-
-        state.projects.forEach((project: Project) => {
-            if (project.ownerId === userID) {
-                projectsCount++;
-            }
-        });
-
-        return projectsCount;
     }
 
     const projects = computed(() => {
@@ -354,24 +312,19 @@ export const useProjectsStore = defineStore('projects', () => {
     return {
         state,
         selectedProjectConfig,
-        versioningUIEnabled,
-        objectLockUIEnabledForProject,
-        promptForVersioningBeta,
         usersFirstProject,
         getProjects,
         deleteProject,
-        getOwnedProjects,
         getDailyProjectData,
         createProject,
-        createDefaultProject,
         selectProject,
         deselectProject,
         getProjectConfig,
-        setVersioningOptInStatus,
         updateProjectName,
         updateProjectDescription,
         updateProjectStorageLimit,
         updateProjectBandwidthLimit,
+        updateLimitNotifications,
         requestLimitIncrease,
         getProjectLimits,
         getTotalLimits,
@@ -380,8 +333,7 @@ export const useProjectsStore = defineStore('projects', () => {
         getEmissionImpact,
         getUserInvitations,
         respondToInvitation,
-        selectInvitation,
-        projectsCount,
+        migratePricing,
         clear,
         projects,
         projectsWithoutSelected,

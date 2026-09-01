@@ -2,7 +2,7 @@
 // See LICENSE for copying information.
 
 <template>
-    <v-card variant="outlined" border rounded="xlg">
+    <v-card variant="outlined">
         <v-data-table-server
             :headers="headers"
             :items="page.sessions"
@@ -11,12 +11,13 @@
             :items-per-page-options="tableSizeOptions(page.totalCount)"
             :item-value="(item: Session) => item"
             no-data-text="No results found"
-            @update:itemsPerPage="onUpdateLimit"
+            class="elevation-0 border-0"
+            @update:items-per-page="onUpdateLimit"
             @update:page="onUpdatePage"
-            @update:sortBy="onUpdateSortBy"
+            @update:sort-by="onUpdateSortBy"
         >
             <template #item.isCurrent="{ item }">
-                <v-chip :color="item.isCurrent ? 'success' : 'primary'" label>
+                <v-chip :color="item.isCurrent ? 'success' : 'primary'" class="font-weight-bold" size="small" label>
                     {{ item.isCurrent ? 'Yes' : 'No' }}
                 </v-chip>
             </template>
@@ -31,8 +32,9 @@
                         variant="outlined"
                         color="default"
                         size="small"
-                        class="mr-1 text-caption"
+                        class="mr-1 text-body-small"
                         :loading="isLoading"
+                        :prepend-icon="LogOut"
                         @click="() => onInvalidate(item)"
                     >
                         {{ item.isCurrent ? 'Logout' : 'Invalidate' }}
@@ -46,12 +48,13 @@
 <script setup lang="ts">
 import { VBtn, VCard, VDataTableServer, VChip } from 'vuetify/components';
 import { computed, onMounted, ref } from 'vue';
+import { LogOut  } from '@lucide/vue';
 
-import { Session, SessionsCursor, SessionsOrderBy, SessionsPage } from '@/types/users';
-import { useNotify } from '@/utils/hooks';
+import { type Session, type SessionsCursor, type SessionsPage, SessionsOrderBy  } from '@/types/users';
+import { useNotify } from '@/composables/useNotify';
 import { DEFAULT_PAGE_LIMIT } from '@/types/pagination';
 import { AnalyticsErrorEventSource } from '@/utils/constants/analyticsEventNames';
-import { DataTableHeader, SortDirection, tableSizeOptions } from '@/types/common';
+import { type DataTableHeader, SortDirection, tableSizeOptions  } from '@/types/common';
 import { useLoading } from '@/composables/useLoading';
 import { Time } from '@/utils/time';
 import { useUsersStore } from '@/store/modules/usersStore';
@@ -86,7 +89,7 @@ async function fetch(page = FIRST_PAGE, limit = DEFAULT_PAGE_LIMIT): Promise<voi
     try {
         await usersStore.getSessions(page, limit);
     } catch (error) {
-        notify.error(`Unable to fetch Active Sessions. ${error.message}`, AnalyticsErrorEventSource.ACCOUNT_SETTINGS_AREA);
+        notify.notifyError(error, AnalyticsErrorEventSource.ACCOUNT_SETTINGS_AREA);
     }
 
     isFetching.value = false;
@@ -100,7 +103,7 @@ function onUpdatePage(page: number): void {
     fetch(page, cursor.value.limit);
 }
 
-function onUpdateSortBy(sortBy: {key: keyof SessionsOrderBy, order: keyof SortDirection}[]): void {
+function onUpdateSortBy(sortBy: { key: keyof SessionsOrderBy, order: keyof SortDirection }[]): void {
     if (!sortBy.length) return;
 
     const sorting = sortBy[0];
@@ -121,7 +124,7 @@ async function onInvalidate(session: Session): Promise<void> {
                 await fetch(cursor.value.page, cursor.value.limit);
             }
         } catch (error) {
-            notify.error(`Unable to invalidate session. ${error.message}`, AnalyticsErrorEventSource.ACCOUNT_SETTINGS_AREA);
+            notify.notifyError(error, AnalyticsErrorEventSource.ACCOUNT_SETTINGS_AREA);
         }
     });
 }

@@ -1,17 +1,14 @@
 // Copyright (C) 2019 Storj Labs, Inc.
 // See LICENSE for copying information.
 
-import Vue from 'vue';
-import Router from 'vue-router';
+import { createRouter, createWebHistory } from 'vue-router';
 
 import { NavigationLink } from '@/app/types/navigation';
+
 import DashboardArea from '@/app/views/DashboardArea.vue';
 import NotificationsArea from '@/app/views/NotificationsArea.vue';
 import PayoutArea from '@/app/views/PayoutArea.vue';
-
 import Page404 from '@/app/components/errors/Page404.vue';
-
-Vue.use(Router);
 
 export abstract class RouteConfig {
     public static Root = new NavigationLink('', 'Root');
@@ -22,8 +19,8 @@ export abstract class RouteConfig {
 /**
  * Router describes location mapping with components.
  */
-export const router = new Router({
-    mode: 'history',
+export const router = createRouter({
+    history: createWebHistory(import.meta.env.PROD ? '' : '/'),
     routes: [
         {
             path: RouteConfig.Root.path,
@@ -41,7 +38,7 @@ export const router = new Router({
             component: PayoutArea,
         },
         {
-            path: '*',
+            path: '/:pathMatch(.*)*',
             name: '404',
             component: Page404,
         },

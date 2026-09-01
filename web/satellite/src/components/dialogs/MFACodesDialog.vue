@@ -17,7 +17,7 @@
                 <v-card-title class="font-weight-bold">Two-Factor Recovery Codes</v-card-title>
                 <template #append>
                     <v-btn
-                        icon="$close"
+                        :icon="X"
                         variant="text"
                         size="small"
                         color="default"
@@ -44,7 +44,7 @@
                         type="number"
                         autofocus
                         maxlength="6"
-                        @update:modelValue="value => onValueChange(value)"
+                        @update:model-value="value => onValueChange(value)"
                     />
                     <v-form v-else v-model="formValid" class="pt-2" @submit.prevent="regenerate">
                         <v-text-field
@@ -138,10 +138,11 @@ import {
     VOtpInput,
     VTextField,
 } from 'vuetify/components';
+import { X } from '@lucide/vue';
 
 import { useUsersStore } from '@/store/modules/usersStore';
 import { useLoading } from '@/composables/useLoading';
-import { useNotify } from '@/utils/hooks';
+import { useNotify } from '@/composables/useNotify';
 import { AnalyticsErrorEventSource } from '@/utils/constants/analyticsEventNames';
 
 const usersStore = useUsersStore();

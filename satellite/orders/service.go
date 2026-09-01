@@ -19,6 +19,8 @@ import (
 	"storj.io/common/pb"
 	"storj.io/common/signing"
 	"storj.io/common/storj"
+	"storj.io/common/uuid"
+	"storj.io/eventkit"
 	"storj.io/storj/satellite/internalpb"
 	"storj.io/storj/satellite/metabase"
 	"storj.io/storj/satellite/nodeselection"
@@ -34,23 +36,29 @@ var (
 
 // Config is a configuration struct for orders Service.
 type Config struct {
-	EncryptionKeys      EncryptionKeys `help:"encryption keys to encrypt info in orders" default:""`
-	Expiration          time.Duration  `help:"how long until an order expires" default:"24h" testDefault:"168h"` // default is 1 day
-	FlushBatchSize      int            `help:"how many items in the rollups write cache before they are flushed to the database" devDefault:"20" releaseDefault:"1000" testDefault:"10"`
-	FlushInterval       time.Duration  `help:"how often to flush the rollups write cache to the database" devDefault:"30s" releaseDefault:"1m" testDefault:"$TESTINTERVAL"`
-	NodeStatusLogging   bool           `hidden:"true" help:"deprecated, log the offline/disqualification status of nodes" default:"false" testDefault:"true"`
-	OrdersSemaphoreSize int            `help:"how many concurrent orders to process at once. zero is unlimited" default:"2"`
+	EncryptionKeys    EncryptionKeys `help:"encryption keys to encrypt info in orders" default:""`
+	Expiration        time.Duration  `help:"how long until an order expires" default:"24h" testDefault:"168h"` // default is 1 day
+	FlushBatchSize    int            `help:"how many items in the rollups write cache before they are flushed to the database" devDefault:"20" releaseDefault:"1000" testDefault:"10"`
+	FlushInterval     time.Duration  `help:"how often to flush the rollups write cache to the database" devDefault:"30s" releaseDefault:"1m" testDefault:"$TESTINTERVAL"`
+	NodeStatusLogging bool           `hidden:"true" help:"deprecated, log the offline/disqualification status of nodes" default:"false" testDefault:"true"`
 
 	DownloadTailToleranceOverrides string `help:"how many nodes should be used for downloads for certain k. must be >= k. if not specified, this is calculated from long tail tolerance. format is comma separated like k-d,k-d,k-d e.g. 29-35,3-5." default:""`
+
+	AcceptOrders  bool `help:"determine if orders from storage nodes should be accepted" default:"true"`
+	TrustedOrders bool `help:"stops validating orders received from trusted nodes" default:"false"`
+
+	MaxCommitDelay               time.Duration `help:"maximum commit delay (currently only used for updating bandwidth rollups). Disable it with 0 or negative" default:"100ms"`
+	EventkitTrackingEnabled      bool          `help:"whether to emit eventkit events for order settlement" default:"false"`
+	PublicProjectIDCacheCapacity int           `help:"capacity of the public project ID LRU cache used for eventkit tracking" default:"100000"`
 }
 
 // Overlay defines the overlay dependency of orders.Service.
-// use `go install github.com/golang/mock/mockgen@v1.6.0` if missing
+// use `go install go.uber.org/mock/mockgen@v0.5.2 if missing
 //
-//go:generate mockgen -destination mock_test.go -package orders . OverlayForOrders
+//go:generate mockgen -destination mock_test.go -package orders -mock_names Overlay=MockOverlayForOrders . Overlay
 type Overlay interface {
 	CachedGetOnlineNodesForGet(context.Context, []storj.NodeID) (map[storj.NodeID]*nodeselection.SelectedNode, error)
-	GetOnlineNodesForAuditRepair(context.Context, []storj.NodeID) (map[storj.NodeID]*overlay.NodeReputation, error)
+	GetOnlineNodesForAudit(context.Context, []storj.NodeID) (map[storj.NodeID]*overlay.NodeReputation, error)
 	Get(ctx context.Context, nodeID storj.NodeID) (*overlay.NodeDossier, error)
 	IsOnline(node *overlay.NodeDossier) bool
 }
@@ -70,6 +78,8 @@ type Service struct {
 	orderExpiration time.Duration
 
 	downloadOverrides map[int16]int32
+
+	eventkitTrackingEnabled bool
 
 	rngMu sync.Mutex
 	rng   *mathrand.Rand
@@ -102,6 +112,8 @@ func NewService(
 
 		downloadOverrides: downloadOverrides,
 
+		eventkitTrackingEnabled: config.EventkitTrackingEnabled,
+
 		rng: mathrand.New(mathrand.NewSource(time.Now().UnixNano())),
 	}, nil
 }
@@ -133,7 +145,6 @@ func (service *Service) updateBandwidth(ctx context.Context, bucket metabase.Buc
 	now := time.Now().UTC()
 	intervalStart := time.Date(now.Year(), now.Month(), now.Day(), now.Hour(), 0, 0, 0, now.Location())
 
-	// TODO: all of this below should be a single db transaction. in fact, this whole function should probably be part of an existing transaction
 	if err := service.orders.UpdateBucketBandwidthAllocation(ctx, bucket.ProjectID, []byte(bucket.BucketName), action, bucketAllocation, intervalStart); err != nil {
 		return Error.Wrap(err)
 	}
@@ -169,6 +180,15 @@ func (service *Service) DownloadNodes(scheme storj.RedundancyScheme) int32 {
 
 // CreateGetOrderLimits creates the order limits for downloading the pieces of a segment.
 func (service *Service) CreateGetOrderLimits(ctx context.Context, peer *identity.PeerIdentity, bucket metabase.BucketLocation, segment metabase.Segment, desiredNodes int32, overrideLimit int64) (_ []*pb.AddressedOrderLimit, privateKey storj.PiecePrivateKey, err error) {
+	return service.createGetOrderLimits(ctx, peer, bucket, segment, desiredNodes, overrideLimit, false)
+}
+
+// CreateLiteGetOrderLimits creates the order limits for downloading the pieces of a segment. Orders are unsigned.
+func (service *Service) CreateLiteGetOrderLimits(ctx context.Context, peer *identity.PeerIdentity, bucket metabase.BucketLocation, segment metabase.Segment, desiredNodes int32, overrideLimit int64) (_ []*pb.AddressedOrderLimit, privateKey storj.PiecePrivateKey, err error) {
+	return service.createGetOrderLimits(ctx, peer, bucket, segment, desiredNodes, overrideLimit, true)
+}
+
+func (service *Service) createGetOrderLimits(ctx context.Context, peer *identity.PeerIdentity, bucket metabase.BucketLocation, segment metabase.Segment, desiredNodes int32, overrideLimit int64, lite bool) (_ []*pb.AddressedOrderLimit, privateKey storj.PiecePrivateKey, err error) {
 	defer mon.Task()(&ctx)(&err)
 
 	orderLimit := segment.PieceSize()
@@ -199,7 +219,7 @@ func (service *Service) CreateGetOrderLimits(ctx context.Context, peer *identity
 		neededLimits = desiredNodes
 	}
 
-	selectedNodes, err := selector(peer.ID, nodes, int(neededLimits))
+	selectedNodes, err := selector(ctx, peer.ID, nodes, int(neededLimits))
 	if err != nil {
 		return nil, storj.PiecePrivateKey{}, Error.Wrap(err)
 	}
@@ -217,7 +237,11 @@ func (service *Service) CreateGetOrderLimits(ctx context.Context, peer *identity
 			continue
 		}
 
-		_, err := signer.Sign(ctx, resolveStorageNode_Selected(node, true), int32(piece.Number))
+		if lite {
+			_, err = signer.SignLite(ctx, resolveStorageNode_Selected(node, true), int32(piece.Number))
+		} else {
+			_, err = signer.Sign(ctx, resolveStorageNode_Selected(node, true), int32(piece.Number))
+		}
 		if err != nil {
 			return nil, storj.PiecePrivateKey{}, Error.Wrap(err)
 		}
@@ -227,7 +251,7 @@ func (service *Service) CreateGetOrderLimits(ctx context.Context, peer *identity
 		}
 	}
 	if len(signer.AddressedLimits) < int(segment.Redundancy.RequiredShares) {
-		mon.Meter("download_failed_not_enough_pieces_uplink").Mark(1) //mon:locked
+		mon.Meter("download_failed_not_enough_pieces_uplink").Mark(1)
 		return nil, storj.PiecePrivateKey{}, ErrDownloadFailedNotEnoughPieces.New("not enough orderlimits: got %d, required %d", len(signer.AddressedLimits), segment.Redundancy.RequiredShares)
 	}
 
@@ -279,6 +303,26 @@ func getLimitByStorageNodeID(limits []*pb.AddressedOrderLimit, storageNodeID sto
 		}
 	}
 	return nil
+}
+
+// CreateLitePutOrderLimits creates AddressedOrderLimits with the minimal amount of information
+// necessary to reconstruct a full order limit if you had a signing key.
+func (service *Service) CreateLitePutOrderLimits(ctx context.Context, bucket metabase.BucketLocation, nodes []*nodeselection.SelectedNode, pieceExpiration time.Time, maxPieceSize int64) (_ storj.PieceID, _ []*pb.AddressedOrderLimit, privateKey storj.PiecePrivateKey, err error) {
+	defer mon.Task()(&ctx)(&err)
+
+	signer, err := NewSignerPut(service, pieceExpiration, time.Now(), maxPieceSize, bucket)
+	if err != nil {
+		return storj.PieceID{}, nil, storj.PiecePrivateKey{}, Error.Wrap(err)
+	}
+
+	for pieceNum, node := range nodes {
+		_, err := signer.SignLite(ctx, resolveStorageNode_Selected(node, true), int32(pieceNum))
+		if err != nil {
+			return storj.PieceID{}, nil, storj.PiecePrivateKey{}, Error.Wrap(err)
+		}
+	}
+
+	return signer.RootPieceID, signer.AddressedLimits, signer.PrivateKey, nil
 }
 
 // CreatePutOrderLimits creates the order limits for uploading pieces to nodes.
@@ -340,7 +384,9 @@ func (service *Service) ReplacePutOrderLimits(ctx context.Context, rootPieceID s
 }
 
 // CreateAuditOrderLimits creates the order limits for auditing the pieces of a segment.
-func (service *Service) CreateAuditOrderLimits(ctx context.Context, segment metabase.Segment, skip map[storj.NodeID]bool) (_ []*pb.AddressedOrderLimit, _ storj.PiecePrivateKey, cachedNodesInfo map[storj.NodeID]overlay.NodeReputation, err error) {
+func (service *Service) CreateAuditOrderLimits(
+	ctx context.Context, segment metabase.SegmentForAudit, skip map[storj.NodeID]bool,
+) (_ []*pb.AddressedOrderLimit, _ storj.PiecePrivateKey, cachedNodesInfo map[storj.NodeID]overlay.NodeReputation, err error) {
 	defer mon.Task()(&ctx)(&err)
 
 	nodeIDs := make([]storj.NodeID, len(segment.Pieces))
@@ -348,7 +394,7 @@ func (service *Service) CreateAuditOrderLimits(ctx context.Context, segment meta
 		nodeIDs[i] = piece.StorageNode
 	}
 
-	nodes, err := service.overlay.GetOnlineNodesForAuditRepair(ctx, nodeIDs)
+	nodes, err := service.overlay.GetOnlineNodesForAudit(ctx, nodeIDs)
 	if err != nil {
 		service.log.Debug("error getting nodes from overlay", zap.Error(err))
 		return nil, storj.PiecePrivateKey{}, nil, Error.Wrap(err)
@@ -421,6 +467,32 @@ func (service *Service) CreateAuditPieceOrderLimit(ctx context.Context, nodeID s
 	return service.createAuditOrderLimitWithSigner(ctx, nodeID, pieceNum, signer)
 }
 
+// CreateAuditPieceOrderLimitForNode creates an order limit for auditing a single
+// piece from a segment using a known node URL, without querying the database
+// for node information.
+func (service *Service) CreateAuditPieceOrderLimitForNode(ctx context.Context, nodeURL storj.NodeURL, pieceNum uint16, rootPieceID storj.PieceID, pieceSize int32) (limit *pb.AddressedOrderLimit, _ storj.PiecePrivateKey, err error) {
+	defer mon.Task()(&ctx)(&err)
+
+	signer, err := NewSignerAudit(service, rootPieceID, time.Now(), int64(pieceSize), metabase.BucketLocation{})
+	if err != nil {
+		return nil, storj.PiecePrivateKey{}, Error.Wrap(err)
+	}
+
+	node := &pb.Node{
+		Id: nodeURL.ID,
+		Address: &pb.NodeAddress{
+			Address: nodeURL.Address,
+		},
+	}
+
+	orderLimit, err := signer.Sign(ctx, node, int32(pieceNum))
+	if err != nil {
+		return nil, storj.PiecePrivateKey{}, Error.Wrap(err)
+	}
+
+	return orderLimit, signer.PrivateKey, nil
+}
+
 func (service *Service) createAuditOrderLimitWithSigner(ctx context.Context, nodeID storj.NodeID, pieceNum uint16, signer *Signer) (limit *pb.AddressedOrderLimit, _ storj.PiecePrivateKey, nodeInfo *overlay.NodeReputation, err error) {
 	defer mon.Task()(&ctx)(&err)
 
@@ -460,7 +532,14 @@ func (service *Service) createAuditOrderLimitWithSigner(ctx context.Context, nod
 //
 // The length of the returned orders slice is the total number of pieces of the
 // segment, setting to null the ones which don't correspond to a healthy piece.
-func (service *Service) CreateGetRepairOrderLimits(ctx context.Context, segment metabase.Segment, healthy metabase.Pieces) (_ []*pb.AddressedOrderLimit, _ storj.PiecePrivateKey, cachedNodesInfo map[storj.NodeID]overlay.NodeReputation, err error) {
+//
+// getNodes is a function to get the node information of the passed node IDs. The returned map may
+// not contain all the nodes because not all of them may fulfill the requirements to upload
+// repaired pieces. If getNodes is nil, then it panics.
+func (service *Service) CreateGetRepairOrderLimits(
+	ctx context.Context, segment metabase.SegmentForRepair, healthy metabase.Pieces,
+	getNodes func(context.Context, []storj.NodeID) (map[storj.NodeID]*overlay.NodeReputation, error),
+) (_ []*pb.AddressedOrderLimit, _ storj.PiecePrivateKey, cachedNodesInfo map[storj.NodeID]overlay.NodeReputation, err error) {
 	defer mon.Task()(&ctx)(&err)
 
 	pieceSize := segment.PieceSize()
@@ -471,7 +550,7 @@ func (service *Service) CreateGetRepairOrderLimits(ctx context.Context, segment 
 		nodeIDs[i] = piece.StorageNode
 	}
 
-	nodes, err := service.overlay.GetOnlineNodesForAuditRepair(ctx, nodeIDs)
+	nodes, err := getNodes(ctx, nodeIDs)
 	if err != nil {
 		service.log.Debug("error getting nodes from overlay", zap.Error(err))
 		return nil, storj.PiecePrivateKey{}, nil, Error.Wrap(err)
@@ -513,12 +592,18 @@ func (service *Service) CreateGetRepairOrderLimits(ctx context.Context, segment 
 }
 
 // CreatePutRepairOrderLimits creates the order limits for uploading the repaired pieces of segment to newNodes.
-func (service *Service) CreatePutRepairOrderLimits(ctx context.Context, segment metabase.Segment, getOrderLimits []*pb.AddressedOrderLimit, healthySet map[uint16]struct{}, newNodes []*nodeselection.SelectedNode) (_ []*pb.AddressedOrderLimit, _ storj.PiecePrivateKey, err error) {
+func (service *Service) CreatePutRepairOrderLimits(
+	ctx context.Context, segment metabase.SegmentForRepair, newRedundancy storj.RedundancyScheme, getOrderLimits []*pb.AddressedOrderLimit, healthySet map[uint16]struct{}, newNodes []*nodeselection.SelectedNode,
+) (_ []*pb.AddressedOrderLimit, _ storj.PiecePrivateKey, err error) {
 	defer mon.Task()(&ctx)(&err)
 
 	// Create the order limits for being used to upload the repaired pieces
 	pieceSize := segment.PieceSize()
-	totalPieces := int(segment.Redundancy.TotalShares)
+	totalPieces := int(newRedundancy.TotalShares)
+
+	if segment.Redundancy.RequiredShares != newRedundancy.RequiredShares {
+		return nil, storj.PiecePrivateKey{}, Error.New("cannot change required share count during this style of repair")
+	}
 
 	var numRetrievablePieces int
 	for _, o := range getOrderLimits {
@@ -594,10 +679,23 @@ func (service *Service) CreateGracefulExitPutOrderLimit(ctx context.Context, buc
 }
 
 // UpdateGetInlineOrder updates amount of inline GET bandwidth for given bucket.
-func (service *Service) UpdateGetInlineOrder(ctx context.Context, bucket metabase.BucketLocation, amount int64) (err error) {
+func (service *Service) UpdateGetInlineOrder(ctx context.Context, bucket metabase.BucketLocation, publicProjectID uuid.UUID, amount int64) (err error) {
 	defer mon.Task()(&ctx)(&err)
 	now := time.Now().UTC()
 	intervalStart := time.Date(now.Year(), now.Month(), now.Day(), now.Hour(), 0, 0, 0, now.Location())
+
+	if service.eventkitTrackingEnabled {
+		ek.Event("inline_bandwidth_update",
+			eventkit.Bytes("public_project_id", publicProjectID.Bytes()),
+			eventkit.String("bucket_name", string(bucket.BucketName)),
+			eventkit.String("tenant_id", ""), // Reserved for future use
+			eventkit.Int64("bytes", amount),
+			eventkit.Timestamp("interval_start", intervalStart),
+			eventkit.Timestamp("interval_end", intervalStart.Add(time.Hour)),
+			eventkit.Timestamp("timestamp", now),
+			eventkit.String("event_type", "instantaneous"),
+		)
+	}
 
 	return service.orders.UpdateBucketBandwidthInline(ctx, bucket.ProjectID, []byte(bucket.BucketName), pb.PieceAction_GET, amount, intervalStart)
 }

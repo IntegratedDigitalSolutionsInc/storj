@@ -6,16 +6,21 @@ package metainfo_test
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"strconv"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/zeebo/errs"
+	"go.uber.org/zap"
 
 	"storj.io/common/errs2"
+	"storj.io/common/macaroon"
 	"storj.io/common/memory"
 	"storj.io/common/pb"
+	"storj.io/common/rpc/rpcpeer"
 	"storj.io/common/rpc/rpcstatus"
 	"storj.io/common/rpc/rpctest"
 	"storj.io/common/signing"
@@ -23,9 +28,12 @@ import (
 	"storj.io/common/testcontext"
 	"storj.io/common/testrand"
 	"storj.io/storj/private/testplanet"
+	"storj.io/storj/satellite"
 	"storj.io/storj/satellite/accounting"
-	"storj.io/storj/satellite/buckets"
+	"storj.io/storj/satellite/internalpb"
 	"storj.io/storj/satellite/metabase"
+	"storj.io/storj/satellite/metabase/metabasetest"
+	"storj.io/storj/satellite/metainfo"
 	"storj.io/uplink/private/metaclient"
 	"storj.io/uplink/private/piecestore"
 )
@@ -34,7 +42,8 @@ func TestExpirationTimeSegment(t *testing.T) {
 	testplanet.Run(t, testplanet.Config{
 		SatelliteCount: 1, StorageNodeCount: 0, UplinkCount: 1,
 	}, func(t *testing.T, ctx *testcontext.Context, planet *testplanet.Planet) {
-		bucket := createTestBucket(ctx, t, planet)
+		bucketName := testrand.BucketName()
+		require.NoError(t, planet.Uplinks[0].TestingCreateBucket(ctx, planet.Satellites[0], bucketName))
 		metainfoClient := createMetainfoClient(ctx, t, planet)
 
 		for i, r := range []struct {
@@ -59,7 +68,7 @@ func TestExpirationTimeSegment(t *testing.T) {
 			},
 		} {
 			_, err := metainfoClient.BeginObject(ctx, metaclient.BeginObjectParams{
-				Bucket:             []byte(bucket.Name),
+				Bucket:             []byte(bucketName),
 				EncryptedObjectKey: []byte("path" + strconv.Itoa(i)),
 				ExpiresAt:          r.expirationDate,
 				EncryptionParameters: storj.EncryptionParameters{
@@ -91,11 +100,12 @@ func TestInlineSegment(t *testing.T) {
 		// * download segments
 		// * delete segments and object
 
-		bucket := createTestBucket(ctx, t, planet)
+		bucketName := testrand.BucketName()
+		require.NoError(t, planet.Uplinks[0].TestingCreateBucket(ctx, planet.Satellites[0], bucketName))
 		metainfoClient := createMetainfoClient(ctx, t, planet)
 
 		params := metaclient.BeginObjectParams{
-			Bucket:             []byte(bucket.Name),
+			Bucket:             []byte(bucketName),
 			EncryptedObjectKey: []byte("encrypted-path"),
 			Redundancy: storj.RedundancyScheme{
 				Algorithm:      storj.ReedSolomon,
@@ -138,15 +148,17 @@ func TestInlineSegment(t *testing.T) {
 		})
 		require.NoError(t, err)
 		err = metainfoClient.CommitObject(ctx, metaclient.CommitObjectParams{
-			StreamID:                      beginObjectResp.StreamID,
-			EncryptedMetadata:             metadata,
-			EncryptedMetadataNonce:        testrand.Nonce(),
-			EncryptedMetadataEncryptedKey: randomEncryptedKey,
+			StreamID: beginObjectResp.StreamID,
+			EncryptedUserData: metaclient.EncryptedUserData{
+				EncryptedMetadata:             metadata,
+				EncryptedMetadataNonce:        testrand.Nonce(),
+				EncryptedMetadataEncryptedKey: randomEncryptedKey,
+			},
 		})
 		require.NoError(t, err)
 
 		objects, _, err := metainfoClient.ListObjects(ctx, metaclient.ListObjectsParams{
-			Bucket:                []byte(bucket.Name),
+			Bucket:                []byte(bucketName),
 			IncludeSystemMetadata: true,
 		})
 		require.NoError(t, err)
@@ -164,7 +176,7 @@ func TestInlineSegment(t *testing.T) {
 
 		{ // Confirm data larger than our configured max inline segment size of 4 KiB cannot be inlined
 			beginObjectResp, err := metainfoClient.BeginObject(ctx, metaclient.BeginObjectParams{
-				Bucket:             []byte(bucket.Name),
+				Bucket:             []byte(bucketName),
 				EncryptedObjectKey: []byte("too-large-inline-segment"),
 				EncryptionParameters: storj.EncryptionParameters{
 					CipherSuite: storj.EncAESGCM,
@@ -389,6 +401,207 @@ func TestObjectSegmentExpiresAt(t *testing.T) {
 	})
 }
 
+func TestCommitSegment(t *testing.T) {
+	testplanet.Run(t, testplanet.Config{
+		SatelliteCount: 1, StorageNodeCount: 1, UplinkCount: 1,
+		Reconfigure: testplanet.Reconfigure{
+			Satellite: testplanet.Combine(
+				testplanet.ReconfigureRS(1, 1, 1, 1),
+				func(log *zap.Logger, index int, config *satellite.Config) {
+					config.Metainfo.ChecksumsEnabled = true
+				},
+			),
+		},
+	}, func(t *testing.T, ctx *testcontext.Context, planet *testplanet.Planet) {
+		sat := planet.Satellites[0]
+		storageNode := planet.StorageNodes[0]
+		up := planet.Uplinks[0]
+		endpoint := sat.Metainfo.Endpoint
+		db := sat.Metabase.DB
+		apiKey := up.APIKey[sat.ID()]
+
+		peerCtx := rpcpeer.NewContext(ctx, &rpcpeer.Peer{
+			State: tls.ConnectionState{
+				PeerCertificates: up.Identity.Chain(),
+			}})
+
+		getPendingObjects := func(ctx context.Context, bucketName, objectKey string) ([]metabase.ObjectEntry, error) {
+			var collector metabasetest.IterateCollector
+			err := sat.Metabase.DB.IteratePendingObjectsByKey(ctx, metabase.IteratePendingObjectsByKey{
+				ObjectLocation: metabase.ObjectLocation{
+					ProjectID:  up.Projects[0].ID,
+					BucketName: metabase.BucketName(bucketName),
+					ObjectKey:  metabase.ObjectKey(objectKey),
+				},
+			}, collector.Add)
+			if err != nil {
+				return nil, err
+			}
+			return []metabase.ObjectEntry(collector), nil
+		}
+
+		beginObjectAndSegment := func(ctx context.Context, bucketName, objectKey string, segmentPos metabase.SegmentPosition) (*pb.SegmentBeginResponse, error) {
+			beginObjectResp, err := endpoint.BeginObject(ctx, &pb.BeginObjectRequest{
+				Header:             &pb.RequestHeader{ApiKey: apiKey.SerializeRaw()},
+				Bucket:             []byte(bucketName),
+				EncryptedObjectKey: []byte(objectKey),
+				EncryptionParameters: &pb.EncryptionParameters{
+					CipherSuite: pb.CipherSuite_ENC_AESGCM,
+					BlockSize:   256,
+				},
+			})
+			if err != nil {
+				return nil, err
+			}
+
+			beginSegmentResp, err := endpoint.BeginSegment(peerCtx, &pb.BeginSegmentRequest{
+				Header:   &pb.RequestHeader{ApiKey: apiKey.SerializeRaw()},
+				StreamId: beginObjectResp.StreamId,
+				Position: &pb.SegmentPosition{
+					PartNumber: int32(segmentPos.Part),
+					Index:      int32(segmentPos.Index),
+				},
+				MaxOrderLimit: memory.KiB.Int64(),
+			})
+			if err != nil {
+				return nil, err
+			}
+
+			return beginSegmentResp, nil
+		}
+
+		t.Run("Basic", func(t *testing.T) {
+			bucketName := testrand.BucketName()
+			require.NoError(t, up.TestingCreateBucket(ctx, sat, bucketName))
+
+			objectKey := testrand.Path()
+
+			segmentPos := metabase.SegmentPosition{
+				Part:  1,
+				Index: 2,
+			}
+
+			beginResp, err := beginObjectAndSegment(peerCtx, bucketName, objectKey, segmentPos)
+			require.NoError(t, err)
+
+			limit := beginResp.AddressedLimits[0].Limit
+			signer := signing.SignerFromFullIdentity(storageNode.Identity)
+			pieceHash, err := signing.SignPieceHash(ctx, signer, &pb.PieceHash{
+				PieceId:   limit.PieceId,
+				PieceSize: 256,
+				Timestamp: time.Now(),
+			})
+			require.NoError(t, err)
+
+			key := testrand.Bytes(48)
+			nonce := testrand.Nonce()
+			eTag := testrand.Bytes(16)
+			checksum := testrand.Bytes(32)
+			encryptedSize := int64(128)
+			plainSize := int64(64)
+
+			_, err = endpoint.CommitSegment(peerCtx, &pb.CommitSegmentRequest{
+				Header:    &pb.RequestHeader{ApiKey: apiKey.SerializeRaw()},
+				SegmentId: beginResp.SegmentId,
+				UploadResult: []*pb.SegmentPieceUploadResult{{
+					PieceNum: 0,
+					NodeId:   limit.StorageNodeId,
+					Hash:     pieceHash,
+				}},
+				EncryptedKey:      key,
+				EncryptedKeyNonce: nonce,
+				EncryptedETag:     eTag,
+				EncryptedChecksum: checksum,
+				SizeEncryptedData: encryptedSize,
+				PlainSize:         plainSize,
+			})
+			require.NoError(t, err)
+
+			objects, err := getPendingObjects(ctx, bucketName, objectKey)
+			require.NoError(t, err)
+
+			segment, err := db.GetSegmentByPosition(ctx, metabase.GetSegmentByPosition{
+				StreamID: objects[0].StreamID,
+				Position: segmentPos,
+			})
+			require.NoError(t, err)
+
+			require.Equal(t, metabase.Segment{
+				StreamID:          objects[0].StreamID,
+				Position:          segmentPos,
+				CreatedAt:         segment.CreatedAt,
+				EncryptedKey:      key,
+				EncryptedKeyNonce: nonce.Bytes(),
+				EncryptedSize:     int32(encryptedSize),
+				PlainSize:         int32(plainSize),
+				RootPieceID:       segment.RootPieceID, // This value is random
+				EncryptedETag:     eTag,
+				EncryptedChecksum: checksum,
+				Redundancy: storj.RedundancyScheme{
+					Algorithm:      storj.ReedSolomon,
+					ShareSize:      256,
+					RequiredShares: 1,
+					RepairShares:   1,
+					OptimalShares:  1,
+					TotalShares:    1,
+				},
+				Pieces: metabase.Pieces{{
+					Number:      0,
+					StorageNode: storageNode.ID(),
+				}},
+			}, segment)
+		})
+
+		t.Run("Checksums disabled", func(t *testing.T) {
+			endpoint.TestingSetChecksumsEnabled(false)
+			defer endpoint.TestingSetChecksumsEnabled(true)
+
+			bucketName := testrand.BucketName()
+			require.NoError(t, up.TestingCreateBucket(ctx, sat, bucketName))
+
+			objectKey := testrand.Path()
+			segmentPos := metabase.SegmentPosition{}
+
+			beginResp, err := beginObjectAndSegment(peerCtx, bucketName, objectKey, segmentPos)
+			require.NoError(t, err)
+
+			limit := beginResp.AddressedLimits[0].Limit
+			signer := signing.SignerFromFullIdentity(storageNode.Identity)
+			pieceHash, err := signing.SignPieceHash(ctx, signer, &pb.PieceHash{
+				PieceId:   limit.PieceId,
+				PieceSize: 256,
+				Timestamp: time.Now(),
+			})
+			require.NoError(t, err)
+
+			_, err = endpoint.CommitSegment(peerCtx, &pb.CommitSegmentRequest{
+				Header:    &pb.RequestHeader{ApiKey: apiKey.SerializeRaw()},
+				SegmentId: beginResp.SegmentId,
+				UploadResult: []*pb.SegmentPieceUploadResult{{
+					PieceNum: 0,
+					NodeId:   limit.StorageNodeId,
+					Hash:     pieceHash,
+				}},
+				EncryptedKey:      testrand.Bytes(48),
+				EncryptedKeyNonce: testrand.Nonce(),
+				EncryptedChecksum: testrand.Bytes(32),
+				SizeEncryptedData: 128,
+				PlainSize:         64,
+			})
+			rpctest.RequireStatus(t, err, rpcstatus.ChecksumsUnsupported, "Checksum options may not be provided at this time")
+
+			objects, err := getPendingObjects(ctx, bucketName, objectKey)
+			require.NoError(t, err)
+
+			_, err = db.GetSegmentByPosition(ctx, metabase.GetSegmentByPosition{
+				StreamID: objects[0].StreamID,
+				Position: segmentPos,
+			})
+			require.ErrorIs(t, err, metabase.ErrSegmentNotFound.Instance())
+		})
+	})
+}
+
 func TestCommitSegment_Validation(t *testing.T) {
 	testplanet.Run(t, testplanet.Config{
 		SatelliteCount: 1, StorageNodeCount: 1, UplinkCount: 1,
@@ -398,11 +611,12 @@ func TestCommitSegment_Validation(t *testing.T) {
 			),
 		},
 	}, func(t *testing.T, ctx *testcontext.Context, planet *testplanet.Planet) {
-		bucket := createTestBucket(ctx, t, planet)
+		bucketName := testrand.BucketName()
+		require.NoError(t, planet.Uplinks[0].TestingCreateBucket(ctx, planet.Satellites[0], bucketName))
 		client := createMetainfoClient(ctx, t, planet)
 
 		beginObjectResponse, err := client.BeginObject(ctx, metaclient.BeginObjectParams{
-			Bucket:             []byte(bucket.Name),
+			Bucket:             []byte(bucketName),
 			EncryptedObjectKey: []byte("a/b/testobject"),
 			EncryptionParameters: storj.EncryptionParameters{
 				CipherSuite: storj.EncAESGCM,
@@ -565,15 +779,162 @@ func TestCommitSegment_Validation(t *testing.T) {
 	})
 }
 
+func TestMakeInlineSegment(t *testing.T) {
+	testplanet.Run(t, testplanet.Config{
+		SatelliteCount: 1, UplinkCount: 1,
+		Reconfigure: testplanet.Reconfigure{
+			Satellite: func(log *zap.Logger, index int, config *satellite.Config) {
+				config.Metainfo.ChecksumsEnabled = true
+			},
+		},
+	}, func(t *testing.T, ctx *testcontext.Context, planet *testplanet.Planet) {
+		sat := planet.Satellites[0]
+		up := planet.Uplinks[0]
+		endpoint := sat.Metainfo.Endpoint
+		db := sat.Metabase.DB
+		apiKey := up.APIKey[sat.ID()]
+
+		getPendingObjects := func(ctx context.Context, bucketName, objectKey string) ([]metabase.ObjectEntry, error) {
+			var collector metabasetest.IterateCollector
+			err := sat.Metabase.DB.IteratePendingObjectsByKey(ctx, metabase.IteratePendingObjectsByKey{
+				ObjectLocation: metabase.ObjectLocation{
+					ProjectID:  up.Projects[0].ID,
+					BucketName: metabase.BucketName(bucketName),
+					ObjectKey:  metabase.ObjectKey(objectKey),
+				},
+			}, collector.Add)
+			if err != nil {
+				return nil, err
+			}
+			return []metabase.ObjectEntry(collector), nil
+		}
+
+		beginObject := func(ctx context.Context, bucketName, objectKey string) (streamID []byte, _ error) {
+			resp, err := endpoint.BeginObject(ctx, &pb.BeginObjectRequest{
+				Header:             &pb.RequestHeader{ApiKey: apiKey.SerializeRaw()},
+				Bucket:             []byte(bucketName),
+				EncryptedObjectKey: []byte(objectKey),
+				EncryptionParameters: &pb.EncryptionParameters{
+					CipherSuite: pb.CipherSuite_ENC_AESGCM,
+					BlockSize:   256,
+				},
+			})
+			if err != nil {
+				return nil, errs.Wrap(err)
+			}
+			return resp.StreamId, nil
+		}
+
+		t.Run("Basic", func(t *testing.T) {
+			bucketName := testrand.BucketName()
+			require.NoError(t, up.TestingCreateBucket(ctx, sat, bucketName))
+
+			objectKey := testrand.Path()
+
+			segmentPos := metabase.SegmentPosition{
+				Part:  1,
+				Index: 2,
+			}
+
+			streamID, err := beginObject(ctx, bucketName, objectKey)
+			require.NoError(t, err)
+
+			key := testrand.Bytes(48)
+			nonce := testrand.Nonce()
+			eTag := testrand.Bytes(16)
+			checksum := testrand.Bytes(32)
+			inlineData := testrand.Bytes(128)
+			plainSize := int64(64)
+
+			_, err = endpoint.MakeInlineSegment(ctx, &pb.MakeInlineSegmentRequest{
+				Header:   &pb.RequestHeader{ApiKey: apiKey.SerializeRaw()},
+				StreamId: streamID,
+				Position: &pb.SegmentPosition{
+					PartNumber: int32(segmentPos.Part),
+					Index:      int32(segmentPos.Index),
+				},
+				EncryptedKey:        key,
+				EncryptedKeyNonce:   nonce,
+				EncryptedETag:       eTag,
+				EncryptedChecksum:   checksum,
+				EncryptedInlineData: inlineData,
+				PlainSize:           plainSize,
+			})
+			require.NoError(t, err)
+
+			objects, err := getPendingObjects(ctx, bucketName, objectKey)
+			require.NoError(t, err)
+
+			segment, err := db.GetSegmentByPosition(ctx, metabase.GetSegmentByPosition{
+				StreamID: objects[0].StreamID,
+				Position: segmentPos,
+			})
+			require.NoError(t, err)
+
+			require.Equal(t, metabase.Segment{
+				StreamID:          objects[0].StreamID,
+				Position:          segmentPos,
+				CreatedAt:         segment.CreatedAt,
+				EncryptedKey:      key,
+				EncryptedKeyNonce: nonce.Bytes(),
+				EncryptedSize:     int32(len(inlineData)),
+				PlainSize:         int32(plainSize),
+				EncryptedETag:     eTag,
+				EncryptedChecksum: checksum,
+				InlineData:        inlineData,
+			}, segment)
+		})
+
+		t.Run("Checksums disabled", func(t *testing.T) {
+			endpoint.TestingSetChecksumsEnabled(false)
+			defer endpoint.TestingSetChecksumsEnabled(true)
+
+			bucketName := testrand.BucketName()
+			require.NoError(t, up.TestingCreateBucket(ctx, sat, bucketName))
+
+			objectKey := testrand.Path()
+			segmentPos := metabase.SegmentPosition{}
+
+			streamID, err := beginObject(ctx, bucketName, objectKey)
+			require.NoError(t, err)
+
+			_, err = endpoint.MakeInlineSegment(ctx, &pb.MakeInlineSegmentRequest{
+				Header:   &pb.RequestHeader{ApiKey: apiKey.SerializeRaw()},
+				StreamId: streamID,
+				Position: &pb.SegmentPosition{
+					PartNumber: int32(segmentPos.Part),
+					Index:      int32(segmentPos.Index),
+				},
+				EncryptedKey:        testrand.Bytes(48),
+				EncryptedKeyNonce:   testrand.Nonce(),
+				EncryptedChecksum:   testrand.Bytes(32),
+				EncryptedInlineData: testrand.Bytes(128),
+				PlainSize:           64,
+			})
+			rpctest.RequireStatus(t, err, rpcstatus.ChecksumsUnsupported, "Checksum options may not be provided at this time")
+
+			objects, err := getPendingObjects(ctx, bucketName, objectKey)
+			require.NoError(t, err)
+
+			_, err = db.GetSegmentByPosition(ctx, metabase.GetSegmentByPosition{
+				StreamID: objects[0].StreamID,
+				Position: segmentPos,
+			})
+			require.ErrorIs(t, err, metabase.ErrSegmentNotFound.Instance())
+		})
+	})
+}
+
 func TestRetryBeginSegmentPieces(t *testing.T) {
 	testplanet.Run(t, testplanet.Config{
 		SatelliteCount: 1, StorageNodeCount: 10, UplinkCount: 1,
 	}, func(t *testing.T, ctx *testcontext.Context, planet *testplanet.Planet) {
-		bucket := createTestBucket(ctx, t, planet)
+		bucketName := testrand.BucketName()
+		require.NoError(t, planet.Uplinks[0].TestingCreateBucket(ctx, planet.Satellites[0], bucketName))
 		metainfoClient := createMetainfoClient(ctx, t, planet)
 
 		params := metaclient.BeginObjectParams{
-			Bucket:             []byte(bucket.Name),
+			Bucket:             []byte(bucketName),
 			EncryptedObjectKey: []byte("encrypted-path"),
 			EncryptionParameters: storj.EncryptionParameters{
 				CipherSuite: storj.EncAESGCM,
@@ -660,11 +1021,12 @@ func TestRetryBeginSegmentPieces_Validation(t *testing.T) {
 	testplanet.Run(t, testplanet.Config{
 		SatelliteCount: 1, StorageNodeCount: 10, UplinkCount: 1,
 	}, func(t *testing.T, ctx *testcontext.Context, planet *testplanet.Planet) {
-		bucket := createTestBucket(ctx, t, planet)
+		bucketName := testrand.BucketName()
+		require.NoError(t, planet.Uplinks[0].TestingCreateBucket(ctx, planet.Satellites[0], bucketName))
 		metainfoClient := createMetainfoClient(ctx, t, planet)
 
 		params := metaclient.BeginObjectParams{
-			Bucket:             []byte(bucket.Name),
+			Bucket:             []byte(bucketName),
 			EncryptedObjectKey: []byte("encrypted-path"),
 			EncryptionParameters: storj.EncryptionParameters{
 				CipherSuite: storj.EncAESGCM,
@@ -734,11 +1096,12 @@ func TestCommitSegment_RejectRetryDuplicate(t *testing.T) {
 	testplanet.Run(t, testplanet.Config{
 		SatelliteCount: 1, StorageNodeCount: 10, UplinkCount: 1,
 	}, func(t *testing.T, ctx *testcontext.Context, planet *testplanet.Planet) {
-		bucket := createTestBucket(ctx, t, planet)
+		bucketName := testrand.BucketName()
+		require.NoError(t, planet.Uplinks[0].TestingCreateBucket(ctx, planet.Satellites[0], bucketName))
 		metainfoClient := createMetainfoClient(ctx, t, planet)
 
 		params := metaclient.BeginObjectParams{
-			Bucket:             []byte(bucket.Name),
+			Bucket:             []byte(bucketName),
 			EncryptedObjectKey: []byte("encrypted-path"),
 			EncryptionParameters: storj.EncryptionParameters{
 				CipherSuite: storj.EncAESGCM,
@@ -819,7 +1182,7 @@ func TestCommitSegment_RejectRetryDuplicate(t *testing.T) {
 		// now we need to make sure that what just happened only used 6 pieces. it would be nice if
 		// we had an API that was more direct than this:
 		resp, err := metainfoClient.GetObjectIPs(ctx, metaclient.GetObjectIPsParams{
-			Bucket:             []byte(bucket.Name),
+			Bucket:             []byte(bucketName),
 			EncryptedObjectKey: []byte("encrypted-path"),
 		})
 		require.NoError(t, err)
@@ -893,7 +1256,7 @@ func TestRetryBeginSegmentPieces_EndToEnd(t *testing.T) {
 
 		data := testrand.Bytes(512)
 
-		err := planet.Uplinks[0].CreateBucket(ctx, planet.Satellites[0], "test")
+		err := planet.Uplinks[0].TestingCreateBucket(ctx, planet.Satellites[0], "test")
 		require.NoError(t, err)
 
 		beginObjectResp, err := metainfoClient.BeginObject(ctx, metaclient.BeginObjectParams{
@@ -956,13 +1319,141 @@ func TestRetryBeginSegmentPieces_EndToEnd(t *testing.T) {
 	})
 }
 
-func createTestBucket(ctx context.Context, tb testing.TB, planet *testplanet.Planet) buckets.Bucket {
-	bucket, err := planet.Satellites[0].API.Buckets.Service.CreateBucket(ctx, buckets.Bucket{
-		Name:      "test",
-		ProjectID: planet.Uplinks[0].Projects[0].ID,
+func TestListSegments(t *testing.T) {
+	testplanet.Run(t, testplanet.Config{
+		SatelliteCount: 1, UplinkCount: 1,
+	}, func(t *testing.T, ctx *testcontext.Context, planet *testplanet.Planet) {
+		sat := planet.Satellites[0]
+		up := planet.Uplinks[0]
+		endpoint := sat.Metainfo.Endpoint
+		metabaseDB := sat.Metabase.DB
+		projectID := up.Projects[0].ID
+		apiKey := up.APIKey[sat.ID()]
+
+		bucketName := testrand.BucketName()
+		require.NoError(t, up.TestingCreateBucket(ctx, sat, bucketName))
+
+		objStream := randObjectStream(projectID, bucketName)
+
+		_, err := metabaseDB.BeginObjectExactVersion(ctx, metabase.BeginObjectExactVersion{
+			ObjectStream: objStream,
+		})
+		require.NoError(t, err)
+
+		var segments []metabase.RawSegment
+		var offset int64
+		for i := range 8 {
+			pos := metabase.SegmentPosition{
+				Part:  uint32(i / 2),
+				Index: uint32(i % 2),
+			}
+			pieces := metabase.Pieces{{
+				Number:      0,
+				StorageNode: testrand.NodeID(),
+			}}
+
+			size := 2 + int32(testrand.Intn(1024))
+			segments = append(segments, metabase.RawSegment{
+				StreamID:          objStream.StreamID,
+				Position:          pos,
+				CreatedAt:         time.Now().Add(time.Duration(i) * time.Minute).Round(time.Microsecond).UTC(),
+				RootPieceID:       testrand.PieceID(),
+				Pieces:            pieces,
+				EncryptedKeyNonce: testrand.Nonce().Bytes(),
+				EncryptedKey:      testrand.Bytes(32),
+				EncryptedETag:     testrand.Bytes(16),
+				EncryptedChecksum: testrand.Bytes(32),
+				PlainOffset:       offset,
+				PlainSize:         size,
+				EncryptedSize:     size,
+			})
+			offset += int64(size)
+		}
+		require.NoError(t, metabaseDB.TestingBatchInsertSegments(ctx, segments))
+
+		_, err = metabaseDB.CommitObject(ctx, metabase.CommitObject{
+			ObjectStream: objStream,
+			Encryption:   metabasetest.DefaultEncryption,
+		})
+		require.NoError(t, err)
+
+		var expectedItems []*pb.SegmentListItem
+		for _, segment := range segments {
+			expectedItems = append(expectedItems, &pb.SegmentListItem{
+				Position: &pb.SegmentPosition{
+					PartNumber: int32(segment.Position.Part),
+					Index:      int32(segment.Position.Index),
+				},
+				PlainSize:         int64(segment.PlainSize),
+				PlainOffset:       segment.PlainOffset,
+				CreatedAt:         segment.CreatedAt,
+				EncryptedKey:      segment.EncryptedKey,
+				EncryptedKeyNonce: pb.Nonce(segment.EncryptedKeyNonce),
+				EncryptedETag:     segment.EncryptedETag,
+				EncryptedChecksum: segment.EncryptedChecksum,
+			})
+		}
+
+		// item.CreatedAt is in the local timezone when using Postgres,
+		// normalize it for the comparisons below.
+		normalizeCreatedAt := func(items []*pb.SegmentListItem) []*pb.SegmentListItem {
+			for _, item := range items {
+				item.CreatedAt = item.CreatedAt.UTC()
+			}
+			return items
+		}
+
+		signer := signing.SignerFromFullIdentity(sat.Identity)
+		satStreamID := &internalpb.StreamID{
+			Bucket:             []byte(objStream.BucketName),
+			EncryptedObjectKey: []byte(objStream.ObjectKey),
+			StreamId:           objStream.StreamID.Bytes(),
+		}
+		signedStreamID, err := metainfo.SignStreamID(ctx, signer, satStreamID)
+		require.NoError(t, err)
+		encodedStreamID, err := pb.Marshal(signedStreamID)
+		require.NoError(t, err)
+
+		t.Run("Basic", func(t *testing.T) {
+			resp, err := endpoint.ListSegments(ctx, &pb.ListSegmentsRequest{
+				Header:   &pb.RequestHeader{ApiKey: apiKey.SerializeRaw()},
+				StreamId: encodedStreamID,
+			})
+			require.NoError(t, err)
+			require.Equal(t, expectedItems, normalizeCreatedAt(resp.Items))
+		})
+
+		t.Run("Limit and pagination", func(t *testing.T) {
+			opts := &pb.ListSegmentsRequest{
+				Header:   &pb.RequestHeader{ApiKey: apiKey.SerializeRaw()},
+				StreamId: encodedStreamID,
+				Limit:    4,
+			}
+
+			resp, err := endpoint.ListSegments(ctx, opts)
+			require.NoError(t, err)
+			require.Equal(t, expectedItems[:4], normalizeCreatedAt(resp.Items))
+			require.True(t, resp.More)
+
+			opts.CursorPosition = expectedItems[3].Position
+
+			resp, err = endpoint.ListSegments(ctx, opts)
+			require.NoError(t, err)
+			require.Equal(t, expectedItems[4:], normalizeCreatedAt(resp.Items))
+			require.False(t, resp.More)
+		})
+
+		t.Run("Unauthorized API key", func(t *testing.T) {
+			restrictedApiKey, err := apiKey.Restrict(macaroon.Caveat{DisallowReads: true})
+			require.NoError(t, err)
+
+			_, err = endpoint.ListSegments(ctx, &pb.ListSegmentsRequest{
+				Header:   &pb.RequestHeader{ApiKey: restrictedApiKey.SerializeRaw()},
+				StreamId: encodedStreamID,
+			})
+			rpctest.RequireCode(t, err, rpcstatus.PermissionDenied)
+		})
 	})
-	require.NoError(tb, err)
-	return bucket
 }
 
 func createMetainfoClient(ctx *testcontext.Context, tb testing.TB, planet *testplanet.Planet) *metaclient.Client {

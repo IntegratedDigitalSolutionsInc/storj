@@ -6,6 +6,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -19,6 +20,7 @@ import (
 	"storj.io/storj/cmd/uplink/ulext"
 	"storj.io/uplink"
 	"storj.io/uplink/edge"
+	privateEdge "storj.io/uplink/private/edge"
 )
 
 type cmdShare struct {
@@ -118,7 +120,21 @@ func (c *cmdShare) Execute(ctx context.Context) (err error) {
 	_, _ = fmt.Fprintf(clingy.Stdout(ctx), "Access       : %s\n", newAccessData)
 
 	if c.register {
-		credentials, err := RegisterAccess(ctx, access, c.authService, c.public, c.caCert)
+		info, err := c.ex.GetEdgeUrlOverrides(ctx, access)
+		if err != nil {
+			return errs.New("could not get project info: %w", err)
+		}
+
+		authService := c.authService
+		linksharingUrl := c.baseURL
+		if info.AuthService != "" {
+			authService = info.AuthService
+		}
+		if info.PublicLinksharing != "" {
+			linksharingUrl = info.PublicLinksharing
+		}
+
+		credentials, err := RegisterAccess(ctx, access, authService, c.public, c.caCert)
 		if err != nil {
 			return err
 		}
@@ -136,7 +152,7 @@ func (c *cmdShare) Execute(ctx context.Context) (err error) {
 				return errs.New("will only generate linksharing URL with readonly restrictions")
 			}
 
-			err = createURL(ctx, credentials.AccessKeyID, c.ap.prefixes, c.baseURL)
+			err = createURL(ctx, credentials.AccessKeyID, c.ap.prefixes, linksharingUrl)
 			if err != nil {
 				return err
 			}
@@ -147,7 +163,7 @@ func (c *cmdShare) Execute(ctx context.Context) (err error) {
 				return errs.New("will only generate DNS entries with readonly restrictions")
 			}
 
-			err = createDNS(ctx, credentials.AccessKeyID, c.ap.prefixes, c.baseURL, c.dns, c.tls)
+			err = createDNS(ctx, credentials.AccessKeyID, c.ap.prefixes, linksharingUrl, c.dns, c.tls)
 			if err != nil {
 				return err
 			}
@@ -213,15 +229,15 @@ func formatPaths(sharePrefixes []uplink.SharePrefix) string {
 }
 
 // RegisterAccess registers an access grant with a Gateway Authorization Service.
-func RegisterAccess(ctx context.Context, access *uplink.Access, authService string, public bool, certificateFile string) (credentials *edge.Credentials, err error) {
+func RegisterAccess(ctx context.Context, access *uplink.Access, authService string, public bool, certificateFile string) (credentials *privateEdge.Credentials, err error) {
 	if authService == "" {
 		return nil, errs.New("no auth service address provided")
 	}
 
 	var edgeConfig edge.Config
 
-	if strings.HasPrefix(authService, "insecure://") {
-		authService = strings.TrimPrefix(authService, "insecure://")
+	if after, ok := strings.CutPrefix(authService, "insecure://"); ok {
+		authService = after
 		edgeConfig.InsecureUnencryptedConnection = true
 	}
 	// preserve compatibility with previous https service
@@ -242,7 +258,7 @@ func RegisterAccess(ctx context.Context, access *uplink.Access, authService stri
 	edgeConfig.AuthServiceAddress = authService
 	edgeConfig.CertificatePEM = certificatePEM
 
-	return edgeConfig.RegisterAccess(ctx, access, &edge.RegisterAccessOptions{Public: public})
+	return privateEdge.RegisterAccess(ctx, &edgeConfig, access, &edge.RegisterAccessOptions{Public: public})
 }
 
 // Creates linksharing url for allowed path prefixes.
@@ -303,9 +319,13 @@ func createDNS(ctx context.Context, accessKey string, prefixes []uplink.SharePre
 }
 
 // DisplayGatewayCredentials formats and writes credentials to stdout.
-func DisplayGatewayCredentials(ctx context.Context, credentials edge.Credentials, format string, awsProfile string) (err error) {
+func DisplayGatewayCredentials(ctx context.Context, credentials privateEdge.Credentials, format string, awsProfile string) (err error) {
 	switch format {
 	case "env": // export / set compatible format
+		err = printExpirationComment(clingy.Stdout(ctx), credentials.FreeTierRestrictedExpiration)
+		if err != nil {
+			return err
+		}
 		// note that AWS_ENDPOINT configuration is not natively utilized by the AWS CLI
 		_, err = fmt.Fprintf(clingy.Stdout(ctx), "AWS_ACCESS_KEY_ID=%s\n"+
 			"AWS_SECRET_ACCESS_KEY=%s\n"+
@@ -315,6 +335,10 @@ func DisplayGatewayCredentials(ctx context.Context, credentials edge.Credentials
 			return err
 		}
 	case "aws": // aws configuration commands
+		err = printExpirationComment(clingy.Stdout(ctx), credentials.FreeTierRestrictedExpiration)
+		if err != nil {
+			return err
+		}
 		profile := ""
 		if awsProfile != "" {
 			profile = " --profile " + awsProfile
@@ -331,15 +355,46 @@ func DisplayGatewayCredentials(ctx context.Context, credentials edge.Credentials
 		if err != nil {
 			return err
 		}
+	case "om", "objectmount", "object-mount": // object mount compatible format
+		_, err = fmt.Fprintf(clingy.Stdout(ctx), "aws_access_key_id = %s\n"+
+			"aws_secret_access_key = %s\n"+
+			"endpoint = %s\n",
+			credentials.AccessKeyID, credentials.SecretKey, credentials.Endpoint)
+		if err != nil {
+			return err
+		}
 	default: // plain text
-		_, err = fmt.Fprintf(clingy.Stdout(ctx), "========== GATEWAY CREDENTIALS ===========================================================\n"+
+		_, err = fmt.Fprintln(clingy.Stdout(ctx), "========== GATEWAY CREDENTIALS ===========================================================")
+		if err != nil {
+			return err
+		}
+
+		if credentials.FreeTierRestrictedExpiration != nil {
+			_, err = fmt.Fprintf(clingy.Stdout(ctx),
+				"Trial account credentials automatically expire.\n"+
+					"Expiration   : %s\n",
+				formatTime(true, *credentials.FreeTierRestrictedExpiration))
+			if err != nil {
+				return err
+			}
+		}
+
+		_, err = fmt.Fprintf(clingy.Stdout(ctx),
 			"Access Key ID: %s\n"+
-			"Secret Key   : %s\n"+
-			"Endpoint     : %s\n",
+				"Secret Key   : %s\n"+
+				"Endpoint     : %s\n",
 			credentials.AccessKeyID, credentials.SecretKey, credentials.Endpoint)
 		if err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+func printExpirationComment(w io.Writer, expiration *time.Time) error {
+	if expiration == nil {
+		return nil
+	}
+	_, err := fmt.Fprintf(w, "# Your trial account credentials will expire at %s.\n", formatTime(true, *expiration))
+	return err
 }

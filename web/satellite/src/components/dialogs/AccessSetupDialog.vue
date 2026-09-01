@@ -9,19 +9,20 @@
         min-width="320px"
         transition="fade-transition"
         persistent
+        scrollable
     >
-        <v-card ref="innerContent">
+        <v-card>
             <v-sheet>
                 <v-card-item class="pa-6">
-                    <v-card-title class="font-weight-bold">
+                    <v-card-title class="font-weight-bold mt-n1">
                         New {{ selectedApp ? selectedApp.name : '' }} Access
                     </v-card-title>
-                    <v-card-subtitle class="text-caption pb-0">
-                        Step: {{ stepName }}
+                    <v-card-subtitle class="text-body-small pb-0">
+                        {{ stepName }}
                     </v-card-subtitle>
                     <template #append>
                         <v-btn
-                            icon="$close"
+                            :icon="X"
                             variant="text"
                             size="small"
                             color="default"
@@ -30,7 +31,7 @@
                         />
                     </template>
                     <template v-if="selectedApp" #prepend>
-                        <img :src="selectedApp.src" :alt="selectedApp.name" width="40" height="40" class="rounded">
+                        <img :src="selectedApp.src" :alt="selectedApp.name" width="40" height="40" class="rounded-md border pa-2">
                     </template>
                     <template v-else #prepend>
                         <v-sheet
@@ -48,110 +49,121 @@
 
             <v-divider />
 
-            <v-window
-                v-model="step"
-                class="setup-app__window"
-                :class="{ 'setup-app__window--loading': isFetching }"
-            >
-                <v-window-item :value="SetupStep.ChooseAccessStep">
-                    <choose-access-step
-                        :ref="stepInfos[SetupStep.ChooseAccessStep].ref"
-                        @name-changed="newName => name = newName"
-                        @typeChanged="newType => accessType = newType"
-                        @submit="nextStep"
-                        @appChanged="application => selectedApp = application"
-                    />
-                </v-window-item>
+            <v-card-text class="pa-0">
+                <v-window
+                    v-model="step"
+                    :touch="false"
+                    class="setup-app__window"
+                    :class="{ 'setup-app__window--loading': isFetching }"
+                >
+                    <v-window-item :value="SetupStep.ChooseAccessStep">
+                        <choose-access-step
+                            :ref="stepInfos[SetupStep.ChooseAccessStep].ref"
+                            @name-changed="newName => name = newName"
+                            @type-changed="newType => accessType = newType"
+                            @submit="nextStep"
+                            @app-changed="application => selectedApp = application"
+                        />
+                    </v-window-item>
 
-                <v-window-item :value="SetupStep.EncryptionInfo">
-                    <encryption-info-step :ref="stepInfos[SetupStep.EncryptionInfo].ref" />
-                </v-window-item>
+                    <v-window-item :value="SetupStep.EncryptionInfo">
+                        <encryption-info-step :ref="stepInfos[SetupStep.EncryptionInfo].ref" />
+                    </v-window-item>
 
-                <v-window-item :value="SetupStep.ChooseFlowStep">
-                    <choose-flow-step
-                        :ref="stepInfos[SetupStep.ChooseFlowStep].ref"
-                        :app="selectedApp"
-                        @setFlowType="val => flowType = val"
-                    />
-                </v-window-item>
+                    <v-window-item :value="SetupStep.ChooseFlowStep">
+                        <choose-flow-step
+                            :ref="stepInfos[SetupStep.ChooseFlowStep].ref"
+                            :app="selectedApp"
+                            @set-flow-type="val => flowType = val"
+                        />
+                    </v-window-item>
 
-                <v-window-item :value="SetupStep.AccessEncryption">
-                    <access-encryption-step
-                        :ref="stepInfos[SetupStep.AccessEncryption].ref"
-                        @selectOption="val => passphraseOption = val"
-                        @passphraseChanged="val => passphrase = val"
-                        @submit="nextStep"
-                    />
-                </v-window-item>
+                    <v-window-item :value="SetupStep.AccessEncryption">
+                        <access-encryption-step
+                            :ref="stepInfos[SetupStep.AccessEncryption].ref"
+                            @select-option="val => passphraseOption = val"
+                            @passphrase-changed="val => passphrase = val"
+                            @submit="nextStep"
+                        />
+                    </v-window-item>
 
-                <v-window-item :value="SetupStep.EnterNewPassphrase">
-                    <enter-passphrase-step
-                        :ref="stepInfos[SetupStep.EnterNewPassphrase].ref"
-                        @passphraseChanged="val => passphrase = val"
-                    />
-                </v-window-item>
+                    <v-window-item :value="SetupStep.EnterNewPassphrase">
+                        <enter-passphrase-step
+                            :ref="stepInfos[SetupStep.EnterNewPassphrase].ref"
+                            @passphrase-changed="val => passphrase = val"
+                        />
+                    </v-window-item>
 
-                <v-window-item :value="SetupStep.PassphraseGenerated">
-                    <passphrase-generated-step
-                        :ref="stepInfos[SetupStep.PassphraseGenerated].ref"
-                        :name="name"
-                        @passphraseChanged="val => passphrase = val"
-                    />
-                </v-window-item>
+                    <v-window-item :value="SetupStep.PassphraseGenerated">
+                        <passphrase-generated-step
+                            :ref="stepInfos[SetupStep.PassphraseGenerated].ref"
+                            :name="name"
+                            @passphrase-changed="val => passphrase = val"
+                        />
+                    </v-window-item>
 
-                <v-window-item :value="SetupStep.ChoosePermissionsStep">
-                    <choose-permissions-step
-                        :ref="stepInfos[SetupStep.ChoosePermissionsStep].ref"
-                        @permissionsChanged="val => permissions = val"
-                    />
-                </v-window-item>
+                    <v-window-item :value="SetupStep.ChoosePermissionsStep">
+                        <choose-permissions-step
+                            :ref="stepInfos[SetupStep.ChoosePermissionsStep].ref"
+                            @permissions-changed="val => permissions = val"
+                        />
+                    </v-window-item>
 
-                <v-window-item :value="SetupStep.ObjectLockPermissionsStep">
-                    <object-lock-permissions-step
-                        :ref="stepInfos[SetupStep.ObjectLockPermissionsStep].ref"
-                        @permissionsChanged="val => objectLockPermissions = val"
-                    />
-                </v-window-item>
+                    <v-window-item :value="SetupStep.ObjectLockPermissionsStep">
+                        <object-lock-permissions-step
+                            :ref="stepInfos[SetupStep.ObjectLockPermissionsStep].ref"
+                            @permissions-changed="val => objectLockPermissions = val"
+                        />
+                    </v-window-item>
 
-                <v-window-item :value="SetupStep.SelectBucketsStep">
-                    <select-buckets-step
-                        :ref="stepInfos[SetupStep.SelectBucketsStep].ref"
-                        @bucketsChanged="val => buckets = val"
-                    />
-                </v-window-item>
+                    <v-window-item :value="SetupStep.BucketNotificationPermissionsStep">
+                        <bucket-notification-permissions-step
+                            :ref="stepInfos[SetupStep.BucketNotificationPermissionsStep].ref"
+                            @permissions-changed="val => bucketNotificationPermissions = val"
+                        />
+                    </v-window-item>
 
-                <v-window-item :value="SetupStep.OptionalExpirationStep">
-                    <optional-expiration-step
-                        :ref="stepInfos[SetupStep.OptionalExpirationStep].ref"
-                        :end-date="endDate"
-                        @endDateChanged="val => endDate = val"
-                    />
-                </v-window-item>
+                    <v-window-item :value="SetupStep.SelectBucketsStep">
+                        <select-buckets-step
+                            :ref="stepInfos[SetupStep.SelectBucketsStep].ref"
+                            @buckets-changed="val => buckets = val"
+                        />
+                    </v-window-item>
 
-                <v-window-item :value="SetupStep.ConfirmDetailsStep">
-                    <confirm-details-step
-                        :ref="stepInfos[SetupStep.ConfirmDetailsStep].ref"
-                        :name="name"
-                        :type="accessType"
-                        :permissions="permissions"
-                        :object-lock-permissions="objectLockPermissions"
-                        :buckets="buckets"
-                        :end-date="endDate"
-                    />
-                </v-window-item>
+                    <v-window-item :value="SetupStep.OptionalExpirationStep">
+                        <optional-expiration-step
+                            :ref="stepInfos[SetupStep.OptionalExpirationStep].ref"
+                            :end-date="endDate"
+                            @end-date-changed="val => endDate = val"
+                        />
+                    </v-window-item>
 
-                <v-window-item :value="SetupStep.AccessCreatedStep">
-                    <access-created-step
-                        :ref="stepInfos[SetupStep.AccessCreatedStep].ref"
-                        :name="name"
-                        :app="selectedApp"
-                        :cli-access="cliAccess"
-                        :access-grant="accessGrant"
-                        :credentials="credentials"
-                        :access-type="accessType"
-                    />
-                </v-window-item>
-            </v-window>
+                    <v-window-item :value="SetupStep.ConfirmDetailsStep">
+                        <confirm-details-step
+                            :ref="stepInfos[SetupStep.ConfirmDetailsStep].ref"
+                            :name="name"
+                            :type="accessType"
+                            :permissions="permissions"
+                            :object-lock-permissions="objectLockPermissions"
+                            :bucket-notification-permissions="bucketNotificationPermissions"
+                            :buckets="buckets"
+                            :end-date="endDate"
+                        />
+                    </v-window-item>
+
+                    <v-window-item :value="SetupStep.AccessCreatedStep">
+                        <access-created-step
+                            :ref="stepInfos[SetupStep.AccessCreatedStep].ref"
+                            :name="name"
+                            :app="selectedApp"
+                            :cli-access="cliAccess"
+                            :access-grant="accessGrant"
+                            :credentials="credentials"
+                            :access-type="accessType"
+                        />
+                    </v-window-item>
+                </v-window>
+            </v-card-text>
 
             <v-divider />
 
@@ -168,9 +180,8 @@
                             {{ stepInfos[step].prevText.value }}
                         </v-btn>
                     </v-col>
-                    <v-col>
+                    <v-col v-if="step !== SetupStep.AccessCreatedStep">
                         <v-btn
-                            v-if="step !== SetupStep.AccessCreatedStep"
                             color="primary"
                             variant="flat"
                             block
@@ -180,8 +191,9 @@
                         >
                             {{ stepInfos[step].nextText.value }}
                         </v-btn>
+                    </v-col>
+                    <v-col v-else-if="configStore.isDefaultBrand">
                         <v-btn
-                            v-else
                             color="primary"
                             variant="flat"
                             block
@@ -203,13 +215,14 @@
 </template>
 
 <script setup lang="ts">
-import { computed, Ref, ref, watch, WatchStopHandle } from 'vue';
+import { type Ref, type WatchStopHandle, computed, ref, watch  } from 'vue';
 import {
     VBtn,
     VCard,
     VCardActions,
     VCardItem,
     VCardSubtitle,
+    VCardText,
     VCardTitle,
     VCol,
     VDialog,
@@ -221,29 +234,31 @@ import {
     VWindowItem,
 } from 'vuetify/components';
 import { useRoute } from 'vue-router';
-import { BookOpenText, KeyRound } from 'lucide-vue-next';
+import { BookOpenText, KeyRound, X } from '@lucide/vue';
 
 import {
     AccessType,
+    BucketNotificationPermission,
     FlowType,
     ObjectLockPermission,
     PassphraseOption,
     Permission,
-    PermissionsMessage,
     SetupStep,
 } from '@/types/setupAccess';
 import { useBucketsStore } from '@/store/modules/bucketsStore';
-import { getUniqueName, IDialogFlowStep } from '@/types/common';
+import { type IDialogFlowStep, getUniqueName  } from '@/types/common';
 import { AnalyticsErrorEventSource, AnalyticsEvent } from '@/utils/constants/analyticsEventNames';
-import { useNotify } from '@/utils/hooks';
+import { useNotify } from '@/composables/useNotify';
 import { useAccessGrantsStore } from '@/store/modules/accessGrantsStore';
 import { useProjectsStore } from '@/store/modules/projectsStore';
-import { AccessGrant, EdgeCredentials } from '@/types/accessGrants';
+import { type AccessGrant, EdgeCredentials } from '@/types/accessGrants';
+import { type AccessPermissions, type CreateAccessRequest } from '@/api/private.gen';
 import { useConfigStore } from '@/store/modules/configStore';
 import { useAnalyticsStore } from '@/store/modules/analyticsStore';
 import { ROUTES } from '@/router';
 import { useUsersStore } from '@/store/modules/usersStore';
-import { Application } from '@/types/applications';
+import type { Application } from '@/types/applications';
+import { type SetPermissionsMessage, useAccessGrantWorker  } from '@/composables/useAccessGrantWorker';
 
 import ChooseFlowStep from '@/components/dialogs/accessSetupSteps/ChooseFlowStep.vue';
 import ChooseAccessStep from '@/components/dialogs/accessSetupSteps/ChooseAccessStep.vue';
@@ -257,6 +272,7 @@ import OptionalExpirationStep from '@/components/dialogs/accessSetupSteps/Option
 import EncryptionInfoStep from '@/components/dialogs/accessSetupSteps/EncryptionInfoStep.vue';
 import ConfirmDetailsStep from '@/components/dialogs/accessSetupSteps/ConfirmDetailsStep.vue';
 import ObjectLockPermissionsStep from '@/components/dialogs/accessSetupSteps/ObjectLockPermissionsStep.vue';
+import BucketNotificationPermissionsStep from '@/components/dialogs/accessSetupSteps/BucketNotificationPermissionsStep.vue';
 
 type SetupLocation = SetupStep | undefined | (() => (SetupStep | undefined));
 
@@ -272,7 +288,7 @@ class StepInfo {
         prevText: string | (() => string),
         prev: SetupLocation = undefined,
         next: SetupLocation = undefined,
-        public beforeNext?: () => Promise<void>,
+        public beforeNext?: () => void | Promise<void>,
     ) {
         this.prev = (typeof prev === 'function') ? computed<SetupStep | undefined>(prev) : ref<SetupStep | undefined>(prev);
         this.next = (typeof next === 'function') ? computed<SetupStep | undefined>(next) : ref<SetupStep | undefined>(next);
@@ -306,13 +322,12 @@ const userStore = useUsersStore();
 
 const notify = useNotify();
 const route = useRoute();
+const { setPermissions, generateAccess } = useAccessGrantWorker();
 
 const model = defineModel<boolean>({ required: true });
 
-const innerContent = ref<VCard>();
 const isCreating = ref<boolean>(false);
 const isFetching = ref<boolean>(true);
-const worker = ref<Worker | null>(null);
 
 const resets: (() => void)[] = [];
 function resettableRef<T>(value: T): Ref<T> {
@@ -326,8 +341,14 @@ const step = resettableRef<SetupStep>(props.defaultStep);
 const accessType = resettableRef<AccessType>(props.defaultAccessType ?? AccessType.S3);
 const flowType = resettableRef<FlowType>(FlowType.FullAccess);
 const name = resettableRef<string>('');
-const permissions = resettableRef<Permission[]>([]);
+const permissions = resettableRef<Permission[]>([
+    Permission.Read,
+    Permission.Write,
+    Permission.List,
+    Permission.Delete,
+]);
 const objectLockPermissions = resettableRef<ObjectLockPermission[]>([]);
+const bucketNotificationPermissions = resettableRef<BucketNotificationPermission[]>([]);
 const buckets = resettableRef<string[]>([]);
 const passphrase = resettableRef<string>(bucketsStore.state.passphrase);
 const endDate = resettableRef<Date | null>(null);
@@ -338,16 +359,19 @@ const credentials = resettableRef<EdgeCredentials>(new EdgeCredentials());
 
 const promptForPassphrase = computed<boolean>(() => bucketsStore.state.promptForPassphrase);
 
+const bucketEventingEnabled = computed<boolean>(() => configStore.state.config.bucketEventingUIEnabled);
 const hasManagedPassphrase = computed<boolean>(() => projectsStore.state.selectedProjectConfig.hasManagedPassphrase);
+const hideUplinkBehavior = computed<boolean>(() => configStore.state.config.hideUplinkBehavior);
+const useAPIAccessCreation = computed<boolean>(() => configStore.state.config.accessCreationViaAPIEnabled && hasManagedPassphrase.value);
 
 const stepName = computed<string>(() => {
     switch (step.value) {
     case SetupStep.ChooseAccessStep:
-        return 'Access Name And Type';
+        return 'Access Name and Type';
     case SetupStep.EncryptionInfo:
-        return 'Encryption Info';
+        return 'Encryption Information';
     case SetupStep.ChooseFlowStep:
-        return 'Flow Type';
+        return 'Configure Access';
     case SetupStep.AccessEncryption:
         return 'Access Encryption';
     case SetupStep.EnterNewPassphrase:
@@ -355,17 +379,19 @@ const stepName = computed<string>(() => {
     case SetupStep.PassphraseGenerated:
         return 'Passphrase Generated';
     case SetupStep.ChoosePermissionsStep:
-        return 'Basic Permissions';
+        return 'Access Permissions';
     case SetupStep.ObjectLockPermissionsStep:
         return 'Object Lock Permissions';
+    case SetupStep.BucketNotificationPermissionsStep:
+        return 'Bucket Notification Permissions';
     case SetupStep.SelectBucketsStep:
         return 'Bucket Restrictions';
     case SetupStep.OptionalExpirationStep:
-        return 'Optional Expiration';
+        return 'Access Expiration';
     case SetupStep.ConfirmDetailsStep:
-        return 'Confirm Details';
+        return 'Confirm Access Details';
     case SetupStep.AccessCreatedStep:
-        return 'Access Created';
+        return 'Access Created Successfully';
     default:
         return '';
     }
@@ -374,19 +400,20 @@ const stepName = computed<string>(() => {
 /**
  * Whether object lock UI is enabled.
  */
-const objectLockUIEnabled = computed<boolean>(() => {
-    return configStore.objectLockUIEnabled
-      && projectsStore.objectLockUIEnabledForProject;
-});
+const objectLockUIEnabled = computed<boolean>(() => configStore.state.config.objectLockUIEnabled);
 
 const stepInfos: Record<SetupStep, StepInfo> = {
     [SetupStep.ChooseAccessStep]: new StepInfo(
         'Next ->',
         'Cancel',
         undefined,
-        () => (accessType.value === AccessType.S3 && !userStore.noticeDismissal.serverSideEncryption && !hasManagedPassphrase.value)
-            ? SetupStep.EncryptionInfo
-            : SetupStep.ChooseFlowStep,
+        () => {
+            if (hideUplinkBehavior.value) return SetupStep.ChooseFlowStep;
+
+            return (accessType.value === AccessType.S3 && !userStore.noticeDismissal.serverSideEncryption && !hasManagedPassphrase.value)
+                ? SetupStep.EncryptionInfo
+                : SetupStep.ChooseFlowStep;
+        },
     ),
     [SetupStep.EncryptionInfo]: new StepInfo(
         'Next ->',
@@ -396,14 +423,13 @@ const stepInfos: Record<SetupStep, StepInfo> = {
     ),
     [SetupStep.ChooseFlowStep]: new StepInfo(
         () => {
-            if (accessType.value === AccessType.APIKey) {
-                return flowType.value === FlowType.FullAccess ? 'Create Access' : 'Next ->';
-            }
-
-            return promptForPassphrase.value || flowType.value === FlowType.Advanced ? 'Next ->' : 'Create Access';
+            if (flowType.value === FlowType.Advanced) return 'Next ->';
+            if (accessType.value === AccessType.APIKey) return 'Create Access';
+            return promptForPassphrase.value ? 'Next ->' : 'Create Access';
         },
         () => props.defaultAccessType ? 'Cancel' : 'Back',
         () => {
+            if (hideUplinkBehavior.value) return SetupStep.ChooseAccessStep;
             if (props.defaultAccessType) return undefined;
 
             return accessType.value === AccessType.S3 && !userStore.noticeDismissal.serverSideEncryption  && !hasManagedPassphrase.value
@@ -420,13 +446,26 @@ const stepInfos: Record<SetupStep, StepInfo> = {
             return flowType.value === FlowType.FullAccess ? SetupStep.AccessCreatedStep : SetupStep.ChoosePermissionsStep;
         },
         async () => {
-            if (flowType.value === FlowType.FullAccess && (accessType.value === AccessType.APIKey || !promptForPassphrase.value)) {
-                await generate();
+            if (flowType.value === FlowType.FullAccess) {
+                setFullAccess();
+
+                if (accessType.value === AccessType.APIKey || !promptForPassphrase.value) {
+                    await generate();
+                }
             }
         },
     ),
     [SetupStep.AccessEncryption]: new StepInfo(
-        () => flowType.value === FlowType.FullAccess && passphraseOption.value === PassphraseOption.SetMyProjectPassphrase ? 'Create Access' : 'Next ->',
+        () => {
+            if (
+                passphraseOption.value === PassphraseOption.EnterNewPassphrase ||
+                passphraseOption.value === PassphraseOption.GenerateNewPassphrase
+            ) {
+                return 'Next ->';
+            }
+
+            return flowType.value === FlowType.FullAccess ? 'Create Access' : 'Next ->';
+        },
         'Back',
         SetupStep.ChooseFlowStep,
         () => {
@@ -436,13 +475,16 @@ const stepInfos: Record<SetupStep, StepInfo> = {
             return flowType.value === FlowType.FullAccess ? SetupStep.AccessCreatedStep : SetupStep.ChoosePermissionsStep;
         },
         async () => {
-            if (
-                passphraseOption.value === PassphraseOption.EnterNewPassphrase ||
-                passphraseOption.value === PassphraseOption.GenerateNewPassphrase ||
-                flowType.value === FlowType.Advanced
-            ) return;
+            if (flowType.value === FlowType.FullAccess) {
+                setFullAccess();
 
-            await generate();
+                if (
+                    passphraseOption.value !== PassphraseOption.EnterNewPassphrase &&
+                    passphraseOption.value !== PassphraseOption.GenerateNewPassphrase
+                ) {
+                    await generate();
+                }
+            }
         },
     ),
     [SetupStep.PassphraseGenerated]: new StepInfo(
@@ -451,7 +493,10 @@ const stepInfos: Record<SetupStep, StepInfo> = {
         SetupStep.AccessEncryption,
         () => flowType.value === FlowType.FullAccess ? SetupStep.AccessCreatedStep : SetupStep.ChoosePermissionsStep,
         async () => {
-            if (flowType.value === FlowType.FullAccess) await generate();
+            if (flowType.value === FlowType.FullAccess) {
+                setFullAccess();
+                await generate();
+            }
         },
     ),
     [SetupStep.EnterNewPassphrase]: new StepInfo(
@@ -460,7 +505,10 @@ const stepInfos: Record<SetupStep, StepInfo> = {
         SetupStep.AccessEncryption,
         () => flowType.value === FlowType.FullAccess ? SetupStep.AccessCreatedStep : SetupStep.ChoosePermissionsStep,
         async () => {
-            if (flowType.value === FlowType.FullAccess) await generate();
+            if (flowType.value === FlowType.FullAccess) {
+                setFullAccess();
+                await generate();
+            }
         },
     ),
     [SetupStep.ChoosePermissionsStep]: new StepInfo(
@@ -476,18 +524,32 @@ const stepInfos: Record<SetupStep, StepInfo> = {
 
             return SetupStep.ChooseFlowStep;
         },
-        () => objectLockUIEnabled.value ? SetupStep.ObjectLockPermissionsStep : SetupStep.SelectBucketsStep,
+        () => {
+            if (objectLockUIEnabled.value) return SetupStep.ObjectLockPermissionsStep;
+            if (bucketEventingEnabled.value) return SetupStep.BucketNotificationPermissionsStep;
+            return SetupStep.SelectBucketsStep;
+        },
     ),
     [SetupStep.ObjectLockPermissionsStep]: new StepInfo(
         'Next ->',
         'Back',
         SetupStep.ChoosePermissionsStep,
+        () => bucketEventingEnabled.value ? SetupStep.BucketNotificationPermissionsStep : SetupStep.SelectBucketsStep,
+    ),
+    [SetupStep.BucketNotificationPermissionsStep]: new StepInfo(
+        'Next ->',
+        'Back',
+        () => objectLockUIEnabled.value ? SetupStep.ObjectLockPermissionsStep : SetupStep.ChoosePermissionsStep,
         SetupStep.SelectBucketsStep,
     ),
     [SetupStep.SelectBucketsStep]: new StepInfo(
         'Next ->',
         'Back',
-        () => objectLockUIEnabled.value ? SetupStep.ObjectLockPermissionsStep : SetupStep.ChoosePermissionsStep,
+        () => {
+            if (bucketEventingEnabled.value) return SetupStep.BucketNotificationPermissionsStep;
+            if (objectLockUIEnabled.value) return SetupStep.ObjectLockPermissionsStep;
+            return SetupStep.ChoosePermissionsStep;
+        },
         SetupStep.OptionalExpirationStep,
     ),
     [SetupStep.OptionalExpirationStep]: new StepInfo(
@@ -499,7 +561,20 @@ const stepInfos: Record<SetupStep, StepInfo> = {
     [SetupStep.ConfirmDetailsStep]: new StepInfo(
         'Create Access',
         'Back',
-        SetupStep.OptionalExpirationStep,
+        () => {
+            if (flowType.value === FlowType.FullAccess) {
+                if (bucketsStore.state.promptForPassphrase && accessType.value !== AccessType.APIKey) {
+                    if (passphraseOption.value === PassphraseOption.EnterNewPassphrase) return SetupStep.EnterNewPassphrase;
+                    if (passphraseOption.value === PassphraseOption.GenerateNewPassphrase) return SetupStep.PassphraseGenerated;
+
+                    return SetupStep.AccessEncryption;
+                }
+
+                return SetupStep.ChooseFlowStep;
+            }
+
+            return SetupStep.OptionalExpirationStep;
+        },
         SetupStep.AccessCreatedStep,
         generate,
     ),
@@ -523,9 +598,16 @@ async function generate(): Promise<void> {
 
     isCreating.value = true;
 
-    await createAPIKey();
+    if (useAPIAccessCreation.value) {
+        await createAccessViaAPI();
+    } else {
+        await createAPIKey();
+        if (accessType.value === AccessType.AccessGrant || accessType.value === AccessType.S3) {
+            await createAccessGrant();
+        }
+    }
+
     if (accessType.value === AccessType.AccessGrant || accessType.value === AccessType.S3) {
-        await createAccessGrant();
         if (accessType.value === AccessType.S3) await createEdgeCredentials();
         if (passphraseOption.value === PassphraseOption.SetMyProjectPassphrase) {
             bucketsStore.setEdgeCredentials(new EdgeCredentials());
@@ -539,86 +621,113 @@ async function generate(): Promise<void> {
     isCreating.value = false;
 }
 
+async function createAccessViaAPI(): Promise<void> {
+    const projectID = projectsStore.state.selectedProject.id;
+    const noCaveats = flowType.value === FlowType.FullAccess;
+
+    const permissionsPayload: AccessPermissions = {
+        allowDownload: noCaveats || permissions.value.includes(Permission.Read),
+        allowUpload: noCaveats || permissions.value.includes(Permission.Write),
+        allowList: noCaveats || permissions.value.includes(Permission.List),
+        allowDelete: noCaveats || permissions.value.includes(Permission.Delete),
+        allowPutBucketNotificationConfiguration: noCaveats || bucketNotificationPermissions.value.includes(BucketNotificationPermission.PutBucketNotificationConfiguration),
+        allowGetBucketNotificationConfiguration: noCaveats || bucketNotificationPermissions.value.includes(BucketNotificationPermission.GetBucketNotificationConfiguration),
+    };
+
+    if (objectLockUIEnabled.value) {
+        permissionsPayload.allowPutObjectRetention = noCaveats || objectLockPermissions.value.includes(ObjectLockPermission.PutObjectRetention);
+        permissionsPayload.allowGetObjectRetention = noCaveats || objectLockPermissions.value.includes(ObjectLockPermission.GetObjectRetention);
+        permissionsPayload.allowBypassGovernanceRetention = objectLockPermissions.value.includes(ObjectLockPermission.BypassGovernanceRetention);
+        permissionsPayload.allowPutObjectLegalHold = noCaveats || objectLockPermissions.value.includes(ObjectLockPermission.PutObjectLegalHold);
+        permissionsPayload.allowGetObjectLegalHold = noCaveats || objectLockPermissions.value.includes(ObjectLockPermission.GetObjectLegalHold);
+        permissionsPayload.allowPutBucketObjectLockConfiguration = noCaveats || objectLockPermissions.value.includes(ObjectLockPermission.PutObjectLockConfiguration);
+        permissionsPayload.allowGetBucketObjectLockConfiguration = noCaveats || objectLockPermissions.value.includes(ObjectLockPermission.GetObjectLockConfiguration);
+    }
+
+    const req: CreateAccessRequest = {
+        projectID,
+        name: name.value,
+        permissions: permissionsPayload,
+        buckets: noCaveats ? [] : buckets.value,
+        notAfter: endDate.value && !noCaveats ? endDate.value.toISOString() : undefined,
+    };
+
+    const resp = await agStore.createRestrictedAccess(req);
+    accessGrant.value = resp.accessGrant;
+    cliAccess.value = '';
+
+    if (route.name === ROUTES.Access.name || route.name === ROUTES.ObjectMount.name) {
+        agStore.getAccessGrants(1, projectID).catch(error => {
+            notify.notifyError(error, AnalyticsErrorEventSource.SETUP_ACCESS_MODAL);
+        });
+    }
+
+    if (accessType.value === AccessType.AccessGrant) {
+        analyticsStore.eventTriggered(AnalyticsEvent.ACCESS_GRANT_CREATED, { project_id: projectID });
+    }
+}
+
 /**
  * Generates API Key.
  */
 async function createAPIKey(): Promise<void> {
-    if (!worker.value) throw new Error('Web worker is not initialized.');
-
     const projectID = projectsStore.state.selectedProject.id;
     const cleanAPIKey: AccessGrant = await agStore.createAccessGrant(name.value, projectID);
 
-    if (route.name === ROUTES.Access.name) {
-        agStore.getAccessGrants(1, projectID).catch(err => {
-            notify.error(`Unable to fetch access grants. ${err.message}`, AnalyticsErrorEventSource.SETUP_ACCESS_MODAL);
+    if (route.name === ROUTES.Access.name || route.name === ROUTES.ObjectMount.name) {
+        agStore.getAccessGrants(1, projectID).catch(error => {
+            notify.notifyError(error, AnalyticsErrorEventSource.SETUP_ACCESS_MODAL);
         });
     }
 
     const noCaveats = flowType.value === FlowType.FullAccess;
 
-    let permissionsMsg: PermissionsMessage = {
-        'type': 'SetPermission',
-        'buckets': JSON.stringify(noCaveats ? [] : buckets.value),
-        'apiKey': cleanAPIKey.secret,
-        'isDownload': noCaveats || permissions.value.includes(Permission.Read),
-        'isUpload': noCaveats || permissions.value.includes(Permission.Write),
-        'isList': noCaveats || permissions.value.includes(Permission.List),
-        'isDelete': noCaveats || permissions.value.includes(Permission.Delete),
-        'notBefore': new Date().toISOString(),
+    let permissionsMsg: SetPermissionsMessage = {
+        buckets: JSON.stringify(noCaveats ? [] : buckets.value),
+        apiKey: cleanAPIKey.secret,
+        isDownload: noCaveats || permissions.value.includes(Permission.Read),
+        isUpload: noCaveats || permissions.value.includes(Permission.Write),
+        isList: noCaveats || permissions.value.includes(Permission.List),
+        isDelete: noCaveats || permissions.value.includes(Permission.Delete),
+        notBefore: new Date().toISOString(),
+        isPutBucketNotificationConfiguration: noCaveats || bucketNotificationPermissions.value.includes(BucketNotificationPermission.PutBucketNotificationConfiguration),
+        isGetBucketNotificationConfiguration: noCaveats || bucketNotificationPermissions.value.includes(BucketNotificationPermission.GetBucketNotificationConfiguration),
     };
 
     if (objectLockUIEnabled.value) {
         permissionsMsg = {
             ...permissionsMsg,
-            'isPutObjectRetention': noCaveats || objectLockPermissions.value.includes(ObjectLockPermission.PutObjectRetention),
-            'isGetObjectRetention': noCaveats || objectLockPermissions.value.includes(ObjectLockPermission.GetObjectRetention),
-            'isBypassGovernanceRetention': noCaveats || objectLockPermissions.value.includes(ObjectLockPermission.BypassGovernanceRetention),
-            'isPutObjectLegalHold': noCaveats || objectLockPermissions.value.includes(ObjectLockPermission.PutObjectLegalHold),
-            'isGetObjectLegalHold': noCaveats || objectLockPermissions.value.includes(ObjectLockPermission.GetObjectLegalHold),
+            isPutObjectRetention: noCaveats || objectLockPermissions.value.includes(ObjectLockPermission.PutObjectRetention),
+            isGetObjectRetention: noCaveats || objectLockPermissions.value.includes(ObjectLockPermission.GetObjectRetention),
+            isBypassGovernanceRetention: objectLockPermissions.value.includes(ObjectLockPermission.BypassGovernanceRetention),
+            isPutObjectLegalHold: noCaveats || objectLockPermissions.value.includes(ObjectLockPermission.PutObjectLegalHold),
+            isGetObjectLegalHold: noCaveats || objectLockPermissions.value.includes(ObjectLockPermission.GetObjectLegalHold),
+            isPutObjectLockConfiguration: noCaveats || objectLockPermissions.value.includes(ObjectLockPermission.PutObjectLockConfiguration),
+            isGetObjectLockConfiguration: noCaveats || objectLockPermissions.value.includes(ObjectLockPermission.GetObjectLockConfiguration),
         };
     }
 
-    if (endDate.value && !noCaveats) permissionsMsg = Object.assign(permissionsMsg, { 'notAfter': endDate.value.toISOString() });
+    if (endDate.value && !noCaveats) permissionsMsg = Object.assign(permissionsMsg, { notAfter: endDate.value.toISOString() });
 
-    worker.value.postMessage(permissionsMsg);
+    cliAccess.value = await setPermissions(permissionsMsg);
 
-    const grantEvent: MessageEvent = await new Promise(resolve => {
-        if (worker.value) worker.value.onmessage = resolve;
-    });
-    if (grantEvent.data.error) throw new Error(grantEvent.data.error);
-
-    cliAccess.value = grantEvent.data.value;
-
-    if (accessType.value === AccessType.APIKey) analyticsStore.eventTriggered(AnalyticsEvent.API_ACCESS_CREATED);
+    if (accessType.value === AccessType.APIKey)
+        analyticsStore.eventTriggered(AnalyticsEvent.API_ACCESS_CREATED, { project_id: projectID });
 }
 
 /**
  * Generates access grant.
  */
 async function createAccessGrant(): Promise<void> {
-    if (!worker.value) throw new Error('Web worker is not initialized.');
     if (!passphrase.value) throw new Error('Passphrase can\'t be empty');
 
-    const satelliteNodeURL = configStore.state.config.satelliteNodeURL;
+    accessGrant.value = await generateAccess({
+        apiKey: cliAccess.value,
+        passphrase: passphrase.value,
+    }, projectsStore.state.selectedProject.id);
 
-    const salt = await projectsStore.getProjectSalt(projectsStore.state.selectedProject.id);
-
-    worker.value.postMessage({
-        'type': 'GenerateAccess',
-        'apiKey': cliAccess.value,
-        'passphrase': passphrase.value,
-        'salt': salt,
-        'satelliteNodeURL': satelliteNodeURL,
-    });
-
-    const accessEvent: MessageEvent = await new Promise(resolve => {
-        if (worker.value) worker.value.onmessage = resolve;
-    });
-    if (accessEvent.data.error) throw new Error(accessEvent.data.error);
-
-    accessGrant.value = accessEvent.data.value;
-
-    if (accessType.value === AccessType.AccessGrant) analyticsStore.eventTriggered(AnalyticsEvent.ACCESS_GRANT_CREATED);
+    if (accessType.value === AccessType.AccessGrant)
+        analyticsStore.eventTriggered(AnalyticsEvent.ACCESS_GRANT_CREATED, { project_id: projectsStore.state.selectedProject.id });
 }
 
 /**
@@ -626,7 +735,23 @@ async function createAccessGrant(): Promise<void> {
  */
 async function createEdgeCredentials(): Promise<void> {
     credentials.value = await agStore.getEdgeCredentials(accessGrant.value);
-    analyticsStore.eventTriggered(AnalyticsEvent.GATEWAY_CREDENTIALS_CREATED);
+    analyticsStore.eventTriggered(AnalyticsEvent.GATEWAY_CREDENTIALS_CREATED, { project_id: projectsStore.state.selectedProject.id });
+}
+
+function setFullAccess(): void {
+    permissions.value = [Permission.Read, Permission.Write, Permission.List, Permission.Delete];
+    objectLockPermissions.value = [
+        ObjectLockPermission.PutObjectRetention,
+        ObjectLockPermission.GetObjectRetention,
+        ObjectLockPermission.PutObjectLegalHold,
+        ObjectLockPermission.GetObjectLegalHold,
+        ObjectLockPermission.PutObjectLockConfiguration,
+        ObjectLockPermission.GetObjectLockConfiguration,
+    ];
+    bucketNotificationPermissions.value = [
+        BucketNotificationPermission.PutBucketNotificationConfiguration,
+        BucketNotificationPermission.GetBucketNotificationConfiguration,
+    ];
 }
 
 /**
@@ -679,7 +804,7 @@ function sendApplicationsAnalytics(e: AnalyticsEvent): void {
  * Initializes the current step when it has changed.
  */
 watch(step, newStep => {
-    if (!innerContent.value) return;
+    if (!model.value) return;
 
     // Window items are lazy loaded, so the component may not exist yet
     let unwatch: WatchStopHandle | null = null;
@@ -710,27 +835,21 @@ watch(step, newStep => {
  * This is used instead of onMounted because the dialog remains mounted
  * even when hidden.
  */
-watch(innerContent, async (comp?: VCard): Promise<void> => {
-    if (!comp) {
+watch(model, async (val: boolean): Promise<void> => {
+    if (!val) {
         resets.forEach(reset => reset());
         return;
-    }
-
-    worker.value = agStore.state.accessGrantsWebWorker;
-    if (worker.value) {
-        worker.value.onerror = (error: ErrorEvent) => {
-            notify.error(error.message, AnalyticsErrorEventSource.SETUP_ACCESS_MODAL);
-        };
     }
 
     isFetching.value = true;
 
     const projectID = projectsStore.state.selectedProject.id;
-    await agStore.getAllAGNames(projectID).catch(err => {
-        notify.error(`Error fetching access grant names. ${err.message}`, AnalyticsErrorEventSource.SETUP_ACCESS_MODAL);
-    });
-    await bucketsStore.getAllBucketsNames(projectID).catch(err => {
-        notify.error(`Error fetching bucket grant names. ${err.message}`, AnalyticsErrorEventSource.SETUP_ACCESS_MODAL);
+
+    await Promise.all([
+        agStore.getAllAGNames(projectID),
+        bucketsStore.getAllBucketsNames(projectID),
+    ]).catch(error => {
+        notify.notifyError(error, AnalyticsErrorEventSource.SETUP_ACCESS_MODAL);
     });
 
     passphrase.value = bucketsStore.state.passphrase;

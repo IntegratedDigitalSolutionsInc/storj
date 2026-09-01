@@ -40,6 +40,23 @@ func TestProjectsGetByPublicID(t *testing.T) {
 	})
 }
 
+func TestProjectsGetPublicID(t *testing.T) {
+	satellitedbtest.Run(t, func(ctx *testcontext.Context, t *testing.T, db satellite.DB) {
+		projects := db.Console().Projects()
+
+		prj, err := projects.Insert(ctx, &console.Project{
+			Name:        "ProjectName",
+			Description: "projects description",
+		})
+		require.NoError(t, err)
+		require.NotNil(t, prj)
+
+		publicID, err := projects.GetPublicID(ctx, prj.ID)
+		require.NoError(t, err)
+		require.Equal(t, prj.PublicID, publicID)
+	})
+}
+
 func TestProjectsGetSalt(t *testing.T) {
 	satellitedbtest.Run(t, func(ctx *testcontext.Context, t *testing.T, db satellite.DB) {
 		projects := db.Console().Projects()
@@ -99,9 +116,11 @@ func TestGetProjectsByUserID(t *testing.T) {
 		})
 		require.NoError(t, err)
 
+		passphraseEnc := testrand.Bytes(2 * memory.B)
 		proj, err := projectsRepo.Insert(ctx, &console.Project{
-			Name:    "Project",
-			OwnerID: user1.ID,
+			Name:          "Project",
+			OwnerID:       user1.ID,
+			PassphraseEnc: passphraseEnc,
 		})
 		require.NoError(t, err)
 
@@ -112,6 +131,8 @@ func TestGetProjectsByUserID(t *testing.T) {
 		require.NoError(t, err)
 		require.Len(t, projects, 1)
 		require.Equal(t, 1, projects[0].MemberCount)
+		require.NotNil(t, projects[0].PassphraseEnc)
+		require.EqualValues(t, passphraseEnc, projects[0].PassphraseEnc)
 
 		_, err = projectMembers.Insert(ctx, user2.ID, proj.ID, console.RoleAdmin)
 		require.NoError(t, err)
@@ -120,6 +141,26 @@ func TestGetProjectsByUserID(t *testing.T) {
 		require.NoError(t, err)
 		require.Len(t, projects, 1)
 		require.Equal(t, 2, projects[0].MemberCount)
+
+		projects, err = projectsRepo.GetActiveByUserID(ctx, user1.ID)
+		require.NoError(t, err)
+		require.Len(t, projects, 1)
+
+		for _, status := range []console.ProjectStatus{console.ProjectDisabled, console.ProjectPendingDeletion} {
+			err = projectsRepo.UpdateStatus(ctx, proj.ID, status)
+			require.NoError(t, err)
+
+			projects, err = projectsRepo.GetByUserID(ctx, user1.ID)
+			require.NoError(t, err)
+			require.Len(t, projects, 1)
+
+			projects, err = projectsRepo.GetActiveByUserID(ctx, user1.ID)
+			require.NoError(t, err)
+			require.Len(t, projects, 0)
+
+			err = projectsRepo.UpdateStatus(ctx, proj.ID, console.ProjectActive)
+			require.NoError(t, err)
+		}
 	})
 }
 
@@ -193,6 +234,42 @@ func TestUpdateAllProjectLimits(t *testing.T) {
 		require.Nil(t, p.MaxBuckets)
 		require.Nil(t, p.RateLimit)
 		require.Nil(t, p.BurstLimit)
+	})
+}
+
+func TestProjectUpdateNotificationFlags(t *testing.T) {
+	satellitedbtest.Run(t, func(ctx *testcontext.Context, t *testing.T, db satellite.DB) {
+		projectsRepo := db.Console().Projects()
+
+		proj, err := projectsRepo.Insert(ctx, &console.Project{Name: "test"})
+		require.NoError(t, err)
+
+		t.Run("nil on new project", func(t *testing.T) {
+			p, err := projectsRepo.Get(ctx, proj.ID)
+			require.NoError(t, err)
+			require.Nil(t, p.NotificationFlags)
+		})
+
+		t.Run("persisted after update", func(t *testing.T) {
+			flags := 3 // StorageNotificationsEnabled | StorageUsage80
+			proj.NotificationFlags = &flags
+			require.NoError(t, projectsRepo.Update(ctx, proj))
+
+			p, err := projectsRepo.Get(ctx, proj.ID)
+			require.NoError(t, err)
+			require.NotNil(t, p.NotificationFlags)
+			require.Equal(t, flags, *p.NotificationFlags)
+		})
+
+		t.Run("not cleared when nil in update", func(t *testing.T) {
+			proj.NotificationFlags = nil
+			require.NoError(t, projectsRepo.Update(ctx, proj))
+
+			p, err := projectsRepo.Get(ctx, proj.ID)
+			require.NoError(t, err)
+			// flags should still be set since nil means "don't update"
+			require.NotNil(t, p.NotificationFlags)
+		})
 	})
 }
 

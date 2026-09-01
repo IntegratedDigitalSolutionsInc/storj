@@ -1,10 +1,10 @@
 // Copyright (C) 2019 Storj Labs, Inc.
 // See LICENSE for copying information.
 
-import { DEFAULT_PAGE_LIMIT } from '@/types/pagination';
 import { ProjectRole } from '@/types/projectMembers';
 import { Versioning } from '@/types/versioning';
-import { DeleteProjectStep } from '@/types/accountActions';
+import type { DeleteProjectStep } from '@/types/accountActions';
+import type { PlacementDetails } from '@/types/buckets';
 
 /**
  * Exposes all project-related functionality.
@@ -14,9 +14,10 @@ export interface ProjectsApi {
      * Creates project.
      *
      * @param createProjectFields - contains project information
+     * @param csrfProtectionToken - CSRF token
      * @throws Error
      */
-    create(createProjectFields: ProjectFields): Promise<Project>;
+    create(createProjectFields: ProjectFields, csrfProtectionToken: string): Promise<Project>;
     /**
      * Fetch projects.
      *
@@ -31,9 +32,10 @@ export interface ProjectsApi {
      * @param projectId
      * @param step
      * @param data
+     * @param csrfProtectionToken
      * @throws Error
      */
-    delete(projectId: string, step: DeleteProjectStep, data: string): Promise<ProjectDeletionData | null>;
+    delete(projectId: string, step: DeleteProjectStep, data: string, csrfProtectionToken: string): Promise<ProjectDeletionData | null>;
 
     /**
      * Fetch config for project.
@@ -45,31 +47,34 @@ export interface ProjectsApi {
     getConfig(projectId: string): Promise<ProjectConfig>;
 
     /**
-     * Opt in or out of versioning beta.
-     *
-     * @param projectId - the project's ID
-     * @param status - the new opt-in status
-     * @throws Error
-     */
-    setVersioningOptInStatus(projectId: string, status: 'in' | 'out'): Promise<void>;
-
-    /**
      * Update project name and description.
      *
      * @param projectId - project ID
      * @param updateProjectFields - project fields to update
+     * @param csrfProtectionToken - CSRF token
      * @throws Error
      */
-    update(projectId: string, updateProjectFields: UpdateProjectFields): Promise<void>;
+    update(projectId: string, updateProjectFields: UpdateProjectFields, csrfProtectionToken: string): Promise<void>;
 
     /**
      * Update project user specified limits.
      *
      * @param projectId - project ID
      * @param fields - project limits to update
+     * @param csrfProtectionToken - CSRF token
      * @throws Error
      */
-    updateLimits(projectId: string, fields: UpdateProjectLimitsFields): Promise<void>;
+    updateLimits(projectId: string, fields: UpdateProjectLimitsFields, csrfProtectionToken: string): Promise<void>;
+
+    /**
+     * Update project user specified limits.
+     *
+     * @param projectId - project ID
+     * @param fields - project limit notifications to update
+     * @param csrfProtectionToken - CSRF token
+     * @throws Error
+     */
+    updateLimitNotifications(projectId: string, fields: UpdateProjectLimitNotificationsFields, csrfProtectionToken: string): Promise<void>;
 
     /**
      * Get project limits.
@@ -116,7 +121,7 @@ export interface ProjectsApi {
      *
      * @throws Error
      */
-    getTotalUsageReportLink(start: number, end: number, projectID: string): string
+    getTotalUsageReportLink(start: number, end: number, includeCost: boolean, projectSummary: boolean, projectID: string): string
 
     /**
      * Get project daily usage by specific date range.
@@ -124,14 +129,6 @@ export interface ProjectsApi {
      * @throws Error
      */
     getDailyUsage(projectID: string, start: Date, end: Date): Promise<ProjectsStorageBandwidthDaily>;
-
-    /**
-     * Fetch owned projects.
-     *
-     * @returns ProjectsPage
-     * @throws Error
-     */
-    getOwnedProjects(cursor: ProjectsCursor): Promise<ProjectsPage>;
 
     /**
      * Returns a user's pending project member invitations.
@@ -145,7 +142,17 @@ export interface ProjectsApi {
      *
      * @throws Error
      */
-    respondToInvitation(projectID: string, response: ProjectInvitationResponse): Promise<void>;
+    respondToInvitation(projectID: string, response: ProjectInvitationResponse, csrfProtectionToken: string): Promise<void>;
+
+    /**
+     * Migrates project pricing from legacy to new pricing model.
+     * @param projectID
+     * @param targetTier
+     * @param csrfProtectionToken
+     *
+     * @throws Error
+     */
+    migratePricing(projectID: string, targetTier: TierMigrationOption, csrfProtectionToken: string): Promise<void>;
 }
 
 /**
@@ -157,6 +164,11 @@ export const MAX_NAME_LENGTH = 20;
  * MAX_DESCRIPTION_LENGTH defines maximum amount of symbols for project description.
  */
 export const MAX_DESCRIPTION_LENGTH = 100;
+
+export enum ProjectEncryption {
+    Automatic = 'Automatic',
+    Manual = 'Self-Managed',
+}
 
 /**
  * Project is a type, used for creating new project in backend.
@@ -173,8 +185,13 @@ export class Project {
         public memberCount: number = 0,
         public edgeURLOverrides?: EdgeURLOverrides,
         public versioning: Versioning = Versioning.NotSupported,
+        public placement: number = 0,
         public storageUsed: number = 0,
         public bandwidthUsed: number = 0,
+        public encryption: ProjectEncryption = ProjectEncryption.Manual,
+        public isClassic: boolean = false,
+        public storageLimitNotificationsEnabled: boolean = false,
+        public egressLimitNotificationsEnabled: boolean = false,
     ) {}
 }
 
@@ -183,17 +200,16 @@ export class Project {
  */
 export class ProjectConfig {
     public constructor(
-        public versioningUIEnabled: boolean = false,
-        public promptForVersioningBeta: boolean = false,
         public hasManagedPassphrase: boolean = false,
         public passphrase: string = '',
+        public encryptPath: boolean = false,
         public isOwnerPaidTier: boolean = false,
+        public hasPaidPrivileges: boolean = false,
         public _role: number = 1,
-        // This indicates whether a project has object lock enabled for it.
-        // In the background (satellite), it is dependent on whether the object
-        // lock feature is enabled for the satellite (metainfo) and whether
-        // the project has opted in for versioning (versioningUIEnabled).
-        public objectLockUIEnabled: boolean = false,
+        public salt: string = '',
+        public membersCount: number = 0,
+        public availablePlacements: PlacementDetails[] = [],
+        public computeAuthToken: string = '',
     ) {}
 
     public get role(): ProjectItemRole {
@@ -213,6 +229,7 @@ export type EdgeURLOverrides = {
     authService?: string;
     publicLinksharing?: string;
     internalLinksharing?: string;
+    gatewayEndpoint?: string;
 };
 
 /**
@@ -224,29 +241,8 @@ export class ProjectFields {
         public description: string = '',
         public ownerId: string = '',
         public managePassphrase: boolean = false,
+        public placement: number = 0,
     ) {}
-
-    /**
-     * checkName checks if project name is valid.
-     */
-    public checkName(): void {
-        this.nameIsNotEmpty();
-        this.nameHasLessThenTwentySymbols();
-    }
-
-    /**
-     * nameIsNotEmpty checks if project name is not empty.
-     */
-    private nameIsNotEmpty(): void {
-        if (this.name.length === 0) throw new Error('Project name can\'t be empty!');
-    }
-
-    /**
-     * nameHasLessThenTwentySymbols checks if project name has less then 20 symbols.
-     */
-    private nameHasLessThenTwentySymbols(): void {
-        if (this.name.length > MAX_NAME_LENGTH) throw new Error('Name should be less than 21 character!');
-    }
 }
 
 /**
@@ -279,28 +275,9 @@ export interface UpdateProjectLimitsFields {
     bandwidthLimit?: string;
 }
 
-/**
- * ProjectsPage class, used to describe paged projects list.
- */
-export class ProjectsPage {
-    public constructor(
-        public projects: Project[] = [],
-        public limit: number = 0,
-        public offset: number = 0,
-        public pageCount: number = 0,
-        public currentPage: number = 0,
-        public totalCount: number = 0,
-    ) {}
-}
-
-/**
- * ProjectsPage class, used to describe paged projects list.
- */
-export class ProjectsCursor {
-    public constructor(
-        public limit: number = DEFAULT_PAGE_LIMIT,
-        public page: number = 1,
-    ) {}
+export interface UpdateProjectLimitNotificationsFields {
+    storageNotificationsEnabled?: boolean;
+    egressNotificationsEnabled?: boolean;
 }
 
 /**
@@ -308,6 +285,7 @@ export class ProjectsCursor {
  */
 export class ProjectDeletionData {
     public constructor(
+        public lockEnabledBuckets: number,
         public buckets: number,
         public apiKeys: number,
         public currentUsage: boolean,
@@ -341,6 +319,7 @@ export class ProjectsStorageBandwidthDaily {
     public constructor(
         public storage: DataStamp[] = [],
         public allocatedBandwidth: DataStamp[] = [],
+        public settledBandwidth: DataStamp[] = [],
     ) {}
 }
 
@@ -366,14 +345,6 @@ export class ProjectInvitation {
         public inviterEmail: string,
         public createdAt: Date,
     ) {}
-
-    /**
-     * Returns created date as a local string.
-     */
-    public get invitedDate(): string {
-        const createdAt = new Date(this.createdAt);
-        return createdAt.toLocaleString('en-US', { year: 'numeric', month: '2-digit', day: 'numeric' });
-    }
 }
 
 /**
@@ -424,6 +395,11 @@ export enum LimitType {
     Segment = 'Segment',
 }
 
+export enum TierMigrationOption {
+    Archive = 'archive',
+    Global = 'global',
+}
+
 export type LimitThresholdsReached = Record<LimitThreshold, LimitType[]>;
 
 export type ManagePassphraseMode = 'auto' | 'manual';
@@ -439,8 +415,10 @@ export class ProjectItemModel {
         public role: ProjectItemRole,
         public memberCount: number | null,
         public createdAt: Date,
-        public storageUsed: string = '',
-        public bandwidthUsed: string = '',
+        public storageUsed: number = 0,
+        public bandwidthUsed: number = 0,
+        public encryption: ProjectEncryption | undefined = undefined,
+        public isClassic: boolean = false,
     ) {}
 }
 
@@ -453,9 +431,9 @@ export type ProjectItemRole = Exclude<ProjectRole, ProjectRole.InviteExpired>;
  * PROJECT_ROLE_COLORS defines what colors project role tags should use.
  */
 export const PROJECT_ROLE_COLORS: Record<ProjectRole, string> = {
-    [ProjectRole.Admin]: 'primary',
+    [ProjectRole.Admin]: 'purple',
     [ProjectRole.Member]: 'success',
-    [ProjectRole.Owner]: 'secondary',
+    [ProjectRole.Owner]: 'primary',
     [ProjectRole.Invited]: 'warning',
     [ProjectRole.InviteExpired]: 'error',
 };

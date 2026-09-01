@@ -6,6 +6,7 @@ package audit
 import (
 	"context"
 	"math/rand"
+	"sync"
 	"time"
 
 	"github.com/zeebo/errs"
@@ -20,27 +21,35 @@ import (
 //
 // architecture: Observer
 type Observer struct {
-	log      *zap.Logger
-	queue    VerifyQueue
-	config   Config
-	seedRand *rand.Rand
+	log    *zap.Logger
+	queue  VerifyQueue
+	config Config
+
+	muSeedRand sync.Mutex
+	seedRand   *rand.Rand
 
 	// The follow fields are reset on each segment loop cycle.
 	Reservoirs map[metabase.NodeAlias]*Reservoir
+
+	include AuditedNodes
 }
 
 var _ rangedloop.Observer = (*Observer)(nil)
 var _ rangedloop.Partial = (*observerFork)(nil)
 
 // NewObserver instantiates Observer.
-func NewObserver(log *zap.Logger, queue VerifyQueue, config Config) *Observer {
+func NewObserver(log *zap.Logger, include AuditedNodes, queue VerifyQueue, config Config) *Observer {
 	if config.VerificationPushBatchSize < 1 {
 		config.VerificationPushBatchSize = 1
+	}
+	if include == nil {
+		include = &AllNodes{}
 	}
 	return &Observer{
 		log:      log,
 		queue:    queue,
 		config:   config,
+		include:  include,
 		seedRand: rand.New(rand.NewSource(time.Now().Unix())),
 	}
 }
@@ -48,7 +57,10 @@ func NewObserver(log *zap.Logger, queue VerifyQueue, config Config) *Observer {
 // Start prepares the observer for audit segment collection.
 func (obs *Observer) Start(ctx context.Context, startTime time.Time) (err error) {
 	defer mon.Task()(&ctx)(&err)
-
+	err = obs.include.Reload(ctx)
+	if err != nil {
+		return errs.Wrap(err)
+	}
 	obs.Reservoirs = make(map[metabase.NodeAlias]*Reservoir)
 	return nil
 }
@@ -62,8 +74,11 @@ func (obs *Observer) Fork(ctx context.Context) (_ rangedloop.Partial, err error)
 	// current time (even with nanosecond precision) may end up reusing a seed
 	// for two or more RNGs. To prevent that, the observer itself uses an RNG
 	// to seed the per-collector RNGs.
-	rnd := rand.New(rand.NewSource(obs.seedRand.Int63()))
-	return newObserverFork(obs.config.Slots, rnd), nil
+	obs.muSeedRand.Lock()
+	source := obs.seedRand.Int63()
+	obs.muSeedRand.Unlock()
+	rnd := rand.New(rand.NewSource(source))
+	return newObserverFork(obs.config.Slots, rnd, obs.include), nil
 }
 
 // Join merges the audit reservoir collector into the per-node reservoirs.
@@ -114,7 +129,7 @@ func (obs *Observer) Finish(ctx context.Context) (err error) {
 				Position: segment.Position.Encode(),
 			}
 			if _, ok := queueSegments[segmentKey]; !ok {
-				newQueue = append(newQueue, NewSegment(segment))
+				newQueue = append(newQueue, segment)
 				queueSegments[segmentKey] = struct{}{}
 			}
 		}
@@ -128,10 +143,12 @@ type observerFork struct {
 	reservoirs map[metabase.NodeAlias]*Reservoir
 	slotCount  int
 	rand       *rand.Rand
+	include    AuditedNodes
 }
 
-func newObserverFork(reservoirSlots int, r *rand.Rand) *observerFork {
+func newObserverFork(reservoirSlots int, r *rand.Rand, include AuditedNodes) *observerFork {
 	return &observerFork{
+		include:    include,
 		reservoirs: make(map[metabase.NodeAlias]*Reservoir),
 		slotCount:  reservoirSlots,
 		rand:       r,
@@ -152,6 +169,9 @@ func (fork *observerFork) Process(ctx context.Context, segments []rangedloop.Seg
 		for _, piece := range segment.AliasPieces {
 			res, ok := fork.reservoirs[piece.Alias]
 			if !ok {
+				if !fork.include.Match(piece.Alias) {
+					continue
+				}
 				res = NewReservoir(fork.slotCount)
 				fork.reservoirs[piece.Alias] = res
 			}

@@ -1,0 +1,831 @@
+// Copyright (C) 2023 Storj Labs, Inc.
+// See LICENSE for copying information.
+
+// Package main defines the satellite administration API through the API generator and generates
+// source code of the API server handlers and clients and the documentation markdown document.
+package main
+
+//go:generate go run $GOFILE
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"storj.io/common/uuid"
+	"storj.io/storj/private/apigen"
+	backoffice "storj.io/storj/satellite/admin"
+	"storj.io/storj/satellite/admin/changehistory"
+	"storj.io/storj/satellite/console"
+)
+
+type authParamKey int
+
+// passAuthParamKey is a setting key to mark endpoints whose service
+// methods should be passed authenticated user's groups.
+const passAuthParamKey authParamKey = 0
+
+func main() {
+	api := &apigen.API{
+		PackageName: "admin",
+		PackagePath: "storj.io/storj/satellite/admin",
+		Version:     "v1",
+		BasePath:    "/api",
+	}
+
+	group := api.Group("Settings", "settings")
+	group.Middleware = append(group.Middleware, authMiddleware{})
+
+	group.Get("/", &apigen.Endpoint{
+		Name:           "Get settings",
+		Description:    "Gets the settings of the service and relevant Storj services settings",
+		GoName:         "GetSettings",
+		TypeScriptName: "get",
+		Response:       backoffice.Settings{},
+		Settings: map[any]any{
+			passAuthParamKey: true,
+		},
+	})
+
+	group = api.Group("PlacementManagement", "placements")
+
+	group.Get("/", &apigen.Endpoint{
+		Name:           "Get placements",
+		Description:    "Gets placement rule IDs and their locations",
+		GoName:         "GetPlacements",
+		TypeScriptName: "getPlacements",
+		Response:       []backoffice.PlacementInfo{},
+	})
+
+	group = api.Group("ProductManagement", "products")
+
+	group.Get("/", &apigen.Endpoint{
+		Name:           "Get products",
+		Description:    "Gets all defined product definitions",
+		GoName:         "GetProducts",
+		TypeScriptName: "getProducts",
+		Response:       []backoffice.ProductInfo{},
+	})
+
+	group = api.Group("UserManagement", "users")
+	group.Middleware = append(group.Middleware, authMiddleware{})
+
+	group.Get("/freeze-event-types", &apigen.Endpoint{
+		Name:           "Get freeze event types",
+		Description:    "Gets account freeze event types",
+		GoName:         "GetFreezeEventTypes",
+		TypeScriptName: "getFreezeEventTypes",
+		Response:       []backoffice.FreezeEventType{},
+	})
+
+	group.Get("/kinds", &apigen.Endpoint{
+		Name:           "Get user kinds",
+		Description:    "Gets available user kinds",
+		GoName:         "GetUserKinds",
+		TypeScriptName: "getUserKinds",
+		Response:       []console.KindInfo{},
+		Settings: map[any]any{
+			authPermsKey: []backoffice.Permission{backoffice.PermAccountView},
+		},
+	})
+
+	group.Get("/statuses", &apigen.Endpoint{
+		Name:           "Get user statuses",
+		Description:    "Gets available user statuses",
+		GoName:         "GetUserStatuses",
+		TypeScriptName: "getUserStatuses",
+		Response:       []console.UserStatusInfo{},
+		Settings: map[any]any{
+			authPermsKey: []backoffice.Permission{backoffice.PermAccountView},
+		},
+	})
+
+	group.Get("/opt-in-statuses", &apigen.Endpoint{
+		Name:           "Get opt-in statuses",
+		Description:    "Gets opt-in statuses that an admin may assign to a user",
+		GoName:         "GetOptInStatuses",
+		TypeScriptName: "getOptInStatuses",
+		Response:       []console.OptInStatusInfo{},
+		Settings: map[any]any{
+			authPermsKey: []backoffice.Permission{backoffice.PermAccountView},
+		},
+	})
+
+	group.Get("/", &apigen.Endpoint{
+		Name:           "Search users",
+		Description:    "Search users by email or name. Results are limited to 100 users.",
+		GoName:         "SearchUsers",
+		TypeScriptName: "searchUsers",
+		QueryParams: []apigen.QueryParam{
+			apigen.NewQueryParam("term", ""),
+		},
+		Response: []backoffice.AccountMin{},
+		Settings: map[any]any{
+			authPermsKey: []backoffice.Permission{backoffice.PermAccountView},
+		},
+	})
+
+	group.Get("/email/{email}", &apigen.Endpoint{
+		Name:           "Get user",
+		Description:    "Gets user by email address",
+		GoName:         "GetUserByEmail",
+		TypeScriptName: "getUserByEmail",
+		PathParams: []apigen.PathParam{
+			apigen.NewPathParam("email", ""),
+		},
+		Response: backoffice.UserAccount{},
+		Settings: map[any]any{
+			authPermsKey: []backoffice.Permission{backoffice.PermAccountView},
+		},
+	})
+
+	group.Get("/{userID}", &apigen.Endpoint{
+		Name:           "Get user",
+		Description:    "Gets user by ID",
+		GoName:         "GetUser",
+		TypeScriptName: "getUser",
+		PathParams: []apigen.PathParam{
+			apigen.NewPathParam("userID", uuid.UUID{}),
+		},
+		Response: backoffice.UserAccount{},
+		Settings: map[any]any{
+			authPermsKey: []backoffice.Permission{backoffice.PermAccountView},
+		},
+	})
+
+	group.Patch("/{userID}", &apigen.Endpoint{
+		Name: "Update user",
+		Description: "Updates user info by ID. Limit updates will cascade to all projects of the user." +
+			"Updating user kind to NFR or Paid without providing limits will set the limits to kind defaults.",
+		GoName:         "UpdateUser",
+		TypeScriptName: "updateUser",
+		PathParams: []apigen.PathParam{
+			apigen.NewPathParam("userID", uuid.UUID{}),
+		},
+		Request:  backoffice.UpdateUserRequest{},
+		Response: backoffice.UserAccount{},
+		Settings: map[any]any{
+			authPermsKey: []backoffice.Permission{
+				/* permissions are validated dynamically in UpdateUser */
+			},
+			passAuthParamKey: true,
+		},
+	})
+
+	group.Patch("/{userID}/upgrade-time", &apigen.Endpoint{
+		Name:           "Update user's upgrade time",
+		Description:    "Updates user's upgrade time by ID",
+		GoName:         "UpdateUserUpgradeTime",
+		TypeScriptName: "updateUserUpgradeTime",
+		PathParams: []apigen.PathParam{
+			apigen.NewPathParam("userID", uuid.UUID{}),
+		},
+		Request:  backoffice.UpdateUserUpgradeTimeRequest{},
+		Response: backoffice.UserAccount{},
+		Settings: map[any]any{
+			authPermsKey:     []backoffice.Permission{backoffice.PermAccountChangeUpgradeTime},
+			passAuthParamKey: true,
+		},
+	})
+
+	group.Patch("/{userID}/opt-in-status", &apigen.Endpoint{
+		Name: "Update user's opt-in status",
+		Description: "Sets a user's OptInStatus. Only NoAction (0) and Excluded (3) are accepted." +
+			" Opting in or out is an explicit user action and must not be performed via the admin API.",
+		GoName:         "UpdateUserOptInStatus",
+		TypeScriptName: "updateUserOptInStatus",
+		PathParams: []apigen.PathParam{
+			apigen.NewPathParam("userID", uuid.UUID{}),
+		},
+		Request: backoffice.UpdateUserOptInStatusRequest{},
+		Settings: map[any]any{
+			authPermsKey:     []backoffice.Permission{backoffice.PermAccountUpdateOptInStatus},
+			passAuthParamKey: true,
+		},
+	})
+
+	group.Patch("/{userID}/tenant-id", &apigen.Endpoint{
+		Name:           "Update user's tenant ID",
+		Description:    "Updates user's tenant ID by user ID",
+		GoName:         "UpdateUserTenantID",
+		TypeScriptName: "updateUserTenantID",
+		PathParams: []apigen.PathParam{
+			apigen.NewPathParam("userID", uuid.UUID{}),
+		},
+		Request:  backoffice.UpdateUserTenantIDRequest{},
+		Response: backoffice.UserAccount{},
+		Settings: map[any]any{
+			authPermsKey:     []backoffice.Permission{backoffice.PermAccountUpdateTenantID},
+			passAuthParamKey: true,
+		},
+	})
+
+	group.Put("/{userID}", &apigen.Endpoint{
+		Name: "Disable user",
+		Description: "Disables user by ID. User can only be disabled if they have no active projects" +
+			" and pending invoices. It can also set status to pending deletion.",
+		GoName:         "DisableUser",
+		TypeScriptName: "disableUser",
+		PathParams: []apigen.PathParam{
+			apigen.NewPathParam("userID", uuid.UUID{}),
+		},
+		Request:  backoffice.DisableUserRequest{},
+		Response: backoffice.UserAccount{},
+		Settings: map[any]any{
+			authPermsKey:     []backoffice.Permission{},
+			passAuthParamKey: true,
+		},
+	})
+
+	group.Put("/{userID}/freeze-events", &apigen.Endpoint{
+		Name:           "Freeze/Unfreeze User",
+		Description:    "Freeze or unfreeze a user account",
+		GoName:         "ToggleFreezeUser",
+		TypeScriptName: "toggleFreezeUser",
+		PathParams: []apigen.PathParam{
+			apigen.NewPathParam("userID", uuid.UUID{}),
+		},
+		Request: backoffice.ToggleFreezeUserRequest{},
+		Settings: map[any]any{
+			authPermsKey: []backoffice.Permission{
+				/* permissions are validated dynamically in FreezeUser */
+			},
+			passAuthParamKey: true,
+		},
+	})
+
+	group.Put("/{userID}/inactivity-exemption", &apigen.Endpoint{
+		Name:           "Toggle inactivity exemption",
+		Description:    "Sets or clears the inactivity exemption flag for a user. When granting, clears any pending inactivity warning or freeze.",
+		GoName:         "ToggleInactivityExemption",
+		TypeScriptName: "toggleInactivityExemption",
+		PathParams: []apigen.PathParam{
+			apigen.NewPathParam("userID", uuid.UUID{}),
+		},
+		Request: backoffice.ToggleInactivityExemptionRequest{},
+		Settings: map[any]any{
+			authPermsKey:     []backoffice.Permission{backoffice.PermManageInactivityExemption},
+			passAuthParamKey: true,
+		},
+	})
+
+	group.Put("/{userID}/mfa", &apigen.Endpoint{
+		Name:           "Toggle MFA",
+		Description:    "Toggles MFA for a user. Only disabling is supported.",
+		GoName:         "ToggleMFA",
+		TypeScriptName: "toggleMFA",
+		PathParams: []apigen.PathParam{
+			apigen.NewPathParam("userID", uuid.UUID{}),
+		},
+		Request: backoffice.ToggleMfaRequest{},
+		Settings: map[any]any{
+			authPermsKey:     []backoffice.Permission{backoffice.PermAccountDisableMFA},
+			passAuthParamKey: true,
+		},
+	})
+
+	group.Post("/rest-keys/{userID}", &apigen.Endpoint{
+		Name:           "Create Rest Key",
+		Description:    "Creates a rest API key a user",
+		GoName:         "CreateRestKey",
+		TypeScriptName: "createRestKey",
+		PathParams: []apigen.PathParam{
+			apigen.NewPathParam("userID", uuid.UUID{}),
+		},
+		Request:  backoffice.CreateRestKeyRequest{},
+		Response: "",
+		Settings: map[any]any{
+			authPermsKey:     []backoffice.Permission{backoffice.PermAccountCreateRestKey},
+			passAuthParamKey: true,
+		},
+	})
+
+	group.Post("/registration-tokens", &apigen.Endpoint{
+		Name:           "Create registration token",
+		Description:    "Creates a registration token that can be used to register a new user with preset limits",
+		GoName:         "CreateRegistrationToken",
+		TypeScriptName: "createRegistrationToken",
+		Request:        backoffice.CreateRegistrationTokenRequest{},
+		Response:       backoffice.CreateRegistrationTokenResponse{},
+		Settings: map[any]any{
+			authPermsKey:     []backoffice.Permission{backoffice.PermAccountCreateRegToken},
+			passAuthParamKey: true,
+		},
+	})
+
+	group.Get("/{userID}/licenses", &apigen.Endpoint{
+		Name:           "Get user licenses",
+		Description:    "Gets all licenses for a user",
+		GoName:         "GetUserLicenses",
+		TypeScriptName: "getUserLicenses",
+		PathParams: []apigen.PathParam{
+			apigen.NewPathParam("userID", uuid.UUID{}),
+		},
+		Response: backoffice.UserLicensesResponse{},
+		Settings: map[any]any{
+			authPermsKey: []backoffice.Permission{backoffice.PermAccountViewLicenses},
+		},
+	})
+
+	group.Post("/{userID}/licenses", &apigen.Endpoint{
+		Name:           "Grant user license",
+		Description:    "Grants a new license to a user",
+		GoName:         "GrantUserLicense",
+		TypeScriptName: "grantUserLicense",
+		PathParams: []apigen.PathParam{
+			apigen.NewPathParam("userID", uuid.UUID{}),
+		},
+		Request: backoffice.GrantLicenseRequest{},
+		Settings: map[any]any{
+			authPermsKey:     []backoffice.Permission{backoffice.PermAccountChangeLicenses},
+			passAuthParamKey: true,
+		},
+	})
+
+	group.Delete("/{userID}/licenses", &apigen.Endpoint{
+		Name:           "Revoke user license",
+		Description:    "Revokes a license for a user",
+		GoName:         "RevokeUserLicense",
+		TypeScriptName: "revokeUserLicense",
+		PathParams: []apigen.PathParam{
+			apigen.NewPathParam("userID", uuid.UUID{}),
+		},
+		Request: backoffice.RevokeLicenseRequest{},
+		Settings: map[any]any{
+			authPermsKey:     []backoffice.Permission{backoffice.PermAccountChangeLicenses},
+			passAuthParamKey: true,
+		},
+	})
+
+	group.Post("/{userID}/licenses/delete", &apigen.Endpoint{
+		Name:           "Delete user license",
+		Description:    "Permanently deletes a license for a user",
+		GoName:         "DeleteUserLicense",
+		TypeScriptName: "deleteUserLicense",
+		PathParams: []apigen.PathParam{
+			apigen.NewPathParam("userID", uuid.UUID{}),
+		},
+		Request: backoffice.DeleteLicenseRequest{},
+		Settings: map[any]any{
+			authPermsKey:     []backoffice.Permission{backoffice.PermAccountChangeLicenses},
+			passAuthParamKey: true,
+		},
+	})
+
+	group.Patch("/{userID}/licenses", &apigen.Endpoint{
+		Name:           "Update user license",
+		Description:    "Updates a license's expiration time for a user",
+		GoName:         "UpdateUserLicense",
+		TypeScriptName: "updateUserLicense",
+		PathParams: []apigen.PathParam{
+			apigen.NewPathParam("userID", uuid.UUID{}),
+		},
+		Request: backoffice.UpdateLicenseRequest{},
+		Settings: map[any]any{
+			authPermsKey:     []backoffice.Permission{backoffice.PermAccountChangeLicenses},
+			passAuthParamKey: true,
+		},
+	})
+
+	group.Get("/{userID}/usage-report", &apigen.Endpoint{
+		Name: "Get user usage report",
+		Description: "Gets storage and bandwidth usage for all active projects owned by a user for a" +
+			" given period as a downloadable CSV file. Filter to a single project with projectID." +
+			" Aggregate by project instead of bucket with projectSummary=true.",
+		GoName:         "GetUserUsageReport",
+		TypeScriptName: "getUserUsageReport",
+		PathParams: []apigen.PathParam{
+			apigen.NewPathParam("userID", uuid.UUID{}),
+		},
+		QueryParams: []apigen.QueryParam{
+			apigen.NewQueryParam("since", time.Time{}),
+			apigen.NewQueryParam("before", time.Time{}),
+			apigen.NewQueryParamOptional("projectID", uuid.UUID{}),
+			apigen.NewQueryParamOptional("projectSummary", false),
+		},
+		ResponseType: "text/csv",
+		ResponseDocumentation: "CSV file. Default columns: projectName, projectPublicID, bucketName," +
+			" storage (GB-hours), egress (GB), objectCount, segmentCount, since, before." +
+			" With projectSummary=true: bucketName is omitted and rows are aggregated per project.",
+		SkipClientGeneration: true,
+		Settings: map[any]any{
+			authPermsKey: []backoffice.Permission{backoffice.PermAccountViewUsage},
+		},
+	})
+
+	group = api.Group("ProjectManagement", "projects")
+	group.Middleware = append(group.Middleware, authMiddleware{})
+
+	group.Get("/statuses", &apigen.Endpoint{
+		Name:           "Get project statuses",
+		Description:    "Gets available project statuses",
+		GoName:         "GetProjectStatuses",
+		TypeScriptName: "getProjectStatuses",
+		Response:       []backoffice.ProjectStatusInfo{},
+		Settings: map[any]any{
+			authPermsKey: []backoffice.Permission{backoffice.PermProjectView},
+		},
+	})
+
+	group.Get("/{publicID}", &apigen.Endpoint{
+		Name:           "Get project",
+		Description:    "Gets project by ID",
+		GoName:         "GetProject",
+		TypeScriptName: "getProject",
+		PathParams: []apigen.PathParam{
+			apigen.NewPathParam("publicID", uuid.UUID{}),
+		},
+		Response: backoffice.Project{},
+		Settings: map[any]any{
+			authPermsKey:     []backoffice.Permission{backoffice.PermProjectView},
+			passAuthParamKey: true,
+		},
+	})
+
+	group.Get("/{publicID}/buckets", &apigen.Endpoint{
+		Name:           "Get project buckets",
+		Description:    "Gets a project's buckets",
+		GoName:         "GetProjectBuckets",
+		TypeScriptName: "getProjectBuckets",
+		PathParams: []apigen.PathParam{
+			apigen.NewPathParam("publicID", uuid.UUID{}),
+		},
+		QueryParams: []apigen.QueryParam{
+			apigen.NewQueryParam("search", ""),
+			apigen.NewQueryParam("page", ""),
+			apigen.NewQueryParam("limit", ""),
+			apigen.NewQueryParam("since", time.Time{}),
+			apigen.NewQueryParam("before", time.Time{}),
+		},
+		Response: backoffice.BucketInfoPage{},
+		Settings: map[any]any{
+			authPermsKey: []backoffice.Permission{backoffice.PermProjectView, backoffice.PermBucketView},
+		},
+	})
+
+	group.Patch("/{publicID}/buckets/{bucketName}", &apigen.Endpoint{
+		Name:           "Update bucket",
+		Description:    "Updates a bucket's user agent, and placement if the bucket is empty",
+		GoName:         "UpdateBucket",
+		TypeScriptName: "updateBucket",
+		PathParams: []apigen.PathParam{
+			apigen.NewPathParam("publicID", uuid.UUID{}),
+			apigen.NewPathParam("bucketName", ""),
+		},
+		Request: backoffice.UpdateBucketRequest{},
+		Settings: map[any]any{
+			authPermsKey:     []backoffice.Permission{},
+			passAuthParamKey: true,
+		},
+	})
+
+	group.Get("/{publicID}/buckets/{bucketName}/state", &apigen.Endpoint{
+		Name:           "Get bucket state",
+		Description:    "Gets a bucket's state that is not stored in the buckets table and requires additional queries.",
+		GoName:         "GetBucketState",
+		TypeScriptName: "getBucketState",
+		PathParams: []apigen.PathParam{
+			apigen.NewPathParam("publicID", uuid.UUID{}),
+			apigen.NewPathParam("bucketName", ""),
+		},
+		Response: backoffice.BucketState{},
+		Settings: map[any]any{
+			authPermsKey: []backoffice.Permission{backoffice.PermProjectView, backoffice.PermBucketView},
+		},
+	})
+
+	group.Patch("/{publicID}", &apigen.Endpoint{
+		Name:           "Update project",
+		Description:    "Updates project name, user agent and default placement by ID",
+		GoName:         "UpdateProject",
+		TypeScriptName: "updateProject",
+		PathParams: []apigen.PathParam{
+			apigen.NewPathParam("publicID", uuid.UUID{}),
+		},
+		Request:  backoffice.UpdateProjectRequest{},
+		Response: backoffice.Project{},
+		Settings: map[any]any{
+			authPermsKey:     []backoffice.Permission{},
+			passAuthParamKey: true,
+		},
+	})
+
+	group.Put("/{publicID}", &apigen.Endpoint{
+		Name:           "Disable project",
+		Description:    "Disables a project by ID. It can also set status to pending deletion.",
+		GoName:         "DisableProject",
+		TypeScriptName: "disableProject",
+		PathParams: []apigen.PathParam{
+			apigen.NewPathParam("publicID", uuid.UUID{}),
+		},
+		Request: backoffice.DisableProjectRequest{},
+		Settings: map[any]any{
+			authPermsKey:     []backoffice.Permission{},
+			passAuthParamKey: true,
+		},
+	})
+
+	group.Patch("/{publicID}/limits", &apigen.Endpoint{
+		Name:           "Update project limits",
+		Description:    "Updates project limits by ID",
+		GoName:         "UpdateProjectLimits",
+		TypeScriptName: "updateProjectLimits",
+		PathParams: []apigen.PathParam{
+			apigen.NewPathParam("publicID", uuid.UUID{}),
+		},
+		Request:  backoffice.ProjectLimitsUpdateRequest{},
+		Response: backoffice.Project{},
+		Settings: map[any]any{
+			authPermsKey:     []backoffice.Permission{backoffice.PermProjectSetLimits},
+			passAuthParamKey: true,
+		},
+	})
+
+	group.Patch("/{publicID}/entitlements", &apigen.Endpoint{
+		Name:           "Update project entitlements",
+		Description:    "Updates project entitlements by ID. Only one entitlement can be updated at a time.",
+		GoName:         "UpdateProjectEntitlements",
+		TypeScriptName: "updateProjectEntitlements",
+		PathParams: []apigen.PathParam{
+			apigen.NewPathParam("publicID", uuid.UUID{}),
+		},
+		Request:  backoffice.UpdateProjectEntitlementsRequest{},
+		Response: backoffice.ProjectEntitlements{},
+		Settings: map[any]any{
+			authPermsKey:     []backoffice.Permission{backoffice.PermProjectSetEntitlements},
+			passAuthParamKey: true,
+		},
+	})
+
+	group.Get("/{publicID}/members", &apigen.Endpoint{
+		Name:           "Get project members",
+		Description:    "Gets paged project members by project ID",
+		GoName:         "GetProjectMembers",
+		TypeScriptName: "getProjectMembers",
+		PathParams: []apigen.PathParam{
+			apigen.NewPathParam("publicID", uuid.UUID{}),
+		},
+		QueryParams: []apigen.QueryParam{
+			apigen.NewQueryParam("search", ""),
+			apigen.NewQueryParam("page", ""),
+			apigen.NewQueryParam("limit", ""),
+			apigen.NewQueryParam("order", ""),
+			apigen.NewQueryParam("direction", ""),
+		},
+		Response: backoffice.ProjectMembersPage{},
+		Settings: map[any]any{
+			authPermsKey: []backoffice.Permission{backoffice.PermProjectMembersView},
+		},
+	})
+
+	// generic api group that handles searching for users and projects together
+	group = api.Group("Search", "search")
+	group.Middleware = append(group.Middleware, authMiddleware{})
+
+	group.Get("/", &apigen.Endpoint{
+		Name:           "Search users or projects",
+		Description:    "Search by ID, email, name, Stripe customer ID, or node operator email. Results include at most one project and up to 100 users and 100 nodes.",
+		GoName:         "SearchUsersProjectsOrNodes",
+		TypeScriptName: "searchUsersProjectsOrNodes",
+		QueryParams: []apigen.QueryParam{
+			apigen.NewQueryParam("term", ""),
+		},
+		Response: backoffice.SearchResult{},
+		Settings: map[any]any{
+			authPermsKey: []backoffice.Permission{
+				/* permissions are validated dynamically in SearchUsersProjectsOrNodes */
+			},
+			passAuthParamKey: true,
+		},
+	})
+
+	// generic api group that handles retrieving change history for users, projects and buckets
+	group = api.Group("ChangeHistory", "changehistory")
+	group.Middleware = append(group.Middleware, authMiddleware{})
+
+	group.Get("/", &apigen.Endpoint{
+		Name: "Get change history",
+		Description: "Retrieves change history for users, projects and buckets. If the exact parameter is `true`, this would" +
+			"fetch changes strictly on the user, project or bucket. It'll do otherwise if it's `false`.",
+		GoName:         "GetChangeHistory",
+		TypeScriptName: "getChangeHistory",
+		QueryParams: []apigen.QueryParam{
+			apigen.NewQueryParam("exact", "true"),    // string because API gen doesn't support bool query params
+			apigen.NewQueryParam("itemType", "user"), // user, project, bucket
+			apigen.NewQueryParam("id", ""),           // userID, projectID, bucketName
+		},
+		Response: []changehistory.ChangeLog{},
+		Settings: map[any]any{
+			authPermsKey: []backoffice.Permission{backoffice.PermViewChangeHistory},
+		},
+	})
+
+	// api group that handles retrieving node information
+	group = api.Group("NodeManagement", "nodes")
+	group.Middleware = append(group.Middleware, authMiddleware{})
+
+	group.Get("/{nodeID}", &apigen.Endpoint{
+		Name:           "Get node info",
+		Description:    "Gets detailed information about a storage node by its ID.",
+		GoName:         "GetNodeInfo",
+		TypeScriptName: "getNodeInfo",
+		PathParams: []apigen.PathParam{
+			apigen.NewPathParam("nodeID", ""),
+		},
+		Response: backoffice.NodeFullInfo{},
+		Settings: map[any]any{
+			authPermsKey: []backoffice.Permission{backoffice.PermNodesView},
+		},
+	})
+
+	group.Post("/{nodeID}/disqualification", &apigen.Endpoint{
+		Name:           "Disqualify node",
+		Description:    "Sets the disqualification status of a storage node by its ID.",
+		GoName:         "DisqualifyNode",
+		TypeScriptName: "disqualifyNode",
+		PathParams: []apigen.PathParam{
+			apigen.NewPathParam("nodeID", ""),
+		},
+		Request: backoffice.DisqualifyNodeRequest{},
+		Settings: map[any]any{
+			authPermsKey:     []backoffice.Permission{backoffice.PermNodesModify},
+			passAuthParamKey: true,
+		},
+	})
+
+	group.Delete("/{nodeID}/disqualification", &apigen.Endpoint{
+		Name:           "Undisqualify node",
+		Description:    "Clears the disqualification status of a storage node by its ID.",
+		GoName:         "UndisqualifyNode",
+		TypeScriptName: "undisqualifyNode",
+		PathParams: []apigen.PathParam{
+			apigen.NewPathParam("nodeID", ""),
+		},
+		Request: backoffice.UndisqualifyNodeRequest{},
+		Settings: map[any]any{
+			authPermsKey:     []backoffice.Permission{backoffice.PermNodesModify},
+			passAuthParamKey: true,
+		},
+	})
+
+	group = api.Group("AccessManagement", "access")
+	group.Middleware = append(group.Middleware, authMiddleware{})
+
+	group.Post("/", &apigen.Endpoint{
+		Name:           "Inspect Access",
+		Description:    "Inspects a provided access string and returns its metadata",
+		GoName:         "InspectAccess",
+		TypeScriptName: "inspectAccess",
+		Request:        backoffice.AccessInspectRequest{},
+		Response:       backoffice.AccessInspectResult{},
+		Settings: map[any]any{
+			authPermsKey: []backoffice.Permission{backoffice.PermAccessInspect},
+		},
+	})
+
+	group.Post("/revoke", &apigen.Endpoint{
+		Name:           "Revoke Access",
+		Description:    "Revokes access based on provided access tail and API key ID",
+		GoName:         "RevokeAccess",
+		TypeScriptName: "revokeAccess",
+		Request:        backoffice.AccessRevokeRequest{},
+		Settings: map[any]any{
+			authPermsKey:     []backoffice.Permission{backoffice.PermAccessRevoke},
+			passAuthParamKey: true,
+		},
+	})
+
+	group = api.Group("WhiteLabelManagement", "whitelabel")
+	group.Middleware = append(group.Middleware, authMiddleware{})
+
+	group.Get("/", &apigen.Endpoint{
+		Name:           "List tenant whitelabel configs",
+		Description:    "Lists all per-tenant whitelabel configs. Not available in tenant-scoped admin.",
+		GoName:         "ListTenantWhiteLabelConfigs",
+		TypeScriptName: "listTenantWhiteLabelConfigs",
+		Response:       []backoffice.TenantWhiteLabelConfig{},
+		Settings: map[any]any{
+			authPermsKey: []backoffice.Permission{backoffice.PermViewWhiteLabelConfig},
+		},
+	})
+
+	group.Get("/{tenantID}", &apigen.Endpoint{
+		Name:           "Get tenant whitelabel config",
+		Description:    "Gets the persisted whitelabel config for a tenant.",
+		GoName:         "GetTenantWhiteLabelConfig",
+		TypeScriptName: "getTenantWhiteLabelConfig",
+		PathParams: []apigen.PathParam{
+			apigen.NewPathParam("tenantID", ""),
+		},
+		Response: backoffice.TenantWhiteLabelConfig{},
+		Settings: map[any]any{
+			authPermsKey: []backoffice.Permission{backoffice.PermViewWhiteLabelConfig},
+		},
+	})
+
+	group.Put("/{tenantID}", &apigen.Endpoint{
+		Name:           "Update tenant whitelabel config",
+		Description:    "Creates or replaces the whitelabel config for a tenant.",
+		GoName:         "UpdateTenantWhiteLabelConfig",
+		TypeScriptName: "updateTenantWhiteLabelConfig",
+		PathParams: []apigen.PathParam{
+			apigen.NewPathParam("tenantID", ""),
+		},
+		Request:  backoffice.UpdateTenantWhiteLabelConfigRequest{},
+		Response: backoffice.TenantWhiteLabelConfig{},
+		Settings: map[any]any{
+			authPermsKey: []backoffice.Permission{backoffice.PermUpdateWhiteLabelConfig},
+		},
+	})
+
+	api.OutputRootDir = findModuleRootDir()
+	api.MustWriteGo(filepath.Join("satellite", "admin", "handlers.gen.go"))
+	api.MustWriteTS(filepath.Join("satellite", "admin", "ui", "src", "api", "client.gen.ts"))
+	api.MustWriteDocs(filepath.Join("satellite", "admin", "api-docs.gen.md"))
+}
+
+type authMiddleware struct {
+	//lint:ignore U1000 this field is used by the API generator to expose in the handler.
+	auth *backoffice.Authorizer
+}
+
+func (a authMiddleware) Generate(_ *apigen.API, _ *apigen.EndpointGroup, ep *apigen.FullEndpoint) string {
+	format := `
+		if err = h.auth.VerifyHost(r); err != nil {
+			api.ServeError(h.log, w, http.StatusForbidden, err)
+			return
+		}
+	`
+	if apigen.LoadSetting(passAuthParamKey, ep, false) {
+		format += `
+			authInfo := h.auth.GetAuthInfo(r)
+			if authInfo == nil || authInfo.Email == "" || (!h.auth.IsOIDCMode() && len(authInfo.Groups) == 0) {
+				api.ServeError(h.log, w, http.StatusUnauthorized, errs.New("Unauthorized"))
+				return
+			}
+		`
+	}
+
+	perms := apigen.LoadSetting(authPermsKey, ep, []backoffice.Permission{})
+	if len(perms) == 0 {
+		return format
+	}
+
+	verbs := make([]string, 0, len(perms))
+	values := make([]any, 0, len(perms))
+	for _, p := range perms {
+		verbs = append(verbs, "%d")
+		values = append(values, p)
+	}
+
+	format += fmt.Sprintf(`
+		if h.auth.IsRejected(w, r, %s) {
+			return
+		}`, strings.Join(verbs, ", "))
+
+	return fmt.Sprintf(format, values...)
+}
+
+// ExtraServiceParams satisfies the apigen.Middleware interface.
+func (a authMiddleware) ExtraServiceParams(_ *apigen.API, _ *apigen.EndpointGroup, ep *apigen.FullEndpoint) []apigen.PathParam {
+	if apigen.LoadSetting(passAuthParamKey, ep, false) {
+		return []apigen.PathParam{
+			apigen.NewPathParam("authInfo", &backoffice.AuthInfo{}),
+		}
+	}
+	return nil
+}
+
+var _ apigen.Middleware = authMiddleware{}
+
+type tagAuthPerms struct{}
+
+var authPermsKey = tagAuthPerms{}
+
+func findModuleRootDir() string {
+	dir, err := os.Getwd()
+	if err != nil {
+		panic("unable to find current working directory")
+	}
+	start := dir
+
+	for i := 0; i < 100; i++ {
+		if fileExists(filepath.Join(dir, "go.mod")) {
+			return dir
+		}
+		next := filepath.Dir(dir)
+		if next == dir {
+			break
+		}
+		dir = next
+	}
+
+	panic("unable to find go.mod starting from " + start)
+}
+
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}

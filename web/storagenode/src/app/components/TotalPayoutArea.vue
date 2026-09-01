@@ -6,49 +6,46 @@
         <div class="total-payout-area__united-info-area">
             <div class="total-payout-area__united-info-area__item">
                 <p class="total-payout-area__united-info-area__item__label">Current Month Earnings</p>
-                <p class="total-payout-area__united-info-area__item__amount">{{ currentEarnings | centsToDollars }}</p>
+                <p class="total-payout-area__united-info-area__item__amount">{{ centsToDollars(currentEarnings) }}</p>
             </div>
             <div class="total-payout-area__united-info-area__item align-center">
                 <p class="total-payout-area__united-info-area__item__label">Total Earned</p>
-                <p class="total-payout-area__united-info-area__item__amount">{{ totalEarnings | centsToDollars }}</p>
+                <p class="total-payout-area__united-info-area__item__amount">{{ centsToDollars(totalEarnings) }}</p>
             </div>
             <div class="total-payout-area__united-info-area__item align-end">
                 <p class="total-payout-area__united-info-area__item__label">Total Held Amount</p>
-                <p class="total-payout-area__united-info-area__item__amount">{{ totalHeld | centsToDollars }}</p>
+                <p class="total-payout-area__united-info-area__item__amount">{{ centsToDollars(totalHeld) }}</p>
             </div>
         </div>
         <div class="total-payout-area__info-area">
-            <SingleInfo width="100%" label="Current Month Earnings" :value="currentEarnings | centsToDollars" />
-            <SingleInfo width="100%" label="Total Earnings" :value="totalEarnings | centsToDollars" />
-            <SingleInfo width="100%" label="Total Held Amount" :value="totalHeld | centsToDollars" />
+            <SingleInfo width="100%" label="Current Month Earnings" :value="centsToDollars(currentEarnings)" />
+            <SingleInfo width="100%" label="Total Earnings" :value="centsToDollars(totalEarnings)" />
+            <SingleInfo width="100%" label="Total Held Amount" :value="centsToDollars(totalHeld)" />
         </div>
     </section>
 </template>
 
-<script lang="ts">
-import { Component, Vue } from 'vue-property-decorator';
+<script setup lang="ts">
+import { computed } from 'vue';
+
+import { centsToDollars } from '@/app/utils/payout';
+import { usePayoutStore } from '@/app/store/modules/payoutStore';
 
 import SingleInfo from '@/app/components/payments/SingleInfo.vue';
 
-// @vue/component
-@Component({
-    components: {
-        SingleInfo,
-    },
-})
-export default class TotalPayoutArea extends Vue {
-    public get totalEarnings(): number {
-        return this.$store.state.payoutModule.totalPayments.paid;
-    }
+const payoutStore = usePayoutStore();
 
-    public get totalHeld(): number {
-        return this.$store.state.payoutModule.totalPayments.held;
-    }
+const totalEarnings = computed(() => {
+    return payoutStore.state.totalPayments.paid;
+});
 
-    public get currentEarnings(): number {
-        return this.$store.state.payoutModule.currentMonthEarnings;
-    }
-}
+const totalHeld = computed(() => {
+    return payoutStore.state.totalPayments.held;
+});
+
+const currentEarnings = computed(() => {
+    return payoutStore.state.currentMonthEarnings;
+});
 </script>
 
 <style scoped lang="scss">
@@ -101,7 +98,7 @@ export default class TotalPayoutArea extends Vue {
         align-items: flex-end;
     }
 
-    @media screen and (max-width: 780px) {
+    @media screen and (width <= 780px) {
 
         .total-payout-area {
 

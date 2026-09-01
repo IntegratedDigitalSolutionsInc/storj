@@ -12,6 +12,7 @@ import (
 	"storj.io/common/process"
 	"storj.io/common/process/eventkitbq"
 	"storj.io/storj/satellite"
+	"storj.io/storj/satellite/jobq"
 	"storj.io/storj/satellite/metabase"
 	"storj.io/storj/satellite/satellitedb"
 )
@@ -36,7 +37,20 @@ func cmdRangedLoopRun(cmd *cobra.Command, args []string) (err error) {
 		err = errs.Combine(err, metabaseDB.Close())
 	}()
 
-	peer, err := satellite.NewRangedLoop(log, db, metabaseDB, &runCfg.Config, process.AtomicLevel(cmd))
+	identity, err := runCfg.Identity.Load()
+	if err != nil {
+		return errs.New("Error loading identity: %+v", err)
+	}
+
+	if runCfg.JobQueue.ServerNodeURL.IsZero() {
+		return errs.New("job queue server node URL is required")
+	}
+	repairQueue, err := jobq.OpenJobQueue(ctx, identity, runCfg.JobQueue)
+	if err != nil {
+		return errs.New("Error opening repair queue: %+v", err)
+	}
+
+	peer, err := satellite.NewRangedLoop(log, db, metabaseDB, repairQueue, &runCfg.Config, process.AtomicLevel(cmd))
 	if err != nil {
 		return err
 	}
@@ -45,14 +59,8 @@ func cmdRangedLoopRun(cmd *cobra.Command, args []string) (err error) {
 		log.Warn("Failed to initialize telemetry on satellite rangedloop", zap.Error(err))
 	}
 
-	if err := metabaseDB.CheckVersion(ctx); err != nil {
-		log.Error("Failed metabase database version check.", zap.Error(err))
-		return errs.New("failed metabase version check: %+v", err)
-	}
-
-	if err := db.CheckVersion(ctx); err != nil {
-		log.Error("Failed satellite database version check.", zap.Error(err))
-		return errs.New("Error checking version for satellitedb: %+v", err)
+	if err := checkDBVersions(ctx, log, runCfg, db, metabaseDB); err != nil {
+		return err
 	}
 
 	runError := peer.Run(ctx)

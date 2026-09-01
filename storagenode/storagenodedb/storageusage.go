@@ -37,13 +37,11 @@ func (db *storageUsageDB) Store(ctx context.Context, stamps []storageusage.Stamp
 
 	return sqliteutil.WithTx(ctx, db.GetDB(), func(ctx context.Context, tx tagsql.Tx) error {
 		for _, stamp := range stamps {
-			_, err = tx.ExecContext(ctx, query, stamp.SatelliteID, stamp.AtRestTotal, stamp.IntervalEndTime.UTC(), stamp.IntervalStart.UTC())
-
+			_, err := tx.ExecContext(ctx, query, stamp.SatelliteID, stamp.AtRestTotal, stamp.IntervalEndTime.UTC(), stamp.IntervalStart.UTC())
 			if err != nil {
 				return err
 			}
 		}
-
 		return nil
 	})
 }
@@ -107,6 +105,47 @@ func (db *storageUsageDB) GetDaily(ctx context.Context, satelliteID storj.NodeID
 			IntervalInHours:  intervalInHours.Float64,
 			IntervalStart:    timestamp,
 		})
+	}
+
+	return stamps, rows.Err()
+}
+
+// GetDailyRawForNormalization returns unmodified satellite storage usage
+// stamps for a particular satellite and time range, together with the two
+// preceding stamps required to normalize the first available rate.
+func (db *storageUsageDB) GetDailyRawForNormalization(ctx context.Context, satelliteID storj.NodeID, from, to time.Time) (_ []storageusage.Stamp, err error) {
+	defer mon.Task()(&ctx)(&err)
+
+	query := `SELECT satellite_id, at_rest_total, timestamp, interval_end_time
+				FROM storage_usage
+				WHERE satellite_id = ?
+				AND (
+					(? <= timestamp AND timestamp <= ?)
+					OR timestamp IN (
+						SELECT timestamp
+						FROM storage_usage
+						WHERE satellite_id = ?
+						AND timestamp < ?
+						ORDER BY timestamp DESC
+						LIMIT 2
+					)
+				)
+				ORDER BY timestamp ASC`
+
+	rows, err := db.QueryContext(ctx, query, satelliteID, from.UTC(), to.UTC(), satelliteID, from.UTC())
+	if err != nil {
+		return nil, err
+	}
+	defer func() { err = errs.Combine(err, rows.Close()) }()
+
+	var stamps []storageusage.Stamp
+	for rows.Next() {
+		var stamp storageusage.Stamp
+		err = rows.Scan(&stamp.SatelliteID, &stamp.AtRestTotal, &stamp.IntervalStart, &stamp.IntervalEndTime)
+		if err != nil {
+			return nil, err
+		}
+		stamps = append(stamps, stamp)
 	}
 
 	return stamps, rows.Err()

@@ -27,14 +27,37 @@ var (
 
 // Config contains configurable values for the shared loop.
 type Config struct {
-	Parallelism          int           `help:"how many chunks of segments to process in parallel" default:"2"`
-	BatchSize            int           `help:"how many items to query in a batch" default:"2500"`
-	AsOfSystemInterval   time.Duration `help:"as of system interval" releaseDefault:"-5m" devDefault:"-1us" testDefault:"-1us"`
-	Interval             time.Duration `help:"how often to run the loop" releaseDefault:"2h" devDefault:"10s" testDefault:"0"`
-	SpannerStaleInterval time.Duration `help:"sets spanner stale read timestamp as now()-interval" default:"0"`
+	Parallelism        int           `help:"how many chunks of segments to process in parallel" default:"2"`
+	BatchSize          int           `help:"how many items to query in a batch, capped at 50000" default:"2500"`
+	AsOfSystemInterval time.Duration `help:"as of system interval" releaseDefault:"-5m" devDefault:"-1us" testDefault:"-1us"`
+	Interval           time.Duration `help:"how often to run the loop" releaseDefault:"2h" devDefault:"10s" testDefault:"0"`
+	StaleInterval      time.Duration `help:"sets the fixed read timestamp as now()-interval" releaseDefault:"0" devDefault:"1s" testDefault:"0"`
+	AllowLiveReads     bool          `help:"let a metabase whose only backend has no AS OF SYSTEM TIME (Postgres) read live instead of at a fixed read timestamp; for testing and restored backups only" releaseDefault:"false" devDefault:"true" testDefault:"true"`
+	Safepoint          SafepointConfig
 
 	SuspiciousProcessedRatio float64 `help:"ratio where to consider processed count as supicious" default:"0.03"`
 }
+
+// SafepointConfig configures pinning a TiKV GC safepoint so a run-once scan
+// reads a consistent snapshot of a TiDB metabase (see shared/dbutil/tidbutil).
+type SafepointConfig struct {
+	PDEndpoints string        `help:"PD endpoints per TiDB cluster in format 'backend_label=host:port,host:port' separated by semicolons (the label defaults to the backend's position in database-url; join labels with '+' when backends share a cluster); when set, gc-bf pins a TiKV GC safepoint on each and scans a consistent snapshot; requires run-once mode and a TiDB metabase" default:""`
+	ServiceID   string        `help:"identifier prefix for the GC barrier/safepoint registered with PD" default:"storj-gc-bf"`
+	TTL         time.Duration `help:"the safepoint auto-expires this long after the last successful heartbeat" default:"1h"`
+	MaxDuration time.Duration `help:"abort the scan when the safepoint has been held longer than this" default:"48h"`
+
+	// PD requires client certificates on a cluster deployed with TLS between
+	// components, and the PD client only enables TLS when it has a certificate
+	// and key, so all three paths go together. Each may be a single path shared
+	// by every cluster, or one labeled path per backend when the clusters do
+	// not share a certificate authority.
+	CACertPath string `help:"path to the CA certificate verifying PD; required together with cert-path and key-path when the TiDB cluster has TLS enabled; a plain path applies to every backend, or use 'backend_label=path' entries separated by semicolons (labels joined with '+') to give each backend its own" default:""`
+	CertPath   string `help:"path to the client certificate presented to PD; a plain path applies to every backend, or use 'backend_label=path' entries separated by semicolons (labels joined with '+')" default:""`
+	KeyPath    string `help:"path to the client private key presented to PD; a plain path applies to every backend, or use 'backend_label=path' entries separated by semicolons (labels joined with '+')" default:""`
+}
+
+// Enabled reports whether safepoint pinning is configured.
+func (config SafepointConfig) Enabled() bool { return config.PDEndpoints != "" }
 
 // Service iterates through all segments and calls the attached observers for every segment
 //
@@ -82,6 +105,10 @@ type ObserverDuration struct {
 	// Duration is set to -1 when the observer has errored out
 	// so someone watching metrics can tell that something went wrong.
 	Duration time.Duration
+	// Err is the error the observer failed with, when it failed. The loop
+	// itself only logs it, so a caller that turns a failure into an exit
+	// needs it to say why.
+	Err error
 }
 
 // Close stops the ranged loop.
@@ -101,14 +128,8 @@ func (service *Service) Run(ctx context.Context) (err error) {
 	service.log.Info("ranged loop initialized")
 
 	return service.Loop.Run(ctx, func(ctx context.Context) error {
-		service.log.Info("ranged loop started",
-			zap.Int("parallelism", service.config.Parallelism),
-			zap.Int("batchSize", service.config.BatchSize),
-		)
 		_, err := service.RunOnce(ctx)
 		if err != nil {
-			service.log.Error("ranged loop failure", zap.Error(err))
-
 			if errs2.IsCanceled(err) {
 				return err
 			}
@@ -116,11 +137,8 @@ func (service *Service) Run(ctx context.Context) (err error) {
 			if ctx.Err() != nil {
 				return errs.Combine(err, ctx.Err())
 			}
-
-			mon.Event("rangedloop_error") //mon:locked
 		}
 
-		service.log.Info("ranged loop finished")
 		return nil
 	})
 }
@@ -129,12 +147,34 @@ func (service *Service) Run(ctx context.Context) (err error) {
 func (service *Service) RunOnce(ctx context.Context) (observerDurations []ObserverDuration, err error) {
 	defer mon.Task()(&ctx)(&err)
 
+	var observerTypes []string
+	for _, observer := range service.observers {
+		observerTypes = append(observerTypes, fmt.Sprintf("%T", observer))
+	}
+	service.log.Info("ranged loop started",
+		zap.Int("parallelism", service.config.Parallelism),
+		zap.Int("batch_size", service.config.BatchSize),
+		zap.Strings("observers", observerTypes),
+		zap.Duration("asofsystem_interval", service.config.AsOfSystemInterval),
+		zap.Duration("stale_interval", service.config.StaleInterval),
+	)
+
+	defer func() {
+		if err != nil {
+			service.log.Error("ranged loop failure", zap.Error(err))
+
+			mon.Event("rangedloop_error")
+		} else {
+			service.log.Info("ranged loop finished")
+		}
+	}()
+
 	observerStates, err := startObservers(ctx, service.log, service.observers)
 	if err != nil {
 		return nil, err
 	}
 
-	rangeProviders, err := service.provider.CreateRanges(service.config.Parallelism, service.config.BatchSize)
+	rangeProviders, err := service.provider.CreateRanges(ctx, service.config.Parallelism, service.config.BatchSize)
 	if err != nil {
 		return nil, err
 	}
@@ -232,6 +272,7 @@ func finishObserver(ctx context.Context, log *zap.Logger, state observerState) O
 		return ObserverDuration{
 			Observer: state.observer,
 			Duration: -1 * time.Second,
+			Err:      state.err,
 		}
 	}
 	for _, rangeObserver := range state.rangeObservers {
@@ -244,6 +285,7 @@ func finishObserver(ctx context.Context, log *zap.Logger, state observerState) O
 			return ObserverDuration{
 				Observer: state.observer,
 				Duration: -1 * time.Second,
+				Err:      rangeObserver.err,
 			}
 		}
 	}
@@ -255,11 +297,12 @@ func finishObserver(ctx context.Context, log *zap.Logger, state observerState) O
 			log.Error(
 				"Observer failed during Join(), it will not be finalized in this run of the ranged segment loop",
 				zap.String("observer", fmt.Sprintf("%T", state.observer)),
-				zap.Error(rangeObserver.err),
+				zap.Error(err),
 			)
 			return ObserverDuration{
 				Observer: state.observer,
 				Duration: -1 * time.Second,
+				Err:      err,
 			}
 		}
 		duration += rangeObserver.duration
@@ -275,6 +318,7 @@ func finishObserver(ctx context.Context, log *zap.Logger, state observerState) O
 		return ObserverDuration{
 			Observer: state.observer,
 			Duration: -1 * time.Second,
+			Err:      err,
 		}
 	}
 

@@ -12,7 +12,7 @@
                 <template #activator="{ props }">
                     <v-btn
                         v-bind="props"
-                        icon="$close"
+                        :icon="X"
                         variant="text"
                         size="small"
                         color="default"
@@ -31,19 +31,22 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue';
 import { VBtn, VTooltip } from 'vuetify/components';
+import { X } from '@lucide/vue';
 
-import { ONBOARDING_STEPPER_STEPS, User } from '@/types/users';
+import { type User, ONBOARDING_STEPPER_STEPS  } from '@/types/users';
 import { useUsersStore } from '@/store/modules/usersStore';
 import { useProjectsStore } from '@/store/modules/projectsStore';
-import { PricingPlanInfo } from '@/types/common';
+import type { PricingPlanInfo } from '@/types/common';
 import { useLoading } from '@/composables/useLoading';
 import { useBillingStore } from '@/store/modules/billingStore';
+import { useConfigStore } from '@/store/modules/configStore';
 
 import PartnerUpgradeNoticeBanner from '@/components/onboarding/PartnerUpgradeNoticeBanner.vue';
 import OnboardingComponent from '@/components/onboarding/OnboardingStepperComponent.vue';
 import PageTitleComponent from '@/components/PageTitleComponent.vue';
 import PageSubtitleComponent from '@/components/PageSubtitleComponent.vue';
 
+const configStore = useConfigStore();
 const projectsStore = useProjectsStore();
 const usersStore = useUsersStore();
 const billingStore = useBillingStore();
@@ -65,6 +68,8 @@ const planInfo = computed<PricingPlanInfo | null>(() => billingStore.state.prici
 const partnerBannerVisible = computed(() => !usersStore.noticeDismissal.partnerUpgradeBanner && billingStore.state.pricingPlansAvailable);
 
 const shouldShowOnboardStepper = computed<boolean>(() => {
+    if (configStore.state.config.newProjectTierLockEnabled) return false;
+
     const isNotOwner = selectedProject.value.ownerId !== user.value.id;
     const isNotFirstProject = selectedProject.value.id !== projectsStore.usersFirstProject?.id;
 

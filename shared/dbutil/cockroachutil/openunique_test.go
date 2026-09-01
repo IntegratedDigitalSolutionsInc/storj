@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+	"go.uber.org/zap/zaptest"
 
 	"storj.io/common/testcontext"
 	"storj.io/storj/shared/dbutil"
@@ -23,7 +24,7 @@ func TestTempCockroachDB(t *testing.T) {
 	defer ctx.Cleanup()
 
 	prefix := "name#spaced/Test/DB"
-	testDB, err := tempdb.OpenUnique(ctx, connstr, prefix)
+	testDB, err := tempdb.OpenUnique(ctx, zaptest.NewLogger(t), connstr, prefix)
 	require.NoError(t, err)
 
 	require.Equal(t, "cockroach", testDB.Driver)
@@ -36,7 +37,7 @@ func TestTempCockroachDB(t *testing.T) {
 	connStrCopy := testDB.ConnStr
 
 	// assert new test db exists and can be connected to again
-	otherConn, err := tagsql.Open(ctx, driverCopy, connStrCopy)
+	otherConn, err := tagsql.Open(ctx, driverCopy, connStrCopy, nil)
 	require.NoError(t, err)
 	defer ctx.Check(otherConn.Close)
 
@@ -60,7 +61,7 @@ func TestTempCockroachDB(t *testing.T) {
 
 	// make a new connection back to the master connstr just to check that the our temp db
 	// really was dropped
-	plainDBConn, err := tagsql.Open(ctx, "cockroach", connstr)
+	plainDBConn, err := tagsql.Open(ctx, "cockroach", connstr, nil)
 	require.NoError(t, err)
 	defer ctx.Check(plainDBConn.Close)
 

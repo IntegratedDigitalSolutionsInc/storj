@@ -29,6 +29,8 @@ var _ console.Users = (*users)(nil)
 type users struct {
 	db   dbx.DriverMethods
 	impl dbutil.Implementation
+
+	nowFn func() time.Time
 }
 
 // UpdateFailedLoginCountAndExpiration increments failed_login_count and sets login_lockout_expiration appropriately.
@@ -41,13 +43,6 @@ func (users *users) UpdateFailedLoginCountAndExpiration(ctx context.Context, fai
 			UPDATE users
 			SET failed_login_count = COALESCE(failed_login_count, 0) + 1,
 				login_lockout_expiration = ?::TIMESTAMPTZ + POWER(?, failed_login_count-1) * INTERVAL '1 minute'
-			WHERE id = ?
-		`), now, failedLoginPenalty, id.Bytes())
-		case dbutil.Spanner:
-			_, err = users.db.ExecContext(ctx, users.db.Rebind(`
-			UPDATE users
-			SET failed_login_count = IFNULL(failed_login_count, 0) + 1,
-				login_lockout_expiration = TIMESTAMP_ADD(?, INTERVAL CAST(POW(?, failed_login_count - 1) AS INT64) MINUTE)
 			WHERE id = ?
 		`), now, failedLoginPenalty, id.Bytes())
 		default:
@@ -63,11 +58,57 @@ func (users *users) UpdateFailedLoginCountAndExpiration(ctx context.Context, fai
 	return
 }
 
+// Search searches for users by a search term in their name or email.
+// Results are limited to 100 users.
+func (users *users) Search(ctx context.Context, term string, tenantID *string) (_ []console.UserInfo, err error) {
+	defer mon.Task()(&ctx)(&err)
+
+	search := "%" + strings.ReplaceAll(term, " ", "%") + "%"
+
+	var query string
+	var args []interface{}
+	if tenantID != nil {
+		query = `
+			SELECT id, full_name, email, status, kind, created_at, tenant_id
+			FROM users
+			WHERE (normalized_email LIKE UPPER(?) OR LOWER(full_name) LIKE LOWER(?))
+			  AND tenant_id = ?
+			ORDER BY normalized_email ASC
+			LIMIT 100;`
+		args = []interface{}{search, search, *tenantID}
+	} else {
+		query = `
+			SELECT id, full_name, email, status, kind, created_at, tenant_id
+			FROM users
+			WHERE normalized_email LIKE UPPER(?)
+			   OR LOWER(full_name) LIKE LOWER(?)
+			ORDER BY normalized_email ASC
+			LIMIT 100;`
+		args = []interface{}{search, search}
+	}
+
+	rows, err := users.db.QueryContext(ctx, users.db.Rebind(query), args...)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { err = errs.Combine(err, rows.Err(), rows.Close()) }()
+
+	var userInfos []console.UserInfo
+	for rows.Next() {
+		var usr console.UserInfo
+		if err := rows.Scan(&usr.ID, &usr.FullName, &usr.Email, &usr.Status, &usr.Kind, &usr.CreatedAt, &usr.TenantID); err != nil {
+			return nil, err
+		}
+		userInfos = append(userInfos, usr)
+	}
+
+	return userInfos, nil
+}
+
 // Get is a method for querying user from the database by id.
 func (users *users) Get(ctx context.Context, id uuid.UUID) (_ *console.User, err error) {
 	defer mon.Task()(&ctx)(&err)
 	user, err := users.db.Get_User_By_Id(ctx, dbx.User_Id(id[:]))
-
 	if err != nil {
 		return nil, err
 	}
@@ -75,9 +116,31 @@ func (users *users) Get(ctx context.Context, id uuid.UUID) (_ *console.User, err
 	return UserFromDBX(ctx, user)
 }
 
+// GetByCustomerID returns the user with the given customer ID.
+func (users *users) GetByCustomerID(ctx context.Context, customerID string) (_ *console.UserInfo, err error) {
+	defer mon.Task()(&ctx)(&err)
+
+	query := `
+		SELECT u.id, u.full_name, u.email, u.status, u.kind, u.created_at, u.tenant_id
+		FROM users AS u
+		WHERE u.id = (SELECT user_id FROM stripe_customers WHERE customer_id = ?);
+	`
+	row := users.db.QueryRowContext(ctx, users.db.Rebind(query), customerID)
+	if row.Err() != nil {
+		return nil, Error.Wrap(row.Err())
+	}
+	var usr console.UserInfo
+	err = row.Scan(&usr.ID, &usr.FullName, &usr.Email, &usr.Status, &usr.Kind, &usr.CreatedAt, &usr.TenantID)
+	if err != nil {
+		return nil, Error.Wrap(err)
+	}
+
+	return &usr, nil
+}
+
 // GetExpiredFreeTrialsAfter is a method for querying users that are in free trial from the database with trial expiry (after)
-// AND have not been frozen.
-func (users *users) GetExpiredFreeTrialsAfter(ctx context.Context, after time.Time, limit int) ([]console.User, error) {
+// AND have not been frozen. tenantID filters by tenant: nil returns users with no tenant, non-nil returns users with that tenant.
+func (users *users) GetExpiredFreeTrialsAfter(ctx context.Context, after time.Time, limit int, tenantID *string) ([]console.User, error) {
 	var err error
 	defer mon.Task()(&ctx)(&err)
 
@@ -85,15 +148,24 @@ func (users *users) GetExpiredFreeTrialsAfter(ctx context.Context, after time.Ti
 		return nil, Error.New("limit cannot be 0")
 	}
 
+	tenantFilter := "u.tenant_id IS NULL"
+	args := []interface{}{console.FreeUser, after, console.Active}
+	if tenantID != nil {
+		tenantFilter = "u.tenant_id = ?"
+		args = append(args, *tenantID)
+	}
+	args = append(args, limit)
+
 	rows, err := users.db.QueryContext(ctx, users.db.Rebind(`
 		SELECT u.id, u.email FROM users AS u
 		LEFT JOIN account_freeze_events AS ae
 			ON u.id = ae.user_id
-		WHERE u.paid_tier = false
+		WHERE u.kind = ?
 			AND u.trial_expiration < ?
-			AND u.status > ?
+			AND u.status = ?
 			AND ae.user_id IS NULL
-		LIMIT ?;`), after, console.Inactive, limit)
+			AND `+tenantFilter+`
+		LIMIT ?`), args...)
 	if err != nil {
 		if errs.Is(err, sql.ErrNoRows) {
 			return []console.User{}, nil
@@ -115,10 +187,18 @@ func (users *users) GetExpiredFreeTrialsAfter(ctx context.Context, after time.Ti
 	return expiredUsers, Error.Wrap(rows.Err())
 }
 
-// GetByEmailWithUnverified is a method for querying users by email from the database.
-func (users *users) GetByEmailWithUnverified(ctx context.Context, email string) (verified *console.User, unverified []console.User, err error) {
+// GetByEmailAndTenantWithUnverified is a method for querying users by email and tenantID from the database.
+func (users *users) GetByEmailAndTenantWithUnverified(ctx context.Context, email string, tenantID *string) (verified *console.User, unverified []console.User, err error) {
 	defer mon.Task()(&ctx)(&err)
-	usersDbx, err := users.db.All_User_By_NormalizedEmail(ctx, dbx.User_NormalizedEmail(normalizeEmail(email)))
+
+	var dbxTenantID dbx.User_TenantId_Field
+	if tenantID == nil || *tenantID == "" {
+		dbxTenantID = dbx.User_TenantId_Null()
+	} else {
+		dbxTenantID = dbx.User_TenantId(*tenantID)
+	}
+
+	usersDbx, err := users.db.All_User_By_NormalizedEmail_And_TenantId(ctx, dbx.User_NormalizedEmail(normalizeEmail(email)), dbxTenantID)
 
 	if err != nil {
 		return nil, nil, err
@@ -143,10 +223,18 @@ func (users *users) GetByEmailWithUnverified(ctx context.Context, email string) 
 }
 
 // GetByExternalID is a method for querying user by external ID from the database.
-func (users *users) GetByExternalID(ctx context.Context, externalID string) (user *console.User, err error) {
+// If tenantID is non-nil and non-empty, only users with a matching tenantID are returned.
+func (users *users) GetByExternalID(ctx context.Context, externalID string, tenantID *string) (user *console.User, err error) {
 	defer mon.Task()(&ctx)(&err)
 
-	userDbx, err := users.db.Get_User_By_ExternalId(ctx, dbx.User_ExternalId(externalID))
+	var dbxTenantID dbx.User_TenantId_Field
+	if tenantID == nil || *tenantID == "" {
+		dbxTenantID = dbx.User_TenantId_Null()
+	} else {
+		dbxTenantID = dbx.User_TenantId(*tenantID)
+	}
+
+	userDbx, err := users.db.Get_User_By_ExternalId_And_TenantId(ctx, dbx.User_ExternalId(externalID), dbxTenantID)
 	if err != nil {
 		return nil, err
 	}
@@ -238,10 +326,18 @@ func (users *users) GetUserInfoByProjectID(ctx context.Context, id uuid.UUID) (_
 	}, nil
 }
 
-// GetByEmail is a method for querying user by verified email from the database.
-func (users *users) GetByEmail(ctx context.Context, email string) (_ *console.User, err error) {
+// GetByEmailAndTenant is a method for querying user by email and tenantID from the database.
+func (users *users) GetByEmailAndTenant(ctx context.Context, email string, tenantID *string) (_ *console.User, err error) {
 	defer mon.Task()(&ctx)(&err)
-	user, err := users.db.Get_User_By_NormalizedEmail_And_Status_Not_Number(ctx, dbx.User_NormalizedEmail(normalizeEmail(email)))
+
+	var dbxTenantID dbx.User_TenantId_Field
+	if tenantID == nil || *tenantID == "" {
+		dbxTenantID = dbx.User_TenantId_Null()
+	} else {
+		dbxTenantID = dbx.User_TenantId(*tenantID)
+	}
+
+	user, err := users.db.Get_User_By_NormalizedEmail_And_TenantId_And_Status_Not_Number(ctx, dbx.User_NormalizedEmail(normalizeEmail(email)), dbxTenantID)
 
 	if err != nil {
 		return nil, err
@@ -250,17 +346,27 @@ func (users *users) GetByEmail(ctx context.Context, email string) (_ *console.Us
 	return UserFromDBX(ctx, user)
 }
 
-// GetExpiresBeforeWithStatus returns users with a particular trial notification status and whose trial expires before 'expiresBefore'.
-func (users *users) GetExpiresBeforeWithStatus(ctx context.Context, notificationStatus console.TrialNotificationStatus, expiresBefore time.Time) (needNotification []*console.User, err error) {
+// GetExpiresBeforeWithStatus returns active users with a particular trial notification status and whose trial expires before 'expiresBefore'.
+// tenantID filters by tenant: nil returns users with no tenant, non-nil returns users with that tenant.
+func (users *users) GetExpiresBeforeWithStatus(ctx context.Context, notificationStatus console.TrialNotificationStatus, expiresBefore time.Time, tenantID *string) (needNotification []*console.User, err error) {
 	defer mon.Task()(&ctx)(&err)
+
+	tenantFilter := "tenant_id IS NULL"
+	args := []interface{}{console.FreeUser, notificationStatus, expiresBefore, console.Active}
+	if tenantID != nil {
+		tenantFilter = "tenant_id = ?"
+		args = append(args, *tenantID)
+	}
 
 	rows, err := users.db.QueryContext(ctx, users.db.Rebind(`
 		SELECT id, email
 		FROM users
-		WHERE paid_tier = false
+		WHERE kind = ?
 			AND trial_notifications = ?
 			AND trial_expiration < ?
-	`), notificationStatus, expiresBefore)
+			AND status = ?
+			AND `+tenantFilter+`
+	`), args...)
 	if err != nil {
 		return nil, err
 	}
@@ -287,8 +393,8 @@ func (users *users) GetEmailsForDeletion(ctx context.Context, statusUpdatedBefor
 		FROM users
 		WHERE status = ?
 			AND status_updated_at < ?
-			AND (paid_tier = false OR final_invoice_generated = true)
-	`), console.UserRequestedDeletion, statusUpdatedBefore)
+			AND (kind = ? OR final_invoice_generated = true)
+	`), console.UserRequestedDeletion, statusUpdatedBefore, console.FreeUser)
 	if err != nil {
 		return nil, err
 	}
@@ -351,6 +457,14 @@ func (users *users) UpdateVerificationReminders(ctx context.Context, id uuid.UUI
 }
 
 // Insert is a method for inserting user into the database.
+//
+// It always insert the user fields ID, Email, FullName and PasswordHash. The ID cannot be zero.
+// The rest of the fields are optional.
+//
+// NOTE this method ignores the user fields: CreatedAt, Status, FinalInvoiceGenerated, MFAEnabled,
+// MFASecretKey, MfaRecoveryCodes, VerificationReminders, TrialNotifications, FailedLoginCount,
+// LoginLockoutExpiration, UpgradeTime, NewUnverifiedEmail, EmailChangeVerificationStep,
+// HubspotObjectID.
 func (users *users) Insert(ctx context.Context, user *console.User) (_ *console.User, err error) {
 	defer mon.Task()(&ctx)(&err)
 
@@ -362,10 +476,13 @@ func (users *users) Insert(ctx context.Context, user *console.User) (_ *console.
 		ShortName:       dbx.User_ShortName(user.ShortName),
 		IsProfessional:  dbx.User_IsProfessional(user.IsProfessional),
 		SignupPromoCode: dbx.User_SignupPromoCode(user.SignupPromoCode),
-		PaidTier:        dbx.User_PaidTier(user.PaidTier),
+		Kind:            dbx.User_Kind(int(user.Kind)),
 	}
 	if user.ExternalID != nil {
 		optional.ExternalId = dbx.User_ExternalId(*user.ExternalID)
+	}
+	if user.TenantID != nil && *user.TenantID != "" {
+		optional.TenantId = dbx.User_TenantId(*user.TenantID)
 	}
 	if user.UserAgent != nil {
 		optional.UserAgent = dbx.User_UserAgent(user.UserAgent)
@@ -409,10 +526,6 @@ func (users *users) Insert(ctx context.Context, user *console.User) (_ *console.
 		optional.TrialExpiration = dbx.User_TrialExpiration(*user.TrialExpiration)
 	}
 
-	if user.StatusUpdatedAt != nil {
-		optional.StatusUpdatedAt = dbx.User_StatusUpdatedAt(*user.StatusUpdatedAt)
-	}
-
 	createdUser, err := users.db.Create_User(ctx,
 		dbx.User_Id(user.ID[:]),
 		dbx.User_Email(user.Email),
@@ -421,7 +534,6 @@ func (users *users) Insert(ctx context.Context, user *console.User) (_ *console.
 		dbx.User_PasswordHash(user.PasswordHash),
 		optional,
 	)
-
 	if err != nil {
 		return nil, err
 	}
@@ -439,7 +551,8 @@ func (users *users) Delete(ctx context.Context, id uuid.UUID) (err error) {
 
 // DeleteUnverifiedBefore deletes unverified users created prior to some time from the database.
 func (users *users) DeleteUnverifiedBefore(
-	ctx context.Context, before time.Time, asOfSystemTimeInterval time.Duration, pageSize int) (err error) {
+	ctx context.Context, before time.Time, asOfSystemTimeInterval time.Duration, pageSize int,
+) (err error) {
 	defer mon.Task()(&ctx)(&err)
 
 	if pageSize <= 0 {
@@ -492,13 +605,6 @@ func (users *users) DeleteUnverifiedBefore(
 			WHERE id = ANY($1)
 			AND status = $2 AND created_at < $3
 		`, pgutil.UUIDArray(selected[:i]), console.Inactive, before)
-		case dbutil.Spanner:
-			// Delete all old, unverified users in the page
-			_, err = users.db.ExecContext(ctx, `
-			DELETE FROM users
-			WHERE id IN UNNEST(?)
-			AND status = ? AND created_at < ?
-		`, uuidsToBytesArray(selected[:i]), console.Inactive, before)
 		default:
 			return errs.New("unsupported database dialect: %s", users.impl)
 		}
@@ -519,7 +625,7 @@ func (users *users) DeleteUnverifiedBefore(
 func (users *users) Update(ctx context.Context, userID uuid.UUID, updateRequest console.UpdateUserRequest) (err error) {
 	defer mon.Task()(&ctx)(&err)
 
-	updateFields, err := toUpdateUser(updateRequest)
+	updateFields, err := users.toUpdateUser(updateRequest)
 	if err != nil {
 		return err
 	}
@@ -533,19 +639,59 @@ func (users *users) Update(ctx context.Context, userID uuid.UUID, updateRequest 
 	return err
 }
 
+// UpdateExternalIDWithActivationCode updates external_id and clears activation_code atomically.
+func (users *users) UpdateExternalIDWithActivationCode(ctx context.Context, userID uuid.UUID, activationCode, externalID string) (rowsAffected int64, err error) {
+	defer mon.Task()(&ctx)(&err)
+
+	var result sql.Result
+	switch users.impl {
+	case dbutil.Postgres, dbutil.Cockroach:
+		result, err = users.db.ExecContext(ctx, `
+			UPDATE users
+			SET external_id = $1,
+				activation_code = '',
+				status = CASE WHEN status = $2 THEN $3 ELSE status END
+			WHERE id = $4
+				AND activation_code = $5
+				AND (external_id IS NULL OR external_id = '' OR external_id = $1)
+		`, externalID, console.Inactive, console.Active, userID.Bytes(), activationCode)
+	default:
+		return 0, errs.New("unsupported database dialect: %s", users.impl)
+	}
+	if err != nil {
+		return 0, Error.Wrap(err)
+	}
+
+	rowsAffected, err = result.RowsAffected()
+	if err != nil {
+		return 0, Error.Wrap(err)
+	}
+
+	return rowsAffected, nil
+}
+
 // UpdatePaidTier sets whether the user is in the paid tier.
 func (users *users) UpdatePaidTier(ctx context.Context, id uuid.UUID, paidTier bool, projectBandwidthLimit, projectStorageLimit memory.Size, projectSegmentLimit int64, projectLimit int, upgradeTime *time.Time) (err error) {
 	defer mon.Task()(&ctx)(&err)
 
+	userType := console.FreeUser
+	if paidTier {
+		userType = console.PaidUser
+	}
 	updateFields := dbx.User_Update_Fields{
-		PaidTier:              dbx.User_PaidTier(paidTier),
+		Kind:                  dbx.User_Kind(int(userType)),
 		ProjectLimit:          dbx.User_ProjectLimit(projectLimit),
 		ProjectBandwidthLimit: dbx.User_ProjectBandwidthLimit(projectBandwidthLimit.Int64()),
 		ProjectStorageLimit:   dbx.User_ProjectStorageLimit(projectStorageLimit.Int64()),
 		ProjectSegmentLimit:   dbx.User_ProjectSegmentLimit(projectSegmentLimit),
 	}
-	if paidTier && upgradeTime != nil {
-		updateFields.UpgradeTime = dbx.User_UpgradeTime(*upgradeTime)
+	if paidTier {
+		updateFields.TrialExpiration = dbx.User_TrialExpiration_Null()
+		updateFields.TrialNotifications = dbx.User_TrialNotifications(0)
+
+		if upgradeTime != nil {
+			updateFields.UpgradeTime = dbx.User_UpgradeTime(*upgradeTime)
+		}
 	}
 
 	_, err = users.db.Update_User_By_Id(
@@ -627,14 +773,15 @@ func (users *users) GetUserProjectLimits(ctx context.Context, id uuid.UUID) (lim
 	return limitsFromDBX(ctx, row)
 }
 
-func (users *users) GetUserPaidTier(ctx context.Context, id uuid.UUID) (isPaid bool, err error) {
+// GetUserKind returns the kind of user.
+func (users *users) GetUserKind(ctx context.Context, id uuid.UUID) (kind console.UserKind, err error) {
 	defer mon.Task()(&ctx)(&err)
 
-	row, err := users.db.Get_User_PaidTier_By_Id(ctx, dbx.User_Id(id[:]))
+	row, err := users.db.Get_User_Kind_By_Id(ctx, dbx.User_Id(id[:]))
 	if err != nil {
-		return false, err
+		return 0, err
 	}
-	return row.PaidTier, nil
+	return console.UserKind(row.Kind), nil
 }
 
 // GetUpgradeTime is a method for returning a user's upgrade time.
@@ -670,6 +817,14 @@ func (users *users) GetSettings(ctx context.Context, userID uuid.UUID) (settings
 		dur := time.Duration(*row.SessionMinutes) * time.Minute
 		settings.SessionDuration = &dur
 	}
+	settings.OptInStatus = console.NoAction
+	if row.OptInStatus != nil {
+		settings.OptInStatus = console.OptInStatus(*row.OptInStatus)
+	}
+
+	if row.InactivityExempt != nil && *row.InactivityExempt {
+		settings.InactivityExempt = true
+	}
 
 	err = json.Unmarshal(row.NoticeDismissal, &settings.NoticeDismissal)
 	if err != nil {
@@ -684,6 +839,13 @@ func (users *users) UpsertSettings(ctx context.Context, userID uuid.UUID, settin
 	defer mon.Task()(&ctx)(&err)
 
 	dbID := dbx.UserSettings_UserId(userID[:])
+
+	_, err = users.db.Get_UserSettings_By_UserId(ctx, dbID)
+	isNewRow := errors.Is(err, sql.ErrNoRows)
+	if err != nil && !isNewRow {
+		return err
+	}
+
 	update := dbx.UserSettings_Update_Fields{}
 	fieldCount := 0
 
@@ -713,7 +875,7 @@ func (users *users) UpsertSettings(ctx context.Context, userID uuid.UUID, settin
 	}
 
 	if settings.NoticeDismissal != nil {
-		noticesBytes, err := json.Marshal(settings.NoticeDismissal)
+		noticesBytes, err := json.Marshal(*settings.NoticeDismissal)
 		if err != nil {
 			return err
 		}
@@ -721,9 +883,17 @@ func (users *users) UpsertSettings(ctx context.Context, userID uuid.UUID, settin
 		fieldCount++
 	}
 
-	// We need to check whether we are creating a new user, to set default values for onboarding.
-	_, err = users.db.Get_UserSettings_By_UserId(ctx, dbID)
-	if errors.Is(err, sql.ErrNoRows) {
+	if settings.OptInStatus != nil {
+		update.OptInStatus = dbx.UserSettings_OptInStatus(int(*settings.OptInStatus))
+		fieldCount++
+	}
+
+	if settings.InactivityExempt != nil {
+		update.InactivityExempt = dbx.UserSettings_InactivityExempt(*settings.InactivityExempt)
+		fieldCount++
+	}
+
+	if isNewRow {
 		create := update
 		if settings.OnboardingStart == nil {
 			// temporarily inserting as false for new users until we make default for this column false.
@@ -738,10 +908,7 @@ func (users *users) UpsertSettings(ctx context.Context, userID uuid.UUID, settin
 		if err == nil { // TODO: this should check "already exists", but this should be good enough
 			return nil
 		}
-		err = nil // ignore the error and retry with a regular update
-	}
-	if err != nil {
-		return err
+		// ignore the error and retry with a regular update
 	}
 
 	if fieldCount <= 0 {
@@ -752,8 +919,362 @@ func (users *users) UpsertSettings(ctx context.Context, userID uuid.UUID, settin
 	return err
 }
 
+// GetCustomerID returns the customer ID for a given user ID.
+func (users *users) GetCustomerID(ctx context.Context, id uuid.UUID) (_ string, err error) {
+	defer mon.Task()(&ctx)(&err)
+	idRow, err := users.db.Get_StripeCustomer_CustomerId_By_UserId(ctx, dbx.StripeCustomer_UserId(id[:]))
+	if err != nil {
+		return "", err
+	}
+
+	return idRow.CustomerId, nil
+}
+
+// SetStatusPendingDeletion set the user to "pending deletion" status safely. It is implemented as
+// documented in the corresponding Users interface method that implements.
+func (users *users) SetStatusPendingDeletion(
+	ctx context.Context, userID uuid.UUID, defaultDaysTillEscalation uint,
+) (err error) {
+	defer mon.Task()(&ctx)(&err)
+
+	var result sql.Result
+	switch users.impl {
+	case dbutil.Postgres, dbutil.Cockroach:
+		result, err = users.db.ExecContext(ctx, `
+					UPDATE users
+					SET status = $1,
+							status_updated_at = CURRENT_TIMESTAMP AT TIME ZONE 'UTC'
+					WHERE id = (
+						SELECT u.id
+						FROM users AS u JOIN account_freeze_events AS e
+							ON e.user_id = u.id
+						WHERE u.id = $2
+							AND u.status = $3
+							AND u.kind = $4
+							AND e.event = $5
+							AND e.created_at + (COALESCE(e.days_till_escalation, $6) || 'days')::interval < NOW()
+							AND 0 = (
+								SELECT COUNT(1)
+								FROM project_members AS m
+								WHERE m.member_id = u.id
+									AND m.project_id NOT IN (
+										SELECT id FROM projects WHERE owner_id = u.id
+									)
+							)
+					)
+			`, console.PendingDeletion, userID.Bytes(), console.Active, console.FreeUser, console.TrialExpirationFreeze,
+			defaultDaysTillEscalation,
+		)
+	default:
+		return errs.New("unsupported database dialect: %s", users.impl)
+	}
+
+	if err != nil {
+		return Error.Wrap(err)
+	}
+
+	n, err := result.RowsAffected()
+	if err != nil {
+		return Error.Wrap(err)
+	}
+
+	if n == 0 {
+		return sql.ErrNoRows
+	}
+
+	return nil
+}
+
+// ListPendingDeletionBefore returns a page of user IDs that are pending deletion and were marked
+// before the specified time, ordered by status_updated_at ascending and starting at the given offset.
+// This does not include users that have been frozen.
+func (users *users) ListPendingDeletionBefore(
+	ctx context.Context,
+	offset int64,
+	limit int,
+	before time.Time,
+) (page console.UserIDsPage, err error) {
+	defer mon.Task()(&ctx)(&err)
+
+	query := users.db.Rebind(`
+			SELECT u.id
+			FROM users as u
+			WHERE u.status = ?
+				AND (u.status_updated_at IS NULL OR u.status_updated_at < ?)
+				-- exclude frozen users
+				AND (SELECT COUNT(1) FROM account_freeze_events as afe WHERE u.id = afe.user_id) = 0
+			-- u.id is a unique tie-breaker so OFFSET paging is deterministic across
+			-- rows that share status_updated_at (e.g. bulk-marked in one operation).
+			ORDER BY u.status_updated_at ASC, u.id ASC
+			LIMIT ? OFFSET ?
+		`)
+
+	rows, err := users.db.QueryContext(ctx, query, console.PendingDeletion, before.UTC(), limit+1, offset)
+	if err != nil {
+		return console.UserIDsPage{}, err
+	}
+	defer func() { err = errs.Combine(err, rows.Err(), rows.Close()) }()
+
+	var ids []uuid.UUID
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return console.UserIDsPage{}, errs.Wrap(err)
+		}
+		ids = append(ids, id)
+	}
+
+	if len(ids) == limit+1 {
+		page.HasNext = true
+
+		ids = ids[:len(ids)-1]
+	}
+	page.IDs = ids
+
+	return page, nil
+}
+
+// ListUsersToOptOutFreeze returns active paid users who have not already been frozen. By default,
+// it returns users whose OptInStatus is not OptedIn and not Excluded (including NoAction/unset);
+// when opts.OptedOutOnly is true it returns only users whose OptInStatus is OptedOut.
+func (users *users) ListUsersToOptOutFreeze(ctx context.Context, opts console.ListUsersToOptOutFreezeOptions) (page console.UserIDsPage, err error) {
+	defer mon.Task()(&ctx)(&err)
+
+	tenantFilter := "u.tenant_id IS NULL"
+	if opts.TenantID != nil {
+		tenantFilter = "u.tenant_id = ?"
+	}
+
+	var cutoffFilter string
+	if !opts.Cutoff.IsZero() {
+		cutoffFilter = "AND u.created_at < ? AND (u.upgrade_time IS NULL OR u.upgrade_time < ?)"
+	}
+
+	var userAgentFilter string
+	if len(opts.ExcludedUserAgents) > 0 {
+		placeholders := make([]string, len(opts.ExcludedUserAgents))
+		for i := range placeholders {
+			placeholders[i] = "?"
+		}
+		userAgentFilter = "AND (u.user_agent IS NULL OR u.user_agent NOT IN (" + strings.Join(placeholders, ", ") + "))"
+	}
+
+	// By default, we select everyone who has not explicitly opted in or been excluded.
+	// When OptedOutOnly is set we select only users who explicitly opted out.
+	optInFilter := "(us.opt_in_status IS NULL OR us.opt_in_status NOT IN (?, ?))"
+	optInArgs := []any{console.OptedIn, console.Excluded}
+	if opts.OptedOutOnly {
+		optInFilter = "us.opt_in_status = ?"
+		optInArgs = []any{console.OptedOut}
+	}
+
+	args := make([]any, 0, 8+len(optInArgs)+len(opts.ExcludedUserAgents))
+	args = append(args, console.Active, console.PaidUser)
+	if opts.TenantID != nil {
+		args = append(args, *opts.TenantID)
+	}
+	args = append(args, optInArgs...)
+	for _, ua := range opts.ExcludedUserAgents {
+		args = append(args, ua)
+	}
+	if !opts.Cutoff.IsZero() {
+		args = append(args, opts.Cutoff, opts.Cutoff)
+	}
+
+	var queryStr string
+	if opts.Cursor == nil {
+		queryStr = `
+				SELECT u.id
+				FROM users as u
+				LEFT JOIN user_settings as us ON u.id = us.user_id
+				WHERE u.status = ?
+					AND u.kind = ?
+					AND ` + tenantFilter + `
+					AND ` + optInFilter + `
+					AND NOT EXISTS (
+						SELECT 1 FROM account_freeze_events as afe
+						WHERE u.id = afe.user_id
+					)
+					` + userAgentFilter + `
+					` + cutoffFilter + `
+				ORDER BY u.id ASC
+				LIMIT ?
+			`
+		args = append(args, opts.Limit+1)
+	} else {
+		queryStr = `
+				SELECT u.id
+				FROM users as u
+				LEFT JOIN user_settings as us ON u.id = us.user_id
+				WHERE u.status = ?
+					AND u.kind = ?
+					AND ` + tenantFilter + `
+					AND ` + optInFilter + `
+					AND NOT EXISTS (
+						SELECT 1 FROM account_freeze_events as afe
+						WHERE u.id = afe.user_id
+					)
+					` + userAgentFilter + `
+					` + cutoffFilter + `
+					AND u.id > ?
+				ORDER BY u.id ASC
+				LIMIT ?
+			`
+		args = append(args, opts.Cursor, opts.Limit+1)
+	}
+
+	rows, err := users.db.QueryContext(ctx, users.db.Rebind(queryStr), args...)
+	if err != nil {
+		return console.UserIDsPage{}, err
+	}
+	defer func() { err = errs.Combine(err, rows.Err(), rows.Close()) }()
+
+	var ids []uuid.UUID
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return console.UserIDsPage{}, errs.Wrap(err)
+		}
+		ids = append(ids, id)
+	}
+
+	if len(ids) == opts.Limit+1 {
+		page.HasNext = true
+		ids = ids[:len(ids)-1]
+	}
+	page.IDs = ids
+
+	return page, nil
+}
+
+// ListUsersForInactivityCheck returns IDs of active paid users who do not have an
+// InactivityWarning, InactivityFreeze or other events and are not inactivity-exempt.
+// tenantID filters by tenant: nil returns users with no tenant, non-nil returns users with that tenant.
+func (users *users) ListUsersForInactivityCheck(ctx context.Context, tenantID *string, limit int, cursor *uuid.UUID) (page console.UserIDsPage, err error) {
+	defer mon.Task()(&ctx)(&err)
+
+	tenantFilter := "u.tenant_id IS NULL"
+	if tenantID != nil {
+		tenantFilter = "u.tenant_id = ?"
+	}
+
+	var (
+		queryStr string
+		args     = make([]interface{}, 0, 13)
+	)
+
+	args = append(args, console.Active, console.PaidUser)
+	if tenantID != nil {
+		args = append(args, *tenantID)
+	}
+
+	freezeEventArgs := []interface{}{
+		console.BillingFreeze,
+		console.ViolationFreeze,
+		console.LegalFreeze,
+		console.BotFreeze,
+		console.TrialExpirationFreeze,
+		console.OptOutFreeze,
+		console.InactivityWarning,
+		console.InactivityFreeze,
+	}
+	args = append(args, freezeEventArgs...)
+
+	if cursor == nil {
+		queryStr = `
+				SELECT u.id
+				FROM users AS u
+				LEFT JOIN user_settings AS us ON u.id = us.user_id
+				WHERE u.status = ?
+					AND u.kind = ?
+					AND ` + tenantFilter + `
+					AND (us.inactivity_exempt IS NULL OR us.inactivity_exempt = false)
+					AND NOT EXISTS (
+						SELECT 1 FROM account_freeze_events AS afe
+						WHERE afe.user_id = u.id
+							AND afe.event IN (?, ?, ?, ?, ?, ?, ?, ?)
+					)
+				ORDER BY u.id ASC
+				LIMIT ?
+			`
+		args = append(args, limit+1)
+	} else {
+		queryStr = `
+				SELECT u.id
+				FROM users AS u
+				LEFT JOIN user_settings AS us ON u.id = us.user_id
+				WHERE u.status = ?
+					AND u.kind = ?
+					AND ` + tenantFilter + `
+					AND (us.inactivity_exempt IS NULL OR us.inactivity_exempt = false)
+					AND NOT EXISTS (
+						SELECT 1 FROM account_freeze_events AS afe
+						WHERE afe.user_id = u.id
+							AND afe.event IN (?, ?, ?, ?, ?, ?, ?, ?)
+					)
+					AND u.id > ?
+				ORDER BY u.id ASC
+				LIMIT ?
+			`
+		args = append(args, cursor, limit+1)
+	}
+
+	rows, err := users.db.QueryContext(ctx, users.db.Rebind(queryStr), args...)
+	if err != nil {
+		return console.UserIDsPage{}, err
+	}
+	defer func() { err = errs.Combine(err, rows.Err(), rows.Close()) }()
+
+	var ids []uuid.UUID
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return console.UserIDsPage{}, errs.Wrap(err)
+		}
+		ids = append(ids, id)
+	}
+
+	if len(ids) == limit+1 {
+		page.HasNext = true
+		ids = ids[:len(ids)-1]
+	}
+	page.IDs = ids
+
+	return page, nil
+}
+
+// TestSetNow is a method to set the now function for testing purposes.
+func (users *users) TestSetNow(nowFn func() time.Time) {
+	users.nowFn = nowFn
+}
+
+// GetNowFn returns the current time function.
+func (users *users) GetNowFn() func() time.Time {
+	return users.nowFn
+}
+
+// TestingGetAll returns all users.
+func (users *users) TestingGetAll(ctx context.Context) (rs []*console.User, err error) {
+	defer mon.Task()(&ctx)(&err)
+
+	rows, err := users.db.All_User(ctx)
+	if err != nil {
+		return nil, errs.Wrap(err)
+	}
+
+	for _, row := range rows {
+		user, err := UserFromDBX(ctx, row)
+		if err != nil {
+			return nil, errs.Wrap(err)
+		}
+		rs = append(rs, user)
+	}
+
+	return rs, nil
+}
+
 // toUpdateUser creates dbx.User_Update_Fields with only non-empty fields as updatable.
-func toUpdateUser(request console.UpdateUserRequest) (*dbx.User_Update_Fields, error) {
+func (users *users) toUpdateUser(request console.UpdateUserRequest) (*dbx.User_Update_Fields, error) {
 	update := dbx.User_Update_Fields{}
 	if request.FullName != nil {
 		update.FullName = dbx.User_FullName(*request.FullName)
@@ -776,15 +1297,13 @@ func toUpdateUser(request console.UpdateUserRequest) (*dbx.User_Update_Fields, e
 	}
 	if request.Status != nil {
 		update.Status = dbx.User_Status(int(*request.Status))
+		update.StatusUpdatedAt = dbx.User_StatusUpdatedAt(users.nowFn())
 	}
 	if request.UserAgent != nil {
 		update.UserAgent = dbx.User_UserAgent(request.UserAgent)
 	}
 	if request.SignupPromoCode != nil {
 		update.SignupPromoCode = dbx.User_SignupPromoCode(*request.SignupPromoCode)
-	}
-	if request.StatusUpdatedAt != nil {
-		update.StatusUpdatedAt = dbx.User_StatusUpdatedAt(*request.StatusUpdatedAt)
 	}
 	if request.FinalInvoiceGenerated != nil {
 		update.FinalInvoiceGenerated = dbx.User_FinalInvoiceGenerated(*request.FinalInvoiceGenerated)
@@ -801,8 +1320,8 @@ func toUpdateUser(request console.UpdateUserRequest) (*dbx.User_Update_Fields, e
 	if request.ProjectSegmentLimit != nil {
 		update.ProjectSegmentLimit = dbx.User_ProjectSegmentLimit(*request.ProjectSegmentLimit)
 	}
-	if request.PaidTier != nil {
-		update.PaidTier = dbx.User_PaidTier(*request.PaidTier)
+	if request.Kind != nil {
+		update.Kind = dbx.User_Kind(int(*request.Kind))
 	}
 	if request.MFAEnabled != nil {
 		update.MfaEnabled = dbx.User_MfaEnabled(*request.MFAEnabled)
@@ -836,8 +1355,12 @@ func toUpdateUser(request console.UpdateUserRequest) (*dbx.User_Update_Fields, e
 		}
 	}
 
-	if request.DefaultPlacement > 0 {
-		update.DefaultPlacement = dbx.User_DefaultPlacement(int(request.DefaultPlacement))
+	if request.DefaultPlacement != nil {
+		if *request.DefaultPlacement == nil {
+			update.DefaultPlacement = dbx.User_DefaultPlacement_Null()
+		} else {
+			update.DefaultPlacement = dbx.User_DefaultPlacement(int(**request.DefaultPlacement))
+		}
 	}
 
 	if request.ActivationCode != nil {
@@ -871,7 +1394,7 @@ func toUpdateUser(request console.UpdateUserRequest) (*dbx.User_Update_Fields, e
 		update.TrialNotifications = dbx.User_TrialNotifications(int(*request.TrialNotifications))
 	}
 	if request.UpgradeTime != nil {
-		update.UpgradeTime = dbx.User_UpgradeTime(*request.UpgradeTime)
+		update.UpgradeTime = dbx.User_UpgradeTime_Raw(*request.UpgradeTime)
 	}
 
 	if request.NewUnverifiedEmail != nil {
@@ -885,7 +1408,25 @@ func toUpdateUser(request console.UpdateUserRequest) (*dbx.User_Update_Fields, e
 		update.EmailChangeVerificationStep = dbx.User_EmailChangeVerificationStep(*request.EmailChangeVerificationStep)
 	}
 	if request.ExternalID != nil {
-		update.ExternalId = dbx.User_ExternalId(*request.ExternalID)
+		if *request.ExternalID == nil {
+			update.ExternalId = dbx.User_ExternalId_Null()
+		} else {
+			update.ExternalId = dbx.User_ExternalId(**request.ExternalID)
+		}
+	}
+	if request.TenantID != nil {
+		if *request.TenantID == nil || **request.TenantID == "" {
+			update.TenantId = dbx.User_TenantId_Null()
+		} else {
+			update.TenantId = dbx.User_TenantId(**request.TenantID)
+		}
+	}
+	if request.HubspotObjectID != nil {
+		if *request.HubspotObjectID == nil {
+			update.HubspotObjectId = dbx.User_HubspotObjectId_Null()
+		} else {
+			update.HubspotObjectId = dbx.User_HubspotObjectId(**request.HubspotObjectID)
+		}
 	}
 
 	return &update, nil
@@ -914,6 +1455,7 @@ func UserFromDBX(ctx context.Context, user *dbx.User) (_ *console.User, err erro
 	result := console.User{
 		ID:                          id,
 		ExternalID:                  user.ExternalId,
+		TenantID:                    user.TenantId,
 		FullName:                    user.FullName,
 		Email:                       user.Email,
 		PasswordHash:                user.PasswordHash,
@@ -924,7 +1466,7 @@ func UserFromDBX(ctx context.Context, user *dbx.User) (_ *console.User, err erro
 		ProjectBandwidthLimit:       user.ProjectBandwidthLimit,
 		ProjectStorageLimit:         user.ProjectStorageLimit,
 		ProjectSegmentLimit:         user.ProjectSegmentLimit,
-		PaidTier:                    user.PaidTier,
+		Kind:                        console.UserKind(user.Kind),
 		IsProfessional:              user.IsProfessional,
 		HaveSalesContact:            user.HaveSalesContact,
 		MFAEnabled:                  user.MfaEnabled,
@@ -936,6 +1478,7 @@ func UserFromDBX(ctx context.Context, user *dbx.User) (_ *console.User, err erro
 		NewUnverifiedEmail:          user.NewUnverifiedEmail,
 		EmailChangeVerificationStep: user.EmailChangeVerificationStep,
 		FinalInvoiceGenerated:       user.FinalInvoiceGenerated,
+		HubspotObjectID:             user.HubspotObjectId,
 	}
 
 	if user.DefaultPlacement != nil {

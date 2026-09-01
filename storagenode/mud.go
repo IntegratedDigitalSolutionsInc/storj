@@ -5,6 +5,7 @@ package storagenode
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -18,23 +19,29 @@ import (
 	"storj.io/common/pb"
 	"storj.io/common/peertls/extensions"
 	"storj.io/common/peertls/tlsopts"
-	"storj.io/common/process"
 	"storj.io/common/rpc"
 	"storj.io/common/storj"
 	"storj.io/common/version"
-	"storj.io/storj/private/mud"
 	"storj.io/storj/private/revocation"
 	"storj.io/storj/private/server"
 	"storj.io/storj/private/version/checker"
 	sdebug "storj.io/storj/shared/debug"
 	"storj.io/storj/shared/modular"
 	"storj.io/storj/shared/modular/config"
+	"storj.io/storj/shared/modular/profiler"
+	"storj.io/storj/shared/modular/tracing"
+	"storj.io/storj/shared/mud"
 	"storj.io/storj/storagenode/bandwidth"
 	"storj.io/storj/storagenode/blobstore"
 	"storj.io/storj/storagenode/blobstore/filestore"
+	"storj.io/storj/storagenode/cleanup"
 	"storj.io/storj/storagenode/collector"
+	"storj.io/storj/storagenode/console"
+	"storj.io/storj/storagenode/console/consoleserver"
 	"storj.io/storj/storagenode/contact"
+	"storj.io/storj/storagenode/hashstore"
 	"storj.io/storj/storagenode/healthcheck"
+	"storj.io/storj/storagenode/load"
 	"storj.io/storj/storagenode/monitor"
 	"storj.io/storj/storagenode/nodestats"
 	"storj.io/storj/storagenode/notifications"
@@ -42,15 +49,18 @@ import (
 	"storj.io/storj/storagenode/orders"
 	"storj.io/storj/storagenode/payouts"
 	"storj.io/storj/storagenode/payouts/estimatedpayouts"
+	"storj.io/storj/storagenode/piecemigrate"
 	"storj.io/storj/storagenode/pieces"
 	"storj.io/storj/storagenode/pieces/lazyfilewalker"
 	"storj.io/storj/storagenode/piecestore"
+	"storj.io/storj/storagenode/piecestore/signaturecheck"
 	"storj.io/storj/storagenode/piecestore/usedserials"
 	"storj.io/storj/storagenode/preflight"
 	"storj.io/storj/storagenode/pricing"
 	"storj.io/storj/storagenode/reputation"
 	"storj.io/storj/storagenode/retain"
 	"storj.io/storj/storagenode/satellites"
+	"storj.io/storj/storagenode/satstore"
 	"storj.io/storj/storagenode/storagenodedb"
 	"storj.io/storj/storagenode/storageusage"
 	"storj.io/storj/storagenode/trust"
@@ -65,11 +75,14 @@ type RawBlobs interface {
 
 // Module is a mud Module (definition of the creation of the components).
 func Module(ball *mud.Ball) {
+	profiler.Module(ball)
+	tracing.Module(ball)
 	config.RegisterConfig[contact.Config](ball, "contact")
 	config.RegisterConfig[server.Config](ball, "server")
 	config.RegisterConfig[preflight.Config](ball, "preflight")
 	config.RegisterConfig[piecestore.Config](ball, "storage2")
 	config.RegisterConfig[piecestore.OldConfig](ball, "storage")
+	config.RegisterConfig[piecemigrate.Config](ball, "piecemigrate")
 	config.RegisterConfig[debug.Config](ball, "debug")
 	config.RegisterConfig[filestore.Config](ball, "filestore")
 	config.RegisterConfig[pieces.Config](ball, "pieces")
@@ -79,6 +92,7 @@ func Module(ball *mud.Ball) {
 	config.RegisterConfig[retain.Config](ball, "retain")
 	config.RegisterConfig[bandwidth.Config](ball, "bandwidth")
 	config.RegisterConfig[checker.Config](ball, "version")
+	config.RegisterConfig[reputation.Config](ball, "reputation")
 
 	mud.View[piecestore.Config, trust.Config](ball, func(c piecestore.Config) trust.Config {
 		return c.Trust
@@ -107,7 +121,6 @@ func Module(ball *mud.Ball) {
 
 	{ // setup notification service.
 		mud.Provide[*notifications.Service](ball, notifications.NewService)
-
 	}
 
 	{
@@ -120,13 +133,12 @@ func Module(ball *mud.Ball) {
 					flatFileStorePath = filepath.Join(oldCfg.Path, flatFileStorePath)
 				}
 			}
-
-			return pieces.NewPieceExpirationStore(log, nil, pieces.PieceExpirationConfig{
+			return pieces.NewPieceExpirationStore(log, pieces.PieceExpirationConfig{
 				DataDir:               flatFileStorePath,
 				ConcurrentFileHandles: cfg.FlatExpirationStoreFileHandles,
 				MaxBufferTime:         cfg.FlatExpirationStoreMaxBufferTime,
 			})
-		}, logWrapper("pieceexpiration"))
+		})
 		mud.RegisterInterfaceImplementation[pieces.PieceExpirationDB, *pieces.PieceExpirationStore](ball)
 	}
 
@@ -134,18 +146,17 @@ func Module(ball *mud.Ball) {
 		sdebug.Module(ball)
 	}
 
+	cleanup.Module(ball)
 	{ // version setup
 		mud.Provide[*checker.Service](ball, func(log *zap.Logger, config checker.Config, versionInfo version.Info) *checker.Service {
 			return checker.NewService(log, config, versionInfo, "Storagenode")
-		}, logWrapper("version"))
+		})
 
 		versionCheckInterval := 12 * time.Hour
 
 		mud.Provide[*snversion.Chore](ball, func(log *zap.Logger, checker *checker.Service, notificationsService *notifications.Service, nodeID storj.NodeID) *snversion.Chore {
-			return snversion.NewChore(process.NamedLog(log, "version:chore"), checker, notificationsService, nodeID, versionCheckInterval)
+			return snversion.NewChore(log, checker, notificationsService, nodeID, versionCheckInterval)
 		})
-
-		mud.Tag[*snversion.Chore, modular.Service](ball, modular.Service{})
 	}
 
 	{
@@ -173,25 +184,32 @@ func Module(ball *mud.Ball) {
 				srv.AddHTTPFallback(fallback.Handler)
 			}
 			return srv, nil
-		}, logWrapper("server"))
-
+		})
 	}
 
 	{ // setup trust pool
-		mud.Provide[*trust.Pool](ball, func(log *zap.Logger, satDb satellites.DB, dialer rpc.Dialer, config trust.Config) (*trust.Pool, error) {
-			pool, err := trust.NewPool(process.NamedLog(log, "trust"), trust.Dialer(dialer), config, satDb)
-			pool.StartWithRefresh = true
+		mud.Provide[*trust.Pool](ball, func(ctx context.Context, log *zap.Logger, satDb satellites.DB, dialer rpc.Dialer, config trust.Config) (*trust.Pool, error) {
+			pool, err := trust.NewPool(log, trust.Dialer(dialer), config, satDb)
+			if err != nil {
+				return nil, err
+			}
+			// Refresh the trust pool immediately so satellites are available
+			// before other components (like HashStoreBackend) are initialized.
+			// The pool's Run() will handle periodic refreshes after startup.
+			if err := pool.Refresh(ctx); err != nil {
+				return nil, err
+			}
 			return pool, err
 		})
-		mud.Tag[*trust.Pool, modular.Service](ball, modular.Service{})
+		mud.RegisterInterfaceImplementation[trust.TrustedSatelliteSource, *trust.Pool](ball)
 	}
 
 	{
-		mud.Provide[*preflight.LocalTime](ball, preflight.NewLocalTime, logWrapper("preflight:localtime"))
+		mud.Provide[*preflight.LocalTime](ball, preflight.NewLocalTime)
 	}
 
 	{ // setup contact service
-		mud.Provide[contact.NodeInfo](ball, func(id storj.NodeID, contactConfig contact.Config, operator operator.Config, versionInfo version.Info, server *server.Server) (contact.NodeInfo, error) {
+		mud.Provide[contact.NodeInfo](ball, func(ctx context.Context, log *zap.Logger, id storj.NodeID, contactConfig contact.Config, operator operator.Config, versionInfo version.Info, server *server.Server, state *satstore.SatelliteStore, hashstoreConfig hashstore.Config) (contact.NodeInfo, error) {
 			externalAddress := contactConfig.ExternalAddress
 			if externalAddress == "" {
 				externalAddress = server.Addr().String()
@@ -202,12 +220,12 @@ func Module(ball *mud.Ball) {
 				return contact.NodeInfo{}, err
 			}
 
-			noiseKeyAttestation, err := server.NoiseKeyAttestation(context.Background())
+			noiseKeyAttestation, err := server.NoiseKeyAttestation(ctx)
 			if err != nil {
 				return contact.NodeInfo{}, err
 			}
 
-			return contact.NodeInfo{
+			nodeInfo := contact.NodeInfo{
 				ID:      id,
 				Address: externalAddress,
 				Operator: pb.NodeOperator{
@@ -219,7 +237,11 @@ func Module(ball *mud.Ball) {
 				NoiseKeyAttestation: noiseKeyAttestation,
 				DebounceLimit:       server.DebounceLimit(),
 				FastOpen:            server.FastOpen(),
-			}, nil
+				HashstoreMemtbl:     hashstoreConfig.TableDefaultKind.Kind == hashstore.TableKind_MemTbl,
+				HashstoreWriteToNew: ReportHashstoreWriteToNew(log, state),
+			}
+
+			return nodeInfo, nil
 		})
 
 		mud.Provide[*contact.PingStats](ball, func() *contact.PingStats {
@@ -233,33 +255,29 @@ func Module(ball *mud.Ball) {
 			return contact.NewQUICStats(server.IsQUICEnabled())
 		})
 
-		mud.Provide[*pb.SignedNodeTagSets](ball, func(config contact.Config) *pb.SignedNodeTagSets {
-			tags := pb.SignedNodeTagSets(config.Tags)
-			return &tags
-		})
+		mud.Provide[*pb.SignedNodeTagSets](ball, contact.GetTags)
 
-		mud.Provide[*contact.Service](ball, contact.NewService, logWrapper("contact:service"))
+		mud.Provide[*contact.Service](ball, contact.NewService)
+
+		mud.Provide[*contact.AmnestyClient](ball, contact.NewAmnestyClient)
 
 		mud.Provide[*contact.Chore](ball, func(log *zap.Logger, contactConfig contact.Config, service *contact.Service) *contact.Chore {
-			return contact.NewChore(log, contactConfig.Interval, service)
-		}, logWrapper("contact:chore"))
-		mud.Tag[*contact.Chore, modular.Service](ball, modular.Service{})
+			return contact.NewChore(log, contactConfig.Interval, contactConfig.CheckInTimeout, service)
+		})
 
-		mud.Provide[*contact.Endpoint](ball, func(log *zap.Logger, trustPool *trust.Pool, pingStats *contact.PingStats, srv *server.Server) (*contact.Endpoint, error) {
-			ep := contact.NewEndpoint(log, trustPool, pingStats)
+		mud.Provide[*contact.Endpoint](ball, func(log *zap.Logger, trustSource trust.TrustedSatelliteSource, pingStats *contact.PingStats, srv *server.Server) (*contact.Endpoint, error) {
+			ep := contact.NewEndpoint(log, trustSource, pingStats)
 			if err := pb.DRPCRegisterContact(srv.DRPC(), ep); err != nil {
 				return nil, err
 			}
 			return ep, nil
 		})
-		mud.Tag[*contact.Endpoint, modular.Service](ball, modular.Service{})
 	}
 
 	// setup bandwidth service
 	{
 		mud.Provide[*bandwidth.Cache](ball, bandwidth.NewCache)
-		mud.Provide[*bandwidth.Service](ball, bandwidth.NewService, logWrapper("bandwidth"))
-		mud.Tag[*bandwidth.Service, modular.Service](ball, modular.Service{})
+		mud.Provide[*bandwidth.Service](ball, bandwidth.NewService)
 	}
 
 	{ // setup storage
@@ -272,21 +290,16 @@ func Module(ball *mud.Ball) {
 
 		mud.Provide[*lazyfilewalker.Supervisor](ball, func(log *zap.Logger, config lazyfilewalker.Config) *lazyfilewalker.Supervisor {
 			return lazyfilewalker.NewSupervisor(log, config, executable)
-		}, logWrapper("lazyfilewalker"))
+		})
 
-		mud.Provide[*pieces.Store](ball, pieces.NewStore, logWrapper("pieces"))
-
-		mud.Provide[*pieces.Deleter](ball, func(log *zap.Logger, store *pieces.Store, storage2Config piecestore.Config) *pieces.Deleter {
-			return pieces.NewDeleter(log, store, storage2Config.DeleteWorkers, storage2Config.DeleteQueueSize)
-		}, logWrapper("piecedeleter"))
-		mud.Tag[*pieces.Deleter, modular.Service](ball, modular.Service{})
+		mud.Provide[*pieces.Store](ball, pieces.NewStore)
 
 		mud.Provide[*pieces.BlobsUsageCache](ball, func(log *zap.Logger, blobs RawBlobs) *pieces.BlobsUsageCache {
 			return pieces.NewBlobsUsageCache(log, blobs)
-		}, logWrapper("blobscache"))
+		})
 		mud.Provide[*pieces.CacheService](ball, func(log *zap.Logger, usageCache *pieces.BlobsUsageCache, store *pieces.Store, usedSpaceDB pieces.PieceSpaceUsedDB, storage2Config piecestore.Config) *pieces.CacheService {
 			return pieces.NewService(log, usageCache, store, usedSpaceDB, storage2Config.CacheSyncInterval, storage2Config.PieceScanOnStartup)
-		}, logWrapper("piecestore:cache"))
+		})
 
 		mud.View[DB, RawBlobs](ball, func(db DB) RawBlobs {
 			return db.Pieces()
@@ -294,24 +307,31 @@ func Module(ball *mud.Ball) {
 
 		mud.RegisterInterfaceImplementation[blobstore.Blobs, RawBlobs](ball)
 
-		mud.Provide[monitor.SpaceReport](ball, func(log *zap.Logger, store *pieces.Store, config monitor.Config) monitor.SpaceReport {
-			return monitor.NewDedicatedDisk(log, store, config.MinimumDiskSpace.Int64(), config.ReservedBytes.Int64())
+		mud.Provide[monitor.PieceStoreSpaceUsage](ball, NewPieceStoreSpaceUsageAdapter)
+		mud.Tag[monitor.PieceStoreSpaceUsage](ball, mud.Optional{})
+		mud.Tag[monitor.PieceStoreSpaceUsage](ball, mud.Nullable{})
+		mud.Provide[monitor.SpaceReport](ball, func(log *zap.Logger, ctx context.Context, store monitor.PieceStoreSpaceUsage, hashStore *piecestore.HashStoreBackend, oldConfig piecestore.OldConfig, config monitor.Config) (monitor.SpaceReport, error) {
+			return monitor.NewSharedDisk(ctx, log, store, hashStore, config.MinimumDiskSpace.Int64(), oldConfig.AllocatedDiskSpace.Int64())
 		})
 		config.RegisterConfig[monitor.Config](ball, "monitor")
 
-		mud.Provide[*monitor.Service](ball, func(log *zap.Logger, store *pieces.Store, oldConfig piecestore.OldConfig, contact *contact.Service, spaceReport monitor.SpaceReport, config monitor.Config) *monitor.Service {
-			return monitor.NewService(log, store, contact, oldConfig.KBucketRefreshInterval, spaceReport, config)
-		}, logWrapper("piecestore:monitor"))
+		mud.RegisterInterfaceImplementation[monitor.DiskVerification, *pieces.Store](ball)
+		mud.Provide[*monitor.Service](ball, func(log *zap.Logger, verifier monitor.DiskVerification, contactService *contact.Service, report monitor.SpaceReport, config monitor.Config, contactConfig contact.Config) *monitor.Service {
+			return monitor.NewService(log, verifier, contactService, report, config, contactConfig.CheckInTimeout)
+		})
 
-		mud.Provide[*retain.Service](ball, retain.NewService, logWrapper("retain"))
+		mud.Provide[*retain.Service](ball, retain.NewService)
+		mud.Provide[*retain.RunOnce](ball, retain.NewRunOnce)
 
 		mud.Provide[*usedserials.Table](ball, func(storage2Config piecestore.Config) *usedserials.Table {
 			return usedserials.NewTable(storage2Config.MaxUsedSerialsSize)
 		})
+		mud.Provide[*usedserials.Chore](ball, usedserials.NewChore)
+		config.RegisterConfig[usedserials.Config](ball, "used-serials")
 
 		mud.Provide[*orders.FileStore](ball, func(log *zap.Logger, storage2Config piecestore.Config) (*orders.FileStore, error) {
 			return orders.NewFileStore(log, storage2Config.Orders.Path, storage2Config.OrderLimitGracePeriod)
-		}, logWrapper("ordersfilestore"))
+		})
 
 		mud.Provide[*pieces.TrashChore](ball, func(log *zap.Logger, trust *trust.Pool, store *pieces.Store) *pieces.TrashChore {
 			return pieces.NewTrashChore(
@@ -319,55 +339,97 @@ func Module(ball *mud.Ball) {
 				24*time.Hour,
 				trashExpiryInterval,
 				trust, store)
-		}, logWrapper("pieces:trash"))
-		mud.Provide[*pieces.TrashRunOnce](ball, func(log *zap.Logger, trust *trust.Pool, store *pieces.Store, stop *modular.StopTrigger) *pieces.TrashRunOnce {
-			return pieces.NewTrashRunOnce(log, trust, store, trashExpiryInterval, stop)
 		})
-		mud.Tag[*pieces.TrashChore, modular.Service](ball, modular.Service{})
-		mud.Provide[*piecestore.Endpoint](ball, piecestore.NewEndpoint, logWrapper("piecestore"))
+		mud.Provide[*pieces.TrashRunOnce](ball, func(log *zap.Logger, blobs blobstore.Blobs, stop *modular.StopTrigger) *pieces.TrashRunOnce {
+			return pieces.NewTrashRunOnce(log, blobs, trashExpiryInterval, stop)
+		})
 
-		mud.Provide[*orders.Service](ball, func(log *zap.Logger, ordersStore *orders.FileStore, ordersDB orders.DB, trust *trust.Pool, config orders.Config, tlsOptions *tlsopts.Options) *orders.Service {
+		mud.RegisterInterfaceImplementation[piecestore.RestoreTrash, *pieces.TrashChore](ball)
+		mud.RegisterImplementation[[]piecestore.QueueRetain](ball)
+		mud.Implementation[[]piecestore.QueueRetain, *retain.Service](ball)
+
+		mud.Provide[*satstore.SatelliteStore](ball, func(cfg hashstore.Config, old piecestore.OldConfig) *satstore.SatelliteStore {
+			logsPath, _ := cfg.Directories(old.Path)
+			return satstore.NewSatelliteStore(filepath.Join(logsPath, "meta"), "migrate")
+		})
+		mud.Provide[*piecestore.OldPieceBackend](ball, piecestore.NewOldPieceBackend)
+		mud.Provide[*load.DiskStatsCollector](ball, func(log *zap.Logger, cfg hashstore.Config, old piecestore.OldConfig) *load.DiskStatsCollector {
+			logsPath, _ := cfg.Directories(old.Path)
+			diskstats := load.DiskStats(log, logsPath)
+			mon.Chain(diskstats)
+			return diskstats
+		})
+		mud.Provide[*piecestore.HashStoreBackend](ball, func(ctx context.Context, cfg hashstore.Config, old piecestore.OldConfig, bfm *retain.BloomFilterManager, rtm *retain.RestoreTimeManager, log *zap.Logger, amnesty *contact.AmnestyClient) (*piecestore.HashStoreBackend, error) {
+			logsPath, tablePath := cfg.Directories(old.Path)
+			backend, err := piecestore.NewHashStoreBackend(ctx, cfg, logsPath, tablePath, bfm, rtm, log, amnesty)
+			if err != nil {
+				return nil, err
+			}
+			mon.Chain(backend)
+			return backend, nil
+		})
+		mud.Provide[*piecemigrate.Chore](ball, func(log *zap.Logger, cfg piecemigrate.Config, config hashstore.Config, old *pieces.Store, new *piecestore.HashStoreBackend, piecestoreOldConfig piecestore.OldConfig, contactService *contact.Service) *piecemigrate.Chore {
+			logsPath, _ := config.Directories(piecestoreOldConfig.Path)
+			chore := piecemigrate.NewChore(log, cfg, satstore.NewSatelliteStore(filepath.Join(logsPath, "meta"), "migrate_chore"), old, new, contactService, filepath.Join(piecestoreOldConfig.Path, "blobs"))
+			mon.Chain(chore)
+			return chore
+		})
+		mud.Provide[*piecestore.MigratingBackend](ball, func(log *zap.Logger, old *piecestore.OldPieceBackend, new *piecestore.HashStoreBackend, state *satstore.SatelliteStore, chore *piecemigrate.Chore, contactService *contact.Service, cfg piecemigrate.Config) *piecestore.MigratingBackend {
+			backend := piecestore.NewMigratingBackend(log, old, new, state, chore, contactService, cfg.SuppressCentralMigration)
+			mon.Chain(backend)
+			return backend
+		})
+		config.RegisterConfig[hashstore.Config](ball, "hashstore")
+
+		// default is the old one
+		mud.RegisterInterfaceImplementation[piecestore.PieceBackend, *piecestore.OldPieceBackend](ball)
+
+		mud.Provide[*retain.BloomFilterManager](ball, func(cfg hashstore.Config, old piecestore.OldConfig, rcfg retain.Config) (*retain.BloomFilterManager, error) {
+			logsPath, _ := cfg.Directories(old.Path)
+			return retain.NewBloomFilterManager(filepath.Join(logsPath, "meta"), rcfg.MaxTimeSkew)
+		})
+		mud.Implementation[[]piecestore.QueueRetain, *retain.BloomFilterManager](ball)
+		mud.Provide[*retain.RestoreTimeManager](ball, func(cfg hashstore.Config, old piecestore.OldConfig) *retain.RestoreTimeManager {
+			logsPath, _ := cfg.Directories(old.Path)
+			return retain.NewRestoreTimeManager(filepath.Join(logsPath, "meta"))
+		})
+
+		mud.Provide[*piecestore.Endpoint](ball, piecestore.NewEndpoint)
+
+		mud.Provide[*orders.Service](ball, func(log *zap.Logger, ordersStore *orders.FileStore, trustSource trust.TrustedSatelliteSource, config orders.Config, tlsOptions *tlsopts.Options) *orders.Service {
 			// TODO workaround for custom timeout for order sending request (read/write)
 			dialer := rpc.NewDefaultDialer(tlsOptions)
 			dialer.DialTimeout = config.SenderDialTimeout
-			return orders.NewService(log, dialer, ordersStore, ordersDB, trust, config)
-		}, logWrapper("orders"))
-		mud.Tag[*orders.Service, modular.Service](ball, modular.Service{})
-
+			return orders.NewService(log, dialer, ordersStore, trustSource, config)
+		})
 	}
 
 	{ // setup payouts.
-		mud.Provide[*payouts.Service](ball, payouts.NewService, logWrapper("payouts:service"))
-		mud.Provide[*payouts.Endpoint](ball, payouts.NewEndpoint, logWrapper("payouts:endpoint"))
+		mud.Provide[*payouts.Service](ball, payouts.NewService)
+		mud.Provide[*payouts.Endpoint](ball, payouts.NewEndpoint)
 	}
 
 	{ // setup reputation service.
-		mud.Provide[*reputation.Service](ball, reputation.NewService, logWrapper("reputation:service"))
+		mud.Provide[*reputation.Service](ball, reputation.NewService)
+		mud.Provide[*reputation.Chore](ball, reputation.NewChore)
 	}
 
 	{ // setup node stats service
-		mud.Provide[*nodestats.Service](ball, nodestats.NewService, logWrapper("nodestats:service"))
-		mud.Provide[nodestats.CacheStorage](ball, func(rdb reputation.DB, sdb storageusage.DB, pdb payouts.DB, prdb pricing.DB) nodestats.CacheStorage {
+		mud.Provide[*nodestats.Service](ball, nodestats.NewService)
+		mud.Provide[nodestats.CacheStorage](ball, func(sdb storageusage.DB, pdb payouts.DB, prdb pricing.DB) nodestats.CacheStorage {
 			return nodestats.CacheStorage{
-				Reputation:   rdb,
 				StorageUsage: sdb,
 				Payout:       pdb,
 				Pricing:      prdb,
 			}
 		})
-		mud.Provide[*nodestats.Cache](ball, nodestats.NewCache, logWrapper("nodestats:cache"))
-		mud.Tag[*nodestats.Cache, modular.Service](ball, modular.Service{})
-	}
-
-	{ // setup estimation service
-		mud.Provide[estimatedpayouts.Service](ball, estimatedpayouts.NewService)
+		mud.Provide[*nodestats.Cache](ball, nodestats.NewCache)
 	}
 
 	{
 		mud.Provide[*collector.Service](ball, collector.NewService)
 		mud.Provide[collector.RunOnce](ball, collector.NewRunnerOnce)
 		config.RegisterConfig[collector.Config](ball, "collector")
-		mud.Tag[*collector.Service, modular.Service](ball, modular.Service{})
 	}
 	// TODO: there is much more elegant way to do this. But we have circular dependency between piecestore endpoint and Server
 	// (mainly, because everybody is interested about the actual server port)
@@ -380,14 +442,12 @@ func Module(ball *mud.Ball) {
 		}
 		return &EndpointRegistration{}, nil
 	})
-	mud.Tag[*EndpointRegistration, modular.Service](ball, modular.Service{})
 
-}
+	signaturecheck.Module(ball)
 
-func logWrapper(name string) any {
-	return mud.NewWrapper[*zap.Logger](func(logger *zap.Logger) *zap.Logger {
-		return process.NamedLog(logger, name)
-	})
+	estimatedpayouts.Module(ball)
+	console.Module(ball)
+	consoleserver.Module(ball, Assets)
 }
 
 // EndpointRegistration is a pseudo component to wire server and DRPC endpoints together.
@@ -396,4 +456,60 @@ type EndpointRegistration struct{}
 // HttpFallbackHandler is an extension to the public DRPC server.
 type HttpFallbackHandler struct {
 	Handler http.HandlerFunc
+}
+
+// pieceStoreBackendAdapter wraps *pieces.Store to implement monitor.PieceStoreSpaceUsage.
+type pieceStoreBackendAdapter struct {
+	store *pieces.Store
+}
+
+// NewPieceStoreSpaceUsageAdapter creates a new monitor.PieceStoreSpaceUsage from *pieces.Store.
+func NewPieceStoreSpaceUsageAdapter(store *pieces.Store) monitor.PieceStoreSpaceUsage {
+	return &pieceStoreBackendAdapter{store: store}
+}
+
+func (a *pieceStoreBackendAdapter) StorageStatus(ctx context.Context) (monitor.StorageStatus, error) {
+	status, err := a.store.StorageStatus(ctx)
+	if err != nil {
+		return monitor.StorageStatus{}, err
+	}
+	return monitor.StorageStatus{
+		DiskTotal: status.DiskTotal,
+		DiskUsed:  status.DiskUsed,
+		DiskFree:  status.DiskFree,
+	}, nil
+}
+
+func (a *pieceStoreBackendAdapter) SpaceUsedForPieces(ctx context.Context) (int64, int64, error) {
+	return a.store.SpaceUsedForPieces(ctx)
+}
+
+func (a *pieceStoreBackendAdapter) SpaceUsedForTrash(ctx context.Context) (int64, error) {
+	return a.store.SpaceUsedForTrash(ctx)
+}
+
+func (a *pieceStoreBackendAdapter) SpaceUsedForPiecesAndTrash(ctx context.Context) (int64, error) {
+	return a.store.SpaceUsedForPiecesAndTrash(ctx)
+}
+
+// ReportHashstoreWriteToNew returns a function that can be used for reporting current WriteToNew status for satellites.
+func ReportHashstoreWriteToNew(log *zap.Logger, store *satstore.SatelliteStore) func() bool {
+	return func() bool {
+		var res bool
+		err := store.Range(func(id storj.NodeID, bytes []byte) error {
+			var ms piecestore.MigrationState
+			err := json.Unmarshal(bytes, &ms)
+			if err != nil {
+				log.Warn("failed to unmarshal migration state", zap.Error(err), zap.Stringer("satellite", id))
+			}
+			if ms.WriteToNew {
+				res = true
+			}
+			return nil
+		})
+		if err != nil {
+			log.Warn("Couldn't read migration state", zap.Error(err))
+		}
+		return res
+	}
 }

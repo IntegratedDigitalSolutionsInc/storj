@@ -101,10 +101,10 @@
                 <p v-if="isBandwidthChartShown" class="chart-container__amount"><b>{{ bandwidthSummary }}</b></p>
                 <p v-if="isEgressChartShown" class="chart-container__amount"><b>{{ egressSummary }}</b></p>
                 <p v-if="isIngressChartShown" class="chart-container__amount"><b>{{ ingressSummary }}</b></p>
-                <div ref="chart" class="chart-container__chart" onresize="recalculateChartDimensions()">
-                    <BandwidthChart v-if="isBandwidthChartShown" :height="chartHeight" :width="chartWidth" :is-dark-mode="isDarkMode" />
-                    <EgressChart v-if="isEgressChartShown" :height="chartHeight" :width="chartWidth" :is-dark-mode="isDarkMode" />
-                    <IngressChart v-if="isIngressChartShown" :height="chartHeight" :width="chartWidth" :is-dark-mode="isDarkMode" />
+                <div ref="chart">
+                    <BandwidthChart v-if="isBandwidthChartShown" :height="240" :width="chartWidth" :is-dark-mode="isDarkMode" />
+                    <EgressChart v-if="isEgressChartShown" :height="240" :width="chartWidth" :is-dark-mode="isDarkMode" />
+                    <IngressChart v-if="isIngressChartShown" :height="240" :width="chartWidth" :is-dark-mode="isDarkMode" />
                 </div>
             </div>
         </section>
@@ -115,8 +115,8 @@
                     <p class="chart-container__title-area__title">Average Disk Space Used This Month</p>
                 </div>
                 <p class="chart-container__amount disk-space-amount"><b>{{ averageUsageBytes }}</b></p>
-                <div ref="diskSpaceChart" class="chart-container__chart" onresize="recalculateChartDimensions()">
-                    <DiskSpaceChart :height="diskSpaceChartHeight" :width="diskSpaceChartWidth" :is-dark-mode="isDarkMode" />
+                <div ref="diskSpaceChart">
+                    <DiskSpaceChart :height="240" :width="diskSpaceChartWidth" :is-dark-mode="isDarkMode" />
                 </div>
             </section>
             <section>
@@ -160,13 +160,17 @@
     </div>
 </template>
 
-<script lang="ts">
-import { Component, Vue } from 'vue-property-decorator';
+<script setup lang="ts">
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue';
 
 import { RouteConfig } from '@/app/router';
-import { APPSTATE_ACTIONS } from '@/app/store/modules/appState';
 import { Size } from '@/private/memory/size';
-import { Dashboard, SatelliteInfo, SatelliteScores } from '@/storagenode/sno/sno';
+import { Node, SatelliteInfo, SatelliteScores } from '@/storagenode/sno/sno';
+import { useAppStore } from '@/app/store/modules/appStore';
+import { useNodeStore } from '@/app/store/modules/nodeStore';
+import LargeSuspensionIcon from '@/../static/images/largeSuspend.svg';
+import LargeDisqualificationIcon from '@/../static/images/largeDisqualify.svg';
+import BlueArrowRight from '@/../static/images/BlueArrowRight.svg';
 
 import AllSatellitesAuditsArea from '@/app/components/AllSatellitesAuditsArea.vue';
 import BandwidthChart from '@/app/components/BandwidthChart.vue';
@@ -179,255 +183,138 @@ import SatelliteSelection from '@/app/components/SatelliteSelection.vue';
 import TotalPayoutArea from '@/app/components/TotalPayoutArea.vue';
 import WalletArea from '@/app/components/WalletArea.vue';
 
-import LargeSuspensionIcon from '@/../static/images/largeSuspend.svg';
-import LargeDisqualificationIcon from '@/../static/images/largeDisqualify.svg';
-import BlueArrowRight from '@/../static/images/BlueArrowRight.svg';
+const appStore = useAppStore();
+const nodeStore = useNodeStore();
 
-// @vue/component
-@Component ({
-    components: {
-        AllSatellitesAuditsArea,
-        DiskStatChart,
-        TotalPayoutArea,
-        EgressChart,
-        IngressChart,
-        SatelliteSelection,
-        BandwidthChart,
-        DiskSpaceChart,
-        ChecksArea,
-        WalletArea,
-        LargeDisqualificationIcon,
-        LargeSuspensionIcon,
-        BlueArrowRight,
-    },
-})
-export default class SNOContentFilling extends Vue {
-    public readonly PAYOUT_PATH: string = RouteConfig.Payout.path;
-    public chartWidth = 0;
-    public chartHeight = 0;
-    public diskSpaceChartWidth = 0;
-    public diskSpaceChartHeight = 0;
+const PAYOUT_PATH = ref<string>(RouteConfig.Payout.path);
+const chartWidth = ref<number>(0);
+const diskSpaceChartWidth = ref<number>(0);
 
-    public $refs: {
-        chart: HTMLElement;
-        diskSpaceChart: HTMLElement;
-    };
+const chart = ref<HTMLElement>();
+const diskSpaceChart = ref<HTMLElement>();
 
-    public get isDarkMode(): boolean {
-        return this.$store.state.appStateModule.isDarkMode;
+const isDarkMode = computed<boolean>(() => {
+    return appStore.state.isDarkMode;
+});
+
+const isBandwidthChartShown = computed<boolean>(() => {
+    return appStore.state.isBandwidthChartShown;
+});
+
+const isIngressChartShown = computed<boolean>(() => {
+    return appStore.state.isIngressChartShown;
+});
+
+const isEgressChartShown = computed<boolean>(() => {
+    return appStore.state.isEgressChartShown;
+});
+
+const nodeInfo = computed<Node>(() => {
+    return nodeStore.state.info;
+});
+
+const bandwidthSummary = computed<string>(() => {
+    return Size.toBase10String(nodeStore.state.bandwidthSummary);
+});
+
+const egressSummary = computed<string>(() => {
+    return Size.toBase10String(nodeStore.state.egressSummary);
+});
+
+const ingressSummary = computed<string>(() => {
+    return Size.toBase10String(nodeStore.state.ingressSummary);
+});
+
+const averageUsageBytes = computed<string>(() => {
+    return Size.toBase10String(nodeStore.state.averageUsageBytes);
+});
+
+const audits = computed<SatelliteScores>(() => {
+    return nodeStore.state.audits as SatelliteScores;
+});
+
+const selectedSatellite = computed<SatelliteInfo>(() => {
+    return nodeStore.state.selectedSatellite;
+});
+
+const disqualifiedSatellites = computed<SatelliteInfo[]>(() => {
+    return nodeStore.state.disqualifiedSatellites;
+});
+
+const isDisqualifiedInfoShown = computed<boolean>(() => {
+    return !!(selectedSatellite.value.id && selectedSatellite.value.disqualified);
+});
+
+const getDisqualificationDate = computed<string>(() => {
+    if (selectedSatellite.value.disqualified) {
+        return selectedSatellite.value.disqualified.toUTCString();
     }
 
-    /**
-     * Used container size recalculation for charts resizing.
-     */
-    public recalculateChartDimensions(): void {
-        this.chartWidth = this.$refs['chart'].clientWidth;
-        this.chartHeight = this.$refs['chart'].clientHeight;
-        this.diskSpaceChartWidth = this.$refs['diskSpaceChart'].clientWidth;
-        this.diskSpaceChartHeight = this.$refs['diskSpaceChart'].clientHeight;
+    return '';
+});
+
+const doDisqualifiedSatellitesExist = computed<boolean>(() => {
+    return disqualifiedSatellites.value.length > 0;
+});
+
+const suspendedSatellites = computed<SatelliteInfo[]>(() => {
+    return nodeStore.state.suspendedSatellites;
+});
+
+const isSuspendedInfoShown = computed<boolean>(() => {
+    return !!(selectedSatellite.value.id && selectedSatellite.value.suspended);
+});
+
+const getSuspensionDate = computed<string>(() => {
+    if (selectedSatellite.value.suspended) {
+        return selectedSatellite.value.suspended.toUTCString();
     }
 
-    /**
-     * Lifecycle hook after initial render.
-     * Adds event on window resizing to recalculate size of charts.
-     */
-    public mounted(): void {
-        window.addEventListener('resize', this.recalculateChartDimensions);
-        this.recalculateChartDimensions();
-    }
+    return '';
+});
 
-    /**
-     * Lifecycle hook before component destruction.
-     * Removes event on window resizing.
-     */
-    public beforeDestroy(): void {
-        window.removeEventListener('resize', this.recalculateChartDimensions);
-    }
+const doSuspendedSatellitesExist = computed<boolean>(() => {
+    return suspendedSatellites.value.length > 0;
+});
 
-    /**
-     * isBandwidthChartShown showing status of bandwidth chart from store.
-     * @return boolean - bandwidth chart displaying status
-     */
-    public get isBandwidthChartShown(): boolean {
-        return this.$store.state.appStateModule.isBandwidthChartShown;
-    }
-
-    /**
-     * isIngressChartShown showing status of ingress chart from store.
-     * @return boolean - ingress chart displaying status
-     */
-    public get isIngressChartShown(): boolean {
-        return this.$store.state.appStateModule.isIngressChartShown;
-    }
-
-    /**
-     * isEgressChartShown showing status of egress chart from store.
-     * @return boolean - egress chart displaying status
-     */
-    public get isEgressChartShown(): boolean {
-        return this.$store.state.appStateModule.isEgressChartShown;
-    }
-
-    /**
-     * toggleEgressChartShowing toggles displaying of egress chart.
-     */
-    public toggleEgressChartShowing(): void {
-        if (this.isBandwidthChartShown || this.isIngressChartShown) {
-            this.$store.dispatch(APPSTATE_ACTIONS.TOGGLE_EGRESS_CHART);
-
-            return;
-        }
-
-        this.$store.dispatch(APPSTATE_ACTIONS.CLOSE_ADDITIONAL_CHARTS);
-    }
-
-    /**
-     * toggleIngressChartShowing toggles displaying of ingress chart.
-     */
-    public toggleIngressChartShowing(): void {
-        if (this.isBandwidthChartShown || this.isEgressChartShown) {
-            this.$store.dispatch(APPSTATE_ACTIONS.TOGGLE_INGRESS_CHART);
-
-            return;
-        }
-
-        this.$store.dispatch(APPSTATE_ACTIONS.CLOSE_ADDITIONAL_CHARTS);
-    }
-
-    /**
-     * nodeInfo - contains common sno dashboard information.
-     * @return Dashboard
-     */
-    public get nodeInfo(): Dashboard {
-        return this.$store.state.node.info;
-    }
-
-    /**
-     * bandwidthSummary - amount of monthly bandwidth used from store.
-     * @return string - formatted amount of monthly bandwidth used
-     */
-    public get bandwidthSummary(): string {
-        return Size.toBase10String(this.$store.state.node.bandwidthSummary);
-    }
-
-    /**
-     * egressSummary - amount of monthly egress used from store.
-     * @return string - formatted amount of monthly egress used
-     */
-    public get egressSummary(): string {
-        return Size.toBase10String(this.$store.state.node.egressSummary);
-    }
-
-    /**
-     * ingressSummary - amount of monthly ingress used from store.
-     * @return string - formatted amount of monthly ingress used
-     */
-    public get ingressSummary(): string {
-        return Size.toBase10String(this.$store.state.node.ingressSummary);
-    }
-
-    /**
-     * storageSummary - amount of monthly disk space used from store.
-     * @return string - formatted amount of monthly disk space used
-     */
-    public get averageUsageBytes(): string {
-        return Size.toBase10String(this.$store.state.node.averageUsageBytes);
-    }
-
-    /**
-     * checks - audit checks status from store.
-     * @return Checks - audit checks statuses
-     */
-    public get audits(): SatelliteScores {
-        return this.$store.state.node.audits;
-    }
-
-    /**
-     * selectedSatellite - current selected satellite from store.
-     * @return SatelliteInfo - current selected satellite
-     */
-    public get selectedSatellite(): SatelliteInfo {
-        return this.$store.state.node.selectedSatellite;
-    }
-
-    /**
-     * disqualifiedSatellites - array of disqualified satellites from store.
-     * @return SatelliteInfo[] - array of disqualified satellites
-     */
-    public get disqualifiedSatellites(): SatelliteInfo[] {
-        return this.$store.state.node.disqualifiedSatellites;
-    }
-
-    /**
-     * isDisqualifiedInfoShown checks if disqualification status is shown.
-     * @return boolean - disqualification status
-     */
-    public get isDisqualifiedInfoShown(): boolean {
-        return !!(this.selectedSatellite.id && this.selectedSatellite.disqualified);
-    }
-
-    /**
-     * getDisqualificationDate gets a date of disqualification.
-     * @return String - date of disqualification
-     */
-    public get getDisqualificationDate(): string {
-        if (this.selectedSatellite.disqualified) {
-            return this.selectedSatellite.disqualified.toUTCString();
-        }
-
-        return '';
-    }
-
-    /**
-     * doDisqualifiedSatellitesExist checks if disqualified satellites exist.
-     * @return boolean - disqualified satellites existing status
-     */
-    public get doDisqualifiedSatellitesExist(): boolean {
-        return this.disqualifiedSatellites.length > 0;
-    }
-
-    /**
-     * suspendedSatellites - array of suspended satellites from store.
-     * @return SatelliteInfo[] - array of suspended satellites
-     */
-    public get suspendedSatellites(): SatelliteInfo[] {
-        return this.$store.state.node.suspendedSatellites;
-    }
-
-    /**
-     * isSuspendedInfoShown checks if suspension status is shown.
-     * @return boolean - suspension status
-     */
-    public get isSuspendedInfoShown(): boolean {
-        return !!(this.selectedSatellite.id && this.selectedSatellite.suspended);
-    }
-
-    /**
-     * getSuspensionDate gets a date of suspension.
-     * @return String - date of suspension
-     */
-    public get getSuspensionDate(): string {
-        if (this.selectedSatellite.suspended) {
-            return this.selectedSatellite.suspended.toUTCString();
-        }
-
-        return '';
-    }
-
-    /**
-     * doSuspendedSatellitesExist checks if suspended satellites exist.
-     * @return boolean - suspended satellites existing status
-     */
-    public get doSuspendedSatellitesExist(): boolean {
-        return this.suspendedSatellites.length > 0;
-    }
+function recalculateChartDimensions(): void {
+    chartWidth.value = chart.value ? chart.value.clientWidth : 0;
+    diskSpaceChartWidth.value = diskSpaceChart.value ? diskSpaceChart.value.clientWidth : 0;
 }
+
+function toggleEgressChartShowing(): void {
+    if (isBandwidthChartShown.value || isIngressChartShown.value) {
+        appStore.toggleEgressChart();
+
+        return;
+    }
+
+    appStore.closeAdditionalCharts();
+}
+
+function toggleIngressChartShowing(): void {
+    if (isBandwidthChartShown.value || isEgressChartShown.value) {
+        appStore.toggleIngressChart();
+
+        return;
+    }
+
+    appStore.closeAdditionalCharts();
+}
+
+onMounted(() => {
+    window.addEventListener('resize', recalculateChartDimensions);
+    recalculateChartDimensions();
+});
+
+onBeforeUnmount(() => {
+    window.removeEventListener('resize', recalculateChartDimensions);
+});
 </script>
 
 <style scoped lang="scss">
     p {
-        margin-block-start: 0;
-        margin-block-end: 0;
+        margin-block: 0;
     }
 
     .info-area {
@@ -602,13 +489,6 @@ export default class SNOContentFilling extends Vue {
             line-height: 57px;
             color: var(--regular-text-color);
         }
-
-        &__chart {
-            position: absolute;
-            left: 0;
-            width: calc(100% - 10px);
-            height: 240px;
-        }
     }
 
     .egress-chart-shown {
@@ -630,7 +510,7 @@ export default class SNOContentFilling extends Vue {
         width: calc(100% - 60px);
     }
 
-    @media screen and (max-width: 1000px) {
+    @media screen and (width <= 1000px) {
 
         .info-area {
 
@@ -645,7 +525,7 @@ export default class SNOContentFilling extends Vue {
         }
     }
 
-    @media screen and (max-width: 780px) {
+    @media screen and (width <= 780px) {
 
         .info-area {
 
@@ -666,7 +546,7 @@ export default class SNOContentFilling extends Vue {
         }
     }
 
-    @media screen and (max-width: 400px) {
+    @media screen and (width <= 400px) {
 
         .chart-container {
             width: calc(100% - 36px);

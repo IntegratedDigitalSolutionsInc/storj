@@ -2,17 +2,22 @@
 // See LICENSE for copying information.
 
 import { defineStore } from 'pinia';
-import { reactive } from 'vue';
+import { computed, reactive } from 'vue';
 
 import {
-    AccessGrant,
+    type AccessGrant,
+    type AccessGrantsOrderBy,
+    type EdgeCredentials,
     AccessGrantCursor,
-    AccessGrantsOrderBy,
     AccessGrantsPage,
-    EdgeCredentials,
 } from '@/types/accessGrants';
-import { SortDirection } from '@/types/common';
+import type { SortDirection } from '@/types/common';
 import { AccessGrantsHttpApi } from '@/api/accessGrants';
+import {
+    AccessGrantManagementHttpApiV1,
+    type CreateAccessRequest,
+    type CreateAccessResponse,
+} from '@/api/private.gen';
 import { useConfigStore } from '@/store/modules/configStore';
 import { useProjectsStore } from '@/store/modules/projectsStore';
 import { DEFAULT_PAGE_LIMIT } from '@/types/pagination';
@@ -26,43 +31,17 @@ class AccessGrantsState {
 
 export const useAccessGrantsStore = defineStore('accessGrants', () => {
     const api = new AccessGrantsHttpApi();
+    const generatedApi = new AccessGrantManagementHttpApiV1();
 
     const state = reactive<AccessGrantsState>(new AccessGrantsState());
 
     const configStore = useConfigStore();
     const projectsStore = useProjectsStore();
 
-    async function startWorker(): Promise<void> {
-        // TODO(vitalii): create an issue here https://github.com/vitejs/vite
-        // about worker chunk being auto removed after rebuild in watch mode if using new URL constructor.
-        let worker: Worker;
-        if (import.meta.env.MODE === 'development') {
-            worker = new Worker('/static/src/utils/accessGrant.worker.js');
-        } else {
-            worker = new Worker(new URL('@/utils/accessGrant.worker.js', import.meta.url));
-        }
+    const csrfToken = computed<string>(() => configStore.state.config.csrfToken);
 
-        worker.postMessage({ 'type': 'Setup' });
-
-        const event: MessageEvent = await new Promise(resolve => worker.onmessage = resolve);
-        if (event.data.error) {
-            throw new Error(event.data.error);
-        }
-
-        if (event.data !== 'configured') {
-            throw new Error('Failed to configure access grants web worker');
-        }
-
-        worker.onerror = (error: ErrorEvent) => {
-            throw new Error(`Failed to configure access grants web worker. ${error.message}`);
-        };
-
+    function setWorker(worker: Worker | null): void {
         state.accessGrantsWebWorker = worker;
-    }
-
-    function stopWorker(): void {
-        state.accessGrantsWebWorker?.terminate();
-        state.accessGrantsWebWorker = null;
     }
 
     async function getAllAGNames(projectID: string): Promise<void> {
@@ -81,18 +60,27 @@ export const useAccessGrantsStore = defineStore('accessGrants', () => {
     }
 
     async function createAccessGrant(name: string, projectID: string): Promise<AccessGrant> {
-        return await api.create(projectID, name);
+        return await api.create(projectID, name, csrfToken.value);
+    }
+
+    async function createRestrictedAccess(req: CreateAccessRequest): Promise<CreateAccessResponse> {
+        return await generatedApi.createAccess(req);
     }
 
     async function deleteAccessGrants(ids: string[]): Promise<void> {
-        await api.delete(ids);
+        await api.delete(ids, csrfToken.value);
     }
 
     async function getEdgeCredentials(accessGrant: string, isPublic = false): Promise<EdgeCredentials> {
         const url = projectsStore.state.selectedProject.edgeURLOverrides?.authService
             || configStore.state.config.gatewayCredentialsRequestURL;
 
-        return await api.getGatewayCredentials(accessGrant, url, isPublic);
+        const creds = await api.getGatewayCredentials(accessGrant, url, isPublic);
+
+        const gatewayEndpoint = projectsStore.state.selectedProject.edgeURLOverrides?.gatewayEndpoint;
+        if (gatewayEndpoint) creds.endpoint = gatewayEndpoint;
+
+        return creds;
     }
 
     function setSearchQuery(query: string): void {
@@ -117,10 +105,10 @@ export const useAccessGrantsStore = defineStore('accessGrants', () => {
     return {
         state,
         getAllAGNames,
-        startWorker,
-        stopWorker,
+        setWorker,
         getAccessGrants,
         createAccessGrant,
+        createRestrictedAccess,
         deleteAccessGrants,
         getEdgeCredentials,
         setSearchQuery,

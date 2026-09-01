@@ -6,18 +6,22 @@ if (!WebAssembly.instantiate) {
 }
 
 async function setupWithCacheControl(mode) {
-    const manifestResp = await fetch('/static/static/wasm/wasm-manifest.json', { cache: 'no-store' });
+    // Determine the base path for WASM files based on environment.
+    // Dev server runs on port 3000, production builds are served differently
+    const wasmBasePath = self.location.port === '3000' ? '/wasm' : '/static/static/wasm';
+
+    const manifestResp = await fetch(`${wasmBasePath}/wasm-manifest.json`, { cache: 'no-store' });
     if (!manifestResp.ok) {
         throw new Error('Failed to fetch wasm manifest.');
     }
     const manifest = await manifestResp.json();
 
     // eslint-disable-next-line no-undef
-    importScripts(`/static/static/wasm/${manifest.helperFileName}`);
+    importScripts(`${wasmBasePath}/${manifest.helperFileName}`);
 
     const go = new self.Go();
 
-    const response = await fetch(`/static/static/wasm/${manifest.moduleFileName}`, { cache: mode });
+    const response = await fetch(`${wasmBasePath}/${manifest.moduleFileName}`, { cache: mode });
     if (!response.ok) {
         throw new Error('Failed to fetch wasm module.');
     }
@@ -64,8 +68,17 @@ self.onmessage = async function (event) {
             const passphrase = data.passphrase;
             const salt = data.salt;
             const nodeURL = data.satelliteNodeURL;
+            const encryptPath = data.encryptPath;
 
-            result = self.generateNewAccessGrant(nodeURL, apiKey, passphrase, salt);
+            if (!encryptPath) {
+                if (!self.generateNewAccessGrantWithPathEncryption) {
+                    self.postMessage({ error: new Error('This page has an update, hard refresh for it to work correctly.') });
+                    return;
+                }
+                result = self.generateNewAccessGrantWithPathEncryption(nodeURL, apiKey, passphrase, salt, encryptPath);
+            } else {
+                result = self.generateNewAccessGrant(nodeURL, apiKey, passphrase, salt);
+            }
             self.postMessage(result);
         }
         break;
@@ -81,6 +94,10 @@ self.onmessage = async function (event) {
             const isBypassGovernanceRetention = data.isBypassGovernanceRetention ?? false;
             const isPutObjectLegalHold = data.isPutObjectLegalHold ?? false;
             const isGetObjectLegalHold = data.isGetObjectLegalHold ?? false;
+            const isPutObjectLockConfiguration = data.isPutObjectLockConfiguration ?? false;
+            const isGetObjectLockConfiguration = data.isGetObjectLockConfiguration ?? false;
+            const isPutBucketNotificationConfiguration = data.isPutBucketNotificationConfiguration ?? false;
+            const isGetBucketNotificationConfiguration = data.isGetBucketNotificationConfiguration ?? false;
             const notBefore = data.notBefore;
             const notAfter = data.notAfter;
 
@@ -95,6 +112,10 @@ self.onmessage = async function (event) {
             permission.AllowBypassGovernanceRetention = isBypassGovernanceRetention;
             permission.AllowPutObjectLegalHold = isPutObjectLegalHold;
             permission.AllowGetObjectLegalHold = isGetObjectLegalHold;
+            permission.AllowPutBucketObjectLockConfiguration = isPutObjectLockConfiguration;
+            permission.AllowGetBucketObjectLockConfiguration = isGetObjectLockConfiguration;
+            permission.AllowPutBucketNotificationConfiguration = isPutBucketNotificationConfiguration;
+            permission.AllowGetBucketNotificationConfiguration = isGetBucketNotificationConfiguration;
 
             if (notBefore) permission.NotBefore = notBefore;
             if (notAfter) permission.NotAfter = notAfter;

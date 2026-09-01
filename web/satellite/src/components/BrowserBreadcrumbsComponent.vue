@@ -6,7 +6,7 @@
         <template #divider>
             <img src="@/assets/icon-right.svg" alt="Breadcrumbs separator" width="10">
         </template>
-        <v-chip v-if="showRegionTag && bucketLocation" class="ml-3" variant="tonal" color="default" size="small" rounded-xl>
+        <v-chip v-if="showRegionTag && bucketLocation" class="text-capitalize" variant="tonal" color="default" size="small" rounded-xl>
             {{ bucketLocation }}
         </v-chip>
     </v-breadcrumbs>
@@ -53,7 +53,7 @@ const filePath = computed<string>(() => bucketsStore.state.fileComponentPath);
 type BreadcrumbItem = {
     title: string;
     to: string;
-}
+};
 
 /**
  * Returns breadcrumb items corresponding to parts in the object browser path.

@@ -10,12 +10,30 @@ import (
 
 // Rates configures the payment rates for network operations.
 type Rates struct {
-	AtRestGBHours Rate // For data at rest in dollars per gigabyte-hour.
-	GetTB         Rate // For data the node has sent for reads in dollars per terabyte.
-	PutTB         Rate // For data the node has received for writes in dollars per terabyte.
-	GetRepairTB   Rate // For data the node has sent for repairs in dollars per terabyte.
-	PutRepairTB   Rate // For data the node has received for repairs in dollars per terabyte.
-	GetAuditTB    Rate // For data the node has sent for audits in dollars per terabyte.
+	// AtRestGBHours is for data at rest in dollars per gigabyte-hour.
+	AtRestGBHours Rate `user:"true" help:"rate for data at rest per GB/hour" default:"0.00000208"`
+	// GetTB is for data the node has sent for reads in dollars per terabyte.
+	GetTB Rate `user:"true" help:"rate for egress bandwidth per TB" default:"20.00"`
+	// PutTB is for data the node has received for writes in dollars per terabyte.
+	PutTB Rate `user:"true" help:"rate for ingress bandwidth per TB" default:"0"`
+	// GetRepairTB is for data the node has sent for repairs in dollars per terabyte.
+	GetRepairTB Rate `user:"true" help:"rate for repair egress bandwidth per TB" default:"10.00"`
+	// PutRepairTB is for data the node has received for repairs in dollars per terabyte.
+	PutRepairTB Rate `user:"true" help:"rate for repair ingress bandwidth per TB" default:"0"`
+	// GetAuditTB is for data the node has sent for audits in dollars per terabyte.
+	GetAuditTB Rate `user:"true" help:"rate for audit egress bandwidth per TB" default:"10.00"`
+}
+
+// Equal returns whether two Rates carry the same value in every field. Uses
+// decimal.Decimal.Equal so it does not depend on the two Rates sharing the
+// same underlying *big.Int (which struct equality would).
+func (rates Rates) Equal(other Rates) bool {
+	return decimal.Decimal(rates.AtRestGBHours).Equal(decimal.Decimal(other.AtRestGBHours)) &&
+		decimal.Decimal(rates.GetTB).Equal(decimal.Decimal(other.GetTB)) &&
+		decimal.Decimal(rates.PutTB).Equal(decimal.Decimal(other.PutTB)) &&
+		decimal.Decimal(rates.GetRepairTB).Equal(decimal.Decimal(other.GetRepairTB)) &&
+		decimal.Decimal(rates.PutRepairTB).Equal(decimal.Decimal(other.PutRepairTB)) &&
+		decimal.Decimal(rates.GetAuditTB).Equal(decimal.Decimal(other.GetAuditTB))
 }
 
 // Rate is a wrapper type around a decimal.Decimal.

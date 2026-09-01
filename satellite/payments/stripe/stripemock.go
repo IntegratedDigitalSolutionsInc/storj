@@ -1,24 +1,28 @@
 // Copyright (C) 2020 Storj Labs, Inc.
 // See LICENSE for copying information.
 
+//lint:file-ignore SA1019 ListMeta.TotalCount is deprecated, but this mock reproduces legacy list responses.
+
 package stripe
 
 import (
 	"context"
 	"errors"
 	"fmt"
+	"math/rand"
+	"strconv"
 	"sync"
 	"time"
 
-	"github.com/stripe/stripe-go/v75"
-	"github.com/stripe/stripe-go/v75/charge"
-	"github.com/stripe/stripe-go/v75/customer"
-	"github.com/stripe/stripe-go/v75/customerbalancetransaction"
-	"github.com/stripe/stripe-go/v75/form"
-	"github.com/stripe/stripe-go/v75/invoice"
-	"github.com/stripe/stripe-go/v75/invoiceitem"
-	"github.com/stripe/stripe-go/v75/paymentmethod"
-	"github.com/stripe/stripe-go/v75/promotioncode"
+	"github.com/stripe/stripe-go/v81"
+	"github.com/stripe/stripe-go/v81/charge"
+	"github.com/stripe/stripe-go/v81/customer"
+	"github.com/stripe/stripe-go/v81/customerbalancetransaction"
+	"github.com/stripe/stripe-go/v81/form"
+	"github.com/stripe/stripe-go/v81/invoice"
+	"github.com/stripe/stripe-go/v81/invoiceitem"
+	"github.com/stripe/stripe-go/v81/paymentmethod"
+	"github.com/stripe/stripe-go/v81/promotioncode"
 
 	"storj.io/common/testrand"
 	"storj.io/common/uuid"
@@ -104,6 +108,8 @@ type mockStripeState struct {
 
 	customers                   *mockCustomersState
 	paymentMethods              *mockPaymentMethods
+	paymentIntents              *mockPaymentIntents
+	setupIntents                *mockSetupIntents
 	invoices                    *mockInvoices
 	invoiceItems                *mockInvoiceItems
 	customerBalanceTransactions *mockCustomerBalanceTransactions
@@ -137,6 +143,8 @@ func NewStripeMock(customersDB CustomersDB, usersDB console.Users) Client {
 	state := &mockStripeState{}
 	state.customers = &mockCustomersState{}
 	state.paymentMethods = newMockPaymentMethods(state)
+	state.paymentIntents = &mockPaymentIntents{}
+	state.setupIntents = &mockSetupIntents{}
 	state.invoiceItems = newMockInvoiceItems(state)
 	state.invoices = newMockInvoices(state, state.invoiceItems)
 	state.customerBalanceTransactions = newMockCustomerBalanceTransactions(state)
@@ -167,6 +175,14 @@ func (m *mockStripeClient) Customers() Customers {
 
 func (m *mockStripeClient) PaymentMethods() PaymentMethods {
 	return m.paymentMethods
+}
+
+func (m *mockStripeClient) PaymentIntents() PaymentIntents {
+	return m.paymentIntents
+}
+
+func (m *mockStripeClient) SetupIntents() SetupIntents {
+	return m.setupIntents
 }
 
 func (m *mockStripeClient) Invoices() Invoices {
@@ -234,30 +250,32 @@ func (m *mockCustomers) repopulate() error {
 	defer m.root.mu.Unlock()
 
 	if !m.state.repopulated {
-		const limit = 25
-		ctx := context.TODO()
+		const limit = 100
 
-		cusPage, err := m.customersDB.List(ctx, uuid.UUID{}, limit, time.Now())
+		ctx, cancel := context.WithTimeout(context.TODO(), 30*time.Second)
+		defer cancel()
+
+		users, err := m.usersDB.TestingGetAll(ctx)
 		if err != nil {
-			return err
-		}
-		for _, cus := range cusPage.Customers {
-			user, err := m.usersDB.Get(ctx, cus.UserID)
-			if err != nil {
-				return err
-			}
-			m.state.customers = append(m.state.customers, newMockCustomer(cus.ID, user.Email))
+			return Error.Wrap(err)
 		}
 
+		userByID := map[uuid.UUID]*console.User{}
+		for _, user := range users {
+			userByID[user.ID] = user
+		}
+
+		var cusPage CustomersPage
+		cusPage.Next = true
 		for cusPage.Next {
 			cusPage, err = m.customersDB.List(ctx, cusPage.Cursor, limit, time.Now())
 			if err != nil {
-				return err
+				return Error.Wrap(err)
 			}
 			for _, cus := range cusPage.Customers {
-				user, err := m.usersDB.Get(ctx, cus.UserID)
-				if err != nil {
-					return err
+				user, ok := userByID[cus.UserID]
+				if !ok {
+					return Error.New("user %q not found", cus.UserID)
 				}
 				m.state.customers = append(m.state.customers, newMockCustomer(cus.ID, user.Email))
 			}
@@ -481,13 +499,15 @@ func (m *mockPaymentMethods) Get(id string, params *stripe.PaymentMethodParams) 
 
 func (m *mockPaymentMethods) New(params *stripe.PaymentMethodParams) (*stripe.PaymentMethod, error) {
 	randID := testrand.BucketName()
-	id := fmt.Sprintf("pm_card_%s", randID)
+	id := "pm_card_" + randID
 	if params.Card.Token != nil {
 		switch *params.Card.Token {
 		case TestPaymentMethodsNewFailure:
 			return nil, &stripe.Error{}
 		case TestPaymentMethodsAttachFailure:
 			id = TestPaymentMethodsAttachFailure
+		case MockInvoicesPaySuccess:
+			id = MockInvoicesPaySuccess
 		case MockInvoicesPayFailure:
 			id = MockInvoicesPayFailure
 		}
@@ -511,6 +531,14 @@ func (m *mockPaymentMethods) New(params *stripe.PaymentMethodParams) (*stripe.Pa
 		ID:   id,
 		Card: card,
 		Type: stripe.PaymentMethodTypeCard,
+		BillingDetails: &stripe.PaymentMethodBillingDetails{
+			Name: "Test User",
+			Address: &stripe.Address{
+				Line1:   "123 Test St",
+				City:    "Test City",
+				Country: "US",
+			},
+		},
 	}
 
 	m.root.mu.Lock()
@@ -519,6 +547,32 @@ func (m *mockPaymentMethods) New(params *stripe.PaymentMethodParams) (*stripe.Pa
 	m.unattached = append(m.unattached, newMethod)
 
 	return newMethod, nil
+}
+
+func (m *mockPaymentMethods) Update(id string, params *stripe.PaymentMethodParams) (*stripe.PaymentMethod, error) {
+	if params.Card == nil || params.Card.ExpMonth == nil || params.Card.ExpYear == nil {
+		return nil, errors.New("missing required field")
+	}
+	card := &stripe.PaymentMethodCard{
+		ExpMonth: *params.Card.ExpMonth,
+		ExpYear:  *params.Card.ExpYear,
+	}
+
+	method, err := m.Get(id, nil)
+	if err != nil {
+		return nil, err
+	}
+	if method.Card == nil {
+		return nil, errors.New("payment method has no card")
+	}
+
+	m.root.mu.Lock()
+	defer m.root.mu.Unlock()
+
+	method.Card.ExpMonth = card.ExpMonth
+	method.Card.ExpYear = card.ExpYear
+
+	return method, nil
 }
 
 func (m *mockPaymentMethods) Attach(id string, params *stripe.PaymentMethodAttachParams) (*stripe.PaymentMethod, error) {
@@ -560,6 +614,27 @@ func (m *mockPaymentMethods) Detach(id string, params *stripe.PaymentMethodDetac
 	}
 
 	return unattached, nil
+}
+
+type mockPaymentIntents struct{}
+
+type mockSetupIntents struct{}
+
+func (m *mockPaymentIntents) New(params *stripe.PaymentIntentParams) (*stripe.PaymentIntent, error) {
+	return &stripe.PaymentIntent{
+		Status:   stripe.PaymentIntentStatusSucceeded,
+		Amount:   *params.Amount,
+		Metadata: params.Metadata,
+	}, nil
+}
+
+func (m *mockSetupIntents) New(params *stripe.SetupIntentParams) (*stripe.SetupIntent, error) {
+	return &stripe.SetupIntent{
+		ClientSecret: fmt.Sprintf("seti_%d_secret", rand.Int31()),
+		Status:       stripe.SetupIntentStatusSucceeded,
+		Usage:        stripe.SetupIntentUsage(*params.Usage),
+		Metadata:     params.Metadata,
+	}, nil
 }
 
 type mockInvoices struct {
@@ -646,6 +721,13 @@ func (m *mockInvoices) New(params *stripe.InvoiceParams) (*stripe.Invoice, error
 		desc = *params.Description
 	}
 
+	periodStart := time.Now().Unix()
+	if ps, ok := params.Metadata["_period_start"]; ok {
+		if v, err := strconv.ParseInt(ps, 10, 64); err == nil {
+			periodStart = v
+		}
+	}
+
 	invoice := &stripe.Invoice{
 		ID:          "in_" + string(testrand.RandAlphaNumeric(25)),
 		Customer:    &stripe.Customer{ID: *params.Customer},
@@ -659,6 +741,7 @@ func (m *mockInvoices) New(params *stripe.InvoiceParams) (*stripe.Invoice, error
 		AmountDue:       amountDue,
 		AmountRemaining: amountDue,
 		Total:           amountDue,
+		PeriodStart:     periodStart,
 	}
 	if params.DefaultPaymentMethod != nil {
 		invoice.DefaultPaymentMethod = &stripe.PaymentMethod{ID: *params.DefaultPaymentMethod}
@@ -736,6 +819,10 @@ func (m *mockInvoices) FinalizeInvoice(id string, params *stripe.InvoiceFinalize
 		for _, invoice := range invoices {
 			if invoice.ID == id && invoice.Status == stripe.InvoiceStatusDraft {
 				invoice.Status = stripe.InvoiceStatusOpen
+				if invoice.StatusTransitions == nil {
+					invoice.StatusTransitions = &stripe.InvoiceStatusTransitions{}
+				}
+				invoice.StatusTransitions.FinalizedAt = time.Now().Unix()
 				return invoice, nil
 			}
 		}
@@ -941,11 +1028,12 @@ func (m *mockCustomerBalanceTransactions) New(params *stripe.CustomerBalanceTran
 		}
 	}
 	tx := &stripe.CustomerBalanceTransaction{
-		Type:        stripe.CustomerBalanceTransactionTypeAdjustment,
-		Amount:      *params.Amount,
-		Description: *params.Description,
-		Metadata:    params.Metadata,
-		Created:     time.Now().Unix(),
+		Type:          stripe.CustomerBalanceTransactionTypeAdjustment,
+		Amount:        *params.Amount,
+		Description:   *params.Description,
+		Metadata:      params.Metadata,
+		Created:       time.Now().Unix(),
+		EndingBalance: *params.Amount,
 	}
 
 	m.transactions[*params.Customer] = append(m.transactions[*params.Customer], tx)
@@ -984,8 +1072,7 @@ func (m *mockCustomerBalanceTransactions) List(listParams *stripe.CustomerBalanc
 	return &customerbalancetransaction.Iter{Iter: stripe.GetIter(listParams, query)}
 }
 
-type mockCharges struct {
-}
+type mockCharges struct{}
 
 func (m *mockCharges) List(listParams *stripe.ChargeListParams) *charge.Iter {
 	return &charge.Iter{Iter: stripe.GetIter(listParams, mockEmptyQuery)}

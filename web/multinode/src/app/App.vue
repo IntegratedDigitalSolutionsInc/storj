@@ -2,42 +2,35 @@
 // See LICENSE for copying information.
 
 <template>
-    <v-app>
+    <VApp>
         <div id="app">
             <router-view />
             <Notifications />
         </div>
-    </v-app>
+    </VApp>
 </template>
 
-<script lang="ts">
-import { Component, Vue } from 'vue-property-decorator';
-import { VApp } from 'vuetify/lib';
+<script setup lang="ts">
+import { onMounted } from 'vue';
+import { VApp } from 'vuetify/components';
+import { useTheme } from 'vuetify';
 
 import Notifications from './components/notification/Notifications.vue';
 
-// @vue/component
-@Component({
-    components:{
-        VApp,
-        Notifications,
-    },
-})
-export default class App extends Vue {
+const theme = useTheme();
 
-    public mounted(): void {
-        const savedTheme = localStorage.getItem('theme') || 'light';
-        if (savedTheme === 'dark' && !this.$vuetify.theme.dark) {
-            this.$vuetify.theme.dark = true;
-        } else if (savedTheme === 'light' && this.$vuetify.theme.dark) {
-            this.$vuetify.theme.dark = false;
-        }
+onMounted(() => {
+    const savedTheme = localStorage.getItem('theme') || 'light';
+    if (savedTheme === 'dark' && !theme.global.current.value.dark) {
+        theme.change('dark');
+    } else if (savedTheme === 'light' && theme.global.current.value.dark) {
+        theme.change('light');
     }
-}
+});
 </script>
 
 <style lang="scss">
-@import 'static/styles/variables';
+@import '../../static/styles/variables';
 
 body {
     margin: 0 !important;

@@ -25,7 +25,7 @@ import (
 
 func TestActivationRouting(t *testing.T) {
 	testplanet.Run(t, testplanet.Config{
-		SatelliteCount: 1, StorageNodeCount: 0, UplinkCount: 0,
+		SatelliteCount: 1,
 	}, func(t *testing.T, ctx *testcontext.Context, planet *testplanet.Planet) {
 		sat := planet.Satellites[0]
 		service := sat.API.Console.Service
@@ -37,7 +37,7 @@ func TestActivationRouting(t *testing.T) {
 			FullName: "User",
 			Email:    "u@mail.test",
 			Password: "password",
-		}, regToken.Secret)
+		}, regToken)
 		require.NoError(t, err)
 
 		activationToken, err := service.GenerateActivationToken(ctx, user.ID, user.Email)
@@ -85,7 +85,7 @@ func TestActivationRouting(t *testing.T) {
 
 func TestInvitedRouting(t *testing.T) {
 	testplanet.Run(t, testplanet.Config{
-		SatelliteCount: 1, StorageNodeCount: 0, UplinkCount: 0,
+		SatelliteCount: 1,
 	}, func(t *testing.T, ctx *testcontext.Context, planet *testplanet.Planet) {
 		sat := planet.Satellites[0]
 		service := sat.API.Console.Service
@@ -97,8 +97,8 @@ func TestInvitedRouting(t *testing.T) {
 		}, 1)
 		require.NoError(t, err)
 
-		paid := true
-		err = sat.DB.Console().Users().Update(ctx, owner.ID, console.UpdateUserRequest{PaidTier: &paid})
+		kind := console.PaidUser
+		err = sat.DB.Console().Users().Update(ctx, owner.ID, console.UpdateUserRequest{Kind: &kind})
 		require.NoError(t, err)
 
 		project, err := sat.AddProject(ctx, owner.ID, "Test Project")
@@ -111,6 +111,27 @@ func TestInvitedRouting(t *testing.T) {
 
 			req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, http.NoBody)
 			require.NoError(t, err, testMsg)
+
+			result, err := client.Do(req)
+			require.NoError(t, err)
+
+			require.Equal(t, http.StatusTemporaryRedirect, result.StatusCode, testMsg)
+			require.Equal(t, redirectURL, result.Header.Get("Location"), testMsg)
+			require.NoError(t, result.Body.Close(), testMsg)
+		}
+
+		checkInvitedRedirectLoggedIn := func(testMsg, redirectURL string, inviteToken string, authToken string) {
+			url := "http://" + sat.API.Console.Listener.Addr().String() + "/invited?invite=" + inviteToken
+
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, http.NoBody)
+			require.NoError(t, err, testMsg)
+
+			req.AddCookie(&http.Cookie{
+				Name:    "_tokenKey",
+				Path:    "/",
+				Value:   authToken,
+				Expires: time.Now().AddDate(0, 0, 1),
+			})
 
 			result, err := client.Do(req)
 			require.NoError(t, err)
@@ -148,7 +169,7 @@ func TestInvitedRouting(t *testing.T) {
 		params := "email=invited%40mail.test&inviter_email=owner%40mail.test"
 		checkInvitedRedirect("Invited - Nonexistent user", baseURL+"signup?"+params, token)
 
-		_, err = sat.AddUser(ctx, console.CreateUser{
+		invitedUser, err := sat.AddUser(ctx, console.CreateUser{
 			FullName: "Invited User",
 			Email:    invitedEmail,
 		}, 1)
@@ -156,13 +177,31 @@ func TestInvitedRouting(t *testing.T) {
 
 		// valid invite should redirect to login page with email.
 		checkInvitedRedirect("Invited - User invited", loginURL+"?email=invited%40mail.test", token)
+
+		tokenInfo, err := sat.API.Console.Service.Token(ctx, console.AuthUser{Email: invitedEmail, Password: invitedUser.FullName})
+		require.NoError(t, err)
+		authToken := tokenInfo.Token.String()
+
+		projectsURL := baseURL + "projects"
+
+		// Logged-in user with a valid pending invite should be redirected to the projects page.
+		checkInvitedRedirectLoggedIn("Invited - Logged in, valid invite", projectsURL, token, authToken)
+
+		// Consume the invite by accepting it.
+		invitedCtx, err := sat.UserContext(ctx, invitedUser.ID)
+		require.NoError(t, err)
+		err = service.RespondToProjectInvitation(invitedCtx, project.ID, console.ProjectInvitationAccept)
+		require.NoError(t, err)
+
+		// Logged-in user with an already-consumed invite should be redirected to projects with invite_invalid param.
+		checkInvitedRedirectLoggedIn("Invited - Logged in, consumed invite", projectsURL+"?invite_invalid=true", token, authToken)
 	})
 }
 
 func TestUserIDRateLimiter(t *testing.T) {
 	numLimits := 2
 	testplanet.Run(t, testplanet.Config{
-		SatelliteCount: 1, StorageNodeCount: 0, UplinkCount: 0,
+		SatelliteCount: 1,
 		Reconfigure: testplanet.Reconfigure{
 			Satellite: func(log *zap.Logger, index int, config *satellite.Config) {
 				config.Console.RateLimit.NumLimits = numLimits
@@ -230,7 +269,7 @@ func TestUserIDRateLimiter(t *testing.T) {
 
 func TestVarPartnerBlocker(t *testing.T) {
 	testplanet.Run(t, testplanet.Config{
-		SatelliteCount: 1, StorageNodeCount: 0, UplinkCount: 0,
+		SatelliteCount: 1,
 		Reconfigure: testplanet.Reconfigure{
 			Satellite: func(log *zap.Logger, index int, config *satellite.Config) {
 				config.Console.VarPartners = []string{"partner1"}
@@ -284,7 +323,7 @@ func TestVarPartnerBlocker(t *testing.T) {
 
 func TestConsoleBackendWithDisabledFrontEnd(t *testing.T) {
 	testplanet.Run(t, testplanet.Config{
-		SatelliteCount: 1, StorageNodeCount: 0, UplinkCount: 0,
+		SatelliteCount: 1,
 		Reconfigure: testplanet.Reconfigure{
 			Satellite: func(log *zap.Logger, index int, config *satellite.Config) {
 				config.Console.FrontendEnable = false
@@ -304,7 +343,7 @@ func TestConsoleBackendWithDisabledFrontEnd(t *testing.T) {
 
 func TestConsoleBackendWithEnabledFrontEnd(t *testing.T) {
 	testplanet.Run(t, testplanet.Config{
-		SatelliteCount: 1, StorageNodeCount: 0, UplinkCount: 0,
+		SatelliteCount: 1,
 	}, func(t *testing.T, ctx *testcontext.Context, planet *testplanet.Planet) {
 		apiAddr := planet.Satellites[0].API.Console.Listener.Addr().String()
 
@@ -318,7 +357,7 @@ func TestConsoleBackendWithEnabledFrontEnd(t *testing.T) {
 // correctly proxies to the new prefix.
 func TestGenCreateProjectProxy(t *testing.T) {
 	testplanet.Run(t, testplanet.Config{
-		SatelliteCount: 1, StorageNodeCount: 0, UplinkCount: 1,
+		SatelliteCount: 1, UplinkCount: 1,
 		Reconfigure: testplanet.Reconfigure{
 			Satellite: func(log *zap.Logger, index int, config *satellite.Config) {
 				config.Console.GeneratedAPIEnabled = true
@@ -335,7 +374,8 @@ func TestGenCreateProjectProxy(t *testing.T) {
 		require.NoError(t, err)
 		require.NotNil(t, user)
 
-		apiKey, _, err := restService.Create(ctx, user.ID, time.Hour)
+		dur := time.Hour
+		apiKey, _, err := restService.CreateNoAuth(ctx, user.ID, &dur)
 		require.NoError(t, err)
 
 		client := http.Client{}
@@ -393,6 +433,131 @@ func TestGenCreateProjectProxy(t *testing.T) {
 		require.NoError(t, json.Unmarshal(bodyBytes, &createdProject))
 		require.Equal(t, name, createdProject.Name)
 		require.Equal(t, description, createdProject.Description)
+	})
+}
+
+func TestBrandingEndpoint(t *testing.T) {
+	var (
+		defaultName = "Storj"
+
+		tenantID = "customer1"
+		name     = "Customer One"
+		logoURLs = map[string]string{
+			"full-dark":   "https://customer1.example.com/logo-full-dark.png",
+			"full-light":  "https://customer1.example.com/logo-full-light.png",
+			"small-dark":  "https://customer1.example.com/logo-small-dark.png",
+			"small-light": "https://customer1.example.com/logo-small-light.png",
+			"mail":        "https://customer1.example.com/logo-small-light.png",
+		}
+		faviconURLs = map[string]string{
+			"16x16":       "https://customer1.example.com/favicon-16x16.ico",
+			"32x32":       "https://customer1.example.com/favicon-32x32.ico",
+			"apple-touch": "https://customer1.example.com/apple-touch-icon.png",
+		}
+		supportURL     = "https://support.customer1.example.com"
+		docsURL        = "https://docs.customer1.example.com"
+		homepageURL    = "https://customer1.example.com"
+		gatewayURL     = "https://gateway.customer1.example.com"
+		primaryColor   = "#FF0000"
+		secondaryColor = "#00FF00"
+		colors         = map[string]string{"primary": primaryColor, "secondary": secondaryColor}
+	)
+
+	t.Run("Default Storj branding", func(t *testing.T) {
+		testplanet.Run(t, testplanet.Config{
+			SatelliteCount: 1,
+		}, func(t *testing.T, ctx *testcontext.Context, planet *testplanet.Planet) {
+			sat := planet.Satellites[0]
+			addr := sat.API.Console.Listener.Addr().String()
+			client := http.DefaultClient
+
+			url := "http://" + addr + "/api/v0/config/branding"
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, http.NoBody)
+			require.NoError(t, err)
+
+			resp, err := client.Do(req)
+			require.NoError(t, err)
+			defer func() { require.NoError(t, resp.Body.Close()) }()
+
+			require.Equal(t, http.StatusOK, resp.StatusCode)
+			require.Equal(t, "application/json", resp.Header.Get("Content-Type"))
+			require.Equal(t, "public, max-age=3600", resp.Header.Get("Cache-Control"))
+
+			bodyBytes, err := io.ReadAll(resp.Body)
+			require.NoError(t, err)
+
+			var branding map[string]any
+			require.NoError(t, json.Unmarshal(bodyBytes, &branding))
+
+			require.Equal(t, defaultName, branding["name"])
+		})
+	})
+
+	t.Run("SingleWhiteLabel branding", func(t *testing.T) {
+		testplanet.Run(t, testplanet.Config{
+			SatelliteCount: 1,
+			Reconfigure: testplanet.Reconfigure{
+				Satellite: func(log *zap.Logger, index int, config *satellite.Config) {
+					config.Console.SingleWhiteLabel = console.SingleWhiteLabelConfig{
+						TenantID:    tenantID,
+						Name:        name,
+						LogoURLs:    logoURLs,
+						FaviconURLs: faviconURLs,
+						Colors:      colors,
+						SupportURL:  supportURL,
+						DocsURL:     docsURL,
+						HomepageURL: homepageURL,
+						GatewayURL:  gatewayURL,
+					}
+				},
+			},
+		}, func(t *testing.T, ctx *testcontext.Context, planet *testplanet.Planet) {
+			sat := planet.Satellites[0]
+			addr := sat.API.Console.Listener.Addr().String()
+			client := http.DefaultClient
+
+			url := "http://" + addr + "/api/v0/config/branding"
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, http.NoBody)
+			require.NoError(t, err)
+
+			resp, err := client.Do(req)
+			require.NoError(t, err)
+			defer func() { require.NoError(t, resp.Body.Close()) }()
+
+			require.Equal(t, http.StatusOK, resp.StatusCode)
+			require.Equal(t, "application/json", resp.Header.Get("Content-Type"))
+			require.Equal(t, "public, max-age=3600", resp.Header.Get("Cache-Control"))
+
+			bodyBytes, err := io.ReadAll(resp.Body)
+			require.NoError(t, err)
+
+			var branding map[string]any
+			require.NoError(t, json.Unmarshal(bodyBytes, &branding))
+
+			require.Equal(t, name, branding["name"])
+			require.Equal(t, supportURL, branding["supportUrl"])
+			require.Equal(t, docsURL, branding["docsUrl"])
+			require.Equal(t, homepageURL, branding["homepageUrl"])
+			require.Equal(t, gatewayURL, branding["gatewayUrl"])
+
+			gotLogoURLs, ok := branding["logoUrls"].(map[string]any)
+			require.True(t, ok)
+			require.Equal(t, logoURLs["full-dark"], gotLogoURLs["full-dark"])
+			require.Equal(t, logoURLs["full-light"], gotLogoURLs["full-light"])
+			require.Equal(t, logoURLs["small-dark"], gotLogoURLs["small-dark"])
+			require.Equal(t, logoURLs["small-light"], gotLogoURLs["small-light"])
+
+			gotFaviconURLs, ok := branding["faviconUrls"].(map[string]any)
+			require.True(t, ok)
+			require.Equal(t, faviconURLs["16x16"], gotFaviconURLs["16x16"])
+			require.Equal(t, faviconURLs["32x32"], gotFaviconURLs["32x32"])
+			require.Equal(t, faviconURLs["apple-touch"], gotFaviconURLs["apple-touch"])
+
+			gotColors, ok := branding["colors"].(map[string]any)
+			require.True(t, ok)
+			require.Equal(t, primaryColor, gotColors["primary"])
+			require.Equal(t, secondaryColor, gotColors["secondary"])
+		})
 	})
 }
 

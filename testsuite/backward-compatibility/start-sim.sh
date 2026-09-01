@@ -46,14 +46,14 @@ install_sim_noquic(){
     local bin_dir="$1"
     mkdir -p ${bin_dir}
 
-    go build -race -tags noquic -v -o ${bin_dir}/storagenode storj.io/storj/cmd/storagenode >/dev/null 2>&1
-    go build -race -tags noquic -v -o ${bin_dir}/satellite storj.io/storj/cmd/satellite >/dev/null 2>&1
-    go build -race -tags noquic -v -o ${bin_dir}/storj-sim storj.io/storj/cmd/storj-sim >/dev/null 2>&1
-    go build -race -tags noquic -v -o ${bin_dir}/versioncontrol storj.io/storj/cmd/versioncontrol >/dev/null 2>&1
+    go build -race -tags noquic -o ${bin_dir}/storagenode storj.io/storj/cmd/storagenode 2>&1
+    go build -race -tags noquic -o ${bin_dir}/satellite storj.io/storj/cmd/satellite 2>&1
+    go build -race -tags noquic -o ${bin_dir}/storj-sim storj.io/storj/cmd/storj-sim 2>&1
+    go build -race -tags noquic -o ${bin_dir}/versioncontrol storj.io/storj/cmd/versioncontrol 2>&1
 
-    go build -race -tags noquic -v -o ${bin_dir}/uplink storj.io/storj/cmd/uplink >/dev/null 2>&1
-    go build -race -tags noquic -v -o ${bin_dir}/identity storj.io/storj/cmd/identity >/dev/null 2>&1
-    go build -race -tags noquic -v -o ${bin_dir}/certificates storj.io/storj/cmd/certificates >/dev/null 2>&1
+    go build -race -tags noquic -o ${bin_dir}/uplink storj.io/storj/cmd/uplink 2>&1
+    go build -race -tags noquic -o ${bin_dir}/identity storj.io/storj/cmd/identity 2>&1
+    go build -race -tags noquic -o ${bin_dir}/certificates storj.io/storj/cmd/certificates 2>&1
 
     GOBIN=${bin_dir} go install -race -tags noquic storj.io/gateway@latest
 }
@@ -101,6 +101,13 @@ popd
 
 # setup the network using the release
 PATH="$RELEASE_DIR"/bin:"$PATH" storj-sim -x --host "$STORJ_NETWORK_HOST4" network --postgres="$STORJ_SIM_POSTGRES" setup
+
+# older release-tagged storj-sim predates jobq, so it doesn't create the jobq
+# identity. The branch storj-sim reads it during `network env` and `network test`.
+if [ ! -f "$STORJ_NETWORK_DIR"/jobq/0/ca.cert ]; then
+    mkdir -p "$STORJ_NETWORK_DIR"/jobq/0
+    "$BRANCH_DIR"/bin/identity --identity-dir "$STORJ_NETWORK_DIR"/jobq/0 --concurrency 1 --difficulty 8 create .
+fi
 
 ##
 ## Run some basic tests on the release branch, creating data for later tests.

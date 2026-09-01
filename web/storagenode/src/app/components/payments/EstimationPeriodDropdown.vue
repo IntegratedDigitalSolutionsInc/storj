@@ -21,59 +21,40 @@
     </button>
 </template>
 
-<script lang="ts">
-import { Component, Vue } from 'vue-property-decorator';
+<script setup lang="ts">
+import { computed } from 'vue';
 
-import { APPSTATE_ACTIONS } from '@/app/store/modules/appState';
-
-import PayoutPeriodCalendar from '@/app/components/payments/PayoutPeriodCalendar.vue';
-
+import { useAppStore } from '@/app/store/modules/appStore';
+import { useNodeStore } from '@/app/store/modules/nodeStore';
 import BlackArrowExpand from '@/../static/images/BlackArrowExpand.svg';
 import BlackArrowHide from '@/../static/images/BlackArrowHide.svg';
 
-// @vue/component
-@Component({
-    components: {
-        PayoutPeriodCalendar,
-        BlackArrowExpand,
-        BlackArrowHide,
-    },
-})
-export default class EstimationPeriodDropdown extends Vue {
-    /**
-     * Indicates if period selection calendar should appear.
-     */
-    public get isCalendarShown(): boolean {
-        return this.$store.state.appStateModule.isPayoutCalendarShown;
+import PayoutPeriodCalendar from '@/app/components/payments/PayoutPeriodCalendar.vue';
+
+const appStore = useAppStore();
+const nodeStore = useNodeStore();
+
+const isCalendarShown = computed<boolean>(() => {
+    return appStore.state.isPayoutCalendarShown;
+});
+
+const isCalendarDisabled = computed<boolean>(() => {
+    const nodeStartedAt = nodeStore.state.selectedSatellite.joinDate;
+    const now = new Date();
+
+    return nodeStartedAt.getUTCMonth() === now.getUTCMonth() && nodeStartedAt.getUTCFullYear() === now.getUTCFullYear();
+});
+
+function openPeriodDropdown(): void {
+    if (isCalendarDisabled.value) {
+        return;
     }
 
-    /**
-     * Indicates if period selection calendar should be disabled.
-     */
-    public get isCalendarDisabled(): boolean {
-        const nodeStartedAt = this.$store.state.node.selectedSatellite.joinDate;
-        const now = new Date();
+    appStore.togglePayoutCalendar(true);
+}
 
-        return nodeStartedAt.getUTCMonth() === now.getUTCMonth() && nodeStartedAt.getUTCFullYear() === now.getUTCFullYear();
-    }
-
-    /**
-     * Opens payout period selection dropdown.
-     */
-    public openPeriodDropdown(): void {
-        if (this.isCalendarDisabled) {
-            return;
-        }
-
-        this.$store.dispatch(APPSTATE_ACTIONS.TOGGLE_PAYOUT_CALENDAR, true);
-    }
-
-    /**
-     * Closes payout period selection dropdown.
-     */
-    public closePeriodDropdown(): void {
-        this.$store.dispatch(APPSTATE_ACTIONS.TOGGLE_PAYOUT_CALENDAR, false);
-    }
+function closePeriodDropdown(): void {
+    appStore.togglePayoutCalendar(false);
 }
 </script>
 
@@ -109,7 +90,7 @@ export default class EstimationPeriodDropdown extends Vue {
         }
     }
 
-    .arrow ::v-deep path {
+    .arrow :deep(path) {
         fill: var(--period-selection-arrow-color);
     }
 
@@ -126,12 +107,12 @@ export default class EstimationPeriodDropdown extends Vue {
             }
         }
 
-        .arrow ::v-deep path {
+        .arrow :deep(path) {
             fill: #909bad !important;
         }
     }
 
-    @media screen and (max-width: 505px) {
+    @media screen and (width <= 505px) {
 
         .period-container__label {
             margin-right: 4px;

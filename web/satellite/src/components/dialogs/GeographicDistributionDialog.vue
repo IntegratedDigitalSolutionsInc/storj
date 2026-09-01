@@ -6,6 +6,7 @@
         v-model="model"
         max-width="420px"
         transition="fade-transition"
+        :persistent="false"
     >
         <v-card :loading="isLoading">
             <v-card-item class="pa-6">
@@ -26,7 +27,7 @@
                 <template #append>
                     <v-btn
                         id="close-geo-distribution"
-                        icon="$close"
+                        :icon="X"
                         variant="text"
                         size="small"
                         color="default"
@@ -45,7 +46,7 @@
                     </p>
                 </template>
                 <p>
-                    Storj splits objects into smaller pieces, then distributes those pieces
+                    {{ configStore.brandName }} splits objects into smaller pieces, then distributes those pieces
                     over a global network of nodes and recompiles them securely on download.
                 </p>
             </div>
@@ -64,7 +65,7 @@
                             Close
                         </v-btn>
                     </v-col>
-                    <v-col>
+                    <v-col v-if="configStore.isDefaultBrand">
                         <v-btn
                             variant="outlined"
                             block
@@ -98,14 +99,15 @@ import {
     VCol,
     VBtn,
 } from 'vuetify/components';
-import { SquareArrowOutUpRight } from 'lucide-vue-next';
+import { SquareArrowOutUpRight, X } from '@lucide/vue';
 
 import { useBucketsStore } from '@/store/modules/bucketsStore';
 import { useObjectBrowserStore } from '@/store/modules/objectBrowserStore';
 import { useLoading } from '@/composables/useLoading';
-import { useNotify } from '@/utils/hooks';
+import { useNotify } from '@/composables/useNotify';
 import { useLinksharing } from '@/composables/useLinksharing';
 import { AnalyticsErrorEventSource } from '@/utils/constants/analyticsEventNames';
+import { useConfigStore } from '@/store/modules/configStore';
 
 import IconDistribution from '@/components/icons/IconDistribution.vue';
 
@@ -113,6 +115,7 @@ const model = defineModel<boolean>({ required: true });
 
 const obStore = useObjectBrowserStore();
 const bucketsStore = useBucketsStore();
+const configStore = useConfigStore();
 
 const notify = useNotify();
 const { isLoading, withLoading } = useLoading();
@@ -143,7 +146,7 @@ async function getMap(): Promise<void> {
             const blob = await getObjectDistributionMap(encodedFilePath.value);
             mapURL.value = URL.createObjectURL(blob);
         } catch (error) {
-            notify.error(`Failed to fetch a map. ${error.message}`, AnalyticsErrorEventSource.GALLERY_VIEW);
+            notify.notifyError(error, AnalyticsErrorEventSource.GALLERY_VIEW);
         }
     });
 }

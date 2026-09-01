@@ -26,7 +26,7 @@
                     </v-card-title>
                     <template #append>
                         <v-btn
-                            icon="$close"
+                            :icon="X"
                             variant="text"
                             size="small"
                             color="default"
@@ -38,7 +38,7 @@
 
             <v-divider />
 
-            <v-card-item class="pa-6">
+            <v-card-item v-if="!hasObjects" class="pa-6">
                 <p class="mb-3">
                     <b>
                         The following bucket and all of its data
@@ -88,8 +88,26 @@
                 />
 
                 <v-alert>
-                    Deletion is performed in the background and may take some time.
-                    Object count and statistics, might not reflect changes made in the past 24 hours.
+                    Bucket deletion runs in your browser session.
+                    <strong>Closing this page may interrupt the process.</strong>
+                    <br><br>
+                    If there are millions of objects, this process may time out.
+                    <span v-if="configStore.isDefaultBrand">
+                        We recommend using one of the approaches mentioned <strong><a href="https://storj.dev/dcs/buckets/delete-buckets" target="_blank" rel="noopener noreferrer">here</a></strong>.
+                    </span>
+                    <br><br>
+                    Object count and statistics might not reflect changes made in the past 24 hours.
+                </v-alert>
+            </v-card-item>
+            <v-card-item v-else class="pa-6">
+                <p class="mb-4">
+                    The bucket you tried to delete is not empty.
+                    You must delete all versions in the bucket.
+                </p>
+
+                <v-alert>
+                    Please toggle 'show versions', delete all object versions,
+                    including delete markers and try again.
                 </v-alert>
             </v-card-item>
 
@@ -99,10 +117,10 @@
                 <v-row>
                     <v-col>
                         <v-btn variant="outlined" color="default" block :disabled="isLoading" @click="model = false">
-                            Cancel
+                            {{ hasObjects ? 'Close' : 'Cancel' }}
                         </v-btn>
                     </v-col>
-                    <v-col>
+                    <v-col v-if="!hasObjects">
                         <v-btn
                             color="error"
                             variant="flat"
@@ -137,20 +155,21 @@ import {
     VSheet,
     VTextField,
 } from 'vuetify/components';
-import { Trash2 } from 'lucide-vue-next';
+import { Trash2, X } from '@lucide/vue';
 
 import { Memory, Size } from '@/utils/bytesSize';
 import { AnalyticsErrorEventSource } from '@/utils/constants/analyticsEventNames';
-import { AccessGrant, EdgeCredentials } from '@/types/accessGrants';
+import type { AccessGrant, EdgeCredentials } from '@/types/accessGrants';
 import { useAccessGrantsStore } from '@/store/modules/accessGrantsStore';
 import { useBucketsStore } from '@/store/modules/bucketsStore';
 import { useProjectsStore } from '@/store/modules/projectsStore';
 import { useConfigStore } from '@/store/modules/configStore';
 import { useLoading } from '@/composables/useLoading';
-import { useNotify } from '@/utils/hooks';
-import { Bucket } from '@/types/buckets';
+import { useNotify } from '@/composables/useNotify';
+import type { Bucket } from '@/types/buckets';
 import { Versioning } from '@/types/versioning';
 import { UploadingStatus, useObjectBrowserStore } from '@/store/modules/objectBrowserStore';
+import { useAccessGrantWorker } from '@/composables/useAccessGrantWorker';
 
 const props = defineProps<{
     bucketName: string;
@@ -168,10 +187,10 @@ const obStore = useObjectBrowserStore();
 
 const { isLoading, withLoading } = useLoading();
 const notify = useNotify();
-
-const worker = ref<Worker| null>(null);
+const { setPermissions, generateAccess } = useAccessGrantWorker();
 
 const confirmDelete = ref<string>();
+const hasObjects = ref<boolean>(false);
 
 /**
  * The bucket to be deleted.
@@ -187,6 +206,45 @@ const apiKey = computed((): string => {
     return bucketsStore.state.apiKey;
 });
 
+async function setCredentials(checkEmpty = false): Promise<void> {
+    const projectID = projectsStore.state.selectedProject.id;
+
+    const now = new Date();
+
+    if (!apiKey.value) {
+        const name = `${configStore.state.config.objectBrowserKeyNamePrefix}${now.getTime()}`;
+        const cleanAPIKey: AccessGrant = await agStore.createAccessGrant(name, projectID);
+        bucketsStore.setApiKey(cleanAPIKey.secret);
+    }
+
+    const inOneHour = new Date(now.setHours(now.getHours() + 1));
+
+    const macaroon = await setPermissions({
+        isDownload: false,
+        isUpload: false,
+        isList: true,
+        isDelete: true,
+        notAfter: inOneHour.toISOString(),
+        buckets: JSON.stringify([props.bucketName]),
+        apiKey: apiKey.value,
+    });
+
+    const accessGrant = await generateAccess({
+        apiKey: macaroon,
+        passphrase: checkEmpty ? bucketsStore.state.passphrase : '',
+    }, projectsStore.state.selectedProject.id);
+
+    const edgeCredentials: EdgeCredentials = await agStore.getEdgeCredentials(accessGrant);
+    bucketsStore.setEdgeCredentialsForDelete(edgeCredentials, bucket.value?.objectLockEnabled);
+}
+
+async function performDelete() {
+    const deleteRequest = bucketsStore.deleteBucket(props.bucketName);
+    bucketsStore.handleDeleteBucketRequest(props.bucketName, deleteRequest);
+    model.value = false;
+    emit('deleted');
+}
+
 /**
  * Creates unrestricted access grant and deletes bucket
  * when Delete button has been clicked.
@@ -198,93 +256,26 @@ async function onDelete(): Promise<void> {
     }
 
     await withLoading(async () => {
-        const projectID = projectsStore.state.selectedProject.id;
-
         try {
-            if (!worker.value) {
-                notify.error('Web worker is not initialized.', AnalyticsErrorEventSource.DELETE_BUCKET_MODAL);
+            const checkEmpty = !!(bucket.value?.objectLockEnabled && bucketsStore.state.passphrase);
+            await setCredentials(checkEmpty);
+            if (!checkEmpty) {
+                await performDelete();
                 return;
             }
-
-            const now = new Date();
-
-            if (!apiKey.value) {
-                const name = `${configStore.state.config.objectBrowserKeyNamePrefix}${now.getTime()}`;
-                const cleanAPIKey: AccessGrant = await agStore.createAccessGrant(name, projectID);
-                bucketsStore.setApiKey(cleanAPIKey.secret);
-            }
-
-            const inOneHour = new Date(now.setHours(now.getHours() + 1));
-
-            worker.value.postMessage({
-                'type': 'SetPermission',
-                'isDownload': false,
-                'isUpload': false,
-                'isList': true,
-                'isDelete': true,
-                'notAfter': inOneHour.toISOString(),
-                'buckets': JSON.stringify([props.bucketName]),
-                'apiKey': apiKey.value,
-            });
-
-            const grantEvent: MessageEvent = await new Promise(resolve => {
-                if (worker.value) {
-                    worker.value.onmessage = resolve;
-                }
-            });
-            if (grantEvent.data.error) {
-                notify.error(grantEvent.data.error, AnalyticsErrorEventSource.DELETE_BUCKET_MODAL);
+            const isEmpty = await bucketsStore.checkBucketEmpty(bucket.value?.name || '');
+            if (isEmpty) {
+                await performDelete();
                 return;
             }
-
-            const salt = await projectsStore.getProjectSalt(projectsStore.state.selectedProject.id);
-            const satelliteNodeURL: string = configStore.state.config.satelliteNodeURL;
-
-            worker.value.postMessage({
-                'type': 'GenerateAccess',
-                'apiKey': grantEvent.data.value,
-                'passphrase': '',
-                'salt': salt,
-                'satelliteNodeURL': satelliteNodeURL,
-            });
-
-            const accessGrantEvent: MessageEvent = await new Promise(resolve => {
-                if (worker.value) {
-                    worker.value.onmessage = resolve;
-                }
-            });
-            if (accessGrantEvent.data.error) {
-                notify.error(accessGrantEvent.data.error, AnalyticsErrorEventSource.DELETE_BUCKET_MODAL);
-                return;
-            }
-
-            const accessGrant = accessGrantEvent.data.value;
-
-            const edgeCredentials: EdgeCredentials = await agStore.getEdgeCredentials(accessGrant);
-            bucketsStore.setEdgeCredentialsForDelete(edgeCredentials, bucket.value?.objectLockEnabled);
-            const deleteRequest = bucketsStore.deleteBucket(props.bucketName);
-            bucketsStore.handleDeleteBucketRequest(props.bucketName, deleteRequest);
+            hasObjects.value = true;
         } catch (error) {
             notify.notifyError(error, AnalyticsErrorEventSource.DELETE_BUCKET_MODAL);
-            return;
         }
-
-        model.value = false;
-        emit('deleted');
     });
 }
 
-/**
- * Sets local worker with worker instantiated in store.
- */
 watch(model, shown => {
-    if (!shown) {
-        confirmDelete.value = '';
-    }
-    worker.value = agStore.state.accessGrantsWebWorker;
-    if (!worker.value) return;
-    worker.value.onerror = (error: ErrorEvent) => {
-        notify.error(error.message, AnalyticsErrorEventSource.DELETE_BUCKET_MODAL);
-    };
+    if (!shown) confirmDelete.value = '';
 });
 </script>

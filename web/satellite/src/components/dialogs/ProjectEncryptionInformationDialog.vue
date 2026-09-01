@@ -27,7 +27,7 @@
                     </v-card-title>
                     <template #append>
                         <v-btn
-                            icon="$close"
+                            :icon="X"
                             variant="text"
                             size="small"
                             color="default"
@@ -44,56 +44,56 @@
                     <v-col>
                         <p class="mb-2">Encryption method:</p>
                         <v-chip-group v-model="encryption" filter variant="tonal" column selected-class="font-weight-bold" mandatory>
-                            <v-chip color="default" value="auto" class="cursor-default" :disabled="encryption === 'manual'">
+                            <v-chip color="primary" value="auto" class="cursor-default" :disabled="encryption === 'manual'">
                                 Automatic
                             </v-chip>
-                            <v-chip color="default" value="manual" class="cursor-default" :disabled="encryption === 'auto'">Manual</v-chip>
+                            <v-chip color="primary" value="manual" class="cursor-default" :disabled="encryption === 'auto'">Self-Managed</v-chip>
 
                             <v-divider thickness="0" class="my-1" />
 
                             <v-alert v-if="encryption === 'auto'" variant="tonal" color="default">
                                 <p>
-                                    <v-chip rounded="md" class="text-caption font-weight-medium" color="secondary" variant="tonal" size="small">
+                                    <v-chip rounded="md" class="text-body-small font-weight-medium" color="secondary" variant="tonal" size="small">
                                         Recommended for ease of use and teams
                                     </v-chip>
                                 </p>
-                                <p class="text-body-2 my-2 font-weight-bold">
-                                    Storj securely manages the encryption and decryption of your project automatically.
+                                <p class="text-body-medium my-2 font-weight-bold">
+                                    {{ configStore.brandName }} securely manages the encryption and decryption of your project automatically.
                                 </p>
-                                <p class="text-body-2 my-2">
+                                <p class="text-body-medium my-2">
                                     Fewer steps to upload, download, manage, and browse your data. No need to remember an additional encryption passphrase.
                                 </p>
-                                <p class="text-body-2 my-2">
+                                <p class="text-body-medium my-2">
                                     The team members will automatically have access to your project's data.
                                 </p>
-                                <p class="text-body-2 mt-2">
+                                <p v-if="configStore.isDefaultBrand" class="text-body-medium mt-2">
                                     <a class="link" @click="goToDocs">Learn more in the documentation.</a>
                                 </p>
                             </v-alert>
 
                             <v-alert v-if="encryption === 'manual'" variant="tonal" color="default">
                                 <p>
-                                    <v-chip rounded="md" class="text-caption font-weight-medium" color="secondary" variant="tonal" size="small">
+                                    <v-chip rounded="md" class="text-body-small font-weight-medium" color="secondary" variant="tonal" size="small">
                                         Best for control over your data encryption
                                     </v-chip>
                                 </p>
-                                <p class="text-body-2 my-2 font-weight-bold">
+                                <p class="text-body-medium my-2 font-weight-bold">
                                     You are responsible for securely managing your own data encryption passphrase.
                                 </p>
-                                <p class="text-body-2 my-2">
+                                <p class="text-body-medium my-2">
                                     You will need to enter your passphrase each time you access your data. If you forget the passphrase, you can't recover your data.
                                 </p>
-                                <p class="text-body-2 my-2">
+                                <p class="text-body-medium my-2">
                                     Team members must share and enter the same encryption passphrase to access the data.
                                 </p>
-                                <p class="text-body-2 mt-2">
+                                <p v-if="configStore.isDefaultBrand" class="text-body-medium mt-2">
                                     <a href="" class="link">Learn more in the documentation.</a>
                                 </p>
                             </v-alert>
                         </v-chip-group>
 
                         <v-alert type="info" variant="tonal" class="mt-4">
-                            <p class="text-body-2">Encryption method is set at project creation and can't be changed. To use a different method, create a new project.</p>
+                            <p class="text-body-medium">Encryption method is set at project creation and can't be changed. To use a different method, create a new project.</p>
                         </v-alert>
                     </v-col>
                 </v-row>
@@ -131,7 +131,6 @@
 </template>
 
 <script setup lang="ts">
-
 import {
     VDialog,
     VCol,
@@ -148,7 +147,7 @@ import {
     VSheet,
 } from 'vuetify/components';
 import { computed, ref } from 'vue';
-import { Plus, LockKeyhole } from 'lucide-vue-next';
+import { Plus, LockKeyhole, X } from '@lucide/vue';
 
 import {
     AnalyticsEvent,
@@ -157,9 +156,11 @@ import {
 } from '@/utils/constants/analyticsEventNames';
 import { useAnalyticsStore } from '@/store/modules/analyticsStore';
 import { useProjectsStore } from '@/store/modules/projectsStore';
+import { useConfigStore } from '@/store/modules/configStore';
 
 const analyticsStore = useAnalyticsStore();
 const projectsStore = useProjectsStore();
+const configStore = useConfigStore();
 
 const emit = defineEmits(['newProject']);
 

@@ -6,7 +6,6 @@
         v-model="model"
         min-width="320px"
         max-width="400px"
-        activator="parent"
         transition="fade-transition"
         scrollable
         persistent
@@ -15,14 +14,23 @@
             <v-sheet>
                 <v-card-item class="pa-6">
                     <template #prepend>
-                        <v-card-title class="font-weight-bold">
-                            {{ currentTitle }}
-                        </v-card-title>
+                        <v-sheet
+                            class="border-sm d-flex justify-center align-center"
+                            width="40"
+                            height="40"
+                            rounded="lg"
+                        >
+                            <v-icon :icon="Globe" size="18" />
+                        </v-sheet>
                     </template>
+
+                    <v-card-title class="font-weight-bold">
+                        {{ currentTitle }}
+                    </v-card-title>
 
                     <template #append>
                         <v-btn
-                            icon="$close"
+                            :icon="X"
                             variant="text"
                             size="small"
                             color="default"
@@ -34,85 +42,87 @@
 
             <v-divider />
 
-            <v-window
-                v-model="step"
-                class="new-domain__window"
-                :class="{ 'new-domain__window--loading': isFetching || isGenerating }"
-            >
-                <v-window-item :value="NewDomainFlowStep.CustomDomain">
-                    <new-custom-domain-step
-                        :ref="stepInfos[NewDomainFlowStep.CustomDomain].ref"
-                        @domain-changed="val => domain = val"
-                        @bucket-changed="val => bucket = val"
-                        @submit="nextStep"
-                    />
-                </v-window-item>
+            <v-card-text class="pa-0">
+                <v-window
+                    v-model="step"
+                    :touch="false"
+                    class="new-domain__window"
+                    :class="{ 'new-domain__window--loading': isFetching || isGenerating }"
+                >
+                    <v-window-item :value="NewDomainFlowStep.CustomDomain">
+                        <new-custom-domain-step
+                            :ref="stepInfos[NewDomainFlowStep.CustomDomain].ref"
+                            @domain-changed="val => domain = val"
+                            @bucket-changed="val => bucket = val"
+                            @submit="nextStep"
+                        />
+                    </v-window-item>
 
-                <v-window-item :value="NewDomainFlowStep.SetupDomainAccess">
-                    <access-encryption-step
-                        :ref="stepInfos[NewDomainFlowStep.SetupDomainAccess].ref"
-                        @selectOption="val => passphraseOption = val"
-                        @passphraseChanged="val => passphrase = val"
-                        @submit="nextStep"
-                    />
-                </v-window-item>
+                    <v-window-item :value="NewDomainFlowStep.SetupDomainAccess">
+                        <access-encryption-step
+                            :ref="stepInfos[NewDomainFlowStep.SetupDomainAccess].ref"
+                            @select-option="val => passphraseOption = val"
+                            @passphrase-changed="val => passphrase = val"
+                            @submit="nextStep"
+                        />
+                    </v-window-item>
 
-                <v-window-item :value="NewDomainFlowStep.EnterNewPassphrase">
-                    <enter-passphrase-step
-                        :ref="stepInfos[NewDomainFlowStep.EnterNewPassphrase].ref"
-                        @passphraseChanged="val => passphrase = val"
-                    />
-                </v-window-item>
+                    <v-window-item :value="NewDomainFlowStep.EnterNewPassphrase">
+                        <enter-passphrase-step
+                            :ref="stepInfos[NewDomainFlowStep.EnterNewPassphrase].ref"
+                            @passphrase-changed="val => passphrase = val"
+                        />
+                    </v-window-item>
 
-                <v-window-item :value="NewDomainFlowStep.PassphraseGenerated">
-                    <passphrase-generated-step
-                        :ref="stepInfos[NewDomainFlowStep.PassphraseGenerated].ref"
-                        :name="accessName"
-                        @passphraseChanged="val => passphrase = val"
-                    />
-                </v-window-item>
+                    <v-window-item :value="NewDomainFlowStep.PassphraseGenerated">
+                        <passphrase-generated-step
+                            :ref="stepInfos[NewDomainFlowStep.PassphraseGenerated].ref"
+                            :name="accessName"
+                            @passphrase-changed="val => passphrase = val"
+                        />
+                    </v-window-item>
 
-                <v-window-item :value="NewDomainFlowStep.SetupCNAME">
-                    <setup-c-n-a-m-e-step
-                        :ref="stepInfos[NewDomainFlowStep.SetupCNAME].ref"
-                        :domain="domain"
-                        :cname="cname"
-                    />
-                </v-window-item>
+                    <v-window-item :value="NewDomainFlowStep.SetupCNAME">
+                        <setup-c-n-a-m-e-step
+                            :ref="stepInfos[NewDomainFlowStep.SetupCNAME].ref"
+                            :domain="domain"
+                            :cname="cname"
+                        />
+                    </v-window-item>
 
-                <v-window-item :value="NewDomainFlowStep.SetupTXT">
-                    <setup-t-x-t-step
-                        :ref="stepInfos[NewDomainFlowStep.SetupTXT].ref"
-                        :domain="domain"
-                        :storj-root="storjRoot"
-                        :storj-access="storjAccess"
-                        :storj-tls="storjTLS"
-                    />
-                </v-window-item>
+                    <v-window-item :value="NewDomainFlowStep.SetupTXT">
+                        <setup-t-x-t-step
+                            :ref="stepInfos[NewDomainFlowStep.SetupTXT].ref"
+                            :domain="domain"
+                            :storj-root="storjRoot"
+                            :storj-access="storjAccess"
+                            :storj-tls="storjTLS"
+                        />
+                    </v-window-item>
 
-                <v-window-item :value="NewDomainFlowStep.VerifyDomain">
-                    <verify-domain-step
-                        :ref="stepInfos[NewDomainFlowStep.VerifyDomain].ref"
-                        :domain="domain"
-                        :cname="cname"
-                        :txt="txt"
-                    />
-                </v-window-item>
+                    <v-window-item :value="NewDomainFlowStep.VerifyDomain">
+                        <verify-domain-step
+                            :ref="stepInfos[NewDomainFlowStep.VerifyDomain].ref"
+                            :domain="domain"
+                            :cname="cname"
+                            :txt="txt"
+                        />
+                    </v-window-item>
 
-                <v-window-item :value="NewDomainFlowStep.DomainConnected">
-                    <domain-connected-step
-                        :ref="stepInfos[NewDomainFlowStep.DomainConnected].ref"
-                    />
-                </v-window-item>
-            </v-window>
+                    <v-window-item :value="NewDomainFlowStep.DomainConnected">
+                        <domain-connected-step
+                            :ref="stepInfos[NewDomainFlowStep.DomainConnected].ref"
+                        />
+                    </v-window-item>
+                </v-window>
+            </v-card-text>
 
             <v-divider />
 
             <v-card-actions class="pa-7">
                 <v-row>
-                    <v-col>
+                    <v-col v-if="step === NewDomainFlowStep.CustomDomain">
                         <v-btn
-                            v-if="step === NewDomainFlowStep.CustomDomain"
                             variant="outlined"
                             color="default"
                             href="https://docs.storj.io/dcs/code/static-site-hosting/custom-domains"
@@ -122,8 +132,9 @@
                         >
                             Learn More
                         </v-btn>
+                    </v-col>
+                    <v-col v-else-if="stepInfos[step].prev.value">
                         <v-btn
-                            v-else
                             variant="outlined"
                             color="default"
                             block
@@ -150,13 +161,14 @@
 </template>
 
 <script setup lang="ts">
-import { Component, computed, Ref, ref, watch, WatchStopHandle } from 'vue';
+import { type Component, type Ref, type WatchStopHandle, computed, ref, watch  } from 'vue';
 import {
     VBtn,
     VCard,
     VCardActions,
     VCardItem,
     VCardTitle,
+    VCardText,
     VCol,
     VDialog,
     VDivider,
@@ -164,15 +176,17 @@ import {
     VSheet,
     VWindow,
     VWindowItem,
+    VIcon,
 } from 'vuetify/components';
+import { Globe, X } from '@lucide/vue';
 
 import { NewDomainFlowStep } from '@/types/domains';
 import { useBucketsStore } from '@/store/modules/bucketsStore';
 import { useProjectsStore } from '@/store/modules/projectsStore';
 import { useDomainsStore } from '@/store/modules/domainsStore';
-import { useNotify } from '@/utils/hooks';
+import { useNotify } from '@/composables/useNotify';
 import { AnalyticsErrorEventSource } from '@/utils/constants/analyticsEventNames';
-import { IDialogFlowStep } from '@/types/common';
+import type { IDialogFlowStep } from '@/types/common';
 import { PassphraseOption } from '@/types/setupAccess';
 import { useLinksharing } from '@/composables/useLinksharing';
 
@@ -227,6 +241,7 @@ const bucket = resettableRef<string | undefined>(undefined);
 const accessKeyID = resettableRef<string>('');
 const passphrase = resettableRef<string>(bucketsStore.state.passphrase);
 const passphraseOption = resettableRef<PassphraseOption>(PassphraseOption.EnterNewPassphrase);
+const accessName = resettableRef<string>('');
 
 const innerContent = ref<Component>();
 const isFetching = ref<boolean>(true);
@@ -284,16 +299,7 @@ const stepInfos: Record<NewDomainFlowStep, StepInfo> = {
     ),
     [NewDomainFlowStep.SetupCNAME]: new StepInfo(
         'Next',
-        () => {
-            if (!hasManagedPassphrase.value && isPromptForPassphrase.value) {
-                if (passphraseOption.value === PassphraseOption.EnterNewPassphrase) return NewDomainFlowStep.EnterNewPassphrase;
-                if (passphraseOption.value === PassphraseOption.GenerateNewPassphrase) return NewDomainFlowStep.PassphraseGenerated;
-
-                return NewDomainFlowStep.SetupDomainAccess;
-            }
-
-            return NewDomainFlowStep.CustomDomain;
-        },
+        undefined,
         NewDomainFlowStep.SetupTXT,
     ),
     [NewDomainFlowStep.SetupTXT]: new StepInfo(
@@ -318,8 +324,6 @@ const storjAccess = computed<string>(() => `storj-access:${accessKeyID.value}`);
 const storjTLS = 'storj-tls:true';
 const txt = computed<string[]>(() => [storjRoot.value, storjAccess.value, storjTLS]);
 
-const accessName = computed<string>(() => `custom-domain-access-${domain.value}`);
-
 const currentTitle = computed<string>(() => {
     switch (step.value) {
     case NewDomainFlowStep.CustomDomain: return 'Setup Custom Domain';
@@ -338,7 +342,14 @@ async function generate(): Promise<void> {
         throw new Error('Passphrase and bucket must be set before generating access');
     }
 
+    // Re-generate a unique access name each time to avoid conflicts.
+    accessName.value = `custom-domain-access-${new Date().toISOString()}`;
+
     accessKeyID.value = await domainsStore.generateDomainCredentials(accessName.value, bucket.value, passphrase.value);
+    await domainsStore.storeDomain({ subdomain: domain.value, prefix: bucket.value, accessID: accessKeyID.value });
+    domainsStore.fetchDomains(1, domainsStore.state.cursor.limit).catch(error => {
+        notify.notifyError(error, AnalyticsErrorEventSource.NEW_DOMAIN_MODAL);
+    });
 }
 
 /**
@@ -436,8 +447,12 @@ watch(innerContent, async (comp: Component): Promise<void> => {
     isFetching.value = true;
 
     const projectID = projectsStore.state.selectedProject.id;
-    await bucketsStore.getAllBucketsNames(projectID).catch(err => {
-        notify.error(`Error fetching bucket grant names. ${err.message}`, AnalyticsErrorEventSource.NEW_DOMAIN_MODAL);
+
+    await Promise.all([
+        domainsStore.getAllDomainNames(projectID),
+        bucketsStore.getAllBucketsNames(projectID),
+    ]).catch(error => {
+        notify.notifyError(error, AnalyticsErrorEventSource.NEW_DOMAIN_MODAL);
     });
 
     passphrase.value = bucketsStore.state.passphrase;

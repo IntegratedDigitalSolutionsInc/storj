@@ -27,7 +27,7 @@
 
                 <template #append>
                     <v-btn
-                        icon="$close"
+                        :icon="X"
                         variant="text"
                         size="small"
                         color="default"
@@ -67,7 +67,7 @@
                                     <password-input-eye-icons
                                         :is-visible="isPassphraseVisible"
                                         type="passphrase"
-                                        @toggleVisibility="isPassphraseVisible = !isPassphraseVisible"
+                                        @toggle-visibility="isPassphraseVisible = !isPassphraseVisible"
                                     />
                                 </template>
                             </v-text-field>
@@ -123,7 +123,7 @@ import {
     VTextField,
     VSheet,
 } from 'vuetify/components';
-import { LockKeyhole } from 'lucide-vue-next';
+import { LockKeyhole, X } from '@lucide/vue';
 
 import { RequiredRule } from '@/types/common';
 import { useAnalyticsStore } from '@/store/modules/analyticsStore';
@@ -134,8 +134,9 @@ import {
     AnalyticsErrorEventSource,
     AnalyticsEvent,
 } from '@/utils/constants/analyticsEventNames';
-import { useNotify } from '@/utils/hooks';
+import { useNotify } from '@/composables/useNotify';
 import { useUsersStore } from '@/store/modules/usersStore.js';
+import { useProjectsStore } from '@/store/modules/projectsStore';
 
 import PasswordInputEyeIcons from '@/components/PasswordInputEyeIcons.vue';
 
@@ -143,6 +144,7 @@ const analyticsStore = useAnalyticsStore();
 const bucketsStore = useBucketsStore();
 const appStore = useAppStore();
 const usersStore = useUsersStore();
+const projectStore = useProjectsStore();
 
 const notify = useNotify();
 const { isLoading, withLoading } = useLoading();
@@ -154,7 +156,7 @@ const innerContent = ref<VCard | null>(null);
 const formValid = ref<boolean>(false);
 
 const model = computed({
-    get: () => appStore.state.isProjectPassphraseDialogShown,
+    get: () => appStore.state.isProjectPassphraseDialogShown && !appStore.state.isPricingOptInDialogShown,
     set: appStore.toggleProjectPassphraseDialog,
 });
 
@@ -177,6 +179,7 @@ function onSkip(confirmed = false): void {
 async function onContinue(): Promise<void> {
     analyticsStore.eventTriggered(AnalyticsEvent.PASSPHRASE_CREATED, {
         method: 'enter',
+        project_id: projectStore.state.selectedProject.id,
     });
 
     bucketsStore.setPassphrase(passphrase.value);

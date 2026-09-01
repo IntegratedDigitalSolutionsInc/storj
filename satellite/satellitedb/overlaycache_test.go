@@ -21,7 +21,6 @@ import (
 	"storj.io/common/testcontext"
 	"storj.io/common/testrand"
 	"storj.io/common/version"
-	"storj.io/storj/private/teststorj"
 	"storj.io/storj/satellite"
 	"storj.io/storj/satellite/nodeselection"
 	"storj.io/storj/satellite/overlay"
@@ -37,11 +36,11 @@ func TestGetOfflineNodesForEmail(t *testing.T) {
 			OnlineWindow: 4 * time.Hour,
 		}
 
-		offlineID := teststorj.NodeIDFromString("offlineNode")
-		onlineID := teststorj.NodeIDFromString("onlineNode")
-		disqualifiedID := teststorj.NodeIDFromString("dqNode")
-		exitedID := teststorj.NodeIDFromString("exitedNode")
-		offlineNoEmailID := teststorj.NodeIDFromString("noEmail")
+		offlineID := testrand.NodeID()
+		onlineID := testrand.NodeID()
+		disqualifiedID := testrand.NodeID()
+		exitedID := testrand.NodeID()
+		offlineNoEmailID := testrand.NodeID()
 
 		checkInInfo := overlay.NodeCheckInInfo{
 			IsUp: true,
@@ -112,8 +111,8 @@ func TestUpdateLastOfflineEmail(t *testing.T) {
 			OnlineWindow: 4 * time.Hour,
 		}
 
-		nodeID0 := teststorj.NodeIDFromString("testnode0")
-		nodeID1 := teststorj.NodeIDFromString("testnode1")
+		nodeID0 := testrand.NodeID()
+		nodeID1 := testrand.NodeID()
 
 		checkInInfo := overlay.NodeCheckInInfo{
 			IsUp: true,
@@ -202,7 +201,7 @@ func TestUpdateCheckInDirectUpdate(t *testing.T) {
 		selectionCfg := overlay.NodeSelectionConfig{
 			OnlineWindow: 4 * time.Hour,
 		}
-		nodeID := teststorj.NodeIDFromString("testnode0")
+		nodeID := testrand.NodeID()
 		checkInInfo := overlay.NodeCheckInInfo{
 			IsUp: true,
 			Address: &pb.NodeAddress{
@@ -470,7 +469,7 @@ func TestOverlayCache_GetNodes(t *testing.T) {
 			for i := range tc.QueryNodes {
 				ids[i] = tc.QueryNodes[i].id
 			}
-			selectedNodes, err := cache.GetNodes(ctx, ids, 1*time.Hour, 0)
+			selectedNodes, err := cache.GetParticipatingNodes(ctx, ids, 1*time.Hour, 0)
 			require.NoError(t, err)
 			require.Equal(t, len(tc.QueryNodes), len(selectedNodes))
 			var gotOnline []nodeselection.SelectedNode
@@ -492,7 +491,7 @@ func TestOverlayCache_GetNodes(t *testing.T) {
 		}
 
 		// test empty id list
-		_, err := cache.GetNodes(ctx, storj.NodeIDList{}, 1*time.Hour, 0)
+		_, err := cache.GetParticipatingNodes(ctx, storj.NodeIDList{}, 1*time.Hour, 0)
 		require.Error(t, err)
 
 		// test as of system time
@@ -501,7 +500,7 @@ func TestOverlayCache_GetNodes(t *testing.T) {
 			allIDs[i] = allNodes[i].id
 		}
 
-		selection, err := cache.GetNodes(ctx, allIDs, 1*time.Hour, -1*time.Microsecond)
+		selection, err := cache.GetParticipatingNodes(ctx, allIDs, 1*time.Hour, -1*time.Microsecond)
 		require.NoError(t, err)
 
 		require.Equal(t, "0x9b7488BF8b6A4FF21D610e3dd202723f705cD1C0", selection[0].Wallet)
@@ -510,7 +509,7 @@ func TestOverlayCache_GetNodes(t *testing.T) {
 	})
 }
 
-func TestOverlayCache_GetParticipatingNodes(t *testing.T) {
+func TestOverlayCache_GetAllParticipatingNodes(t *testing.T) {
 	satellitedbtest.Run(t, func(ctx *testcontext.Context, t *testing.T, db satellite.DB) {
 		cache := db.OverlayCache()
 
@@ -556,13 +555,13 @@ func TestOverlayCache_GetParticipatingNodes(t *testing.T) {
 				selectedNode.Online = false
 				expectedNodes = append(expectedNodes, selectedNode)
 			}
-			gotNodes, err := cache.GetParticipatingNodes(ctx, tc.OnlineWindow, 0)
+			gotNodes, err := cache.GetAllParticipatingNodes(ctx, tc.OnlineWindow, 0)
 			require.NoError(t, err)
 			require.ElementsMatch(t, expectedNodes, gotNodes, "#%d", i)
 		}
 
 		// test as of system time
-		selection, err := cache.GetParticipatingNodes(ctx, 1*time.Hour, -1*time.Microsecond)
+		selection, err := cache.GetAllParticipatingNodes(ctx, 1*time.Hour, -1*time.Microsecond)
 		require.NoError(t, err)
 
 		require.Equal(t, "0x9b7488BF8b6A4FF21D610e3dd202723f705cD1C0", selection[0].Wallet)
@@ -729,7 +728,7 @@ func TestOverlayCache_KnownReliableTagHandling(t *testing.T) {
 		}
 
 		// WHEN
-		nodes, err := cache.GetNodes(ctx, ids, 1*time.Hour, 0)
+		nodes, err := cache.GetParticipatingNodes(ctx, ids, 1*time.Hour, 0)
 		require.NoError(t, err)
 
 		// THEN
@@ -850,5 +849,156 @@ func TestOverlayCache_GetLastIPPortByNodeTagName(t *testing.T) {
 
 		_, ok = queriedLastIPPorts[ids[5]]
 		require.False(t, ok)
+	})
+}
+
+func TestOverlayCache_ActiveNodesPieceCounts(t *testing.T) {
+	satellitedbtest.Run(t, func(ctx *testcontext.Context, t *testing.T, db satellite.DB) {
+		overlay := db.OverlayCache()
+
+		onlineNode := addNode(ctx, t, overlay, "online           ", "127.0.0.1", time.Second, false, false, false, false, false)
+		offlineNode := addNode(ctx, t, overlay, "offline          ", "127.0.0.2", 2*time.Hour, false, false, false, false, false)
+
+		addNode(ctx, t, overlay, "disqualified     ", "127.0.0.3", 2*time.Hour, true, false, false, false, false)
+		addNode(ctx, t, overlay, "exiting          ", "127.0.0.5", 2*time.Hour, false, false, false, true, false)
+		addNode(ctx, t, overlay, "exited           ", "127.0.0.6", 2*time.Hour, false, false, false, false, true)
+
+		nodes, err := overlay.ActiveNodesPieceCounts(ctx)
+		require.NoError(t, err)
+
+		require.Len(t, nodes, 2)
+
+		_, found := nodes[onlineNode.id]
+		require.True(t, found)
+
+		_, found = nodes[offlineNode.id]
+		require.True(t, found)
+	})
+}
+
+func TestGetNodesByEmail(t *testing.T) {
+	satellitedbtest.Run(t, func(ctx *testcontext.Context, t *testing.T, db satellite.DB) {
+		cache := db.OverlayCache()
+
+		selectionCfg := overlay.NodeSelectionConfig{
+			OnlineWindow: 4 * time.Hour,
+		}
+
+		testEmail := "operator@storj.test"
+		otherEmail := "other@storj.test"
+
+		node1ID := testrand.NodeID()
+		node2ID := testrand.NodeID()
+		disqualifiedID := testrand.NodeID()
+		exitedID := testrand.NodeID()
+		otherEmailID := testrand.NodeID()
+
+		checkInInfo := overlay.NodeCheckInInfo{
+			IsUp: true,
+			Address: &pb.NodeAddress{
+				Address: "1.2.3.4",
+			},
+			Version: &pb.NodeVersion{
+				Version: "v0.0.0",
+			},
+			Operator: &pb.NodeOperator{
+				Email: testEmail,
+			},
+		}
+
+		now := time.Now()
+
+		// add first node with test email
+		checkInInfo.NodeID = node1ID
+		require.NoError(t, cache.UpdateCheckIn(ctx, checkInInfo, now, selectionCfg))
+
+		// add second node with test email
+		checkInInfo.NodeID = node2ID
+		require.NoError(t, cache.UpdateCheckIn(ctx, checkInInfo, now, selectionCfg))
+
+		// add disqualified node with test email - should be excluded
+		checkInInfo.NodeID = disqualifiedID
+		require.NoError(t, cache.UpdateCheckIn(ctx, checkInInfo, now, selectionCfg))
+		_, err := cache.DisqualifyNode(ctx, disqualifiedID, now, overlay.DisqualificationReasonUnknown)
+		require.NoError(t, err)
+
+		// add exited node with test email - should be excluded
+		checkInInfo.NodeID = exitedID
+		require.NoError(t, cache.UpdateCheckIn(ctx, checkInInfo, now, selectionCfg))
+		_, err = cache.UpdateExitStatus(ctx, &overlay.ExitStatusRequest{
+			NodeID:              exitedID,
+			ExitInitiatedAt:     now,
+			ExitLoopCompletedAt: now,
+			ExitFinishedAt:      now,
+			ExitSuccess:         true,
+		})
+		require.NoError(t, err)
+
+		// add node with different email - should not be returned
+		checkInInfo.NodeID = otherEmailID
+		checkInInfo.Operator.Email = otherEmail
+		require.NoError(t, cache.UpdateCheckIn(ctx, checkInInfo, now, selectionCfg))
+
+		options := overlay.GetNodesByEmailOptions{
+			Email: testEmail,
+			Limit: 10,
+		}
+		// test GetNodesByEmail returns all nodes with matching email (including disqualified and exited)
+		nodes, _, err := cache.GetNodesByEmail(ctx, options)
+		require.NoError(t, err)
+		require.Len(t, nodes, 4)
+
+		foundIDs := make(map[storj.NodeID]bool)
+		for _, node := range nodes {
+			foundIDs[node.Id] = true
+			require.Equal(t, testEmail, node.Operator.Email)
+		}
+		require.True(t, foundIDs[node1ID], "node1 should be found")
+		require.True(t, foundIDs[node2ID], "node2 should be found")
+		require.True(t, foundIDs[disqualifiedID], "disqualified node should be found")
+		require.True(t, foundIDs[exitedID], "exited node should be found")
+		require.False(t, foundIDs[otherEmailID], "node with different email should not be found")
+
+		options.Email = otherEmail
+		// test GetNodesByEmail with different email
+		nodes, _, err = cache.GetNodesByEmail(ctx, options)
+		require.NoError(t, err)
+		require.Len(t, nodes, 1)
+		require.Equal(t, otherEmailID, nodes[0].Id)
+
+		options.Email = "nonexistent@storj.test"
+		// test GetNodesByEmail with non-existent email
+		nodes, _, err = cache.GetNodesByEmail(ctx, options)
+		require.NoError(t, err)
+		require.Len(t, nodes, 0)
+
+		options.Email = ""
+		// test GetNodesByEmail with empty email returns nil
+		nodes, _, err = cache.GetNodesByEmail(ctx, options)
+		require.NoError(t, err)
+		require.Empty(t, nodes)
+
+		// test pagination
+		options.Email = testEmail
+		options.Limit = 2
+		firstPage, continuation, err := cache.GetNodesByEmail(ctx, options)
+		require.NoError(t, err)
+		require.Len(t, firstPage, 2)
+		require.NotNil(t, continuation)
+
+		options.Next = continuation
+		secondPage, _, err := cache.GetNodesByEmail(ctx, options)
+		require.NoError(t, err)
+		require.Len(t, secondPage, 2)
+
+		// verify all 4 nodes returned across pages
+		allIDs := make(map[storj.NodeID]bool)
+		for _, n := range firstPage {
+			allIDs[n.Id] = true
+		}
+		for _, n := range secondPage {
+			allIDs[n.Id] = true
+		}
+		require.Len(t, allIDs, 4)
 	})
 }

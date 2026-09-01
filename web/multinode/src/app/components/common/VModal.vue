@@ -23,25 +23,20 @@
     </div>
 </template>
 
-<script lang="ts">
-import { Component, Vue } from 'vue-property-decorator';
+<script setup lang="ts">
+const emit = defineEmits<{
+    (e: 'onClose'): void;
+}>();
 
-// @vue/component
-@Component
-export default class VModal extends Vue {
-    public close(): void {
-        this.$emit('onClose');
-    }
+function close(): void {
+    emit('onClose');
 }
 </script>
 
 <style lang="scss">
     .modal-wrap {
         position: fixed;
-        top: 0;
-        left: 0;
-        right: 0;
-        bottom: 0;
+        inset: 0;
         background-color: rgb(37 42 50 / 70%);
         z-index: 1000;
         display: flex;

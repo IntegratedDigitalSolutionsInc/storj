@@ -25,19 +25,20 @@
     />
     <update-session-timeout-prompt-dialog
         v-model="isUpdateTimeoutPromptModalShown"
-        @showSetTimeoutModal="isSetTimeoutModalShown = true"
+        @show-set-timeout-modal="isSetTimeoutModalShown = true"
     />
     <session-expired-dialog v-model="sessionTimeout.sessionExpiredModalShown.value" />
 </template>
 
 <script setup lang="ts">
 import { onMounted, ref } from 'vue';
-import { VSnackbar, VIcon } from 'vuetify/lib/components/index.mjs';
-import { Clock } from 'lucide-vue-next';
+import { VSnackbar, VIcon } from 'vuetify/components';
+import { Clock } from '@lucide/vue';
 
 import { useSessionTimeout } from '@/composables/useSessionTimeout';
 import { LocalData } from '@/utils/localData';
 import { useUsersStore } from '@/store/modules/usersStore';
+import { useConfigStore } from '@/store/modules/configStore';
 
 import InactivityDialog from '@/components/dialogs/InactivityDialog.vue';
 import SessionExpiredDialog from '@/components/dialogs/SessionExpiredDialog.vue';
@@ -45,6 +46,7 @@ import SetSessionTimeoutDialog from '@/components/dialogs/SetSessionTimeoutDialo
 import UpdateSessionTimeoutPromptDialog from '@/components/dialogs/UpdateSessionTimeoutPromptDialog.vue';
 
 const usersStore = useUsersStore();
+const configStore = useConfigStore();
 
 const isSetTimeoutModalShown = ref<boolean>(false);
 const isUpdateTimeoutPromptModalShown = ref<boolean>(false);
@@ -54,7 +56,7 @@ const sessionTimeout = useSessionTimeout({
 });
 
 onMounted(() => {
-    if (LocalData.getSessionHasExpired() && !usersStore.state.settings.sessionDuration) {
+    if (LocalData.getSessionHasExpired() && !usersStore.state.settings.sessionDuration && !configStore.externalAuthEnabled) {
         isUpdateTimeoutPromptModalShown.value = true;
     }
 });

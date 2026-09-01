@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -17,24 +18,30 @@ import (
 	"golang.org/x/time/rate"
 
 	"storj.io/common/encryption"
+	"storj.io/common/identity"
 	"storj.io/common/macaroon"
 	"storj.io/common/pb"
 	"storj.io/common/rpc/rpcstatus"
 	"storj.io/common/signing"
 	"storj.io/common/storj"
-	"storj.io/common/uuid"
 	"storj.io/eventkit"
 	"storj.io/storj/satellite/accounting"
 	"storj.io/storj/satellite/attribution"
 	"storj.io/storj/satellite/buckets"
 	"storj.io/storj/satellite/console"
+	"storj.io/storj/satellite/console/consoleweb"
+	"storj.io/storj/satellite/entitlements"
+	"storj.io/storj/satellite/eventing"
 	"storj.io/storj/satellite/internalpb"
 	"storj.io/storj/satellite/metabase"
+	"storj.io/storj/satellite/metainfo/bloomrate"
 	"storj.io/storj/satellite/metainfo/pointerverification"
 	"storj.io/storj/satellite/nodeselection"
 	"storj.io/storj/satellite/orders"
 	"storj.io/storj/satellite/overlay"
+	"storj.io/storj/satellite/projectlimitevents"
 	"storj.io/storj/satellite/revocation"
+	"storj.io/storj/satellite/trust"
 	"storj.io/storj/shared/lrucache"
 )
 
@@ -68,30 +75,45 @@ type APIKeys interface {
 type Endpoint struct {
 	pb.DRPCMetainfoUnimplementedServer
 
-	log                    *zap.Logger
-	buckets                *buckets.Service
-	metabase               *metabase.DB
-	orders                 *orders.Service
-	overlay                *overlay.Service
-	attributions           attribution.DB
-	pointerVerification    *pointerverification.Service
-	projectUsage           *accounting.Service
-	projects               console.Projects
-	projectMembers         console.ProjectMembers
-	users                  console.Users
-	apiKeys                APIKeys
-	satellite              signing.Signer
-	limiterCache           *lrucache.ExpiringLRUOf[*rate.Limiter]
-	singleObjectLimitCache *lrucache.ExpiringLRUOf[struct{}]
-	userInfoCache          *lrucache.ExpiringLRUOf[*console.UserInfo]
-	encInlineSegmentSize   int64 // max inline segment size + encryption overhead
-	revocations            revocation.DB
-	config                 ExtendedConfig
-	versionCollector       *versionCollector
-	zstdDecoder            *zstd.Decoder
-	zstdEncoder            *zstd.Encoder
-	successTrackers        *SuccessTrackers
-	placement              nodeselection.PlacementDefinitions
+	log                            *zap.Logger
+	buckets                        *buckets.Service
+	metabase                       *metabase.DB
+	remainderChargeRecorder        *accounting.RemainderChargeRecorder
+	orders                         *orders.Service
+	overlay                        *overlay.Service
+	attributions                   attribution.DB
+	projectLimitEventsDB           projectlimitevents.DB
+	pointerVerification            *pointerverification.Service
+	projectUsage                   *accounting.Service
+	projects                       console.Projects
+	projectMembers                 console.ProjectMembers
+	users                          console.Users
+	apiKeys                        APIKeys
+	apiKeyTails                    console.APIKeyTails
+	satellite                      signing.Signer
+	limiterCache                   *lrucache.ExpiringLRUOf[*rate.Limiter]
+	singleObjectUploadLimitCache   *bloomrate.BloomRate
+	singleObjectDownloadLimitCache *bloomrate.BloomRate
+	userInfoCache                  *lrucache.ExpiringLRUOf[*console.UserInfo]
+	encInlineSegmentSize           int64 // max inline segment size + encryption overhead
+	revocations                    revocation.DB
+	config                         Config
+	migrationModeFlag              *MigrationModeFlagExtension
+	versionCollector               *versionCollector
+	zstdDecoder                    *zstd.Decoder
+	zstdEncoder                    *zstd.Encoder
+	trackers                       *Trackers
+	trustedUplinks                 *trust.TrustedPeersList
+	placement                      nodeselection.PlacementDefinitions
+	placementEdgeUrlOverrides      console.PlacementEdgeURLOverrides
+	selfServePlacements            map[storj.PlacementConstraint]console.PlacementDetail
+	selfServePlacementEnabled      bool
+	nodeSelectionStats             *NodeSelectionStats
+	bucketEventingCache            *eventing.ConfigCache
+	entitlementsService            *entitlements.Service
+	entitlementsConfig             entitlements.Config
+	keyTailsHandler                *keyTailsHandler
+	sunsetPlacementEffectiveDate   time.Time
 
 	// rateLimiterTime is a function that returns the time to check with the rate limiter.
 	// It's handy for testing purposes. It defaults to time.Now.
@@ -100,16 +122,19 @@ type Endpoint struct {
 
 // NewEndpoint creates new metainfo endpoint instance.
 func NewEndpoint(log *zap.Logger, buckets *buckets.Service, metabaseDB *metabase.DB,
+	remainderChargeRecorder *accounting.RemainderChargeRecorder,
 	orders *orders.Service, cache *overlay.Service, attributions attribution.DB, peerIdentities overlay.PeerIdentities,
-	apiKeys APIKeys, projectUsage *accounting.Service, projects console.Projects, projectMembers console.ProjectMembers, users console.Users,
-	satellite signing.Signer, revocations revocation.DB, successTrackers *SuccessTrackers, config Config, placement nodeselection.PlacementDefinitions) (*Endpoint, error) {
-
+	apiKeys APIKeys, apiKeyTails console.APIKeyTails, projectUsage *accounting.Service, projects console.Projects,
+	projectMembers console.ProjectMembers, users console.Users, satellite signing.Signer, revocations revocation.DB,
+	trackers *Trackers, trustedUplinks *trust.TrustedPeersList, config Config,
+	migrationModeFlag *MigrationModeFlagExtension, placement nodeselection.PlacementDefinitions, consoleConfig consoleweb.Config,
+	ordersConfig orders.Config, nodeSelectionStats *NodeSelectionStats,
+	bucketEventingCache *eventing.ConfigCache, entitlementsService *entitlements.Service, entitlementsConfig entitlements.Config,
+	projectLimitEventsDB projectlimitevents.DB,
+) (*Endpoint, error) {
+	trustedOrders := ordersConfig.TrustedOrders
+	placementEdgeUrlOverrides := consoleConfig.Config.PlacementEdgeURLOverrides
 	// TODO do something with too many params
-
-	extendedConfig, err := NewExtendedConfig(config)
-	if err != nil {
-		return nil, err
-	}
 
 	encInlineSegmentSize, err := encryption.CalcEncryptedSize(config.MaxInlineSegmentSize.Int64(), storj.EncryptionParameters{
 		CipherSuite: storj.EncAESGCM,
@@ -134,92 +159,145 @@ func NewEndpoint(log *zap.Logger, buckets *buckets.Service, metabaseDB *metabase
 		return nil, errs.Wrap(err)
 	}
 
-	return &Endpoint{
-		log:                 log,
-		buckets:             buckets,
-		metabase:            metabaseDB,
-		orders:              orders,
-		overlay:             cache,
-		attributions:        attributions,
-		pointerVerification: pointerverification.NewService(peerIdentities),
-		apiKeys:             apiKeys,
-		projectUsage:        projectUsage,
-		projects:            projects,
-		projectMembers:      projectMembers,
-		users:               users,
-		satellite:           satellite,
+	selfServePlacements := make(map[storj.PlacementConstraint]console.PlacementDetail)
+	for _, p := range consoleConfig.Placement.SelfServeDetails {
+		selfServePlacements[storj.PlacementConstraint(p.ID)] = p
+	}
+
+	var sunsetPlacementEffectiveDate time.Time
+	if config.SunsetPlacementsEffectiveDate != "" {
+		sunsetPlacementEffectiveDate, err = time.Parse(time.RFC3339, config.SunsetPlacementsEffectiveDate)
+		if err != nil {
+			return nil, errs.New("invalid SunsetPlacementsEffectiveDate: %w", err)
+		}
+	}
+
+	e := &Endpoint{
+		log:                     log,
+		buckets:                 buckets,
+		metabase:                metabaseDB,
+		remainderChargeRecorder: remainderChargeRecorder,
+		orders:                  orders,
+		overlay:                 cache,
+		attributions:            attributions,
+		pointerVerification:     pointerverification.NewService(peerIdentities, cache, trustedUplinks, trustedOrders),
+		apiKeys:                 apiKeys,
+		apiKeyTails:             apiKeyTails,
+		projectUsage:            projectUsage,
+		projects:                projects,
+		projectMembers:          projectMembers,
+		users:                   users,
+		satellite:               satellite,
 		limiterCache: lrucache.NewOf[*rate.Limiter](lrucache.Options{
 			Capacity:   config.RateLimiter.CacheCapacity,
 			Expiration: config.RateLimiter.CacheExpiration,
 			Name:       "metainfo-ratelimit",
 		}),
-		singleObjectLimitCache: lrucache.NewOf[struct{}](lrucache.Options{
-			Expiration: config.UploadLimiter.SingleObjectLimit,
-			Capacity:   config.UploadLimiter.CacheCapacity,
-		}),
+		singleObjectUploadLimitCache: bloomrate.NewBloomRate(
+			config.UploadLimiter.SizeExponent,
+			config.UploadLimiter.HashCount,
+			rate.Every(config.UploadLimiter.SingleObjectLimit),
+			config.UploadLimiter.BurstLimit),
+		singleObjectDownloadLimitCache: bloomrate.NewBloomRate(
+			config.DownloadLimiter.SizeExponent,
+			config.DownloadLimiter.HashCount,
+			rate.Every(config.DownloadLimiter.SingleObjectLimit),
+			config.DownloadLimiter.BurstLimit),
 		userInfoCache: lrucache.NewOf[*console.UserInfo](lrucache.Options{
 			Expiration: config.UserInfoValidation.CacheExpiration,
 			Capacity:   config.UserInfoValidation.CacheCapacity,
 		}),
-		encInlineSegmentSize: encInlineSegmentSize,
-		revocations:          revocations,
-		config:               extendedConfig,
-		versionCollector:     newVersionCollector(log),
-		zstdDecoder:          decoder,
-		zstdEncoder:          encoder,
-		successTrackers:      successTrackers,
-		placement:            placement,
-		rateLimiterTime:      time.Now,
-	}, nil
+		encInlineSegmentSize:         encInlineSegmentSize,
+		revocations:                  revocations,
+		config:                       config,
+		migrationModeFlag:            migrationModeFlag,
+		versionCollector:             newVersionCollector(log),
+		zstdDecoder:                  decoder,
+		zstdEncoder:                  encoder,
+		trackers:                     trackers,
+		trustedUplinks:               trustedUplinks,
+		placement:                    placement,
+		placementEdgeUrlOverrides:    placementEdgeUrlOverrides,
+		selfServePlacements:          selfServePlacements,
+		selfServePlacementEnabled:    consoleConfig.Placement.SelfServeEnabled,
+		rateLimiterTime:              time.Now,
+		nodeSelectionStats:           nodeSelectionStats,
+		bucketEventingCache:          bucketEventingCache,
+		entitlementsService:          entitlementsService,
+		entitlementsConfig:           entitlementsConfig,
+		projectLimitEventsDB:         projectLimitEventsDB,
+		sunsetPlacementEffectiveDate: sunsetPlacementEffectiveDate,
+	}
+	if config.APIKeyTailsConfig.CombinerQueueEnabled {
+		e.keyTailsHandler = &keyTailsHandler{
+			cache: lrucache.NewOf[struct{}](lrucache.Options{
+				Expiration: config.APIKeyTailsConfig.CacheExpiration,
+				Capacity:   config.APIKeyTailsConfig.CacheCapacity,
+				Name:       "seen_macaroon_tail_cache",
+			}),
+		}
+	}
+
+	return e, nil
 }
 
 // TestingNewAPIKeysEndpoint returns an endpoint suitable for testing api keys behaviour.
 func TestingNewAPIKeysEndpoint(log *zap.Logger, apiKeys APIKeys) *Endpoint {
 	return &Endpoint{
-		log:     log,
-		apiKeys: apiKeys,
+		log:               log,
+		apiKeys:           apiKeys,
+		migrationModeFlag: NewMigrationModeFlagExtension(Config{}),
 	}
+}
+
+// TestingGetLimiterCache returns the limiter cache for testing purposes.
+func (endpoint *Endpoint) TestingGetLimiterCache() *lrucache.ExpiringLRUOf[*rate.Limiter] {
+	return endpoint.limiterCache
 }
 
 // Run manages the internal dependencies of the endpoint such as the
 // success tracker.
 func (endpoint *Endpoint) Run(ctx context.Context) error {
-	ticker := time.NewTicker(endpoint.config.SuccessTrackerTickDuration)
-	defer ticker.Stop()
+	successTicker := time.NewTicker(endpoint.config.SuccessTrackerTickDuration)
+	defer successTicker.Stop()
+	failureTicker := time.NewTicker(endpoint.config.FailureTrackerTickDuration)
+	defer failureTicker.Stop()
+	retryTicker := time.NewTicker(endpoint.config.RetryTrackerTickDuration)
+	defer retryTicker.Stop()
+
+	if endpoint.config.APIKeyTailsConfig.CombinerQueueEnabled && endpoint.keyTailsHandler != nil {
+		endpoint.initTailsCombiner(ctx)
+	}
 
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
-		case <-ticker.C:
-			endpoint.successTrackers.BumpGeneration()
+		case <-successTicker.C:
+			endpoint.trackers.BumpGeneration()
+		case <-failureTicker.C:
+			endpoint.trackers.BumpFailureGeneration()
+		case <-retryTicker.C:
+			endpoint.trackers.BumpRetryGeneration()
 		}
 	}
 }
 
 // Close closes resources.
-func (endpoint *Endpoint) Close() error { return nil }
-
-// TestSetObjectLockEnabled sets whether bucket-level Object Lock functionality should be globally enabled.
-// Used for testing.
-func (endpoint *Endpoint) TestSetObjectLockEnabled(enabled bool) {
-	endpoint.config.ObjectLockEnabled = enabled
-}
-
-// TestSetUseBucketLevelVersioning sets whether bucket-level Object Versioning functionality should be globally enabled.
-// Used for testing.
-func (endpoint *Endpoint) TestSetUseBucketLevelVersioning(enabled bool) {
-	endpoint.config.UseBucketLevelObjectVersioning = enabled
-}
-
-// TestSetUseBucketLevelVersioningByProjectID sets whether bucket-level Object Versioning functionality should be enabled
-// for a specific project. Used for testing.
-func (endpoint *Endpoint) TestSetUseBucketLevelVersioningByProjectID(projectID uuid.UUID, enabled bool) {
-	if !enabled {
-		delete(endpoint.config.useBucketLevelObjectVersioningProjects, projectID)
-		return
+func (endpoint *Endpoint) Close() error {
+	if endpoint.keyTailsHandler != nil {
+		combiner := endpoint.keyTailsHandler.combiner.Load()
+		if combiner != nil {
+			combiner.Close()
+		}
 	}
-	endpoint.config.useBucketLevelObjectVersioningProjects[projectID] = struct{}{}
+
+	return nil
+}
+
+// TestSelfServePlacementEnabled sets whether self-serve placement should be enabled.
+func (endpoint *Endpoint) TestSelfServePlacementEnabled(enabled bool) {
+	endpoint.selfServePlacementEnabled = enabled
 }
 
 // ProjectInfo returns allowed ProjectInfo for the provided API key.
@@ -242,10 +320,81 @@ func (endpoint *Endpoint) ProjectInfo(ctx context.Context, req *pb.ProjectInfoRe
 		return nil, err
 	}
 
-	return &pb.ProjectInfoResponse{
-		ProjectPublicId: keyInfo.ProjectPublicID.Bytes(),
-		ProjectSalt:     salt,
-	}, nil
+	project, err := endpoint.projects.Get(ctx, keyInfo.ProjectID)
+	if err != nil {
+		return nil, err
+	}
+
+	info := &pb.ProjectInfoResponse{
+		ProjectPublicId:  keyInfo.ProjectPublicID.Bytes(),
+		ProjectCreatedAt: project.CreatedAt,
+		ProjectSalt:      salt,
+	}
+
+	if endpoint.config.SendEdgeUrlOverrides {
+		if edgeURLs, ok := endpoint.placementEdgeUrlOverrides.Get(project.DefaultPlacement); ok {
+			info.EdgeUrlOverrides = &pb.EdgeUrlOverrides{
+				AuthService:        []byte(edgeURLs.AuthService),
+				PublicLinksharing:  []byte(edgeURLs.PublicLinksharing),
+				PrivateLinksharing: []byte(edgeURLs.InternalLinksharing),
+			}
+		}
+	}
+
+	return info, nil
+}
+
+// AccountLicenses returns active licenses for the account associated with the provided API key.
+func (endpoint *Endpoint) AccountLicenses(ctx context.Context, req *pb.AccountLicensesRequest) (response *pb.AccountLicensesResponse, err error) {
+	defer mon.Task()(&ctx)(&err)
+
+	now := time.Now()
+	keyInfo, err := endpoint.validateAuth(ctx, req.Header, macaroon.Action{
+		Op:   macaroon.ActionProjectInfo,
+		Time: now,
+	}, console.RateLimitHead)
+	if err != nil {
+		return nil, err
+	}
+	endpoint.usageTracking(keyInfo, req.Header, fmt.Sprintf("%T", req))
+
+	if endpoint.config.OmLicenseForAllUntil != "" {
+		omLicenseExpiration, err := time.Parse(time.RFC3339, endpoint.config.OmLicenseForAllUntil)
+		if err != nil {
+			endpoint.log.Warn("unable to parse OmLicenseForAllUntil config value, ignoring OM license for all", zap.String("value", endpoint.config.OmLicenseForAllUntil), zap.Error(err))
+		} else {
+			if omLicenseExpiration.After(now) {
+				return &pb.AccountLicensesResponse{
+					Licenses: []*pb.AccountLicense{{
+						Type:      entitlements.OMLicenseType,
+						ExpiresAt: omLicenseExpiration,
+					}},
+				}, nil
+			}
+		}
+	}
+
+	// TODO does API Key creator give us correct user?
+	licenses, err := endpoint.entitlementsService.Licenses().GetActive(ctx, keyInfo.CreatedBy, entitlements.GetActiveOptions{
+		LicenseType: req.Type,
+		PublicID:    keyInfo.ProjectPublicID,
+		BucketName:  req.BucketName,
+		Now:         &now,
+	})
+	if err != nil {
+		return nil, endpoint.ConvertKnownErrWithMessage(err, "internal error")
+	}
+
+	response = &pb.AccountLicensesResponse{}
+	for _, license := range licenses {
+		response.Licenses = append(response.Licenses, &pb.AccountLicense{
+			Type:      license.Type,
+			ExpiresAt: license.ExpiresAt,
+			Key:       license.Key,
+		})
+	}
+
+	return response, nil
 }
 
 // RevokeAPIKey handles requests to revoke an api key.
@@ -266,8 +415,7 @@ func (endpoint *Endpoint) RevokeAPIKey(ctx context.Context, req *pb.RevokeAPIKey
 
 	err = endpoint.revocations.Revoke(ctx, macToRevoke.Tail(), keyInfo.ID[:])
 	if err != nil {
-		endpoint.log.Error("Failed to revoke API key", zap.Error(err))
-		return nil, rpcstatus.Error(rpcstatus.Internal, "Failed to revoke API key")
+		return nil, endpoint.ConvertKnownErrWithMessage(err, "Failed to revoke API key")
 	}
 
 	return &pb.RevokeAPIKeyResponse{}, nil
@@ -288,17 +436,17 @@ func (endpoint *Endpoint) packStreamID(ctx context.Context, satStreamID *interna
 
 	signedStreamID, err := SignStreamID(ctx, endpoint.satellite, satStreamID)
 	if err != nil {
-		return nil, rpcstatus.Error(rpcstatus.Internal, err.Error())
+		return nil, rpcstatus.Wrap(rpcstatus.Internal, err)
 	}
 
 	encodedStreamID, err := pb.Marshal(signedStreamID)
 	if err != nil {
-		return nil, rpcstatus.Error(rpcstatus.Internal, err.Error())
+		return nil, rpcstatus.Wrap(rpcstatus.Internal, err)
 	}
 
 	streamID, err = storj.StreamIDFromBytes(encodedStreamID)
 	if err != nil {
-		return nil, rpcstatus.Error(rpcstatus.Internal, err.Error())
+		return nil, rpcstatus.Wrap(rpcstatus.Internal, err)
 	}
 	return streamID, nil
 }
@@ -398,15 +546,26 @@ func (endpoint *Endpoint) unmarshalSatSegmentID(ctx context.Context, segmentID s
 	return satSegmentID, nil
 }
 
-// ConvertMetabaseErr converts domain errors from metabase to appropriate rpc statuses errors.
+// ConvertMetabaseErr converts known domain errors to appropriate rpc statuses errors.
 func (endpoint *Endpoint) ConvertMetabaseErr(err error) error {
+	return endpoint.ConvertKnownErrWithMessage(err, "internal error")
+}
+
+// ConvertKnownErr converts known domain errors to appropriate rpc statuses errors.
+func (endpoint *Endpoint) ConvertKnownErr(err error) error {
+	return endpoint.ConvertKnownErrWithMessage(err, "internal error")
+}
+
+// ConvertKnownErrWithMessage converts known domain errors to appropriate rpc statuses errors with
+// a custom message.
+func (endpoint *Endpoint) ConvertKnownErrWithMessage(err error, message string) error {
 	switch {
 	case err == nil:
 		return nil
 	case errors.Is(err, context.Canceled):
-		return rpcstatus.Error(rpcstatus.Canceled, "context canceled")
+		return rpcstatus.Wrap(rpcstatus.Canceled, context.Canceled)
 	case errors.Is(err, context.DeadlineExceeded):
-		return rpcstatus.Error(rpcstatus.DeadlineExceeded, "context deadline exceeded")
+		return rpcstatus.Wrap(rpcstatus.DeadlineExceeded, context.DeadlineExceeded)
 	case rpcstatus.Code(err) != rpcstatus.Unknown:
 		// it's already RPC error
 		return err
@@ -420,14 +579,20 @@ func (endpoint *Endpoint) ConvertMetabaseErr(err error) error {
 		message = strings.TrimPrefix(message, ": ")
 		// uplink expects a message that starts with the specified prefix
 		return rpcstatus.Error(rpcstatus.NotFound, "segment not found: "+message)
+	case metabase.ErrInsufficientMetadataIncludes.Has(err):
+		return rpcstatus.Error(rpcstatus.InsufficientObjectMetadataIncludes, err.Error())
 	case metabase.ErrObjectLock.Has(err):
 		return rpcstatus.Error(rpcstatus.ObjectLockObjectProtected, objectLockedErrMsg)
+	case metabase.ErrChecksumMissing.Has(err):
+		return rpcstatus.Error(rpcstatus.ObjectMetadataMissing, err.Error())
 	case metabase.ErrObjectExpiration.Has(err):
 		return rpcstatus.Error(rpcstatus.InvalidArgument, err.Error())
 	case metabase.ErrInvalidRequest.Has(err):
 		return rpcstatus.Error(rpcstatus.InvalidArgument, err.Error())
 	case metabase.ErrFailedPrecondition.Has(err):
 		return rpcstatus.Error(rpcstatus.FailedPrecondition, err.Error())
+	case metabase.ErrUnimplemented.Has(err):
+		return rpcstatus.Error(rpcstatus.Unimplemented, err.Error())
 	case metabase.ErrObjectAlreadyExists.Has(err):
 		return rpcstatus.Error(rpcstatus.AlreadyExists, err.Error())
 	case metabase.ErrPendingObjectMissing.Has(err):
@@ -435,8 +600,8 @@ func (endpoint *Endpoint) ConvertMetabaseErr(err error) error {
 	case metabase.ErrPermissionDenied.Has(err):
 		return rpcstatus.Error(rpcstatus.PermissionDenied, err.Error())
 	default:
-		endpoint.log.Error("internal", zap.Error(err))
-		return rpcstatus.Error(rpcstatus.Internal, "internal error")
+		endpoint.log.Error(message, zap.Error(err))
+		return rpcstatus.Error(rpcstatus.Internal, message)
 	}
 }
 
@@ -469,4 +634,28 @@ func (endpoint *Endpoint) TestingSetRSConfig(rs RSConfig) {
 // TestingSetRateLimiterTime sets the time function used by the rate limiter.
 func (endpoint *Endpoint) TestingSetRateLimiterTime(time func() time.Time) {
 	endpoint.rateLimiterTime = time
+}
+
+// TestingSetSunsetPlacementsEffectiveDate overrides the sunset placements effective date.
+func (endpoint *Endpoint) TestingSetSunsetPlacementsEffectiveDate(d time.Time) {
+	endpoint.sunsetPlacementEffectiveDate = d
+}
+
+// TestingAddTrustedUplink is a helper function for tests to add a trusted uplink.
+func (endpoint *Endpoint) TestingAddTrustedUplink(id storj.NodeID) {
+	endpoint.trustedUplinks.TestingAddTrustedUplink(id)
+}
+
+func placementSeriesTag(p storj.PlacementConstraint) monkit.SeriesTag {
+	return monkit.NewSeriesTag("placement", strconv.FormatUint(uint64(p), 10))
+}
+
+func (endpoint *Endpoint) uplinkPeer(ctx context.Context) (peer *identity.PeerIdentity, trusted bool, err error) {
+	peer, err = identity.PeerIdentityFromContext(ctx)
+	if err != nil {
+		// N.B. jeff thinks this is a bad idea but jt convinced him
+		return nil, false, rpcstatus.Errorf(rpcstatus.Unauthenticated, "unable to get peer identity: %w", err)
+	}
+
+	return peer, endpoint.trustedUplinks.IsTrusted(peer.ID), nil
 }

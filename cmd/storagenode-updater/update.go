@@ -5,9 +5,12 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"time"
 
 	"github.com/zeebo/errs"
 	"go.uber.org/zap"
@@ -15,16 +18,16 @@ import (
 	"storj.io/common/version"
 )
 
-func update(ctx context.Context, restartMethod, serviceName, binaryLocation, storeDir string, ver version.Process) error {
+func update(ctx context.Context, standalone bool, restartMethod, serviceName, binaryLocation, storeDir string, ver version.Process) error {
 	currentVersion, err := binaryVersion(binaryLocation)
 	if err != nil {
 		return errs.Wrap(err)
 	}
 
-	log := zap.L().With(zap.String("Service", serviceName))
+	log := zap.L().With(zap.String("service", serviceName))
 
 	log.Info("Current binary version",
-		zap.String("Version", currentVersion.String()),
+		zap.String("version", currentVersion.VString()),
 	)
 
 	// should update
@@ -35,6 +38,17 @@ func update(ctx context.Context, restartMethod, serviceName, binaryLocation, sto
 	if newVersion.IsZero() {
 		log.Info(reason)
 		return nil
+	}
+	newSemVer, err := newVersion.SemVer()
+	if err != nil {
+		return err
+	}
+
+	// do not try to redownload the binary that failed to start
+	if lastFailure, ok := loadLastUpdateFailure(ctx, log, storeDir, serviceName); ok {
+		if lastFailure.Version.Compare(newSemVer) == 0 {
+			return nil
+		}
 	}
 
 	newVersionPath := prependExtension(binaryLocation, newVersion.Version)
@@ -48,14 +62,21 @@ func update(ctx context.Context, restartMethod, serviceName, binaryLocation, sto
 		return errs.Combine(errs.Wrap(err), os.Remove(newVersionPath))
 	}
 
-	newSemVer, err := newVersion.SemVer()
-	if err != nil {
-		return errs.Combine(err, os.Remove(newVersionPath))
-	}
-
 	if newSemVer.Compare(downloadedVersion) != 0 {
 		err := errs.New("invalid version downloaded: wants %s got %s", newVersion.Version, downloadedVersion)
 		return errs.Combine(err, os.Remove(newVersionPath))
+	}
+
+	if err := tryRunBinary(ctx, log, serviceName, newVersionPath); err != nil {
+		saveLastUpdateFailure(ctx, log, storeDir, serviceName, failedUpdate{
+			Version: newSemVer,
+			Date:    time.Now(),
+			Failure: err.Error(),
+		})
+		return errs.Combine(
+			errs.New("unable to run binary: %w", err),
+			os.Remove(newVersionPath),
+		)
 	}
 
 	if err = copyToStore(binaryLocation, storeDir); err != nil {
@@ -67,10 +88,10 @@ func update(ctx context.Context, restartMethod, serviceName, binaryLocation, sto
 		// NB: don't include old version number for updater binary backup
 		backupPath = prependExtension(binaryLocation, "old")
 	} else {
-		backupPath = prependExtension(binaryLocation, "old."+currentVersion.String())
+		backupPath = prependExtension(binaryLocation, "old."+currentVersion.VString())
 	}
 
-	if err = restartAndCleanup(ctx, log, restartMethod, serviceName, binaryLocation, newVersionPath, backupPath); err != nil {
+	if err = restartAndCleanup(ctx, log, standalone, restartMethod, serviceName, binaryLocation, newVersionPath, backupPath); err != nil {
 		return errs.Wrap(err)
 	}
 	return nil
@@ -89,10 +110,10 @@ func copyToStore(binaryLocation, storeDir string) error {
 
 	storeLocation := filepath.Join(storeDir, base)
 
-	log := zap.L().With(zap.String("Service", "copyToStore"))
+	log := zap.L().With(zap.String("service", "copyToStore"))
 
 	// copy binary to store
-	log.Info("Copying binary to store.", zap.String("From", binaryLocation), zap.String("To", storeLocation))
+	log.Info("Copying binary to store.", zap.String("from", binaryLocation), zap.String("to", storeLocation))
 	src, err := os.Open(binaryLocation)
 	if err != nil {
 		return errs.Wrap(err)
@@ -115,14 +136,14 @@ func copyToStore(binaryLocation, storeDir string) error {
 		return errs.Wrap(err)
 	}
 
-	log.Info("Binary copied to store.", zap.String("From", binaryLocation), zap.String("To", storeLocation))
+	log.Info("Binary copied to store.", zap.String("from", binaryLocation), zap.String("to", storeLocation))
 
 	return nil
 }
 
-func restartAndCleanup(ctx context.Context, log *zap.Logger, restartMethod, service, binaryLocation, newVersionPath, backupPath string) error {
+func restartAndCleanup(ctx context.Context, log *zap.Logger, standalone bool, restartMethod, service, binaryLocation, newVersionPath, backupPath string) error {
 	log.Info("Restarting service.")
-	exit, err := restartService(ctx, restartMethod, service, binaryLocation, newVersionPath, backupPath)
+	exit, err := swapBinariesAndRestart(ctx, standalone, restartMethod, service, binaryLocation, newVersionPath, backupPath)
 	if err != nil {
 		return err
 	}
@@ -131,9 +152,9 @@ func restartAndCleanup(ctx context.Context, log *zap.Logger, restartMethod, serv
 		log.Info("Service restarted successfully.")
 	}
 
-	log.Info("Cleaning up old binary.", zap.String("Path", backupPath))
+	log.Info("Cleaning up old binary.", zap.String("path", backupPath))
 	if err := os.Remove(backupPath); err != nil && !errs.Is(err, os.ErrNotExist) {
-		log.Error("Failed to remove backup binary. Consider removing manually.", zap.String("Path", backupPath), zap.Error(err))
+		log.Error("Failed to remove backup binary. Consider removing manually.", zap.String("path", backupPath), zap.Error(err))
 	}
 
 	if exit {
@@ -141,4 +162,68 @@ func restartAndCleanup(ctx context.Context, log *zap.Logger, restartMethod, serv
 	}
 
 	return nil
+}
+
+// tryRunBinary tries to execute the binary to see whether basic functionality works on the current system.
+func tryRunBinary(ctx context.Context, log *zap.Logger, serviceName, binaryLocation string) error {
+	cmd := exec.Command(binaryLocation, "--help")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		log.Error("failed to run binary", zap.String("output", string(out)))
+		return errs.New("%w\n%s", err, out)
+	}
+	return nil
+}
+
+type failedUpdate struct {
+	Version version.SemVer
+	Date    time.Time
+	Failure string
+}
+
+// lastFailedUpdateName returns the json file where we store update failure.
+func lastFailedUpdateName(storeDir, serviceName string) string {
+	return filepath.Join(storeDir, "last-failed-update."+serviceName+".json")
+}
+
+// loadLastUpdateFailure loads information about the last failed update.
+func loadLastUpdateFailure(ctx context.Context, log *zap.Logger, storeDir, serviceName string) (_ failedUpdate, ok bool) {
+	log = log.Named("log-failure")
+
+	name := lastFailedUpdateName(storeDir, serviceName)
+	data, err := os.ReadFile(name)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return failedUpdate{}, false
+		}
+		log.Error("failed to read update failure file", zap.Error(err))
+		return failedUpdate{}, false
+	}
+
+	var result failedUpdate
+	err = json.Unmarshal(data, &result)
+	if err != nil {
+		log.Error("failed to read update failure file", zap.Error(err))
+		return failedUpdate{}, false
+	}
+
+	return result, true
+}
+
+// saveLastUpdateFailure writes information about the last failed update.
+func saveLastUpdateFailure(ctx context.Context, log *zap.Logger, storeDir, serviceName string, fail failedUpdate) {
+	log = log.Named("log-failure")
+
+	name := lastFailedUpdateName(storeDir, serviceName)
+	data, err := json.MarshalIndent(fail, "", "    ")
+	if err != nil {
+		log.Error("failed to marshal json for update failure", zap.Error(err))
+		return
+	}
+
+	err = os.WriteFile(name, data, 0755)
+	if err != nil {
+		log.Error("failed to write json for update failure", zap.Error(err))
+		return
+	}
 }

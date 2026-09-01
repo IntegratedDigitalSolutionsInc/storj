@@ -1,10 +1,12 @@
-// Copyright (C) 2022 Storj Labs, Inc.
+// Copyright (C) 2025 Storj Labs, Inc.
 // See LICENSE for copying information.
 
 package bloomfilter
 
 import (
 	"context"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/spacemonkeygo/monkit/v3"
@@ -14,16 +16,9 @@ import (
 	"storj.io/common/storj"
 	"storj.io/storj/satellite/metabase/rangedloop"
 	"storj.io/storj/shared/bloomfilter"
-	"storj.io/storj/shared/nodeidmap"
 )
 
 var mon = monkit.Package()
-
-// TestingObserver provides testing methods for bloom filter generation ranged loop observers.
-type TestingObserver interface {
-	TestingRetainInfos() nodeidmap.Map[*RetainInfo]
-	TestingForceTableSize(size int)
-}
 
 // Overlay minimal set of overlay functions that are needed for the observer.
 type Overlay interface {
@@ -36,29 +31,90 @@ type RetainInfo struct {
 	Count  int
 }
 
-// Observer implements a rangedloop observer to collect bloom filters for the garbage collection.
+// MinimalRetainInfoMap is what is exposed by the observer to the upload.
+type MinimalRetainInfoMap interface {
+	IsEmpty() bool
+	Load(nodeID storj.NodeID) (info *RetainInfo, ok bool)
+	Range(f func(nodeID storj.NodeID, info *RetainInfo) bool)
+}
+
+type concurrentRetainInfo struct {
+	mu   sync.Mutex
+	info *RetainInfo
+}
+
+type concurrentRetainInfos struct {
+	m sync.Map
+}
+
+// IsEmpty implements MinimalRetainInfoMap.
+func (c *concurrentRetainInfos) IsEmpty() bool {
+	empty := true
+	c.m.Range(func(key, value interface{}) bool {
+		empty = false
+		return false
+	})
+	return empty
+}
+
+// Load implements MinimalRetainInfoMap.
+func (c *concurrentRetainInfos) Load(nodeID storj.NodeID) (info *RetainInfo, ok bool) {
+	value, ok := c.m.Load(nodeID)
+	if !ok {
+		return nil, false
+	}
+	return value.(*concurrentRetainInfo).info, true
+}
+
+// Range implements MinimalRetainInfoMap.
+func (c *concurrentRetainInfos) Range(f func(nodeID storj.NodeID, info *RetainInfo) bool) {
+	c.m.Range(func(key, value any) bool {
+		info := value.(*concurrentRetainInfo).info
+		if info == nil {
+			// We will inevitably have nil values in the map because we
+			// always add the locking information for storage nodes,
+			// even those we will not generate bloom filters for. In
+			// this case, we iterate further and ignore the nil value.
+			return true
+		}
+		return f(key.(storj.NodeID), info)
+	})
+}
+
+// Observer collects bloom filters for the garbage collection.
 //
 // architecture: Observer
 type Observer struct {
 	log     *zap.Logger
 	config  Config
-	upload  *Upload
 	overlay Overlay
+	upload  *Upload
+
+	retainInfos     *concurrentRetainInfos
+	forcedTableSize int
+
+	// publishGuard, when set, has to pass before a finished generation is
+	// published.
+	publishGuard func(ctx context.Context) error
 
 	// The following fields are reset for each loop.
 	startTime       time.Time
 	lastPieceCounts map[storj.NodeID]int64
-	retainInfos     nodeidmap.Map[*RetainInfo]
-	creationTime    time.Time
 	seed            byte
 
-	forcedTableSize int
+	inlineCount, remoteCount atomic.Uint64
+
+	// LatestCreationTime will be used to set bloom filter CreationDate.
+	mu                 sync.Mutex
+	latestCreationTime time.Time
 }
 
-var _ (rangedloop.Observer) = (*Observer)(nil)
-var _ (rangedloop.Partial) = (*observerFork)(nil)
+var (
+	_ (rangedloop.Observer) = (*Observer)(nil)
+	_ (rangedloop.Partial)  = (*Observer)(nil)
+)
 
-// NewObserver creates a new instance of the gc rangedloop observer.
+// NewObserver creates a new Observer.
 func NewObserver(log *zap.Logger, config Config, overlay Overlay) *Observer {
 	return &Observer{
 		log:     log,
@@ -68,196 +124,169 @@ func NewObserver(log *zap.Logger, config Config, overlay Overlay) *Observer {
 	}
 }
 
+// SetPublishGuard registers a check that has to pass before a finished
+// generation is published. It runs at the end of every pass, once the scan is
+// complete but before anything is uploaded, so a scan whose counts do not add
+// up leaves no generation behind: nodes would delete the live pieces such a
+// filter missed, and rerunning is cheaper than that.
+func (observer *Observer) SetPublishGuard(guard func(ctx context.Context) error) {
+	observer.publishGuard = guard
+}
+
+// ProcessedSegments returns the number of segments the current pass has seen.
+func (observer *Observer) ProcessedSegments() uint64 {
+	return observer.inlineCount.Load() + observer.remoteCount.Load()
+}
+
 // Start is called at the beginning of each segment loop.
-func (obs *Observer) Start(ctx context.Context, startTime time.Time) (err error) {
+func (observer *Observer) Start(ctx context.Context, startTime time.Time) (err error) {
 	defer mon.Task()(&ctx)(&err)
 
-	if err := obs.upload.CheckConfig(); err != nil {
+	if err := observer.upload.CheckConfig(); err != nil {
 		return err
 	}
 
-	obs.log.Debug("collecting bloom filters started")
+	observer.log.Debug("collecting bloom filters started")
 
 	// load last piece counts from overlay db
-	lastPieceCounts, err := obs.overlay.ActiveNodesPieceCounts(ctx)
+	lastPieceCounts, err := observer.overlay.ActiveNodesPieceCounts(ctx)
 	if err != nil {
-		obs.log.Error("error getting last piece counts", zap.Error(err))
+		observer.log.Error("error getting last piece counts", zap.Error(err))
 		err = nil
 	}
 	if lastPieceCounts == nil {
 		lastPieceCounts = make(map[storj.NodeID]int64)
 	}
 
-	obs.startTime = startTime
-	obs.lastPieceCounts = lastPieceCounts
-	obs.retainInfos = nodeidmap.MakeSized[*RetainInfo](len(lastPieceCounts))
-	obs.creationTime = time.Now()
-	obs.seed = bloomfilter.GenerateSeed()
+	observer.startTime = startTime
+	observer.lastPieceCounts = lastPieceCounts
+	observer.retainInfos = &concurrentRetainInfos{}
+	observer.latestCreationTime = time.Time{}
+	observer.seed = bloomfilter.GenerateSeed()
+	observer.inlineCount.Store(0)
+	observer.remoteCount.Store(0)
 	return nil
 }
 
-// Fork creates a Partial to build bloom filters over a chunk of all the segments.
-func (obs *Observer) Fork(ctx context.Context) (_ rangedloop.Partial, err error) {
-	defer mon.Task()(&ctx)(&err)
-
-	return newObserverFork(obs.log.Named("gc observer"), obs.config, obs.lastPieceCounts, obs.seed, obs.startTime, obs.forcedTableSize), nil
+// Fork returns itself as a partial.
+func (observer *Observer) Fork(context.Context) (rangedloop.Partial, error) {
+	return observer, nil
 }
 
-// Join merges the bloom filters gathered by each Partial.
-func (obs *Observer) Join(ctx context.Context, partial rangedloop.Partial) (err error) {
-	defer mon.Task()(&ctx)(&err)
-	pieceTracker, ok := partial.(*observerFork)
-	if !ok {
-		return errs.New("expected %T but got %T", pieceTracker, partial)
-	}
-
-	var failures []error
-
-	// Update the count and merge the bloom filters for each node.
-	obs.retainInfos.Add(pieceTracker.retainInfos,
-		func(old *RetainInfo, new *RetainInfo) *RetainInfo {
-			old.Count += new.Count
-			if err := old.Filter.AddFilter(new.Filter); err != nil {
-				failures = append(failures, err)
-			}
-			return old
-		})
-
-	if len(failures) > 0 {
-		return errs.Combine(failures...)
-	}
-
-	// find oldest from all latest creation time and GC observer start
-	for _, lct := range pieceTracker.latestCreationTime {
-		if lct != (time.Time{}) && lct.Before(obs.creationTime) {
-			obs.creationTime = lct
-		}
-	}
-
+// Join is a no-op.
+func (*Observer) Join(context.Context, rangedloop.Partial) error {
 	return nil
 }
 
 // Finish uploads the bloom filters.
-func (obs *Observer) Finish(ctx context.Context) (err error) {
+func (observer *Observer) Finish(ctx context.Context) (err error) {
 	defer mon.Task()(&ctx)(&err)
-	if err := obs.upload.UploadBloomFilters(ctx, obs.creationTime, obs.retainInfos); err != nil {
+
+	if observer.publishGuard != nil {
+		if err := observer.publishGuard(ctx); err != nil {
+			return err
+		}
+	}
+
+	if err := observer.upload.UploadBloomFilters(ctx, observer.latestCreationTime, observer.retainInfos); err != nil {
 		return err
 	}
-	obs.log.Debug("collecting bloom filters finished")
+
+	observer.log.Info("collecting bloom filters finished",
+		zap.Uint64("inline_segments", observer.inlineCount.Load()),
+		zap.Uint64("remote_segments", observer.remoteCount.Load()))
+
 	return nil
 }
 
 // TestingRetainInfos returns retain infos collected by observer.
-func (obs *Observer) TestingRetainInfos() nodeidmap.Map[*RetainInfo] {
-	return obs.retainInfos
+func (observer *Observer) TestingRetainInfos() MinimalRetainInfoMap {
+	return observer.retainInfos
 }
 
 // TestingForceTableSize sets a fixed size for tables. Used for testing.
-func (obs *Observer) TestingForceTableSize(size int) {
-	obs.forcedTableSize = size
-}
-
-// TestingCreationTime gets the creation time which will be used to set bloom filter CreationDate.
-func (obs *Observer) TestingCreationTime() time.Time {
-	return obs.creationTime
-}
-
-type observerFork struct {
-	log    *zap.Logger
-	config Config
-	// TODO: should we use int or int64 consistently for piece count (db type is int64)?
-	pieceCounts map[storj.NodeID]int64
-	seed        byte
-	startTime   time.Time
-
-	retainInfos nodeidmap.Map[*RetainInfo]
-	// latestCreationTime will be used to set bloom filter CreationDate.
-	// Because bloom filter service needs to be run against immutable database view
-	// we can set CreationDate using this logic:
-	// * find latest segment creation time for each source
-	// * choose the oldest one from all latest creation time and GC observer start time
-	latestCreationTime map[string]time.Time
-
-	forcedTableSize int
-}
-
-// newObserverFork instantiates a new observer fork to process different segment range.
-// The seed is passed so that it can be shared among all parallel forks.
-func newObserverFork(log *zap.Logger, config Config, pieceCounts map[storj.NodeID]int64, seed byte, startTime time.Time, forcedTableSize int) *observerFork {
-	return &observerFork{
-		log:                log,
-		config:             config,
-		pieceCounts:        pieceCounts,
-		seed:               seed,
-		startTime:          startTime,
-		forcedTableSize:    forcedTableSize,
-		retainInfos:        nodeidmap.MakeSized[*RetainInfo](len(pieceCounts)),
-		latestCreationTime: make(map[string]time.Time),
-	}
+func (observer *Observer) TestingForceTableSize(size int) {
+	observer.forcedTableSize = size
 }
 
 // Process adds pieces to the bloom filter from remote segments.
-func (fork *observerFork) Process(ctx context.Context, segments []rangedloop.Segment) error {
-	now := time.Now()
+func (observer *Observer) Process(ctx context.Context, segments []rangedloop.Segment) error {
+	var latestCreationTime time.Time
 	for _, segment := range segments {
 		if segment.Inline() {
+			observer.inlineCount.Add(1)
 			continue
 		}
 
-		if fork.config.ExcludeExpiredPieces && segment.Expired(now) {
-			continue
+		observer.remoteCount.Add(1)
+
+		// This is a sanity check to detect if we're not running against
+		// a live database.
+		if segment.CreatedAt.After(observer.startTime) {
+			observer.log.Error("segment created after loop started",
+				zap.Stringer("stream_id", segment.StreamID),
+				zap.Time("loop_started", observer.startTime),
+				zap.Time("segment_created", segment.CreatedAt))
+			return errs.New("segment created after loop started")
 		}
 
-		fork.updateLatestCreationTime(segment)
+		if latestCreationTime.Before(segment.CreatedAt) {
+			latestCreationTime = segment.CreatedAt
+		}
 
 		deriver := segment.RootPieceID.Deriver()
 		for _, piece := range segment.Pieces {
 			pieceID := deriver.Derive(piece.StorageNode, int32(piece.Number))
-			fork.add(piece.StorageNode, pieceID)
+			observer.add(piece.StorageNode, pieceID)
 		}
 	}
+
+	observer.mu.Lock()
+	if observer.latestCreationTime.Before(latestCreationTime) {
+		observer.latestCreationTime = latestCreationTime
+	}
+	observer.mu.Unlock()
+
 	return nil
 }
 
-func (fork *observerFork) updateLatestCreationTime(segment rangedloop.Segment) {
-	if lct, found := fork.latestCreationTime[segment.Source]; found {
-		if lct.Before(segment.CreatedAt) {
-			fork.latestCreationTime[segment.Source] = segment.CreatedAt
-		}
-	} else {
-		fork.latestCreationTime[segment.Source] = segment.CreatedAt
-	}
-}
-
-// add adds a pieceID to the relevant node's RetainInfo.
-func (fork *observerFork) add(nodeID storj.NodeID, pieceID storj.PieceID) {
-	info, ok := fork.retainInfos.Load(nodeID)
+// add adds a piece ID to the relevant node's RetainInfo.
+func (observer *Observer) add(nodeID storj.NodeID, pieceID storj.PieceID) {
+	v, ok := observer.retainInfos.m.Load(nodeID)
 	if !ok {
-		// If we know how many pieces a node should be storing, use that number. Otherwise use default.
-		numPieces := fork.config.InitialPieces
-		if pieceCounts, found := fork.pieceCounts[nodeID]; found {
+		v, _ = observer.retainInfos.m.LoadOrStore(nodeID, &concurrentRetainInfo{})
+	}
+	cri := v.(*concurrentRetainInfo)
+	cri.mu.Lock()
+	defer cri.mu.Unlock()
+
+	if cri.info == nil {
+		// If we know how many pieces a node should be storing, use that
+		// number. Otherwise, use default.
+		numPieces := observer.config.InitialPieces
+		if pieceCounts, found := observer.lastPieceCounts[nodeID]; found {
 			if pieceCounts > 0 {
 				numPieces = pieceCounts
 			}
 		} else {
-			// node was not in pieceCounts which means it was disqalified
-			// and we won't generate bloom filter for it
+			// Node was not in lastPieceCounts, which means it was
+			// disqualified, and we won't generate a bloom filter for
+			// it.
 			return
 		}
 
-		hashCount, tableSize := bloomfilter.OptimalParameters(numPieces, fork.config.FalsePositiveRate, fork.config.MaxBloomFilterSize)
-		// limit size of bloom filter to ensure we are under the limit for RPC
-		if fork.forcedTableSize > 0 {
-			tableSize = fork.forcedTableSize
+		hashCount, tableSize := bloomfilter.OptimalParameters(numPieces, observer.config.FalsePositiveRate, observer.config.MaxBloomFilterSize)
+		// Limit the size of the bloom filter to ensure we are under the
+		// limit for RPC.
+		if observer.forcedTableSize > 0 {
+			tableSize = observer.forcedTableSize
 		}
-
-		filter := bloomfilter.NewExplicit(fork.seed, hashCount, tableSize)
-		info = &RetainInfo{
+		filter := bloomfilter.NewExplicit(observer.seed, hashCount, tableSize)
+		cri.info = &RetainInfo{
 			Filter: filter,
 		}
-		fork.retainInfos.Store(nodeID, info)
 	}
 
-	info.Filter.Add(pieceID)
-	info.Count++
+	cri.info.Filter.Add(pieceID)
+	cri.info.Count++
 }

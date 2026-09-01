@@ -4,12 +4,12 @@
 <template>
     <div class="pa-6">
         Your encryption passphrase is ready to use.
-        Now you can upload objects into your buckets securely using an encryption passphrase only you know.
+        Now you can upload files into your buckets securely using an encryption passphrase only you know.
     </div>
 </template>
 
 <script setup lang="ts">
-import { DialogStepComponent } from '@/types/common';
+import type { DialogStepComponent } from '@/types/common';
 import { useAnalyticsStore } from '@/store/modules/analyticsStore';
 import { useBucketsStore } from '@/store/modules/bucketsStore';
 import { PassphraseOption } from '@/types/managePassphrase';

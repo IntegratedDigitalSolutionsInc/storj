@@ -7,9 +7,21 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"storj.io/storj/satellite/metabase"
 )
+
+// startCursorVersion mirrors the version resume rule of ListObjects.StartCursor:
+// all-versions listings resume the scan exactly at the client cursor version, except
+// ascending non-pending (unversioned) listings; everything else rescans the cursor key
+// from its first version.
+func startCursorVersion(opts metabase.ListObjects) metabase.Version {
+	if opts.AllVersions && (opts.Pending || !opts.VersionAscending()) {
+		return opts.Cursor.Version
+	}
+	return opts.FirstVersion()
+}
 
 func TestListObjects_startCursor(t *testing.T) {
 	// There are few behaviors that need to be mentioned multiple times:
@@ -22,250 +34,270 @@ func TestListObjects_startCursor(t *testing.T) {
 	// skip outside for non-recursive -- we started iterating from an entry
 	// that is IsPrefix=true, so we need to skip all the entries.
 
-	// empty cursor starting behaviour
-	for _, allVersions := range []bool{false, true} {
-		for _, recursive := range []bool{false, true} {
-			for _, pending := range []bool{false, true} {
-				opts := metabase.ListObjects{
-					AllVersions: allVersions,
-					Recursive:   recursive,
-					Pending:     pending,
-					Cursor:      metabase.ListObjectsCursor{},
-				}
+	t.Run("Unskippable prefix in starting cursor", func(t *testing.T) {
+		opts := metabase.ListObjects{
+			Prefix:    "a",
+			Delimiter: "\xff",
+			Cursor: metabase.ListObjectsCursor{
+				Key:     "a\xffb",
+				Version: 100,
+			},
+		}
 
-				switch {
-				case !allVersions:
-					// latest version double check, optional
+		startCursor, ok := opts.StartCursor()
+		assert.False(t, ok)
+		assert.Empty(t, startCursor)
+	})
+
+	t.Run("Empty starting cursor", func(t *testing.T) {
+		for _, allVersions := range []bool{false, true} {
+			for _, recursive := range []bool{false, true} {
+				for _, pending := range []bool{false, true} {
+					opts := metabase.ListObjects{
+						AllVersions: allVersions,
+						Recursive:   recursive,
+						Pending:     pending,
+						Cursor:      metabase.ListObjectsCursor{},
+					}
+
+					startCursor, ok := opts.StartCursor()
+					assert.True(t, ok)
+
+					// latest version double check
 					assert.Equal(t, metabase.ListObjectsCursor{
 						Key:     "",
-						Version: opts.FirstVersion(),
-					}, opts.StartCursor(), opts)
-				default:
-					assert.Equal(t, metabase.ListObjectsCursor{
-						Key:     "",
-						Version: 0,
-					}, opts.StartCursor(), opts)
+						Version: startCursorVersion(opts),
+					}, startCursor, opts)
 				}
 			}
 		}
-	}
+	})
 
-	// plain simple cursor
-	for _, allVersions := range []bool{false, true} {
-		for _, recursive := range []bool{false, true} {
-			for _, pending := range []bool{false, true} {
-				opts := metabase.ListObjects{
-					AllVersions: allVersions,
-					Recursive:   recursive,
-					Pending:     pending,
-					Cursor: metabase.ListObjectsCursor{
-						Key:     "a",
-						Version: 100,
-					},
-				}
+	t.Run("Simple cursor", func(t *testing.T) {
+		for _, allVersions := range []bool{false, true} {
+			for _, recursive := range []bool{false, true} {
+				for _, pending := range []bool{false, true} {
+					opts := metabase.ListObjects{
+						AllVersions: allVersions,
+						Recursive:   recursive,
+						Pending:     pending,
+						Cursor: metabase.ListObjectsCursor{
+							Key:     "a",
+							Version: 100,
+						},
+					}
 
-				switch {
-				case !allVersions:
+					startCursor, ok := opts.StartCursor()
+					assert.True(t, ok)
+
 					// latest version double check
 					assert.Equal(t, metabase.ListObjectsCursor{
 						Key:     "a",
-						Version: opts.FirstVersion(),
-					}, opts.StartCursor(), opts)
-
-				case allVersions:
-					assert.Equal(t, metabase.ListObjectsCursor{
-						Key:     "a",
-						Version: 100,
-					}, opts.StartCursor(), opts)
-
-				default:
-					panic("unhandled scenario")
+						Version: startCursorVersion(opts),
+					}, startCursor, opts)
 				}
 			}
 		}
-	}
+	})
 
-	// cursor with nesting
-	for _, prefix := range []metabase.ObjectKey{"", "x/", "x/x/", "/", "//"} {
-		for _, allVersions := range []bool{false, true} {
-			for _, recursive := range []bool{false, true} {
-				for _, pending := range []bool{false, true} {
-					opts := metabase.ListObjects{
-						AllVersions: allVersions,
-						Recursive:   recursive,
-						Pending:     pending,
-						Cursor: metabase.ListObjectsCursor{
-							Key:     prefix + "a/a",
-							Version: 100,
-						},
-						Prefix: prefix,
-					}
+	t.Run("Cursor with nesting", func(t *testing.T) {
+		for _, delimiter := range []metabase.ObjectKey{"/", "DELIM"} {
+			for _, prefix := range []metabase.ObjectKey{
+				"",
+				"x" + delimiter,
+				"x" + delimiter + "x" + delimiter,
+				delimiter,
+				delimiter + delimiter,
+			} {
+				nextDelimiter, ok := metabase.SkipPrefix(delimiter)
+				require.True(t, ok)
 
-					switch {
-					case recursive && allVersions:
-						assert.Equal(t, metabase.ListObjectsCursor{
-							Key:     prefix + "a/a",
-							Version: 100,
-						}, opts.StartCursor(), opts)
+				for _, allVersions := range []bool{false, true} {
+					for _, recursive := range []bool{false, true} {
+						for _, pending := range []bool{false, true} {
+							opts := metabase.ListObjects{
+								AllVersions: allVersions,
+								Recursive:   recursive,
+								Pending:     pending,
+								Cursor: metabase.ListObjectsCursor{
+									Key:     prefix + "a" + delimiter + "a",
+									Version: 100,
+								},
+								Prefix:    prefix,
+								Delimiter: delimiter,
+							}
 
-					case recursive && !allVersions:
-						// latest version double check
-						assert.Equal(t, metabase.ListObjectsCursor{
-							Key:     prefix + "a/a",
-							Version: opts.FirstVersion(),
-						}, opts.StartCursor(), opts)
+							startCursor, ok := opts.StartCursor()
+							assert.True(t, ok)
 
-					case !recursive:
-						// skip outside for non-recursive
-						assert.Equal(t, metabase.ListObjectsCursor{
-							Key:     prefix + "a" + metabase.DelimiterNext,
-							Version: opts.FirstVersion(),
-						}, opts.StartCursor(), opts)
+							switch {
+							case recursive:
+								// latest version double check
+								assert.Equal(t, metabase.ListObjectsCursor{
+									Key:     prefix + "a" + delimiter + "a",
+									Version: startCursorVersion(opts),
+								}, startCursor, opts)
 
-					default:
-						panic("unhandled scenario")
-					}
-				}
-			}
-		}
-	}
+							case !recursive:
+								// skip outside for non-recursive
+								assert.Equal(t, metabase.ListObjectsCursor{
+									Key:     prefix + "a" + nextDelimiter,
+									Version: opts.FirstVersion(),
+								}, startCursor, opts)
 
-	// cursor inside a prefix
-	for _, prefix := range []metabase.ObjectKey{"a/", "a/a/", "/", "//"} {
-		for _, allVersions := range []bool{false, true} {
-			for _, recursive := range []bool{false, true} {
-				for _, pending := range []bool{false, true} {
-					opts := metabase.ListObjects{
-						AllVersions: allVersions,
-						Recursive:   recursive,
-						Pending:     pending,
-						Cursor: metabase.ListObjectsCursor{
-							Key:     prefix + "a",
-							Version: 100,
-						},
-						Prefix: prefix,
-					}
-
-					switch {
-					case !allVersions:
-						// latest version double check
-						assert.Equal(t, metabase.ListObjectsCursor{
-							Key:     prefix + "a",
-							Version: opts.FirstVersion(),
-						}, opts.StartCursor(), opts)
-
-					case allVersions:
-						assert.Equal(t, metabase.ListObjectsCursor{
-							Key:     prefix + "a",
-							Version: 100,
-						}, opts.StartCursor(), opts)
-
-					default:
-						panic("unhandled scenario")
+							default:
+								panic("unhandled scenario")
+							}
+						}
 					}
 				}
 			}
 		}
-	}
+	})
 
-	// cursor the same as prefix
-	for _, prefix := range []metabase.ObjectKey{"a/", "a/a/", "/", "//"} {
-		for _, allVersions := range []bool{false, true} {
-			for _, recursive := range []bool{false, true} {
-				for _, pending := range []bool{false, true} {
-					opts := metabase.ListObjects{
-						AllVersions: allVersions,
-						Recursive:   recursive,
-						Pending:     pending,
-						Cursor: metabase.ListObjectsCursor{
-							Key:     prefix,
-							Version: 100,
-						},
-						Prefix: prefix,
-					}
+	t.Run("Cursor inside a prefix", func(t *testing.T) {
+		for _, delimiter := range []metabase.ObjectKey{"/", "DELIM"} {
+			for _, prefix := range []metabase.ObjectKey{
+				"a" + delimiter,
+				"a" + delimiter + "a" + delimiter,
+				delimiter,
+				delimiter + delimiter,
+			} {
+				for _, allVersions := range []bool{false, true} {
+					for _, recursive := range []bool{false, true} {
+						for _, pending := range []bool{false, true} {
+							opts := metabase.ListObjects{
+								AllVersions: allVersions,
+								Recursive:   recursive,
+								Pending:     pending,
+								Cursor: metabase.ListObjectsCursor{
+									Key:     prefix + "a",
+									Version: 100,
+								},
+								Prefix: prefix,
+							}
 
-					switch {
-					case !allVersions:
-						// latest version double check
-						assert.Equal(t, metabase.ListObjectsCursor{
-							Key:     prefix,
-							Version: opts.FirstVersion(),
-						}, opts.StartCursor(), opts)
+							startCursor, ok := opts.StartCursor()
+							assert.True(t, ok)
 
-					case allVersions:
-						assert.Equal(t, metabase.ListObjectsCursor{
-							Key:     prefix,
-							Version: 100,
-						}, opts.StartCursor(), opts)
-
-					default:
-						panic("unhandled scenario")
-					}
-				}
-			}
-		}
-	}
-
-	// cursor before the prefix
-	for _, cursor := range []metabase.ObjectKey{"", "a", "a/", "a/a", "b"} {
-		for _, allVersions := range []bool{false, true} {
-			for _, recursive := range []bool{false, true} {
-				for _, pending := range []bool{false, true} {
-					opts := metabase.ListObjects{
-						AllVersions: allVersions,
-						Recursive:   recursive,
-						Pending:     pending,
-						Cursor: metabase.ListObjectsCursor{
-							Key:     cursor,
-							Version: 100,
-						},
-						Prefix: "b/",
-					}
-
-					assert.Equal(t, metabase.ListObjectsCursor{
-						Key:     "b/",
-						Version: opts.FirstVersion(),
-					}, opts.StartCursor(), opts)
-				}
-			}
-		}
-	}
-
-	// cursor after the prefix
-	for _, cursor := range []metabase.ObjectKey{"c", "c/", "c/c"} {
-		for _, allVersions := range []bool{false, true} {
-			for _, recursive := range []bool{false, true} {
-				for _, pending := range []bool{false, true} {
-					opts := metabase.ListObjects{
-						AllVersions: allVersions,
-						Recursive:   recursive,
-						Pending:     pending,
-						Cursor: metabase.ListObjectsCursor{
-							Key:     cursor,
-							Version: 100,
-						},
-						Prefix: "b/",
-					}
-
-					switch {
-					case !allVersions:
-						// latest version double check, optional
-						assert.Equal(t, metabase.ListObjectsCursor{
-							Key:     cursor,
-							Version: opts.FirstVersion(),
-						}, opts.StartCursor(), opts)
-
-					case allVersions:
-						assert.Equal(t, metabase.ListObjectsCursor{
-							Key:     cursor,
-							Version: 100,
-						}, opts.StartCursor(), opts)
-
-					default:
-						panic("unhandled scenario")
+							// latest version double check
+							assert.Equal(t, metabase.ListObjectsCursor{
+								Key:     prefix + "a",
+								Version: startCursorVersion(opts),
+							}, startCursor, opts)
+						}
 					}
 				}
 			}
 		}
-	}
+	})
+
+	t.Run("Cursor the same as prefix", func(t *testing.T) {
+		for _, delimiter := range []metabase.ObjectKey{"/", "DELIM"} {
+			for _, prefix := range []metabase.ObjectKey{
+				"a" + delimiter,
+				"a" + delimiter + "a" + delimiter,
+				delimiter,
+				delimiter + delimiter,
+			} {
+				for _, allVersions := range []bool{false, true} {
+					for _, recursive := range []bool{false, true} {
+						for _, pending := range []bool{false, true} {
+							opts := metabase.ListObjects{
+								AllVersions: allVersions,
+								Recursive:   recursive,
+								Pending:     pending,
+								Cursor: metabase.ListObjectsCursor{
+									Key:     prefix,
+									Version: 100,
+								},
+								Prefix: prefix,
+							}
+
+							startCursor, ok := opts.StartCursor()
+							assert.True(t, ok)
+
+							// latest version double check
+							assert.Equal(t, metabase.ListObjectsCursor{
+								Key:     prefix,
+								Version: startCursorVersion(opts),
+							}, startCursor, opts)
+						}
+					}
+				}
+			}
+		}
+	})
+
+	t.Run("Cursor before the prefix", func(t *testing.T) {
+		for _, delimiter := range []metabase.ObjectKey{"/", "DELIM"} {
+			for _, cursor := range []metabase.ObjectKey{
+				"",
+				"a",
+				"a" + delimiter,
+				"a" + delimiter + "a",
+				"b",
+			} {
+				nextDelimiter, ok := metabase.SkipPrefix(delimiter)
+				require.True(t, ok)
+
+				for _, allVersions := range []bool{false, true} {
+					for _, recursive := range []bool{false, true} {
+						for _, pending := range []bool{false, true} {
+							opts := metabase.ListObjects{
+								AllVersions: allVersions,
+								Recursive:   recursive,
+								Pending:     pending,
+								Cursor: metabase.ListObjectsCursor{
+									Key:     cursor,
+									Version: 100,
+								},
+								Prefix: "b" + nextDelimiter,
+							}
+
+							startCursor, ok := opts.StartCursor()
+							assert.True(t, ok)
+
+							assert.Equal(t, metabase.ListObjectsCursor{
+								Key:     "b" + nextDelimiter,
+								Version: opts.FirstVersion(),
+							}, startCursor, opts)
+						}
+					}
+				}
+			}
+		}
+	})
+
+	t.Run("Cursor after the prefix", func(t *testing.T) {
+		for _, delimiter := range []metabase.ObjectKey{"/", "DELIM"} {
+			for _, cursor := range []metabase.ObjectKey{"c", "c" + delimiter, "c" + delimiter + "c"} {
+				for _, allVersions := range []bool{false, true} {
+					for _, recursive := range []bool{false, true} {
+						for _, pending := range []bool{false, true} {
+							opts := metabase.ListObjects{
+								AllVersions: allVersions,
+								Recursive:   recursive,
+								Pending:     pending,
+								Cursor: metabase.ListObjectsCursor{
+									Key:     cursor,
+									Version: 100,
+								},
+								Prefix: "b" + delimiter,
+							}
+
+							startCursor, ok := opts.StartCursor()
+							assert.True(t, ok)
+
+							// latest version double check
+							assert.Equal(t, metabase.ListObjectsCursor{
+								Key:     cursor,
+								Version: opts.FirstVersion(),
+							}, startCursor, opts)
+						}
+					}
+				}
+			}
+		}
+	})
 }

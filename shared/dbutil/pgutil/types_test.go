@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+	"go.uber.org/zap/zaptest"
 
 	"storj.io/common/storj"
 	"storj.io/common/testcontext"
@@ -118,7 +119,7 @@ func TestInt2Array(t *testing.T) {
 
 func TestPlacementConstraintArray(t *testing.T) {
 	withUniqueDB(t, "pgutil-types", func(ctx *testcontext.Context, t *testing.T, db *dbutil.TempDatabase) {
-		array := []storj.PlacementConstraint{storj.EveryCountry, storj.DE, storj.EU, storj.US, math.MaxUint16}
+		array := []storj.PlacementConstraint{storj.PlacementConstraint(0), storj.PlacementConstraint(4), storj.PlacementConstraint(1), storj.PlacementConstraint(3), math.MaxUint16}
 
 		// PostgreSQL (and SQL) don't have unsigned int types, but values above math.MaxInt16 should
 		// translate ok in a round trip.
@@ -143,7 +144,7 @@ func TestPlacementConstraintArray(t *testing.T) {
 // database) and runs a test callback for each type of test database available.
 func withUniqueDB(t *testing.T, namePrefix string, cb func(ctx *testcontext.Context, t *testing.T, db *dbutil.TempDatabase)) {
 	dbtest.Run(t, func(ctx *testcontext.Context, t *testing.T, connStr string) {
-		db, err := tempdb.OpenUnique(ctx, connStr, namePrefix)
+		db, err := tempdb.OpenUnique(ctx, zaptest.NewLogger(t), connStr, namePrefix)
 		if err != nil {
 			t.Fatalf("encountered error: %v", err)
 		}

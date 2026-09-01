@@ -8,7 +8,7 @@ import vuetify, { transformAssetUrls } from 'vite-plugin-vuetify';
 import { defineConfig } from 'vite';
 import { visualizer } from 'rollup-plugin-visualizer';
 import viteCompression from 'vite-plugin-compression2';
-import checker from 'vite-plugin-checker';
+import { checker } from 'vite-plugin-checker';
 
 import papaParseWorker from './vitePlugins/papaParseWorker';
 
@@ -24,8 +24,9 @@ const plugins = [
             configFile: 'src/styles/settings.scss',
         },
     }),
-    checker({ typescript: true, vueTsc: true }),
-    papaParseWorker(),
+    // The type checker holds a worker open that keeps vitest from exiting, and
+    // the tests do not need it — build and lint-ci already cover typing.
+    ...(process.env['VITEST'] ? [] : [checker({ typescript: true, vueTsc: true })]),
 ];
 
 if (process.env['STORJ_DEBUG_BUNDLE_SIZE']) {
@@ -39,29 +40,82 @@ if (process.env['STORJ_DEBUG_BUNDLE_SIZE']) {
 
 export default defineConfig(({ mode }) => {
     const isProd = mode === 'production';
+    const isSatelliteDev = mode === 'satellite-dev';
+    const isDev = !isProd && !isSatelliteDev;
 
-    // compress chunks only for production mode builds.
+    switch (mode) {
+    case 'satellite-dev':
+    case 'development':
+        process.env['NODE_ENV'] = 'development';
+        break;
+    default:
+        process.env['NODE_ENV'] = 'production';
+    }
+
+    if (isProd || isSatelliteDev) {
+        plugins.push(papaParseWorker());
+    }
     if (isProd) {
         plugins.push(viteCompression({
-            algorithm: 'brotliCompress',
+            algorithms: ['brotliCompress'],
             threshold: 1024,
             ext: '.br',
             filter: new RegExp('\\.(' + productionBrotliExtensions.join('|') + ')$'),
         }));
-    } else {
-        process.env['NODE_ENV'] = 'development';
+    }
+    if (isDev) {
+        // Provide a stub for the papa parse worker in DEV mode.
+        plugins.push({
+            name: 'papa-parse-worker-dev-stub',
+            resolveId(id) {
+                if (id === 'virtual:papa-parse-worker') {
+                    return id;
+                }
+            },
+            load(id) {
+                if (id === 'virtual:papa-parse-worker') {
+                    return 'export default null;';
+                }
+            },
+        });
     }
 
     return {
-        base: '/static/dist',
+        base: isDev ? '/' : '/static/dist',
         plugins,
         define: {
             'process.env': {},
+            // process.version and process.platform are read-only in Node.js
+            // and must not be redefined during test runs.
+            ...(!process.env['VITEST'] && {
+                'process.version': '"v20.0.0"',
+                'process.platform': '"browser"',
+            }),
+            'process.browser': 'true',
+            global: 'globalThis',
         },
+        server: {
+            port: 3000,
+            host: true,
+            proxy: {
+                '/api': {
+                    target: 'http://localhost:10000',
+                    changeOrigin: true,
+                    secure: false,
+                },
+                '/static/static': {
+                    target: 'http://localhost:10000',
+                    changeOrigin: true,
+                    secure: false,
+                },
+            },
+        },
+        publicDir: isDev ? 'static' : '',
         resolve: {
             alias: {
                 '@': resolve(__dirname, './src'),
                 'stream': 'stream-browserify', // Passphrase mnemonic generation will not work without this
+                'util': 'util/',
             },
             extensions: [
                 '.js',
@@ -76,10 +130,56 @@ export default defineConfig(({ mode }) => {
         build: {
             outDir: resolve(__dirname, 'dist'),
             emptyOutDir: true,
-            reportCompressedSize: isProd,
+            reportCompressedSize: false,
+            minChunkSize: 150*1024, // 150KB
             rollupOptions: {
                 output: {
-                    experimentalMinChunkSize: 50*1024,
+                    manualChunks: (id) => {
+                        if (id.includes('node_modules')) {
+                            if (id.includes('vuetify')) return 'vendor-ui';
+                            if (id.includes('vue') || id.includes('pinia') || id.includes('vue-router')) return 'vendor-vue';
+                            if (id.includes('lucide')) return 'vendor-icons';
+                            if (id.includes('chart.js')) return 'vendor-charts';
+                            if (id.includes('papaparse')) return 'vendor-utils';
+                            // Keep AWS SDK in vendor-misc to avoid circular deps.
+                            return 'vendor-misc';
+                        }
+
+                        // The plugin-vue export helper (_export_sfc) is used by every SFC.
+                        // Without explicit placement Rollup puts it in feature-dialogs, which
+                        // creates a cycle with components-icons (dialogs import icons, icons
+                        // import the helper from dialogs). Group it with Vue vendor code instead.
+                        if (id.includes('plugin-vue:export-helper')) {
+                            return 'vendor-vue';
+                        }
+
+                        if (id.includes('/store/')) return 'app-store';
+                        if (id.includes('/api/')) return 'app-api';
+                        if (id.includes('/composables/')) return 'app-composables';
+                        if (id.includes('/utils/')) return 'app-utils';
+
+                        if (id.includes('/dialogs/') || id.includes('Dialog.vue')) {
+                            return 'feature-dialogs';
+                        }
+                        if (id.includes('/components/common/')) {
+                            return 'components-common';
+                        }
+                        if (id.includes('/components/') && (id.includes('Icon') || id.includes('icon'))) {
+                            return 'components-icons';
+                        }
+                    },
+                    chunkFileNames: (chunkInfo) => {
+                        if (chunkInfo.name && chunkInfo.name.startsWith('vendor-')) {
+                            return 'vendors/[name]-[hash].js';
+                        }
+                        if (chunkInfo.name && chunkInfo.name.startsWith('feature-')) {
+                            return 'features/[name]-[hash].js';
+                        }
+                        if (chunkInfo.name && chunkInfo.name.startsWith('components-')) {
+                            return 'components/[name]-[hash].js';
+                        }
+                        return 'chunks/[name]-[hash].js';
+                    },
                 },
             },
             chunkSizeWarningLimit: 3000,
@@ -93,7 +193,9 @@ export default defineConfig(({ mode }) => {
             exclude: [
                 '**/node_modules/**',
                 '**/dist/**',
-                '**/tests/unit/ignore/**',
+                // wasm folder has independent testing
+                './wasm/**',
+                './tests/wasm/**',
             ],
         },
     };

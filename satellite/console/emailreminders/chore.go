@@ -5,7 +5,7 @@ package emailreminders
 
 import (
 	"context"
-	"fmt"
+	"net/url"
 	"strings"
 	"time"
 
@@ -48,11 +48,12 @@ type Chore struct {
 	address            string
 	supportURL         string
 	scheduleMeetingURL string
+	tenantID           *string
 	useBlockingSend    bool
 }
 
 // NewChore instantiates Chore.
-func NewChore(log *zap.Logger, tokens *consoleauth.Service, usersDB console.Users, mailservice *mailservice.Service, config Config, address, supportURL, scheduleMeetingURL string) *Chore {
+func NewChore(log *zap.Logger, tokens *consoleauth.Service, usersDB console.Users, mailservice *mailservice.Service, config Config, address, supportURL, scheduleMeetingURL string, tenantID *string) *Chore {
 	if !strings.HasSuffix(address, "/") {
 		address += "/"
 	}
@@ -66,6 +67,7 @@ func NewChore(log *zap.Logger, tokens *consoleauth.Service, usersDB console.User
 		address:            address,
 		supportURL:         supportURL,
 		scheduleMeetingURL: scheduleMeetingURL,
+		tenantID:           tenantID,
 		useBlockingSend:    false,
 	}
 }
@@ -107,16 +109,19 @@ func (chore *Chore) sendVerificationReminders(ctx context.Context) (err error) {
 
 	for _, u := range users {
 		token, err := chore.tokens.CreateToken(ctx, u.ID, u.Email)
-
 		if err != nil {
 			return errs.New("error generating activation token: %w", err)
 		}
-		authController := consoleapi.NewAuth(chore.log, nil, nil, nil, nil, nil, nil, "", chore.address, "", "", "", "", false, nil)
 
-		link := authController.ActivateAccountURL + "?token=" + token
+		authController := consoleapi.NewAuth(chore.log, nil, nil, nil, nil, nil, nil, nil, "", chore.address, "", "", "", "", false, false, nil, "", nil, console.SingleWhiteLabelConfig{}, console.PartnerAdminEmailMapping{}, false, "")
+
+		linkBase, err := url.JoinPath(authController.ExternalAddress, "activation")
+		if err != nil {
+			return errs.New("error sending verification reminder: %w", err)
+		}
 
 		err = chore.sendEmail(ctx, u.Email, &console.AccountActivationEmail{
-			ActivationLink: link,
+			ActivationLink: linkBase + "?token=" + token,
 			Origin:         authController.ExternalAddress,
 		})
 		if err != nil {
@@ -138,7 +143,7 @@ func (chore *Chore) sendExpirationNotifications(ctx context.Context) (err error)
 	expiring := console.TrialExpirationReminder
 
 	// get free trial users needing reminder expiration is approaching.
-	users, err := chore.usersDB.GetExpiresBeforeWithStatus(ctx, console.NoTrialNotification, now.Add(chore.config.TrialExpirationReminder))
+	users, err := chore.usersDB.GetExpiresBeforeWithStatus(ctx, console.NoTrialNotification, now.Add(chore.config.TrialExpirationReminder), chore.tenantID)
 	if err != nil {
 		chore.log.Error("error getting users in need of upcoming expiration warning", zap.Error(err))
 		return nil
@@ -146,7 +151,7 @@ func (chore *Chore) sendExpirationNotifications(ctx context.Context) (err error)
 	mon.IntVal("expiring_needing_reminder").Observe(int64(len(users)))
 
 	expirationWarning := &console.TrialExpirationReminderEmail{
-		SignInLink:          chore.address + fmt.Sprintf("login?source=%s", analytics.SourceTrialExpiringNotice),
+		SignInLink:          chore.address + "login?source=" + analytics.SourceTrialExpiringNotice,
 		Origin:              chore.address,
 		ContactInfoURL:      chore.supportURL,
 		ScheduleMeetingLink: chore.scheduleMeetingURL,
@@ -165,7 +170,7 @@ func (chore *Chore) sendExpirationNotifications(ctx context.Context) (err error)
 	expired := console.TrialExpired
 
 	// get free trial users needing notification that trial is expired
-	users, err = chore.usersDB.GetExpiresBeforeWithStatus(ctx, console.TrialExpirationReminder, now)
+	users, err = chore.usersDB.GetExpiresBeforeWithStatus(ctx, console.TrialExpirationReminder, now, chore.tenantID)
 	if err != nil {
 		chore.log.Error("error getting users in need of expiration notice", zap.Error(err))
 		return nil
@@ -173,7 +178,7 @@ func (chore *Chore) sendExpirationNotifications(ctx context.Context) (err error)
 	mon.IntVal("expired_needing_notice").Observe(int64(len(users)))
 
 	expirationNotice := &console.TrialExpiredEmail{
-		SignInLink:          chore.address + fmt.Sprintf("login?source=%s", analytics.SourceTrialExpiredNotice),
+		SignInLink:          chore.address + "login?source=" + analytics.SourceTrialExpiredNotice,
 		Origin:              chore.address,
 		ContactInfoURL:      chore.supportURL,
 		ScheduleMeetingLink: chore.scheduleMeetingURL,
@@ -194,7 +199,9 @@ func (chore *Chore) sendExpirationNotifications(ctx context.Context) (err error)
 
 // Close closes chore.
 func (chore *Chore) Close() error {
-	chore.Loop.Close()
+	if chore != nil && chore.Loop != nil {
+		chore.Loop.Close()
+	}
 	return nil
 }
 

@@ -4,7 +4,7 @@
 import { DEFAULT_PAGE_LIMIT } from '@/types/pagination';
 import { Placement } from '@/types/placements';
 import { Versioning } from '@/types/versioning';
-import { COMPLIANCE_LOCK, GOVERNANCE_LOCK, ObjLockMode } from '@/types/objectLock';
+import { type ObjLockMode, COMPLIANCE_LOCK, GOVERNANCE_LOCK, NO_MODE_SET  } from '@/types/objectLock';
 
 /**
  * Exposes all bucket-related functionality.
@@ -16,7 +16,7 @@ export interface BucketsApi {
      * @returns BucketPage
      * @throws Error
      */
-    get(projectId: string, before: Date, cursor: BucketCursor): Promise<BucketPage>;
+    get(projectId: string, since: Date, before: Date, cursor: BucketCursor): Promise<BucketPage>;
 
     /**
      * Fetch single bucket data.
@@ -42,18 +42,27 @@ export interface BucketsApi {
      * @throws Error
      */
     getAllBucketMetadata(projectId: string): Promise<BucketMetadata[]>
+
+    /**
+     * Fetch placement details
+     *
+     * @returns PlacementDetails[]
+     * @throws Error
+     */
+    getPlacementDetails(projectID: string): Promise<PlacementDetails[]>;
 }
 
 /**
  * Bucket class holds info for Bucket entity.
  */
 export class Bucket {
-    public defaultRetentionMode: ObjLockMode | 'Not set' = 'Not set';
+    public defaultRetentionMode: ObjLockMode | typeof NO_MODE_SET = NO_MODE_SET;
 
     public constructor(
         public name: string = '',
         public versioning: Versioning = Versioning.NotSupported,
         public objectLockEnabled: boolean = false,
+        public eventingEnabled: boolean = false,
         public defaultPlacement: number = 0,
         public location: string = '',
         public storage: number = 0,
@@ -65,6 +74,8 @@ export class Bucket {
         public _defaultRetentionMode: number = 0,
         public defaultRetentionDays: number | null = null,
         public defaultRetentionYears: number | null = null,
+        public createdAt: Date = new Date(),
+        public creatorEmail: string = '',
     ) {
         if (this._defaultRetentionMode) {
             this.defaultRetentionMode = this._defaultRetentionMode === 1 ? COMPLIANCE_LOCK : GOVERNANCE_LOCK;
@@ -107,5 +118,18 @@ export class BucketMetadata {
         public versioning: Versioning = Versioning.NotSupported,
         public placement: Placement = new Placement(),
         public objectLockEnabled: boolean = false,
+    ) { }
+}
+
+export class PlacementDetails {
+    public constructor(
+        public id: number = 0,
+        public idName: string = '',
+        public name: string = '',
+        public title: string = '',
+        public description: string = '',
+        public pending: boolean = false,
+        public shortName: string = '',
+        public lucideIcon: string = '',
     ) { }
 }

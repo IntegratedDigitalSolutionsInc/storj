@@ -6,56 +6,46 @@
         <more-icon />
         <div v-if="areOptionsShown" v-click-outside="closeOptions" class="options">
             <div class="options__item" @click.stop="onCopy">Copy Node ID</div>
-            <delete-node :node-id="id" @closeOptions="closeOptions" />
-            <update-name :node-id="id" @closeOptions="closeOptions" />
+            <delete-node :node-id="id" @close-options="closeOptions" />
+            <update-name :node-id="id" @close-options="closeOptions" />
         </div>
     </div>
 </template>
 
-<script lang="ts">
-import { Component, Prop, Vue } from 'vue-property-decorator';
+<script setup lang="ts">
+import { ref } from 'vue';
+
+import MoreIcon from '@/../static/images/icons/more.svg';
 
 import DeleteNode from '@/app/components/modals/DeleteNode.vue';
 import UpdateName from '@/app/components/modals/UpdateName.vue';
 
-import MoreIcon from '@/../static/images/icons/more.svg';
+const props = withDefaults(defineProps<{
+    id?: string;
+}>(), {
+    id: '',
+});
 
-// @vue/component
-@Component({
-    components: {
-        UpdateName,
-        DeleteNode,
-        MoreIcon,
-    },
-})
-export default class NodeOptions extends Vue {
-    @Prop({ default: '' })
-    public id: string;
+const areOptionsShown = ref<boolean>(false);
 
-    public areOptionsShown = false;
+function openOptions(): void {
+    areOptionsShown.value = true;
+}
 
-    public openOptions(): void {
-        this.areOptionsShown = true;
+function closeOptions(): void {
+    if (!areOptionsShown.value) return;
+
+    areOptionsShown.value = false;
+}
+
+async function onCopy(): Promise<void> {
+    try {
+        await navigator.clipboard.writeText(props.id);
+    } catch (error) {
+        console.error(error);
     }
 
-    public closeOptions(): void {
-        if (!this.areOptionsShown) { return; }
-
-        this.areOptionsShown = false;
-    }
-
-    /**
-     * Copies node id to clipboard and closes popup.
-     */
-    public async onCopy(): Promise<void> {
-        try {
-            await this.$copyText(this.id);
-        } catch (error) {
-            console.error(error);
-        }
-
-        this.closeOptions();
-    }
+    closeOptions();
 }
 </script>
 

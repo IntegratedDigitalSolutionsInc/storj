@@ -90,6 +90,7 @@ func TestAutoUpdater(t *testing.T) {
 
 	// run updater (update)
 	args := []string{"run",
+		"--standalone",
 		"--config-dir", ctx.Dir(),
 		"--version.server-address", "http://" + versionControlPeer.Addr(),
 		"--binary-location", storagenodePath,
@@ -107,17 +108,17 @@ func TestAutoUpdater(t *testing.T) {
 	if assert.NoError(t, logErr) {
 		logStr := string(logData)
 		t.Log(logStr)
-		if !assert.Contains(t, logStr, `Service restarted successfully.	{"Process": "storagenode-updater", "Service": "storagenode"}`) {
+		if !assert.Contains(t, logStr, `Service restarted successfully.	{"process": "storagenode-updater", "service": "storagenode"}`) {
 			t.Log(logStr)
 		}
-		if !assert.Contains(t, logStr, `Service restarted successfully.	{"Process": "storagenode-updater", "Service": "storagenode-updater"}`) {
+		if !assert.Contains(t, logStr, `Service restarted successfully.	{"process": "storagenode-updater", "service": "storagenode-updater"}`) {
 			t.Log(logStr)
 		}
 		// check that backup binary was deleted
-		if !assert.Contains(t, logStr, `Cleaning up old binary.	{"Process": "storagenode-updater", "Service": "storagenode-updater", "Path": "`+ctx.File("fake", "storagenode-updater.old.exe")+`"}`) {
+		if !assert.Contains(t, logStr, `Cleaning up old binary.	{"process": "storagenode-updater", "service": "storagenode-updater", "path": "`+ctx.File("fake", "storagenode-updater.old.exe")+`"}`) {
 			t.Log(logStr)
 		}
-		if !assert.Contains(t, logStr, `Cleaning up old binary.	{"Process": "storagenode-updater", "Service": "storagenode", "Path": "`+ctx.File("fake", "storagenode"+".old."+oldVersion+".exe")+`"}`) {
+		if !assert.Contains(t, logStr, `Cleaning up old binary.	{"process": "storagenode-updater", "service": "storagenode", "path": "`+ctx.File("fake", "storagenode"+".old."+oldVersion+".exe")+`"}`) {
 			t.Log(logStr)
 		}
 	} else {
@@ -152,7 +153,7 @@ func CompileWithVersion(ctx *testcontext.Context, pkg string, info version.Info)
 	ldFlagsX := map[string]string{
 		"storj.io/common/version.buildTimestamp":  strconv.Itoa(int(info.Timestamp.Unix())),
 		"storj.io/common/version.buildCommitHash": info.CommitHash,
-		"storj.io/common/version.buildVersion":    info.Version.String(),
+		"storj.io/common/version.buildVersion":    info.Version.VString(),
 		"storj.io/common/version.buildRelease":    strconv.FormatBool(info.Release),
 	}
 	return ctx.CompileWithLDFlagsX(pkg, ldFlagsX)

@@ -13,9 +13,9 @@ import (
 	"go.uber.org/zap"
 
 	"storj.io/common/testcontext"
+	"storj.io/common/testrand"
 	"storj.io/common/uuid"
 	"storj.io/storj/private/testplanet"
-	"storj.io/storj/private/teststorj"
 	"storj.io/storj/satellite"
 	"storj.io/storj/satellite/nodeevents"
 	"storj.io/storj/satellite/overlay"
@@ -56,7 +56,7 @@ func TestNodeEventsChore(t *testing.T) {
 		SatelliteCount: 1, StorageNodeCount: 2, UplinkCount: 0,
 		Reconfigure: testplanet.Reconfigure{
 			Satellite: func(log *zap.Logger, index int, config *satellite.Config) {
-				config.Overlay.SendNodeEmails = true
+				config.NodeEvents.SendNodeEmails = true
 				config.NodeEvents.SelectionWaitPeriod = 5 * time.Minute
 			},
 			StorageNode: func(index int, config *storagenode.Config) {
@@ -122,7 +122,7 @@ func TestNodeEventsChoreFailedNotify(t *testing.T) {
 		SatelliteCount: 1, StorageNodeCount: 1, UplinkCount: 0,
 		Reconfigure: testplanet.Reconfigure{
 			Satellite: func(log *zap.Logger, index int, config *satellite.Config) {
-				config.Overlay.SendNodeEmails = true
+				config.NodeEvents.SendNodeEmails = true
 				config.NodeEvents.SelectionWaitPeriod = 5 * time.Minute
 			},
 		},
@@ -161,7 +161,7 @@ func TestNodeEventsChoreInvalidEmails(t *testing.T) {
 		SatelliteCount: 1, StorageNodeCount: 0, UplinkCount: 0,
 		Reconfigure: testplanet.Reconfigure{
 			Satellite: func(log *zap.Logger, index int, config *satellite.Config) {
-				config.Overlay.SendNodeEmails = true
+				config.NodeEvents.SendNodeEmails = true
 				config.NodeEvents.SelectionWaitPeriod = 5 * time.Minute
 			},
 		},
@@ -200,7 +200,7 @@ func TestNodeEventsChoreInvalidEmails(t *testing.T) {
 
 		event := nodeevents.Disqualified
 		for _, e := range emails {
-			_, err := sat.DB.NodeEvents().Insert(ctx, e, nil, teststorj.NodeIDFromString("test"), event)
+			_, err := sat.DB.NodeEvents().Insert(ctx, e, nil, testrand.NodeID(), event)
 			require.NoError(t, err)
 		}
 

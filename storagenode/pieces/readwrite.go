@@ -140,8 +140,8 @@ func (w *Writer) Commit(ctx context.Context, pieceHeader *pb.PieceHeader) (err e
 				totalSize, sizeErr := w.blob.Size()
 				if sizeErr != nil {
 					w.log.Error("Failed to calculate piece size, cannot update the cache",
-						zap.Error(sizeErr), zap.Stringer("piece ID", pieceHeader.GetOrderLimit().PieceId),
-						zap.Stringer("satellite ID", w.satellite))
+						zap.Error(sizeErr), zap.Stringer("piece_id", pieceHeader.GetOrderLimit().PieceId),
+						zap.Stringer("satellite_id", w.satellite))
 					return
 				}
 				cache.Update(ctx, w.satellite, totalSize, w.Size(), 0)
@@ -297,7 +297,7 @@ func (r *Reader) GetPieceHeader() (*pb.PieceHeader, error) {
 func (r *Reader) Read(data []byte) (int, error) {
 	if r.formatVersion >= filestore.FormatV1 && r.pos < V1PieceHeaderReservedArea {
 		// should only be necessary once per reader. or zero times, if GetPieceHeader is used
-		if _, err := r.blob.Seek(V1PieceHeaderReservedArea, io.SeekStart); err != nil {
+		if _, err := r.Seek(0, io.SeekStart); err != nil {
 			return 0, Error.Wrap(err)
 		}
 	}

@@ -31,7 +31,7 @@
                                 <password-input-eye-icons
                                     :is-visible="isPassphraseVisible"
                                     type="passphrase"
-                                    @toggleVisibility="isPassphraseVisible = !isPassphraseVisible"
+                                    @toggle-visibility="isPassphraseVisible = !isPassphraseVisible"
                                 />
                             </template>
                         </v-text-field>
@@ -107,7 +107,7 @@ import {
 
 import { PassphraseOption } from '@/types/setupAccess';
 import { useBucketsStore } from '@/store/modules/bucketsStore';
-import { ValidationRule, IDialogFlowStep } from '@/types/common';
+import type { ValidationRule, IDialogFlowStep } from '@/types/common';
 
 import InfoTooltip from '@/components/dialogs/accessSetupSteps/InfoTooltip.vue';
 import PasswordInputEyeIcons from '@/components/PasswordInputEyeIcons.vue';

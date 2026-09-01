@@ -17,6 +17,7 @@ import (
 	migrator "storj.io/storj/cmd/tools/migrate-encryption-master-key"
 	"storj.io/storj/satellite/console"
 	"storj.io/storj/satellite/kms"
+	"storj.io/storj/satellite/satellitedb"
 	"storj.io/storj/satellite/satellitedb/satellitedbtest"
 	"storj.io/storj/shared/dbutil/tempdb"
 )
@@ -61,18 +62,21 @@ func TestMigrateEncryptionPassphrases(t *testing.T) {
 	err = newKeyKmsService.Initialize(ctx)
 	require.NoError(t, err)
 
-	for _, satelliteDB := range satellitedbtest.Databases() {
-		if satelliteDB.Name == "Spanner" {
-			t.Skip("not implemented for spanner")
-		}
+	for _, satelliteDB := range satellitedbtest.Databases(t) {
 		t.Run(satelliteDB.Name, func(t *testing.T) {
+			if satelliteDB.Name == "TiDB" {
+				t.Skip("not implemented for tidb")
+			}
+
 			schemaSuffix := satellitedbtest.SchemaSuffix()
 			schema := satellitedbtest.SchemaName(t.Name(), "category", 0, schemaSuffix)
 
-			tempDB, err := tempdb.OpenUnique(ctx, satelliteDB.MasterDB.URL, schema)
+			tempDB, err := tempdb.OpenUnique(ctx, log, satelliteDB.MasterDB.URL, schema)
 			require.NoError(t, err)
 
-			db, err := satellitedbtest.CreateMasterDBOnTopOf(ctx, log, tempDB, "migrate-public-ids")
+			db, err := satellitedbtest.CreateMasterDBOnTopOf(ctx, log, tempDB, satellitedb.Options{
+				ApplicationName: "migrate-public-ids",
+			})
 			require.NoError(t, err)
 			defer ctx.Check(db.Close)
 

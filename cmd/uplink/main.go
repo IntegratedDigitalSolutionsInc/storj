@@ -35,7 +35,7 @@ func main() {
 	}.Run(ctx, func(cmds clingy.Commands) {
 		ex.Setup(cmds) // setup ex first so that stdlib flags can consult config
 		newStdlibFlags(flag.CommandLine).Setup(cmds)
-		commands(cmds, ex)
+		Commands(cmds, ex)
 	})
 	if err != nil {
 		_, _ = fmt.Fprintf(os.Stderr, "%+v\n", err)
@@ -61,7 +61,8 @@ func withPieceHashAlgorithm(ctx context.Context) context.Context {
 	return ctx
 }
 
-func commands(cmds clingy.Commands, ex ulext.External) {
+// Commands registers Uplink CLI commands.
+func Commands(cmds clingy.Commands, ex ulext.External) {
 	cmds.Group("access", "Access related commands", func() {
 		cmds.New("create", "Create an access from the satellite UI", newCmdAccessCreate(ex))
 		cmds.New("export", "Export an access to a file", newCmdAccessExport(ex))
@@ -77,13 +78,16 @@ func commands(cmds clingy.Commands, ex ulext.External) {
 	})
 	cmds.New("setup", "Wizard for setting up uplink from satellite UI", newCmdAccessSetup(ex))
 	cmds.New("mb", "Create a new bucket", newCmdMb(ex))
-	cmds.New("rb", "Remove a bucket bucket", newCmdRb(ex))
+	cmds.New("rb", "Remove a bucket", newCmdRb(ex))
 	cmds.New("cp", "Copies files or objects into or out of storj", newCmdCp(ex))
 	cmds.New("mv", "Moves files or objects", newCmdMv(ex))
 	cmds.New("ls", "Lists buckets, prefixes, or objects", newCmdLs(ex))
 	cmds.New("rm", "Remove an object", newCmdRm(ex))
 	cmds.Group("meta", "Object metadata related commands", func() {
 		cmds.New("get", "Get an object's metadata", newCmdMetaGet(ex))
+	})
+	cmds.Group("debug", "Debug commands", func() {
+		cmds.New("decrypt-path", "decrypt encrypted path", newCmdDebugDecryptPath(ex))
 	})
 	cmds.New("share", "Shares restricted accesses to objects", newCmdShare(ex))
 	cmds.New("version", "Prints version information", newCmdVersion())

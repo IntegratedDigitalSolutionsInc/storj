@@ -26,9 +26,8 @@
             </div>
             <div v-else class="row">
                 <div
-                    v-clipboard:copy="selectedSatellite.id"
                     class="satellite-selection-toggle-container__right-area__button copy-button"
-                    @click.stop="() => {}"
+                    @click.stop="onCopy"
                 >
                     <CopyIcon />
                 </div>
@@ -46,66 +45,53 @@
     </button>
 </template>
 
-<script lang="ts">
-import { Component, Vue } from 'vue-property-decorator';
+<script setup lang="ts">
+import { computed, ref } from 'vue';
 
 import SatelliteSelectionDropdown from './SatelliteSelectionDropdown.vue';
 
-import { APPSTATE_ACTIONS } from '@/app/store/modules/appState';
 import { SatelliteInfo } from '@/storagenode/sno/sno';
-
+import { useAppStore } from '@/app/store/modules/appStore';
+import { useNodeStore } from '@/app/store/modules/nodeStore';
 import CopyIcon from '@/../static/images/Copy.svg';
 import DropdownArrowIcon from '@/../static/images/dropdownArrow.svg';
 import EyeIcon from '@/../static/images/Eye.svg';
 
-// @vue/component
-@Component({
-    components: {
-        SatelliteSelectionDropdown,
-        DropdownArrowIcon,
-        CopyIcon,
-        EyeIcon,
-    },
-})
-export default class SatelliteSelection extends Vue {
-    /**
-     * Indicates if name or id should be shown.
-     */
-    public isNameShown = true;
+const appStore = useAppStore();
+const nodeStore = useNodeStore();
 
-    /**
-     * Returns label depends on which satellite is selected.
-     */
-    public get label(): string {
-        if (!this.selectedSatellite.id) {
-            return 'All Satellites';
-        }
+const isNameShown = ref<boolean>(true);
 
-        return this.isNameShown ? this.selectedSatellite.url : this.selectedSatellite.id;
+const label = computed<string>(() => {
+    if (!selectedSatellite.value.id) {
+        return 'All Satellites';
     }
 
-    /**
-     * Toggles between name and id view.
-     */
-    public toggleSatelliteView(): void {
-        this.isNameShown = !this.isNameShown;
-    }
+    return isNameShown.value ? selectedSatellite.value.url : selectedSatellite.value.id;
+});
 
-    public toggleDropDown(): void {
-        this.$store.dispatch(APPSTATE_ACTIONS.TOGGLE_SATELLITE_SELECTION);
-    }
+const satellites = computed<SatelliteInfo[]>(() => {
+    return nodeStore.state.satellites;
+});
 
-    public get satellites(): SatelliteInfo[] {
-        return this.$store.state.node.satellites;
-    }
+const selectedSatellite = computed<SatelliteInfo>(() => {
+    return nodeStore.state.selectedSatellite;
+});
 
-    public get selectedSatellite(): SatelliteInfo {
-        return this.$store.state.node.selectedSatellite;
-    }
+const isPopupShown = computed<boolean>(() => {
+    return appStore.state.isSatelliteSelectionShown;
+});
 
-    public get isPopupShown(): boolean {
-        return this.$store.state.appStateModule.isSatelliteSelectionShown;
-    }
+function onCopy(): void {
+    navigator.clipboard.writeText(selectedSatellite.value.id);
+}
+
+function toggleSatelliteView(): void {
+    isNameShown.value = !isNameShown.value;
+}
+
+function toggleDropDown(): void {
+    appStore.toggleSatelliteSelection();
 }
 </script>
 
@@ -161,7 +147,7 @@ export default class SatelliteSelection extends Vue {
                     cursor: pointer;
                     color: #133e9c;
 
-                    .svg ::v-deep path {
+                    .svg :deep(path) {
                         fill: #133e9c !important;
                     }
                 }

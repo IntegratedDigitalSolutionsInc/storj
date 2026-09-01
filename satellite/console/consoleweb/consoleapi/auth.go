@@ -8,6 +8,7 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"math/big"
 	"net/http"
@@ -19,18 +20,23 @@ import (
 	"github.com/gorilla/mux"
 	"github.com/zeebo/errs"
 	"go.uber.org/zap"
+	"golang.org/x/exp/slices"
+	"golang.org/x/oauth2"
 
 	"storj.io/common/http/requestid"
+	"storj.io/common/memory"
 	"storj.io/common/uuid"
 	"storj.io/storj/private/post"
 	"storj.io/storj/private/web"
 	"storj.io/storj/satellite/analytics"
 	"storj.io/storj/satellite/console"
 	"storj.io/storj/satellite/console/consoleauth"
+	"storj.io/storj/satellite/console/consoleauth/csrf"
 	"storj.io/storj/satellite/console/consoleauth/sso"
 	"storj.io/storj/satellite/console/consoleweb/consoleapi/utils"
 	"storj.io/storj/satellite/console/consoleweb/consolewebauth"
 	"storj.io/storj/satellite/mailservice"
+	"storj.io/storj/satellite/tenancy"
 )
 
 var (
@@ -44,48 +50,77 @@ var (
 
 // Auth is an api controller that exposes all auth functionality.
 type Auth struct {
-	log                       *zap.Logger
-	ExternalAddress           string
-	LetUsKnowURL              string
-	TermsAndConditionsURL     string
-	ContactInfoURL            string
-	GeneralRequestURL         string
-	PasswordRecoveryURL       string
-	CancelPasswordRecoveryURL string
-	ActivateAccountURL        string
-	ActivationCodeEnabled     bool
-	SatelliteName             string
-	badPasswords              map[string]struct{}
-	service                   *console.Service
-	accountFreezeService      *console.AccountFreezeService
-	analytics                 *analytics.Service
-	mailService               *mailservice.Service
-	ssoService                *sso.Service
-	cookieAuth                *consolewebauth.CookieAuth
+	log                      *zap.Logger
+	ExternalAddress          string
+	LetUsKnowURL             string
+	TermsAndConditionsURL    string
+	ContactInfoURL           string
+	GeneralRequestURL        string
+	ActivationCodeEnabled    bool
+	MemberAccountsEnabled    bool
+	SatelliteName            string
+	badPasswords             map[string]struct{}
+	badPasswordsEncoded      string
+	validAnnouncementNames   []string
+	singleWhiteLabel         console.SingleWhiteLabelConfig
+	partnerAdminEmailMapping console.PartnerAdminEmailMapping
+
+	service              *console.Service
+	accountFreezeService *console.AccountFreezeService
+	analytics            *analytics.Service
+	mailService          *mailservice.Service
+	ssoService           *sso.Service
+	csrfService          *csrf.Service
+	cookieAuth           *consolewebauth.CookieAuth
+
+	ssoEnabled          bool
+	primaryAuthProvider string
 }
 
 // NewAuth is a constructor for api auth controller.
-func NewAuth(log *zap.Logger, service *console.Service, accountFreezeService *console.AccountFreezeService, mailService *mailservice.Service, cookieAuth *consolewebauth.CookieAuth, analytics *analytics.Service, ssoService *sso.Service, satelliteName, externalAddress, letUsKnowURL, termsAndConditionsURL, contactInfoURL, generalRequestURL string, activationCodeEnabled bool, badPasswords map[string]struct{}) *Auth {
+func NewAuth(
+	log *zap.Logger, service *console.Service, accountFreezeService *console.AccountFreezeService, mailService *mailservice.Service,
+	cookieAuth *consolewebauth.CookieAuth, analytics *analytics.Service, ssoService *sso.Service, csrfService *csrf.Service,
+	satelliteName, externalAddress, letUsKnowURL, termsAndConditionsURL, contactInfoURL, generalRequestURL string,
+	activationCodeEnabled, memberAccountsEnabled bool, badPasswords map[string]struct{}, badPasswordsEncoded string, validAnnouncementNames []string,
+	singleWhiteLabel console.SingleWhiteLabelConfig, partnerAdminEmailMapping console.PartnerAdminEmailMapping, ssoEnabled bool,
+	primarySsoProvider string,
+) *Auth {
 	return &Auth{
-		log:                       log,
-		ExternalAddress:           externalAddress,
-		LetUsKnowURL:              letUsKnowURL,
-		TermsAndConditionsURL:     termsAndConditionsURL,
-		ContactInfoURL:            contactInfoURL,
-		GeneralRequestURL:         generalRequestURL,
-		SatelliteName:             satelliteName,
-		PasswordRecoveryURL:       externalAddress + "password-recovery",
-		CancelPasswordRecoveryURL: externalAddress + "cancel-password-recovery",
-		ActivateAccountURL:        externalAddress + "activation",
-		ActivationCodeEnabled:     activationCodeEnabled,
-		service:                   service,
-		accountFreezeService:      accountFreezeService,
-		mailService:               mailService,
-		cookieAuth:                cookieAuth,
-		analytics:                 analytics,
-		badPasswords:              badPasswords,
-		ssoService:                ssoService,
+		log:                      log,
+		ExternalAddress:          externalAddress,
+		LetUsKnowURL:             letUsKnowURL,
+		TermsAndConditionsURL:    termsAndConditionsURL,
+		ContactInfoURL:           contactInfoURL,
+		GeneralRequestURL:        generalRequestURL,
+		SatelliteName:            satelliteName,
+		ActivationCodeEnabled:    activationCodeEnabled,
+		MemberAccountsEnabled:    memberAccountsEnabled,
+		singleWhiteLabel:         singleWhiteLabel,
+		service:                  service,
+		accountFreezeService:     accountFreezeService,
+		mailService:              mailService,
+		cookieAuth:               cookieAuth,
+		analytics:                analytics,
+		badPasswords:             badPasswords,
+		badPasswordsEncoded:      badPasswordsEncoded,
+		ssoService:               ssoService,
+		csrfService:              csrfService,
+		validAnnouncementNames:   validAnnouncementNames,
+		ssoEnabled:               ssoEnabled,
+		primaryAuthProvider:      primarySsoProvider,
+		partnerAdminEmailMapping: partnerAdminEmailMapping,
 	}
+}
+
+// getExternalAddress returns the external address.
+// If single white label mode is enabled with an external address, it returns that;
+// otherwise, it falls back to the global external address.
+func (a *Auth) getExternalAddress() string {
+	if a.singleWhiteLabel.Enabled() && a.singleWhiteLabel.ExternalAddress != "" {
+		return a.singleWhiteLabel.ExternalAddress
+	}
+	return a.ExternalAddress
 }
 
 // Token authenticates user by credentials and returns auth token.
@@ -101,12 +136,18 @@ func (a *Auth) Token(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if tokenRequest.Password == "" {
+		a.serveJSONError(ctx, w, console.ErrValidation.New("password is required"))
+		return
+	}
+
 	tokenRequest.UserAgent = r.UserAgent()
 	tokenRequest.IP, err = web.GetRequestIP(r)
 	if err != nil {
 		a.serveJSONError(ctx, w, err)
 		return
 	}
+	tokenRequest.AnonymousID = LoadAjsAnonymousID(r)
 
 	tokenInfo, err := a.service.Token(ctx, tokenRequest)
 	if err != nil {
@@ -139,85 +180,171 @@ func (a *Auth) AuthenticateSso(w http.ResponseWriter, r *http.Request) {
 	var err error
 	defer mon.Task()(&ctx)(&err)
 
-	ssoFailedAddr := strings.TrimSuffix(a.ExternalAddress, "/") + "/login?sso_failed=true"
+	errorPath := "/login?sso_failed=true"
 
-	provider, claims, err := a.verifySsoAuth(r)
+	provider := mux.Vars(r)["provider"]
+	isGeneralProvider := a.ssoService.IsGeneralProvider(provider)
+	if a.ssoService.IsPrimaryAuthProvider(provider) {
+		errorPath = "/auth-error"
+	}
+
+	ssoFailedAddr := strings.TrimSuffix(a.getExternalAddress(), "/") + errorPath
+
+	stateCookie, err := r.Cookie(a.cookieAuth.GetSSOStateCookieName())
 	if err != nil {
-		a.log.Error("Error verifying SSO auth", zap.Error(err))
-		http.Redirect(w, r, ssoFailedAddr, http.StatusPermanentRedirect)
+		a.log.Error("Error verifying SSO auth", zap.Error(console.ErrValidation.New("missing state cookie")))
+		http.Redirect(w, r, ssoFailedAddr, http.StatusSeeOther)
 		return
 	}
+	emailToken := ""
+	emailTokenCookie, err := r.Cookie(a.cookieAuth.GetSSOEmailTokenCookieName())
+	if err != nil {
+		if !isGeneralProvider {
+			a.log.Error("Error verifying SSO auth", zap.Error(console.ErrValidation.New("missing email token cookie")))
+			http.Redirect(w, r, ssoFailedAddr, http.StatusSeeOther)
+			return
+		}
+	} else {
+		emailToken = emailTokenCookie.Value
+	}
+
+	ssoState := r.URL.Query().Get("state")
+	if ssoState == "" {
+		a.log.Error("Error verifying SSO auth", zap.Error(console.ErrValidation.New("missing state value")))
+		http.Redirect(w, r, ssoFailedAddr, http.StatusSeeOther)
+		return
+	}
+
+	if ssoState != stateCookie.Value {
+		a.log.Error("Error verifying SSO auth", zap.Error(sso.ErrInvalidState.New("")))
+		http.Redirect(w, r, ssoFailedAddr, http.StatusSeeOther)
+		return
+	}
+
+	err = a.service.ValidateSecurityToken(ssoState)
+	if err != nil {
+		a.log.Error("Error verifying SSO auth", zap.Error(sso.ErrInvalidState.New("invalid signature")))
+		http.Redirect(w, r, ssoFailedAddr, http.StatusSeeOther)
+		return
+	}
+
+	code := r.URL.Query().Get("code")
+	if code == "" {
+		a.log.Error("Error verifying SSO auth", zap.Error(console.ErrValidation.New("missing auth code")))
+		http.Redirect(w, r, ssoFailedAddr, http.StatusSeeOther)
+		return
+	}
+
+	pkceVerifier := ""
+	nonce := ""
+	if a.ssoService.IsPrimaryAuthProvider(provider) {
+		pkceVerifierCookie, err := r.Cookie(a.cookieAuth.GetPkceVerifierCookieName())
+		if err != nil {
+			a.log.Error("Error verifying SSO auth", zap.Error(console.ErrValidation.New("missing pkce verifier cookie")))
+			http.Redirect(w, r, ssoFailedAddr, http.StatusSeeOther)
+			return
+		}
+		pkceVerifier = pkceVerifierCookie.Value
+
+		nonceCookie, err := r.Cookie(a.cookieAuth.GetSSONonceCookieName())
+		if err != nil {
+			a.log.Error("Error verifying SSO auth", zap.Error(console.ErrValidation.New("missing nonce cookie")))
+			http.Redirect(w, r, ssoFailedAddr, http.StatusSeeOther)
+			return
+		}
+		nonce = nonceCookie.Value
+	}
+
+	verifyResult, err := a.ssoService.VerifySso(ctx, provider, emailToken, code, pkceVerifier, nonce)
+	if err != nil {
+		a.log.Error("Error verifying SSO auth", zap.Error(err))
+		http.Redirect(w, r, ssoFailedAddr, http.StatusSeeOther)
+		return
+	}
+
+	a.cookieAuth.RemoveSSOCookies(w)
 
 	ip, err := web.GetRequestIP(r)
 	if err != nil {
 		a.log.Error("Error getting request IP", zap.Error(err))
-		http.Redirect(w, r, ssoFailedAddr, http.StatusPermanentRedirect)
+		http.Redirect(w, r, ssoFailedAddr, http.StatusSeeOther)
 		return
 	}
 	userAgent := r.UserAgent()
 
-	user, err := a.service.GetUserForSsoAuth(ctx, *claims, provider, ip, userAgent)
-	if err != nil {
-		a.log.Error("Error getting user for sso auth", zap.Error(err))
-		http.Redirect(w, r, ssoFailedAddr, http.StatusPermanentRedirect)
+	if isGeneralProvider && a.ssoService.GeneralLinkVerificationEnabled() {
+		// For general providers, we set external ID to the subject claim directly, without provider prefix.
+		externalID := verifyResult.Claims.Sub
+
+		existingUser, _, err := a.service.GetUserByEmailWithUnverified(ctx, verifyResult.Claims.Email)
+		if err != nil && !console.ErrEmailNotFound.Has(err) {
+			a.log.Error("Error getting user for sso link verification", zap.Error(err))
+			http.Redirect(w, r, ssoFailedAddr, http.StatusSeeOther)
+			return
+		}
+		if existingUser != nil && (existingUser.ExternalID == nil || *existingUser.ExternalID == "") {
+			linkToken, expiresAt, err := a.service.InitiateSsoLinkVerification(ctx, existingUser, externalID)
+			if err != nil {
+				a.log.Error("Error initiating sso link verification", zap.Error(err))
+				http.Redirect(w, r, ssoFailedAddr, http.StatusSeeOther)
+				return
+			}
+
+			a.cookieAuth.SetSSOLinkCookie(w, linkToken, expiresAt)
+
+			externalAddr := a.getExternalAddress()
+			linkAddr := strings.TrimSuffix(externalAddr, "/") + "/sso-link"
+			http.Redirect(w, r, linkAddr, http.StatusTemporaryRedirect)
+			return
+		}
 	}
 
-	tokenInfo, err := a.service.GenerateSessionToken(ctx, user.ID, user.Email, ip, userAgent, nil)
+	user, err := a.service.GetUserForSsoAuth(ctx, *verifyResult.Claims, provider, ip, userAgent)
+	if err != nil {
+		a.log.Error("Error getting user for sso auth", zap.Error(err))
+		http.Redirect(w, r, ssoFailedAddr, http.StatusSeeOther)
+		return
+	}
+
+	tokenInfo, err := a.service.GenerateSessionToken(ctx, console.SessionTokenRequest{
+		UserID:          user.ID,
+		TenantID:        user.TenantID,
+		Email:           user.Email,
+		IP:              ip,
+		UserAgent:       userAgent,
+		AnonymousID:     LoadAjsAnonymousID(r),
+		CustomDuration:  nil,
+		HubspotObjectID: user.HubspotObjectID,
+		IDPToken:        verifyResult.AccessToken,
+		IDPTokenExpiry:  verifyResult.AccessExpiry,
+		IDPRefreshToken: verifyResult.RefreshToken,
+	})
 	if err != nil {
 		a.log.Error("Failed to generate session token", zap.Error(err))
-		http.Redirect(w, r, ssoFailedAddr, http.StatusPermanentRedirect)
+		http.Redirect(w, r, ssoFailedAddr, http.StatusSeeOther)
 		return
 	}
 
 	a.cookieAuth.SetTokenCookie(w, *tokenInfo)
 
-	http.Redirect(w, r, a.ExternalAddress, http.StatusFound)
-}
-
-// verifySsoAuth verifies the SSO authentication.
-func (a *Auth) verifySsoAuth(r *http.Request) (provider string, _ *sso.OidcSsoClaims, err error) {
-	ctx := r.Context()
-
-	provider = mux.Vars(r)["provider"]
-	oidcSetup := a.ssoService.GetOidcSetupByProvider(provider)
-	if oidcSetup == nil {
-		return "", nil, console.ErrValidation.New("invalid provider %s", provider)
+	if !a.ssoService.IsPrimaryAuthProvider(provider) {
+		http.Redirect(w, r, a.getExternalAddress(), http.StatusSeeOther)
+		return
 	}
 
-	ssoState := r.URL.Query().Get("state")
-	if ssoState == "" {
-		return "", nil, console.ErrValidation.New("missing email hash")
-	}
-
-	oauth2Token, err := oidcSetup.Config.Exchange(ctx, r.URL.Query().Get("code"))
+	// Use a JavaScript redirect rather than HTTP 303 to break the cross-site redirect chain.
+	// When the OIDC provider redirects here (a cross-site navigation), browsers do not send
+	// SameSite=Strict cookies set in the callback response back to any immediate HTTP redirect.
+	// window.location.replace initiates a fresh same-site top-level navigation from the
+	// satellite's own origin, ensuring SameSite=Strict cookies are included.
+	externalAddr := a.getExternalAddress()
+	targetJSON, err := json.Marshal(externalAddr)
 	if err != nil {
-		return "", nil, console.ErrValidation.New("invalid code")
+		http.Redirect(w, r, externalAddr, http.StatusSeeOther)
+		return
 	}
-
-	rawIDToken, ok := oauth2Token.Extra("id_token").(string)
-	if !ok {
-		return "", nil, console.ErrValidation.New("missing id token")
-	}
-
-	idToken, err := oidcSetup.Verifier.Verify(ctx, rawIDToken)
-	if err != nil {
-		return "", nil, console.ErrUnauthorized.New("Failed to verify ID token")
-	}
-
-	var claims sso.OidcSsoClaims
-	if err = idToken.Claims(&claims); err != nil {
-		return "", nil, console.Error.New("failed to parse claims")
-	}
-
-	state, err := a.service.GetSsoStateFromEmail(claims.Email)
-	if err != nil {
-		return "", nil, console.Error.New("failed to get state")
-	}
-	if state != ssoState {
-		return "", nil, console.ErrUnauthorized.New("SSO state mismatch")
-	}
-
-	return provider, &claims, nil
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_, _ = fmt.Fprintf(w, `<!DOCTYPE html><html><body><script>window.location.replace(%s);</script></body></html>`, targetJSON)
 }
 
 // GetSsoUrl returns the SSO URL for the given provider.
@@ -231,8 +358,8 @@ func (a *Auth) GetSsoUrl(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNotFound)
 		return
 	}
-	ssoUrl, err := url.JoinPath(a.ExternalAddress, "sso", provider)
-	if provider == "" {
+	ssoUrl, err := url.JoinPath(a.getExternalAddress(), "sso", provider)
+	if err != nil {
 		a.serveJSONError(ctx, w, err)
 		return
 	}
@@ -242,40 +369,248 @@ func (a *Auth) GetSsoUrl(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// HandleSsoWebhook handles the primary auth provider's webhook events to keep satellite user records in sync.
+func (a *Auth) HandleSsoWebhook(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	var err error
+	defer mon.Task()(&ctx)(&err)
+
+	provider := mux.Vars(r)["provider"]
+
+	if !a.ssoService.IsPrimaryAuthProvider(provider) || !a.ssoService.WebhookEnabled() {
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+
+	r.Body = http.MaxBytesReader(w, r.Body, (20 * memory.KB).Int64())
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		a.log.Error("SSO webhook: failed to read request body", zap.Error(err))
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	username, password, _ := r.BasicAuth()
+	event, err := a.ssoService.ValidateAndParseWebhookData(username, password, r.Header.Get(a.ssoService.WebhookSignatureHeader()), body)
+	if err != nil {
+		switch {
+		case sso.ErrWebhookUnauthorized.Has(err):
+			a.log.Error("SSO webhook: unauthorized", zap.Error(err))
+			w.WriteHeader(http.StatusUnauthorized)
+		case sso.ErrWebhookBadRequest.Has(err):
+			a.log.Error("SSO webhook: bad request", zap.Error(err))
+			w.WriteHeader(http.StatusBadRequest)
+		default:
+			a.log.Error("SSO webhook: unexpected error", zap.Error(err))
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+		return
+	}
+
+	if event.Type == sso.WebhookEventTypeUserUpdate {
+		updatedUser := console.User{
+			ExternalID: &event.User.ID,
+			FullName:   event.User.FullName,
+			Email:      event.User.Email,
+		}
+		if err = a.service.UpdateUserFromIdPWebhook(ctx, updatedUser, event.User.Verified); err != nil {
+			if console.ErrExternalIdNotFound.Has(err) {
+				a.log.Warn("SSO webhook: user not found by external ID", zap.String("external_id", event.User.ID))
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+			a.log.Error("SSO webhook: failed to update user", zap.Error(err), zap.String("external_id", event.User.ID))
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+	}
+
+	w.WriteHeader(http.StatusOK)
+}
+
+// SsoPostLogout begins the post logout flow which starts after the primary
+// auth provider calls the configured post-logout redirect URL. This is mainly
+// relevant for logouts outside the Satellite because the Satellite already handles
+// post-logout clean up.
+// Similar to AuthenticateSso, it returns an HTML that redirects to /post-logout-confirm
+// so that we can have access to same-site cookies.
+func (a *Auth) SsoPostLogout(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	var err error
+	defer mon.Task()(&ctx)(&err)
+
+	provider := mux.Vars(r)["provider"]
+	if !a.ssoService.IsPrimaryAuthProvider(provider) {
+		http.Redirect(w, r, "/sso/"+provider, http.StatusFound)
+		return
+	}
+
+	confirmURL, err := url.JoinPath(a.getExternalAddress(), "sso", provider, "post-logout-confirm")
+	if err != nil {
+		a.log.Error("post-logout: failed to build confirmation URL", zap.Error(err))
+		http.Redirect(w, r, "/sso/"+provider, http.StatusSeeOther)
+		return
+	}
+
+	confirmURLJSON, err := json.Marshal(confirmURL)
+	if err != nil {
+		a.log.Error("post-logout: failed to marshal confirmation URL", zap.Error(err))
+		http.Redirect(w, r, "/sso/"+provider, http.StatusSeeOther)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_, _ = fmt.Fprintf(w, `<!DOCTYPE html><html><body><script>window.location.replace(%s);</script></body></html>`, confirmURLJSON)
+}
+
+// SsoPostLogoutConfirm completes the post-logout flow by deleting all user sessions.
+func (a *Auth) SsoPostLogoutConfirm(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	var err error
+	defer mon.Task()(&ctx)(&err)
+
+	provider := mux.Vars(r)["provider"]
+	if !a.ssoService.IsPrimaryAuthProvider(provider) {
+		http.Redirect(w, r, "/sso/"+provider, http.StatusFound)
+		return
+	}
+
+	sessionID, err := a.getSessionID(r)
+	if err != nil {
+		a.log.Error("post-logout confirm: failed to get session ID", zap.Error(err))
+		a.cookieAuth.RemoveTokenCookie(w)
+		http.Redirect(w, r, "/sso/"+provider, http.StatusSeeOther)
+		return
+	}
+
+	if err = a.service.LogoutAllSessions(ctx, sessionID); err != nil {
+		a.log.Error("post-logout confirm: failed to delete sessions", zap.Error(err))
+	}
+
+	a.cookieAuth.RemoveTokenCookie(w)
+	http.Redirect(w, r, "/sso/"+provider, http.StatusSeeOther)
+}
+
+// VerifySsoLink verifies an email code and completes general SSO account linking.
+func (a *Auth) VerifySsoLink(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	var err error
+	defer mon.Task()(&ctx)(&err)
+
+	var data struct {
+		Code string `json:"code"`
+	}
+	if err = json.NewDecoder(r.Body).Decode(&data); err != nil {
+		a.serveJSONError(ctx, w, err)
+		return
+	}
+	if len(data.Code) != 6 {
+		a.serveJSONError(ctx, w, console.ErrValidation.New("the verification code must be 6 characters long"))
+		return
+	}
+
+	linkCookie, err := r.Cookie(a.cookieAuth.GetSSOLinkCookieName())
+	if err != nil {
+		a.serveJSONError(ctx, w, console.ErrValidation.New("missing SSO link token"))
+		return
+	}
+
+	ip, err := web.GetRequestIP(r)
+	if err != nil {
+		a.serveJSONError(ctx, w, err)
+		return
+	}
+
+	tokenInfo, err := a.service.VerifySsoLink(ctx, linkCookie.Value, data.Code, ip, r.UserAgent(), LoadAjsAnonymousID(r))
+	if err != nil {
+		a.serveJSONError(ctx, w, err)
+		return
+	}
+
+	a.cookieAuth.RemoveSSOLinkCookie(w)
+	a.cookieAuth.SetTokenCookie(w, *tokenInfo)
+
+	w.Header().Set("Content-Type", "application/json")
+
+	if err = json.NewEncoder(w).Encode(struct {
+		console.TokenInfo
+		Token string `json:"token"`
+	}{*tokenInfo, tokenInfo.Token.String()}); err != nil {
+		a.log.Error("could not encode token response", zap.Error(ErrAuthAPI.Wrap(err)))
+	}
+}
+
 // BeginSsoFlow starts the SSO flow by redirecting to the OIDC provider.
 func (a *Auth) BeginSsoFlow(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	var err error
 	defer mon.Task()(&ctx)(&err)
 
-	ssoFailedAddr, err := url.JoinPath(a.ExternalAddress, "login?sso_failed=true")
+	provider := mux.Vars(r)["provider"]
+
+	errorPath := "login?sso_failed=true"
+	if a.ssoService.IsPrimaryAuthProvider(provider) {
+		errorPath = "auth-error"
+	}
+
+	ssoFailedAddr, err := url.JoinPath(a.getExternalAddress(), errorPath)
 	if err != nil {
 		a.log.Error("failed to get sso failed url", zap.Error(err))
-		http.Redirect(w, r, ssoFailedAddr, http.StatusPermanentRedirect)
+		http.Redirect(w, r, ssoFailedAddr, http.StatusSeeOther)
 		return
 	}
 
-	provider := mux.Vars(r)["provider"]
-	oidcSetup := a.ssoService.GetOidcSetupByProvider(provider)
+	isGeneralProvider := a.ssoService.IsGeneralProvider(provider)
+
+	oidcSetup := a.ssoService.GetOidcSetupByProvider(ctx, provider)
 	if oidcSetup == nil {
 		a.log.Error("invalid provider "+provider, zap.Error(console.ErrValidation.New("invalid provider")))
-		http.Redirect(w, r, ssoFailedAddr, http.StatusPermanentRedirect)
+		http.Redirect(w, r, ssoFailedAddr, http.StatusSeeOther)
 		return
 	}
 
 	email := r.URL.Query().Get("email")
-	if email == "" {
+	if email == "" && !isGeneralProvider {
 		a.log.Error("email is required for SSO flow", zap.Error(console.ErrValidation.New("email is required")))
-		http.Redirect(w, r, ssoFailedAddr, http.StatusPermanentRedirect)
-	}
-
-	state, err := a.service.GetSsoStateFromEmail(email)
-	if err != nil {
-		a.log.Error("failed to get sso state", zap.Error(err))
-		http.Redirect(w, r, ssoFailedAddr, http.StatusPermanentRedirect)
+		http.Redirect(w, r, ssoFailedAddr, http.StatusSeeOther)
 		return
 	}
-	http.Redirect(w, r, oidcSetup.Config.AuthCodeURL(state), http.StatusFound)
+
+	emailToken := ""
+	if email != "" {
+		emailToken, err = a.ssoService.GetSsoEmailToken(email)
+		if err != nil {
+			a.log.Error("failed to get security token", zap.Error(err))
+			http.Redirect(w, r, ssoFailedAddr, http.StatusSeeOther)
+			return
+		}
+	}
+
+	state, err := a.csrfService.GenerateSecurityToken()
+	if err != nil {
+		a.log.Error("failed to generate sso state", zap.Error(err))
+		http.Redirect(w, r, ssoFailedAddr, http.StatusSeeOther)
+		return
+	}
+
+	pkceVerifier := ""
+	nonce := ""
+	var authCodeOpts []oauth2.AuthCodeOption
+	if a.ssoService.IsPrimaryAuthProvider(provider) {
+		pkceVerifier = oauth2.GenerateVerifier()
+		authCodeOpts = append(authCodeOpts, oauth2.S256ChallengeOption(pkceVerifier))
+		nonce, err = sso.GenerateNonce()
+		if err != nil {
+			a.log.Error("failed to generate sso nonce", zap.Error(err))
+			http.Redirect(w, r, ssoFailedAddr, http.StatusSeeOther)
+			return
+		}
+		authCodeOpts = append(authCodeOpts, oauth2.SetAuthURLParam("nonce", nonce))
+	}
+
+	a.cookieAuth.SetSSOCookies(w, state, emailToken, pkceVerifier, nonce)
+
+	http.Redirect(w, r, oidcSetup.Config.AuthCodeURL(state, authCodeOpts...), http.StatusFound)
 }
 
 // TokenByAPIKey authenticates user by API key and returns auth token.
@@ -327,12 +662,12 @@ func (a *Auth) getSessionID(r *http.Request) (id uuid.UUID, err error) {
 		return uuid.UUID{}, err
 	}
 
-	sessionID, err := uuid.FromBytes(tokenInfo.Token.Payload)
+	p, err := consoleauth.ParseSessionPayload(tokenInfo.Token.Payload)
 	if err != nil {
 		return uuid.UUID{}, err
 	}
 
-	return sessionID, nil
+	return p.SessionID, nil
 }
 
 // Logout removes auth cookie.
@@ -382,6 +717,7 @@ func (a *Auth) Register(w http.ResponseWriter, r *http.Request) {
 		CaptchaResponse  string `json:"captchaResponse"`
 		SignupPromoCode  string `json:"signupPromoCode"`
 		IsMinimal        bool   `json:"isMinimal"`
+		InviterEmail     string `json:"inviterEmail"`
 	}
 
 	err = json.NewDecoder(r.Body).Decode(&registerData)
@@ -396,6 +732,11 @@ func (a *Auth) Register(w http.ResponseWriter, r *http.Request) {
 	isValidEmail := utils.ValidateEmail(registerData.Email)
 	if !isValidEmail {
 		a.serveJSONError(ctx, w, console.ErrValidation.Wrap(errs.New("Invalid email.")))
+		return
+	}
+
+	if a.MemberAccountsEnabled && registerData.InviterEmail != "" && !utils.ValidateEmail(registerData.InviterEmail) {
+		a.serveJSONError(ctx, w, console.ErrValidation.Wrap(errs.New("Invalid inviter email.")))
 		return
 	}
 
@@ -417,6 +758,56 @@ func (a *Auth) Register(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	ip, err := web.GetRequestIP(r)
+	if err != nil {
+		a.serveJSONError(ctx, w, err)
+		return
+	}
+
+	var invitation *console.ProjectInvitation
+	if a.MemberAccountsEnabled && registerData.InviterEmail != "" {
+		invitation, err = a.handleProjectInvitation(ctx, registerData.Email, registerData.InviterEmail)
+		if err != nil {
+			a.serveJSONError(ctx, w, err)
+			return
+		}
+	}
+
+	secret, err := console.RegistrationSecretFromBase64(registerData.SecretInput)
+	if err != nil {
+		a.serveJSONError(ctx, w, err)
+		return
+	}
+
+	regToken, err := a.service.CheckRegistrationSecret(ctx, secret)
+	// in the case of a closed registration satellite, project invites must
+	// succeed even if there's no registration token (as is the case for closed registration).
+	// console.ErrUnauthorized is returned when there's no registration token.
+	isClosedRegInvite := invitation != nil && console.ErrUnauthorized.Has(err)
+	if err != nil && !isClosedRegInvite {
+		a.serveJSONError(ctx, w, err)
+		return
+	}
+
+	var captchaScore *float64
+	if regToken == nil {
+		var valid bool
+		valid, captchaScore, err = a.service.VerifyRegistrationCaptcha(ctx, registerData.CaptchaResponse, ip)
+		if err != nil {
+			mon.Counter("create_user_captcha_error").Inc(1)
+			a.log.Error("captcha authorization failed", zap.Error(err))
+
+			a.serveJSONError(ctx, w, console.ErrCaptcha.Wrap(err))
+			return
+		}
+		if !valid {
+			mon.Counter("create_user_captcha_unsuccessful").Inc(1)
+
+			a.serveJSONError(ctx, w, console.ErrCaptcha.New("captcha validation unsuccessful"))
+			return
+		}
+	}
+
 	verified, unverified, err := a.service.GetUserByEmailWithUnverified(ctx, registerData.Email)
 	if err != nil && !console.ErrEmailNotFound.Has(err) {
 		a.serveJSONError(ctx, w, err)
@@ -424,7 +815,7 @@ func (a *Auth) Register(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if verified != nil {
-		satelliteAddress := a.ExternalAddress
+		satelliteAddress := a.getExternalAddress()
 		if !strings.HasSuffix(satelliteAddress, "/") {
 			satelliteAddress += "/"
 		}
@@ -444,12 +835,6 @@ func (a *Auth) Register(w http.ResponseWriter, r *http.Request) {
 
 	if registerData.Partner != "" {
 		registerData.UserAgent = []byte(registerData.Partner)
-	}
-
-	ip, err := web.GetRequestIP(r)
-	if err != nil {
-		a.serveJSONError(ctx, w, err)
-		return
 	}
 
 	var code string
@@ -478,12 +863,33 @@ func (a *Auth) Register(w http.ResponseWriter, r *http.Request) {
 		EmployeeCount:    registerData.EmployeeCount,
 		HaveSalesContact: registerData.HaveSalesContact,
 		CaptchaResponse:  registerData.CaptchaResponse,
+		CaptchaScore:     captchaScore,
 		IP:               ip,
 		SignupPromoCode:  registerData.SignupPromoCode,
 		ActivationCode:   code,
 		SignupId:         requestID,
 		// the minimal signup from the v2 app doesn't require name.
 		AllowNoName: registerData.IsMinimal,
+	}
+
+	tenantID := tenancy.TenantIDFromContext(ctx)
+	if tenantID != "" && !a.singleWhiteLabel.FreeTrialsEnabled {
+		requestData.Kind = console.PaidUser
+	}
+	// if registration token is provided and has user kind, assign it to the new user.
+	if regToken != nil && regToken.UserKind != nil {
+		requestData.Kind = *regToken.UserKind
+	}
+	if invitation != nil {
+		requestData.Kind = console.MemberUser
+	}
+
+	if requestData.Kind == console.FreeUser && a.singleWhiteLabel.Enabled() && !a.singleWhiteLabel.FreeTrialsEnabled {
+		a.serveJSONError(ctx, w, errs.New("Free user registration is not allowed in this environment"))
+		return
+	}
+	if requestData.Kind != console.FreeUser {
+		requestData.NoTrialExpiration = true
 	}
 
 	var user *console.User
@@ -499,13 +905,7 @@ func (a *Auth) Register(w http.ResponseWriter, r *http.Request) {
 		user.SignupId = requestData.SignupId
 		user.ActivationCode = requestData.ActivationCode
 	} else {
-		secret, err := console.RegistrationSecretFromBase64(registerData.SecretInput)
-		if err != nil {
-			a.serveJSONError(ctx, w, err)
-			return
-		}
-
-		user, err = a.service.CreateUser(ctx, requestData, secret)
+		user, err = a.service.CreateUser(ctx, requestData, regToken)
 		if err != nil {
 			if !console.ErrEmailUsed.Has(err) {
 				a.serveJSONError(ctx, w, err)
@@ -526,7 +926,7 @@ func (a *Auth) Register(w http.ResponseWriter, r *http.Request) {
 
 		trackCreateUserFields := analytics.TrackCreateUserFields{
 			ID:            user.ID,
-			AnonymousID:   loadSession(r),
+			AnonymousID:   LoadAjsAnonymousID(r),
 			FullName:      user.FullName,
 			Email:         user.Email,
 			Type:          analytics.Personal,
@@ -544,25 +944,48 @@ func (a *Auth) Register(w http.ResponseWriter, r *http.Request) {
 			trackCreateUserFields.JobTitle = user.Position
 			trackCreateUserFields.HaveSalesContact = user.HaveSalesContact
 		}
+		if tenantID != "" {
+			trackCreateUserFields.TenantID = &tenantID
+		}
+
 		a.analytics.TrackCreateUser(trackCreateUserFields)
 	}
 
-	invites, err := a.service.GetInvitesByEmail(ctx, registerData.Email)
-	if err != nil {
-		a.log.Error("Could not get invitations", zap.String("email", registerData.Email), zap.Error(err))
-	} else if len(invites) > 0 {
-		var firstInvite console.ProjectInvitation
-		for _, inv := range invites {
-			if inv.InviterID != nil && (firstInvite.CreatedAt.IsZero() || inv.CreatedAt.Before(firstInvite.CreatedAt)) {
-				firstInvite = inv
-			}
+	if regToken != nil && regToken.Partner != nil {
+		if adminEmail, ok := a.partnerAdminEmailMapping.Get(*regToken.Partner); ok {
+			a.mailService.SendRenderedAsync(
+				ctx,
+				[]post.Address{{Address: adminEmail}},
+				&console.NewUserNotificationEmail{
+					UserEmail: user.Email,
+					UserID:    user.ID.String(),
+					CreatedAt: user.CreatedAt.Format(time.RFC3339),
+				},
+			)
 		}
-		if firstInvite.InviterID != nil {
-			inviter, err := a.service.GetUser(ctx, *firstInvite.InviterID)
-			if err != nil {
-				a.log.Error("Error getting inviter info", zap.String("ID", firstInvite.InviterID.String()), zap.Error(err))
-			} else {
-				a.analytics.TrackInviteLinkSignup(inviter.Email, registerData.Email)
+	}
+
+	if a.MemberAccountsEnabled && invitation != nil {
+		a.service.JoinProjectNoAuth(ctx, invitation.ProjectID, user, console.RoleMember)
+		a.analytics.TrackInviteLinkSignup(invitation.Email, registerData.Email)
+	} else {
+		invites, err := a.service.GetInvitesByEmail(ctx, registerData.Email)
+		if err != nil {
+			a.log.Error("Could not get invitations", zap.String("email", registerData.Email), zap.Error(err))
+		} else if len(invites) > 0 {
+			var firstInvite console.ProjectInvitation
+			for _, inv := range invites {
+				if inv.InviterID != nil && (firstInvite.CreatedAt.IsZero() || inv.CreatedAt.Before(firstInvite.CreatedAt)) {
+					firstInvite = inv
+				}
+			}
+			if firstInvite.InviterID != nil {
+				inviter, err := a.service.GetUser(ctx, *firstInvite.InviterID)
+				if err != nil {
+					a.log.Error("Error getting inviter info", zap.String("id", firstInvite.InviterID.String()), zap.Error(err))
+				} else {
+					a.analytics.TrackInviteLinkSignup(inviter.Email, registerData.Email)
+				}
 			}
 		}
 	}
@@ -584,16 +1007,63 @@ func (a *Auth) Register(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	link := a.ActivateAccountURL + "?token=" + token
+	externalAddr := a.getExternalAddress()
+	linkBase, err := url.JoinPath(externalAddr, "activation")
+	if err != nil {
+		a.serveJSONError(ctx, w, err)
+		return
+	}
 
 	a.mailService.SendRenderedAsync(
 		ctx,
 		[]post.Address{{Address: user.Email}},
 		&console.AccountActivationEmail{
-			ActivationLink: link,
-			Origin:         a.ExternalAddress,
+			ActivationLink: linkBase + "?token=" + token,
+			Origin:         externalAddr,
 		},
 	)
+}
+
+func (a *Auth) handleProjectInvitation(ctx context.Context, userEmail, inviterEmail string) (invitation *console.ProjectInvitation, err error) {
+	invites, err := a.service.GetInvitesByEmail(ctx, userEmail)
+	if err != nil {
+		return nil, console.ErrProjectInviteInvalid.New("could not get invitations")
+	}
+	if len(invites) == 0 {
+		return nil, console.ErrProjectInviteInvalid.New("no valid invitation found")
+	}
+
+	inviter, _, err := a.service.GetUserByEmailWithUnverified(ctx, inviterEmail)
+	if err != nil {
+		return nil, console.ErrProjectInviteInvalid.New("error getting inviter info")
+	}
+	if inviter == nil {
+		return nil, console.ErrProjectInviteInvalid.New("could not find inviter")
+	}
+
+	for _, invite := range invites {
+		if invite.InviterID != nil && *invite.InviterID == inviter.ID {
+			invitation = &invite
+			break
+		}
+	}
+
+	if invitation == nil {
+		return nil, console.ErrProjectInviteInvalid.New("no valid invitation found")
+	}
+	if a.service.IsProjectInvitationExpired(invitation) {
+		return nil, console.ErrProjectInviteInvalid.New("the invitation has expired")
+	}
+
+	proj, err := a.service.GetProjectNoAuth(ctx, invitation.ProjectID)
+	if err != nil {
+		return nil, console.ErrProjectInviteInvalid.New("could not get project info")
+	}
+	if proj.Status != nil && *proj.Status == console.ProjectDisabled {
+		return nil, console.ErrProjectInviteInvalid.New("the project you were invited to no longer exists")
+	}
+
+	return invitation, nil
 }
 
 // ActivateAccount verifies a signup activation code.
@@ -625,7 +1095,7 @@ func (a *Auth) ActivateAccount(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if verified != nil {
-		satelliteAddress := a.ExternalAddress
+		satelliteAddress := a.getExternalAddress()
 		if !strings.HasSuffix(satelliteAddress, "/") {
 			satelliteAddress += "/"
 		}
@@ -682,16 +1152,16 @@ func (a *Auth) ActivateAccount(w http.ResponseWriter, r *http.Request) {
 			)
 		}
 
-		mon.Counter("account_activation_failed").Inc(1)                                          //mon:locked
-		mon.IntVal("account_activation_user_failed_count").Observe(int64(user.FailedLoginCount)) //mon:locked
+		mon.Counter("account_activation_failed").Inc(1)
+		mon.IntVal("account_activation_user_failed_count").Observe(int64(user.FailedLoginCount))
 		penaltyThreshold := a.service.GetLoginAttemptsWithoutPenalty()
 
 		if user.FailedLoginCount == penaltyThreshold {
-			mon.Counter("account_activation_lockout_initiated").Inc(1) //mon:locked
+			mon.Counter("account_activation_lockout_initiated").Inc(1)
 		}
 
 		if user.FailedLoginCount > penaltyThreshold {
-			mon.Counter("account_activation_lockout_reinitiated").Inc(1) //mon:locked
+			mon.Counter("account_activation_lockout_reinitiated").Inc(1)
 		}
 
 		a.serveJSONError(ctx, w, console.ErrActivationCode.New("invalid activation code or account locked"))
@@ -711,35 +1181,22 @@ func (a *Auth) ActivateAccount(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// see if referrer was provided in URL query, otherwise use the Referer header in the request.
-	referrer := r.URL.Query().Get("referrer")
-	if referrer == "" {
-		referrer = r.Referer()
-	}
-	hubspotUTK := ""
-	hubspotCookie, err := r.Cookie("hubspotutk")
-	if err == nil {
-		hubspotUTK = hubspotCookie.Value
-	}
-
-	trackCreateUserFields := analytics.TrackCreateUserFields{
-		ID:            user.ID,
-		Email:         user.Email,
-		OriginHeader:  r.Header.Get("Origin"),
-		Referrer:      referrer,
-		HubspotUTK:    hubspotUTK,
-		UserAgent:     string(user.UserAgent),
-		SignupCaptcha: user.SignupCaptcha,
-	}
-	a.analytics.CreateContact(trackCreateUserFields)
-
 	ip, err := web.GetRequestIP(r)
 	if err != nil {
 		a.serveJSONError(ctx, w, err)
 		return
 	}
 
-	tokenInfo, err := a.service.GenerateSessionToken(ctx, user.ID, user.Email, ip, r.UserAgent(), nil)
+	tokenInfo, err := a.service.GenerateSessionToken(ctx, console.SessionTokenRequest{
+		UserID:          user.ID,
+		TenantID:        user.TenantID,
+		Email:           user.Email,
+		IP:              ip,
+		UserAgent:       r.UserAgent(),
+		AnonymousID:     LoadAjsAnonymousID(r),
+		CustomDuration:  nil,
+		HubspotObjectID: user.HubspotObjectID,
+	})
 	if err != nil {
 		a.serveJSONError(ctx, w, err)
 		return
@@ -758,61 +1215,14 @@ func (a *Auth) ActivateAccount(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// loadSession looks for a cookie for the session id.
-// this cookie is set from the reverse proxy if the user opts into cookies from Storj.
-func loadSession(req *http.Request) string {
-	sessionCookie, err := req.Cookie("webtraf-sid")
+// LoadAjsAnonymousID looks for ajs_anonymous_id cookie.
+// this cookie is set from the website if the user opts into cookies from Storj.
+func LoadAjsAnonymousID(req *http.Request) string {
+	cookie, err := req.Cookie("ajs_anonymous_id")
 	if err != nil {
 		return ""
 	}
-	return sessionCookie.Value
-}
-
-// GetFreezeStatus checks to see if an account is frozen or warned.
-func (a *Auth) GetFreezeStatus(w http.ResponseWriter, r *http.Request) {
-	type FrozenResult struct {
-		Frozen                     bool `json:"frozen"`
-		Warned                     bool `json:"warned"`
-		ViolationFrozen            bool `json:"violationFrozen"`
-		TrialExpiredFrozen         bool `json:"trialExpiredFrozen"`
-		TrialExpirationGracePeriod int  `json:"trialExpirationGracePeriod"`
-	}
-
-	ctx := r.Context()
-	var err error
-	defer mon.Task()(&ctx)(&err)
-
-	userID, err := a.service.GetUserID(ctx)
-	if err != nil {
-		a.serveJSONError(ctx, w, err)
-		return
-	}
-
-	freezes, err := a.accountFreezeService.GetAll(ctx, userID)
-	if err != nil {
-		a.serveJSONError(ctx, w, err)
-		return
-	}
-
-	result := FrozenResult{
-		Frozen:             freezes.BillingFreeze != nil,
-		Warned:             freezes.BillingWarning != nil,
-		ViolationFrozen:    freezes.ViolationFreeze != nil,
-		TrialExpiredFrozen: freezes.TrialExpirationFreeze != nil,
-	}
-	if result.TrialExpiredFrozen {
-		days := a.accountFreezeService.GetDaysTillEscalation(*freezes.TrialExpirationFreeze, time.Now())
-		if days != nil && *days > 0 {
-			result.TrialExpirationGracePeriod = *days
-		}
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	err = json.NewEncoder(w).Encode(result)
-	if err != nil {
-		a.log.Error("could not encode account status", zap.Error(ErrAuthAPI.Wrap(err)))
-		return
-	}
+	return cookie.Value
 }
 
 // AccountActionData holds data needed to perform change email or account delete actions.
@@ -926,41 +1336,58 @@ func (a *Auth) SetupAccount(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// GetBadPasswords returns a list of encoded bad passwords.
+func (a *Auth) GetBadPasswords(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	var err error
+	defer mon.Task()(&ctx)(&err)
+
+	w.Header().Set("Cache-Control", "public, max-age=604800") // cache response for 7 days.
+	w.Header().Set("Content-Type", "text/plain")
+	w.Header().Set("Content-Disposition", "attachment; filename=\"bad-passwords.txt\"")
+
+	if _, err = w.Write([]byte(a.badPasswordsEncoded)); err != nil {
+		a.log.Error("could not write encoded bad passwords", zap.Error(ErrAuthAPI.Wrap(err)))
+	}
+}
+
 // GetAccount gets authorized user and take it's params.
 func (a *Auth) GetAccount(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	var err error
 	defer mon.Task()(&ctx)(&err)
 
-	var user struct {
-		ID                    uuid.UUID  `json:"id"`
-		ExternalID            string     `json:"externalID"`
-		FullName              string     `json:"fullName"`
-		ShortName             string     `json:"shortName"`
-		Email                 string     `json:"email"`
-		Partner               string     `json:"partner"`
-		ProjectLimit          int        `json:"projectLimit"`
-		ProjectStorageLimit   int64      `json:"projectStorageLimit"`
-		ProjectBandwidthLimit int64      `json:"projectBandwidthLimit"`
-		ProjectSegmentLimit   int64      `json:"projectSegmentLimit"`
-		IsProfessional        bool       `json:"isProfessional"`
-		Position              string     `json:"position"`
-		CompanyName           string     `json:"companyName"`
-		EmployeeCount         string     `json:"employeeCount"`
-		HaveSalesContact      bool       `json:"haveSalesContact"`
-		PaidTier              bool       `json:"paidTier"`
-		MFAEnabled            bool       `json:"isMFAEnabled"`
-		MFARecoveryCodeCount  int        `json:"mfaRecoveryCodeCount"`
-		CreatedAt             time.Time  `json:"createdAt"`
-		PendingVerification   bool       `json:"pendingVerification"`
-		TrialExpiration       *time.Time `json:"trialExpiration"`
-		HasVarPartner         bool       `json:"hasVarPartner"`
-	}
-
 	consoleUser, err := console.GetUser(ctx)
 	if err != nil {
 		a.serveJSONError(ctx, w, err)
 		return
+	}
+
+	freezes, err := a.accountFreezeService.GetAll(ctx, consoleUser.ID)
+	if err != nil {
+		a.serveJSONError(ctx, w, err)
+		return
+	}
+
+	user := console.UserAccount{
+		FreezeStatus: console.FreezeStat{
+			Frozen:             freezes.BillingFreeze != nil,
+			Warned:             freezes.BillingWarning != nil,
+			TrialExpiredFrozen: freezes.TrialExpirationFreeze != nil,
+			OptOutFrozen:       freezes.OptOutFreeze != nil,
+		},
+	}
+	if user.FreezeStatus.TrialExpiredFrozen {
+		days := a.accountFreezeService.GetDaysTillEscalation(*freezes.TrialExpirationFreeze, time.Now())
+		if days != nil && *days > 0 {
+			user.FreezeStatus.TrialExpirationGracePeriod = *days
+		}
+	}
+	if user.FreezeStatus.OptOutFrozen {
+		days := a.accountFreezeService.GetDaysTillEscalation(*freezes.OptOutFreeze, time.Now())
+		if days != nil && *days > 0 {
+			user.FreezeStatus.OptOutGracePeriod = *days
+		}
 	}
 
 	user.ShortName = consoleUser.ShortName
@@ -982,7 +1409,10 @@ func (a *Auth) GetAccount(w http.ResponseWriter, r *http.Request) {
 	user.Position = consoleUser.Position
 	user.EmployeeCount = consoleUser.EmployeeCount
 	user.HaveSalesContact = consoleUser.HaveSalesContact
-	user.PaidTier = consoleUser.PaidTier
+	user.PaidTier = consoleUser.IsPaid()
+	kindInfo := consoleUser.Kind.Info()
+	kindInfo.HasPaidPrivileges = a.service.UserHasPaidPrivileges(consoleUser)
+	user.Kind = kindInfo
 	user.MFAEnabled = consoleUser.MFAEnabled
 	user.MFARecoveryCodeCount = len(consoleUser.MFARecoveryCodes)
 	user.CreatedAt = consoleUser.CreatedAt
@@ -993,6 +1423,7 @@ func (a *Auth) GetAccount(w http.ResponseWriter, r *http.Request) {
 		a.serveJSONError(ctx, w, err)
 		return
 	}
+	user.DefaultPlacement = consoleUser.DefaultPlacement
 
 	w.Header().Set("Content-Type", "application/json")
 	err = json.NewEncoder(w).Encode(&user)
@@ -1075,11 +1506,11 @@ func (a *Auth) ForgotPassword(w http.ResponseWriter, r *http.Request) {
 
 	user, _, err := a.service.GetUserByEmailWithUnverified(ctx, forgotPassword.Email)
 	if err != nil || user == nil {
-		satelliteAddress := a.ExternalAddress
-
+		satelliteAddress := a.getExternalAddress()
 		if !strings.HasSuffix(satelliteAddress, "/") {
 			satelliteAddress += "/"
 		}
+
 		resetPasswordLink := satelliteAddress + "forgot-password"
 		doubleCheckLink := satelliteAddress + "login"
 		createAccountLink := satelliteAddress + "signup"
@@ -1099,21 +1530,22 @@ func (a *Auth) ForgotPassword(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if a.ssoService != nil && user.ExternalID != nil && *user.ExternalID != "" {
-		a.log.Info("sso user attempted 'forgot password' flow", zap.String("email", user.Email))
-		return
-	}
-
 	recoveryToken, err := a.service.GeneratePasswordRecoveryToken(ctx, user)
 	if err != nil {
 		a.serveJSONError(ctx, w, err)
 		return
 	}
 
-	passwordRecoveryLink := a.PasswordRecoveryURL + "?token=" + recoveryToken
-	cancelPasswordRecoveryLink := a.CancelPasswordRecoveryURL + "?token=" + recoveryToken
+	externalAddr := a.getExternalAddress()
+	if !strings.HasSuffix(externalAddr, "/") {
+		externalAddr += "/"
+	}
+
+	passwordRecoveryLink := externalAddr + "password-recovery?token=" + recoveryToken
+	cancelPasswordRecoveryLink := externalAddr + "cancel-password-recovery?token=" + recoveryToken
+
 	userName := user.ShortName
-	if user.ShortName == "" {
+	if userName == "" {
 		userName = user.FullName
 	}
 
@@ -1125,7 +1557,7 @@ func (a *Auth) ForgotPassword(w http.ResponseWriter, r *http.Request) {
 		ctx,
 		[]post.Address{{Address: user.Email, Name: userName}},
 		&console.ForgotPasswordEmail{
-			Origin:                     a.ExternalAddress,
+			Origin:                     externalAddr,
 			ResetLink:                  passwordRecoveryLink,
 			CancelPasswordRecoveryLink: cancelPasswordRecoveryLink,
 			LetUsKnowURL:               letUsKnowURL,
@@ -1186,13 +1618,18 @@ func (a *Auth) ResendEmail(w http.ResponseWriter, r *http.Request) {
 			userName = verified.FullName
 		}
 
+		externalAddr := a.getExternalAddress()
+		if !strings.HasSuffix(externalAddr, "/") {
+			externalAddr += "/"
+		}
+
 		a.mailService.SendRenderedAsync(
 			ctx,
 			[]post.Address{{Address: verified.Email, Name: userName}},
 			&console.ForgotPasswordEmail{
-				Origin:                     a.ExternalAddress,
-				ResetLink:                  a.PasswordRecoveryURL + "?token=" + recoveryToken,
-				CancelPasswordRecoveryLink: a.CancelPasswordRecoveryURL + "?token=" + recoveryToken,
+				Origin:                     externalAddr,
+				ResetLink:                  externalAddr + "password-recovery?token=" + recoveryToken,
+				CancelPasswordRecoveryLink: externalAddr + "cancel-password-recovery?token=" + recoveryToken,
 				LetUsKnowURL:               a.LetUsKnowURL,
 				ContactInfoURL:             a.ContactInfoURL,
 				TermsAndConditionsURL:      a.TermsAndConditionsURL,
@@ -1227,18 +1664,21 @@ func (a *Auth) ResendEmail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	link := a.ActivateAccountURL + "?token=" + token
-	contactInfoURL := a.ContactInfoURL
-	termsAndConditionsURL := a.TermsAndConditionsURL
+	externalAddr := a.getExternalAddress()
+	linkBase, err := url.JoinPath(externalAddr, "activation")
+	if err != nil {
+		a.serveJSONError(ctx, w, err)
+		return
+	}
 
 	a.mailService.SendRenderedAsync(
 		ctx,
 		[]post.Address{{Address: user.Email}},
 		&console.AccountActivationEmail{
-			Origin:                a.ExternalAddress,
-			ActivationLink:        link,
-			TermsAndConditionsURL: termsAndConditionsURL,
-			ContactInfoURL:        contactInfoURL,
+			Origin:                externalAddr,
+			ActivationLink:        linkBase + "?token=" + token,
+			TermsAndConditionsURL: a.TermsAndConditionsURL,
+			ContactInfoURL:        a.ContactInfoURL,
 		},
 	)
 }
@@ -1481,21 +1921,25 @@ func (a *Auth) RefreshSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	id, err := uuid.FromBytes(tokenInfo.Token.Payload)
+	p, err := consoleauth.ParseSessionPayload(tokenInfo.Token.Payload)
 	if err != nil {
 		a.serveJSONError(ctx, w, err)
 		return
 	}
 
-	tokenInfo.ExpiresAt, err = a.service.RefreshSession(ctx, id)
+	result, err := a.service.RefreshSession(ctx, p.SessionID, a.primaryAuthProvider, p.IDPRefreshToken)
 	if err != nil {
 		a.serveJSONError(ctx, w, err)
 		return
 	}
 
+	if result.NewToken != nil {
+		tokenInfo.Token = *result.NewToken
+	}
+	tokenInfo.ExpiresAt = result.ExpiresAt
 	a.cookieAuth.SetTokenCookie(w, tokenInfo)
 
-	err = json.NewEncoder(w).Encode(tokenInfo.ExpiresAt)
+	err = json.NewEncoder(w).Encode(result.ExpiresAt)
 	if err != nil {
 		a.log.Error("could not encode refreshed session expiration date", zap.Error(ErrAuthAPI.Wrap(err)))
 		return
@@ -1675,12 +2119,31 @@ func (a *Auth) SetUserSettings(w http.ResponseWriter, r *http.Request) {
 		OnboardingStep   *string                  `json:"onboardingStep"`
 		SessionDuration  *int64                   `json:"sessionDuration"`
 		NoticeDismissal  *console.NoticeDismissal `json:"noticeDismissal"`
+		OptInStatus      *console.OptInStatus     `json:"optInStatus"`
 	}
 
 	err = json.NewDecoder(r.Body).Decode(&updateInfo)
 	if err != nil {
 		a.serveJSONError(ctx, w, err)
 		return
+	}
+
+	if updateInfo.NoticeDismissal != nil && len(updateInfo.NoticeDismissal.Announcements) > 0 {
+		filteredAnnouncements := make(map[string]bool)
+		for announcement, dismissed := range updateInfo.NoticeDismissal.Announcements {
+			if announcement == "" {
+				// Skip storing dismissal for empty string announcements (not permanently dismissible).
+				continue
+			}
+			if !slices.Contains(a.validAnnouncementNames, announcement) {
+				a.log.Error("invalid announcement name in notice dismissal", zap.String("name", announcement))
+				continue
+			}
+
+			filteredAnnouncements[announcement] = dismissed
+		}
+
+		updateInfo.NoticeDismissal.Announcements = filteredAnnouncements
 	}
 
 	var newDuration **time.Duration
@@ -1699,6 +2162,7 @@ func (a *Auth) SetUserSettings(w http.ResponseWriter, r *http.Request) {
 		PassphrasePrompt: updateInfo.PassphrasePrompt,
 		SessionDuration:  newDuration,
 		NoticeDismissal:  updateInfo.NoticeDismissal,
+		OptInStatus:      updateInfo.OptInStatus,
 	})
 	if err != nil {
 		a.serveJSONError(ctx, w, err)
@@ -1740,13 +2204,20 @@ func (a *Auth) getStatusCode(err error) int {
 	var maxBytesError *http.MaxBytesError
 
 	switch {
-	case console.ErrValidation.Has(err), console.ErrCaptcha.Has(err), console.ErrMFAMissing.Has(err), console.ErrMFAPasscode.Has(err), console.ErrMFARecoveryCode.Has(err), console.ErrChangePassword.Has(err), console.ErrInvalidProjectLimit.Has(err):
+	case console.ErrValidation.Has(err), console.ErrCaptcha.Has(err),
+		console.ErrMFAMissing.Has(err), console.ErrMFAPasscode.Has(err),
+		console.ErrMFARecoveryCode.Has(err), console.ErrChangePassword.Has(err),
+		console.ErrInvalidProjectLimit.Has(err), sso.ErrInvalidProvider.Has(err),
+		sso.ErrInvalidCode.Has(err), sso.ErrNoIdToken.Has(err):
 		return http.StatusBadRequest
-	case console.ErrUnauthorized.Has(err), console.ErrTokenExpiration.Has(err), console.ErrRecoveryToken.Has(err), console.ErrLoginCredentials.Has(err), console.ErrActivationCode.Has(err):
+	case console.ErrUnauthorized.Has(err), console.ErrTokenExpiration.Has(err),
+		console.ErrRecoveryToken.Has(err), console.ErrLoginCredentials.Has(err),
+		console.ErrActivationCode.Has(err), sso.ErrTokenVerification.Has(err),
+		sso.ErrInvalidState.Has(err):
 		return http.StatusUnauthorized
-	case console.ErrEmailUsed.Has(err), console.ErrMFAConflict.Has(err), console.ErrMFAEnabled.Has(err):
+	case console.ErrEmailUsed.Has(err), console.ErrMFAConflict.Has(err), console.ErrMFAEnabled.Has(err), console.ErrConflict.Has(err):
 		return http.StatusConflict
-	case console.ErrLoginRestricted.Has(err), console.ErrTooManyAttempts.Has(err), console.ErrForbidden.Has(err), console.ErrSsoUserRestricted.Has(err):
+	case console.ErrLoginRestricted.Has(err), console.ErrTooManyAttempts.Has(err), console.ErrForbidden.Has(err), console.ErrSsoUserRestricted.Has(err), console.ErrProjectInviteInvalid.Has(err):
 		return http.StatusForbidden
 	case errors.Is(err, errNotImplemented):
 		return http.StatusNotImplemented
@@ -1785,11 +2256,13 @@ func (a *Auth) getUserErrorMessage(err error) string {
 		return "The MFA passcode is not valid or has expired"
 	case console.ErrMFARecoveryCode.Has(err):
 		return "The MFA recovery code is not valid or has been previously used"
-	case console.ErrLoginCredentials.Has(err):
+	case console.ErrLoginCredentials.Has(err), console.ErrSsoUserRestricted.Has(err):
 		return "Your login credentials are incorrect, please try again"
 	case console.ErrLoginRestricted.Has(err):
 		return "You can't be authenticated. Please contact support"
-	case console.ErrValidation.Has(err), console.ErrChangePassword.Has(err), console.ErrInvalidProjectLimit.Has(err), console.ErrNotPaidTier.Has(err), console.ErrTooManyAttempts.Has(err), console.ErrMFAEnabled.Has(err), console.ErrForbidden.Has(err):
+	case console.ErrValidation.Has(err), console.ErrChangePassword.Has(err), console.ErrInvalidProjectLimit.Has(err),
+		console.ErrNotPaidTier.Has(err), console.ErrTooManyAttempts.Has(err), console.ErrMFAEnabled.Has(err),
+		console.ErrForbidden.Has(err), console.ErrConflict.Has(err), console.ErrProjectInviteInvalid.Has(err):
 		return err.Error()
 	case errors.Is(err, errNotImplemented):
 		return "The server is incapable of fulfilling the request"

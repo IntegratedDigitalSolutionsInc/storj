@@ -2,15 +2,14 @@
 // See LICENSE for copying information.
 
 <template>
-    <v-container class="fill-height">
+    <v-container class="fill-height align-content-center">
         <v-row align="start" justify="center">
-            <v-col cols="12" sm="9" md="7" lg="5" xl="4" xxl="3">
+            <v-col cols="12" sm="9" md="7" lg="5" xl="5" xxl="5">
                 <v-card title="Did you forget your password?" class="pa-2 pa-sm-6">
                     <v-card-item v-if="isPasswordResetExpired">
                         <v-alert
                             variant="tonal"
                             color="error"
-                            rounded="lg"
                             density="comfortable"
                             border
                             closable
@@ -21,9 +20,11 @@
                         </v-alert>
                     </v-card-item>
                     <v-card-text>
-                        <p>Select your account satellite, enter your email address, and we will send you a password reset link.</p>
+                        <p v-if="configStore.isDefaultBrand">Select your account satellite, enter your email address, and we will send you a password reset link.</p>
+                        <p v-else>Enter your email address, we will send you a password reset link.</p>
                         <v-form v-model="formValid" class="pt-4" @submit.prevent>
                             <v-select
+                                v-if="configStore.isDefaultBrand"
                                 v-model="satellite"
                                 label="Satellite"
                                 :items="satellites"
@@ -51,6 +52,17 @@
                                 :re-captcha-compat="false"
                                 size="invisible"
                                 @verify="onCaptchaVerified"
+                                @expired="onCaptchaError"
+                                @challenge-expired="onCaptchaError"
+                                @error="onCaptchaError"
+                                @closed="onCaptchaClosed"
+                            />
+                            <TurnstileWidget
+                                v-if="captchaConfig.turnstile.enabled"
+                                ref="turnstile"
+                                :site-key="captchaConfig.turnstile.siteKey"
+                                @verify="onCaptchaVerified"
+                                @expired="onCaptchaError"
                                 @error="onCaptchaError"
                             />
                             <v-btn
@@ -66,7 +78,7 @@
                         </v-form>
                     </v-card-text>
                 </v-card>
-                <p class="pt-6 text-center text-body-2">Go back to <router-link class="link font-weight-bold" :to="ROUTES.Login.path">Login</router-link></p>
+                <p class="pt-6 text-center text-body-medium">Go back to <router-link class="link font-weight-bold" :to="ROUTES.Login.path">Login</router-link></p>
             </v-col>
         </v-row>
     </v-container>
@@ -91,12 +103,14 @@ import {
 import VueHcaptcha from '@hcaptcha/vue3-hcaptcha';
 
 import { useConfigStore } from '@/store/modules/configStore';
-import { EmailRule, RequiredRule, ValidationRule } from '@/types/common';
+import { type ValidationRule, EmailRule, RequiredRule  } from '@/types/common';
 import { useLoading } from '@/composables/useLoading';
-import { useNotify } from '@/utils/hooks';
+import { useNotify } from '@/composables/useNotify';
 import { AuthHttpApi } from '@/api/auth';
-import { MultiCaptchaConfig } from '@/types/config.gen';
+import type { MultiCaptchaConfig } from '@/types/config.gen';
 import { ROUTES } from '@/router';
+
+import TurnstileWidget from '@/components/TurnstileWidget.vue';
 
 const configStore = useConfigStore();
 
@@ -120,7 +134,15 @@ const formValid = ref<boolean>(false);
 const isPasswordResetExpired = ref<boolean>(false);
 const email = ref('');
 const captcha = ref<VueHcaptcha>();
+const turnstile = ref<InstanceType<typeof TurnstileWidget> | null>(null);
 const captchaResponseToken = ref<string>('');
+
+/**
+ * Returns the active captcha widget instance (hCaptcha or Turnstile), whichever is mounted.
+ */
+function getCaptcha(): { execute(): void; reset(): void } | null {
+    return (captcha.value ?? turnstile.value) as { execute(): void; reset(): void } | null;
+}
 
 /**
  * This component's captcha configuration.
@@ -162,8 +184,9 @@ const satellites = computed(() => {
  * Sends recovery password email.
  */
 async function onPasswordReset(): Promise<void> {
-    if (captcha.value && !captchaResponseToken.value) {
-        captcha.value.execute();
+    const captchaWidget = getCaptcha();
+    if (captchaWidget && !captchaResponseToken.value) {
+        captchaWidget.execute();
         return;
     }
 
@@ -176,7 +199,7 @@ async function onPasswordReset(): Promise<void> {
             notify.notifyError(error);
         }
     });
-    captcha.value?.reset();
+    getCaptcha()?.reset();
     captchaResponseToken.value = '';
 }
 
@@ -192,8 +215,18 @@ function onCaptchaVerified(response: string): void {
  * Handles captcha error.
  */
 function onCaptchaError(): void {
+    getCaptcha()?.reset();
     captchaResponseToken.value = '';
-    notify.error('The captcha encountered an error. Please try again.', null);
+    notify.error('Captcha verification failed. If you are using a VPN, try disabling it.', null);
+}
+
+/**
+ * Handles the captcha challenge being closed without completion.
+ */
+function onCaptchaClosed(): void {
+    if (captchaResponseToken.value) return;
+    getCaptcha()?.reset();
+    isLoading.value = false;
 }
 
 onMounted(() => {

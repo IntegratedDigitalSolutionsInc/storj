@@ -41,7 +41,7 @@ func OpenUnique(ctx context.Context, connStr string, schemaPrefix string) (db *d
 
 	schemaName := schemaPrefix + "-" + CreateRandomTestingSchemaName(8)
 
-	masterDB, err := tagsql.Open(ctx, "cockroach", connStr)
+	masterDB, err := tagsql.Open(ctx, "cockroach", connStr, nil)
 	if err != nil {
 		return nil, errs.Wrap(err)
 	}
@@ -54,7 +54,7 @@ func OpenUnique(ctx context.Context, connStr string, schemaPrefix string) (db *d
 		return nil, errs.New("Could not open masterDB at conn %q: %w", connStr, err)
 	}
 
-	_, err = masterDB.Exec(ctx, "CREATE DATABASE "+pgutil.QuoteIdentifier(schemaName))
+	_, err = masterDB.ExecContext(ctx, "CREATE DATABASE "+pgutil.QuoteIdentifier(schemaName))
 	if err != nil {
 		return nil, errs.Wrap(err)
 	}
@@ -69,7 +69,7 @@ func OpenUnique(ctx context.Context, connStr string, schemaPrefix string) (db *d
 		// It's better to ignore the DROP than to prevent tests
 		// from failing and causing wasted time.
 		err := asyncTimeout(ctx, 15*time.Second, func(ctx context.Context) error {
-			_, err := cleanupDB.Exec(ctx, "DROP DATABASE "+pgutil.QuoteIdentifier(schemaName))
+			_, err := cleanupDB.ExecContext(ctx, "DROP DATABASE "+pgutil.QuoteIdentifier(schemaName))
 			return err
 		})
 
@@ -86,7 +86,7 @@ func OpenUnique(ctx context.Context, connStr string, schemaPrefix string) (db *d
 		return nil, errs.Combine(err, cleanup(masterDB))
 	}
 
-	sqlDB, err := tagsql.Open(ctx, "cockroach", modifiedConnStr)
+	sqlDB, err := tagsql.Open(ctx, "cockroach", modifiedConnStr, nil)
 	if err != nil {
 		return nil, errs.Combine(errs.Wrap(err), cleanup(masterDB))
 	}

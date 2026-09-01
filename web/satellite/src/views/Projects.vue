@@ -3,18 +3,19 @@
 
 <template>
     <v-container>
+        <announcement-banner />
+
+        <opt-in-pricing-banner />
+
         <trial-expiration-banner v-if="isTrialExpirationBanner" :expired="isExpired" />
 
         <card-expire-banner />
 
-        <low-token-balance-banner
-            v-if="!isLoading && isLowBalance && billingEnabled"
-            cta-label="Go to billing"
-            @click="redirectToBilling"
-        />
+        <failed-payment-banner />
+
         <PageTitleComponent title="All Projects" />
 
-        <v-row class="mt-0">
+        <v-row class="my-3">
             <v-col>
                 <v-btn
                     class="mr-3"
@@ -35,12 +36,11 @@
                         mandatory
                         border
                         inset
-                        density="comfortable"
+                        rounded="lg"
                         class="pa-1 bg-surface"
                     >
                         <v-btn
-                            size="small"
-                            rounded="xl"
+                            rounded="md"
                             active-class="active"
                             :active="!isTableView"
                             aria-label="Toggle Cards View"
@@ -52,35 +52,46 @@
                             Cards
                         </v-btn>
                         <v-btn
-                            size="small"
-                            rounded="xl"
+                            rounded="md"
                             active-class="active"
                             :active="isTableView"
                             aria-label="Toggle Table View"
                             @click="isTableView = true"
                         >
                             <template #prepend>
-                                <component :is="List" :size="15" />
+                                <component :is="Table" :size="15" />
                             </template>
-                            List
+                            Table
                         </v-btn>
                     </v-btn-toggle>
                 </v-col>
             </template>
         </v-row>
 
-        <v-row v-if="isTableView">
+        <v-row v-if="isTableView" class="mt-1">
             <v-col>
-                <ProjectsTableComponent :items="items" @join-click="onJoinClicked" @invite-click="(item) => onInviteClicked(item)" />
+                <ProjectsTableComponent
+                    :items="items"
+                    @join-click="onJoinClicked"
+                    @edit-click="editClick"
+                    @update-limits-click="updateLimitsClick"
+                    @invite-click="(item) => onInviteClicked(item)"
+                />
             </v-col>
         </v-row>
 
         <v-row v-else>
             <v-col v-if="!items.length" cols="12" sm="6" md="4" lg="3">
-                <ProjectCard class="h-100" @create-click="newProjectClicked" />
+                <ProjectCard @create-click="newProjectClicked" />
             </v-col>
             <v-col v-for="item in items" v-else :key="item.id" cols="12" sm="6" md="4" lg="3">
-                <ProjectCard :item="item" class="h-100" @join-click="onJoinClicked(item)" @invite-click="onInviteClicked(item)" />
+                <ProjectCard
+                    :item="item"
+                    @join-click="onJoinClicked(item)"
+                    @invite-click="onInviteClicked(item)"
+                    @edit-click="(field) => editClick(item, field)"
+                    @update-limits-click="(limit) => updateLimitsClick(item, limit)"
+                />
             </v-col>
         </v-row>
     </v-container>
@@ -93,10 +104,13 @@
     />
     <create-project-dialog v-model="isCreateProjectDialogShown" />
     <add-team-member-dialog v-model="isAddMemberDialogShown" :project-id="addMemberProjectId" />
+    <edit-project-details-dialog v-model="isEditProjectDialogShown" :field="fieldToEdit" />
+    <edit-project-limit-dialog v-model="isUpdateLimitsDialogShown" :limit-type="limitToChange" />
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue';
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue';
+import { useRoute, useRouter } from 'vue-router';
 import {
     VContainer,
     VRow,
@@ -105,23 +119,19 @@ import {
     VSpacer,
     VBtnToggle,
 } from 'vuetify/components';
-import { useRouter } from 'vue-router';
-import { CirclePlus, Grid2X2, List } from 'lucide-vue-next';
+import { CirclePlus, Grid2X2, Table } from '@lucide/vue';
 
-import { ProjectItemModel } from '@/types/projects';
+import { FieldToChange, LimitToChange, ProjectItemModel } from '@/types/projects';
 import { useProjectsStore } from '@/store/modules/projectsStore';
 import { useUsersStore } from '@/store/modules/usersStore';
 import { ProjectRole } from '@/types/projectMembers';
 import { useAppStore } from '@/store/modules/appStore';
-import { useLowTokenBalance } from '@/composables/useLowTokenBalance';
 import { useConfigStore } from '@/store/modules/configStore';
 import { useBillingStore } from '@/store/modules/billingStore';
-import { ROUTES } from '@/router';
-import { AnalyticsEvent } from '@/utils/constants/analyticsEventNames';
+import { AnalyticsErrorEventSource, AnalyticsEvent } from '@/utils/constants/analyticsEventNames';
 import { useAnalyticsStore } from '@/store/modules/analyticsStore';
-import { Dimensions, Size } from '@/utils/bytesSize';
 import { usePreCheck } from '@/composables/usePreCheck';
-import { AccountBalance, CreditCard } from '@/types/payments';
+import { useNotify } from '@/composables/useNotify';
 
 import ProjectCard from '@/components/ProjectCard.vue';
 import PageTitleComponent from '@/components/PageTitleComponent.vue';
@@ -129,9 +139,13 @@ import ProjectsTableComponent from '@/components/ProjectsTableComponent.vue';
 import JoinProjectDialog from '@/components/dialogs/JoinProjectDialog.vue';
 import CreateProjectDialog from '@/components/dialogs/CreateProjectDialog.vue';
 import AddTeamMemberDialog from '@/components/dialogs/AddTeamMemberDialog.vue';
-import LowTokenBalanceBanner from '@/components/LowTokenBalanceBanner.vue';
 import TrialExpirationBanner from '@/components/TrialExpirationBanner.vue';
 import CardExpireBanner from '@/components/CardExpireBanner.vue';
+import FailedPaymentBanner from '@/components/FailedPaymentBanner.vue';
+import EditProjectDetailsDialog from '@/components/dialogs/EditProjectDetailsDialog.vue';
+import EditProjectLimitDialog from '@/components/dialogs/EditProjectLimitDialog.vue';
+import AnnouncementBanner from '@/components/AnnouncementBanner.vue';
+import OptInPricingBanner from '@/components/OptInPricingBanner.vue';
 
 const analyticsStore = useAnalyticsStore();
 const appStore = useAppStore();
@@ -140,8 +154,9 @@ const usersStore = useUsersStore();
 const configStore = useConfigStore();
 const billingStore = useBillingStore();
 
+const route = useRoute();
 const router = useRouter();
-const isLowBalance = useLowTokenBalance();
+const notify = useNotify();
 const { isTrialExpirationBanner, isExpired, withTrialCheck } = usePreCheck();
 
 const joiningItem = ref<ProjectItemModel | null>(null);
@@ -149,12 +164,18 @@ const isJoinProjectDialogShown = ref<boolean>(false);
 const isCreateProjectDialogShown = ref<boolean>(false);
 const addMemberProjectId = ref<string>('');
 const isAddMemberDialogShown = ref<boolean>(false);
+const limitToChange = ref(LimitToChange.Storage);
+const fieldToEdit = ref(FieldToChange.Name);
+const isEditProjectDialogShown = ref(false);
+const isUpdateLimitsDialogShown = ref(false);
 const isLoading = ref<boolean>(true);
 
 /**
  * Indicates if billing features are enabled.
  */
-const billingEnabled = computed<boolean>(() => configStore.getBillingEnabled(usersStore.state.user.hasVarPartner));
+const billingEnabled = computed<boolean>(() => configStore.getBillingEnabled(usersStore.state.user));
+
+const isMemberAccount = computed<boolean>(() => usersStore.state.user.isMember);
 
 /**
  * Returns whether to use the table view.
@@ -190,8 +211,10 @@ const items = computed((): ProjectItemModel[] => {
         project.ownerId === usersStore.state.user.id ? ProjectRole.Owner : ProjectRole.Member,
         project.memberCount,
         new Date(project.createdAt),
-        formattedValue(new Size(project.storageUsed, 2)),
-        formattedValue(new Size(project.bandwidthUsed, 2)),
+        project.storageUsed,
+        project.bandwidthUsed,
+        project.encryption,
+        project.isClassic,
     )).sort((projA, projB) => {
         if (projA.role === ProjectRole.Owner && projB.role === ProjectRole.Member) return -1;
         if (projA.role === ProjectRole.Member && projB.role === ProjectRole.Owner) return 1;
@@ -206,13 +229,6 @@ function newProjectClicked() {
         analyticsStore.eventTriggered(AnalyticsEvent.NEW_PROJECT_CLICKED);
         isCreateProjectDialogShown.value = true;
     }, true);
-}
-
-/**
- * Redirects to Billing Page tab.
- */
-function redirectToBilling(): void {
-    router.push({ name: ROUTES.Billing.name });
 }
 
 /**
@@ -233,28 +249,46 @@ function onInviteClicked(item: ProjectItemModel): void {
     }, true);
 }
 
-/**
- * Formats value to needed form and returns it.
- */
-function formattedValue(value: Size): string {
-    switch (value.label) {
-    case Dimensions.Bytes:
-        return '0';
-    default:
-        return `${value.formattedBytes.replace(/\.0+$/, '')}${value.label}`;
+function editClick(item: ProjectItemModel, field: FieldToChange): void {
+    projectsStore.selectProject(item.id);
+    fieldToEdit.value = field;
+    isEditProjectDialogShown.value = true;
+}
+
+async function updateLimitsClick(item: ProjectItemModel, limit: LimitToChange): Promise<void> {
+    try {
+        projectsStore.selectProject(item.id);
+        // await projectsStore.getProjectLimits(item.id);
+        isUpdateLimitsDialogShown.value = true;
+        limitToChange.value = limit;
+    } catch (error) {
+        projectsStore.deselectProject();
+        notify.notifyError(error, AnalyticsErrorEventSource.ALL_PROJECT_DASHBOARD);
     }
 }
 
-onMounted(async () => {
-    if (billingEnabled.value) {
-        const promises: Promise<CreditCard[] | AccountBalance | void>[] = [billingStore.getCreditCards()];
+watch([isEditProjectDialogShown, isUpdateLimitsDialogShown], ([edit, update]) => {
+    if (edit || update) return;
+    projectsStore.deselectProject();
+});
 
-        if (configStore.state.config.nativeTokenPaymentsEnabled) {
-            promises.push(billingStore.getBalance(), billingStore.getNativePaymentsHistory());
-        }
-        await Promise.all(promises).catch(_ => {});
+onMounted(async () => {
+    if (route.query.invite_invalid === 'true') {
+        notify.error('The invite link you used has expired or is invalid.', null);
+        void router.replace({ query: { ...route.query, invite_invalid: undefined } });
+    }
+
+    if (billingEnabled.value && !isMemberAccount.value) {
+        await Promise.all([
+            billingStore.getCreditCards(),
+            billingStore.getFailedInvoice(),
+        ]).catch(_ => {});
     }
 
     isLoading.value = false;
+});
+
+onBeforeUnmount(() => {
+    appStore.toggleHasJustLoggedIn(false);
 });
 </script>

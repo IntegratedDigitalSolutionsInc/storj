@@ -27,8 +27,11 @@ type SegmentProvider struct {
 	batchSize int
 }
 
+// ReadsSnapshot is always true: the in-memory segments are a snapshot by construction.
+func (m *RangeSplitter) ReadsSnapshot() bool { return true }
+
 // CreateRanges splits the segments into equal ranges.
-func (m *RangeSplitter) CreateRanges(nRanges int, batchSize int) ([]rangedloop.SegmentProvider, error) {
+func (m *RangeSplitter) CreateRanges(ctx context.Context, nRanges int, batchSize int) ([]rangedloop.SegmentProvider, error) {
 	// The segments for a given stream must be handled by a single segment
 	// provider. Split the segments into streams.
 	streams := streamsFromSegments(m.Segments)
@@ -65,13 +68,6 @@ func (m *SegmentProvider) Iterate(ctx context.Context, fn func([]rangedloop.Segm
 	}
 
 	return nil
-}
-
-func min(x, y int) int {
-	if x < y {
-		return x
-	}
-	return y
 }
 
 func streamsFromSegments(segments []rangedloop.Segment) [][]rangedloop.Segment {

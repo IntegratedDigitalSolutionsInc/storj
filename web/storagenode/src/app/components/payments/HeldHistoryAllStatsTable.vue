@@ -27,10 +27,10 @@
                     <p class="held-history-table-container--large__info-area__text">{{ item.joinedAt.toISOString().split('T')[0] }}</p>
                 </div>
                 <div class="column justify-end column-3">
-                    <p class="held-history-table-container--large__info-area__text">{{ item.totalHeld | centsToDollars }}</p>
+                    <p class="held-history-table-container--large__info-area__text">{{ centsToDollars(item.totalHeld) }}</p>
                 </div>
                 <div class="column justify-end column-4">
-                    <p class="held-history-table-container--large__info-area__text">{{ item.totalDisposed | centsToDollars }}</p>
+                    <p class="held-history-table-container--large__info-area__text">{{ centsToDollars(item.totalDisposed) }}</p>
                 </div>
             </div>
         </div>
@@ -44,26 +44,124 @@
     </div>
 </template>
 
-<script lang="ts">
-import { Component } from 'vue-property-decorator';
+<script setup lang="ts">
+import { computed } from 'vue';
 
 import { SatelliteHeldHistory } from '@/storagenode/payouts/payouts';
+import { centsToDollars } from '@/app/utils/payout';
+import { usePayoutStore } from '@/app/store/modules/payoutStore';
 
-import BaseHeldHistoryTable from '@/app/components/payments/BaseHeldHistoryTable.vue';
 import HeldHistoryAllStatsTableItemSmall from '@/app/components/payments/HeldHistoryAllStatsTableItemSmall.vue';
 
-// @vue/component
-@Component({
-    components: {
-        HeldHistoryAllStatsTableItemSmall,
-    },
-})
-export default class HeldHistoryAllStatsTable extends BaseHeldHistoryTable {
-    /**
-     * Returns list of satellite held history items by periods from store.
-     */
-    public get allSatellitesHeldHistory(): SatelliteHeldHistory[] {
-        return this.$store.state.payoutModule.heldHistory;
+const payoutStore = usePayoutStore();
+
+const allSatellitesHeldHistory = computed<SatelliteHeldHistory[]>(() => {
+    return payoutStore.state.heldHistory as SatelliteHeldHistory[];
+});
+</script>
+
+// Deliberately not scoped to allow styles to cascade to other components.
+<style lang="scss">
+.held-history-table-container--large {
+
+    &__labels-area {
+        display: flex;
+        flex-direction: row;
+        align-items: center;
+        justify-content: space-between;
+        margin-top: 17px;
+        padding: 0 16px;
+        width: calc(100% - 32px);
+        height: 36px;
+        background: var(--table-header-color);
+
+        &__text {
+            font-family: 'font_medium', sans-serif;
+            font-size: 14px;
+            color: #909bad;
+        }
+    }
+
+    &__info-area {
+        padding: 11px 16px;
+        display: flex;
+        flex-direction: row;
+        align-items: center;
+        justify-content: space-between;
+        min-height: 34px;
+        height: auto;
+        border-bottom: 1px solid rgb(169 181 193 / 30%);
+
+        &:last-of-type {
+            border-bottom: none;
+        }
+
+        &__text {
+            font-family: 'font_regular', sans-serif;
+            font-size: 14px;
+            color: var(--regular-text-color);
+            max-width: 100%;
+            overflow-wrap: anywhere;
+        }
+
+        &__months {
+            font-family: 'font_regular', sans-serif;
+            font-size: 11px;
+            color: #9b9db1;
+            margin-top: 3px;
+        }
     }
 }
-</script>
+
+.held-history-table-container--small {
+    display: none;
+}
+
+.column {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+}
+
+.justify-start {
+    justify-content: flex-start;
+}
+
+.justify-end {
+    justify-content: flex-end;
+}
+
+.column-1 {
+    width: 37%;
+}
+
+.column-2,
+.column-3,
+.column-4 {
+    width: 21%;
+}
+
+@media screen and (width <= 720px) {
+
+    .column-1 {
+        width: 31%;
+    }
+
+    .column-2,
+    .column-3,
+    .column-4 {
+        width: 23%;
+    }
+}
+
+@media screen and (width <= 600px) {
+
+    .held-history-table-container--large {
+        display: none;
+    }
+
+    .held-history-table-container--small {
+        display: block;
+    }
+}
+</style>

@@ -73,11 +73,35 @@ func (invites *projectInvitations) GetByProjectID(ctx context.Context, projectID
 	return projectInvitationSliceFromDBX(dbxInvites)
 }
 
-// GetByEmail returns all of the project member invitations for the specified email address.
+// GetByEmail returns all the project member invitations for the specified email address.
 func (invites *projectInvitations) GetByEmail(ctx context.Context, email string) (_ []console.ProjectInvitation, err error) {
 	defer mon.Task()(&ctx)(&err)
 
 	dbxInvites, err := invites.db.All_ProjectInvitation_By_Email(ctx, dbx.ProjectInvitation_Email(normalizeEmail(email)))
+	if err != nil {
+		return nil, err
+	}
+
+	return projectInvitationSliceFromDBX(dbxInvites)
+}
+
+// GetForActiveProjectsByEmail returns all project member invitations associated with active projects for the specified email address.
+func (invites *projectInvitations) GetForActiveProjectsByEmail(ctx context.Context, email string) (_ []console.ProjectInvitation, err error) {
+	defer mon.Task()(&ctx)(&err)
+
+	dbxInvites, err := invites.db.All_ProjectInvitation_By_Project_Status_And_ProjectInvitation_Email(ctx, dbx.Project_Status(int(console.ProjectActive)), dbx.ProjectInvitation_Email(normalizeEmail(email)))
+	if err != nil {
+		return nil, err
+	}
+
+	return projectInvitationSliceFromDBX(dbxInvites)
+}
+
+// GetForActiveProjectsByEmailAndUserTenantID returns all project member invitations associated with active projects for the specified email address and user tenant ID.
+func (invites *projectInvitations) GetForActiveProjectsByEmailAndUserTenantID(ctx context.Context, email string, tenantID *string) (_ []console.ProjectInvitation, err error) {
+	defer mon.Task()(&ctx)(&err)
+
+	dbxInvites, err := invites.db.All_ProjectInvitation_By_Project_Status_And_ProjectInvitation_Email_And_User_TenantId(ctx, dbx.Project_Status(int(console.ProjectActive)), dbx.ProjectInvitation_Email(normalizeEmail(email)), dbx.User_TenantId_Raw(tenantID))
 	if err != nil {
 		return nil, err
 	}

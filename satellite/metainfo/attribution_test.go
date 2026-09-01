@@ -13,15 +13,18 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
 	"golang.org/x/sync/errgroup"
 
 	"storj.io/common/macaroon"
 	"storj.io/common/memory"
+	"storj.io/common/storj"
 	"storj.io/common/testcontext"
 	"storj.io/common/testrand"
 	"storj.io/common/uuid"
 	"storj.io/storj/private/testplanet"
-	"storj.io/storj/satellite/attribution"
+	"storj.io/storj/satellite"
+	"storj.io/storj/satellite/buckets"
 	"storj.io/storj/satellite/console"
 	"storj.io/storj/satellite/metainfo"
 	"storj.io/uplink"
@@ -41,8 +44,8 @@ func TestTrimUserAgent(t *testing.T) {
 		{userAgent: []byte("Zenko uplink/v1.0.0"), strippedUserAgent: []byte("Zenko")},
 		{userAgent: []byte("Zenko uplink/v1.0.0 (drpc/v0.10.0 common/v0.0.0-00010101000000-000000000000)"), strippedUserAgent: []byte("Zenko")},
 		{userAgent: []byte("Zenko uplink/v1.0.0 (drpc/v0.10.0) (common/v0.0.0-00010101000000-000000000000)"), strippedUserAgent: []byte("Zenko")},
-		{userAgent: []byte("uplink/v1.0.0 (drpc/v0.10.0 common/v0.0.0-00010101000000-000000000000)"), strippedUserAgent: []byte("")},
-		{userAgent: []byte("uplink/v1.0.0"), strippedUserAgent: []byte("")},
+		{userAgent: []byte("uplink/v1.0.0 (drpc/v0.10.0 common/v0.0.0-00010101000000-000000000000)"), strippedUserAgent: nil},
+		{userAgent: []byte("uplink/v1.0.0"), strippedUserAgent: nil},
 		{userAgent: []byte("uplink/v1.0.0 Zenko/v3"), strippedUserAgent: []byte("Zenko/v3")},
 		// oversize alphanumeric as 2nd entry product should use just the first entry
 		{userAgent: append([]byte("Zenko/v3 "), oversizeProduct...), strippedUserAgent: []byte("Zenko/v3")},
@@ -71,7 +74,7 @@ func TestBucketAttribution(t *testing.T) {
 			expectedAttribution []byte
 		}{
 			{signupPartner: nil, userAgent: nil, expectedAttribution: nil},
-			{signupPartner: []byte(""), userAgent: []byte(""), expectedAttribution: nil},
+			{signupPartner: []byte(""), userAgent: []byte(""), expectedAttribution: []byte("")},
 			{signupPartner: []byte("Minio"), userAgent: nil, expectedAttribution: []byte("Minio")},
 			{signupPartner: []byte("Minio"), userAgent: []byte("Minio"), expectedAttribution: []byte("Minio")},
 			{signupPartner: []byte("Minio"), userAgent: []byte("Zenko"), expectedAttribution: []byte("Minio")},
@@ -127,12 +130,8 @@ func TestBucketAttribution(t *testing.T) {
 				assert.Equal(t, tt.expectedAttribution, bucketInfo.UserAgent, errTag)
 
 				attributionInfo, err := planet.Satellites[0].DB.Attribution().Get(ctx, satProject.ID, []byte(bucketName))
-				if tt.expectedAttribution == nil {
-					assert.True(t, attribution.ErrBucketNotAttributed.Has(err), errTag)
-				} else {
-					require.NoError(t, err, errTag)
-					assert.Equal(t, tt.expectedAttribution, attributionInfo.UserAgent, errTag)
-				}
+				require.NoError(t, err, errTag)
+				assert.Equal(t, tt.expectedAttribution, attributionInfo.UserAgent, errTag)
 			}
 
 			createBucketAndCheckAttribution(user1.ID, "apikey1", "bucket1")
@@ -141,13 +140,183 @@ func TestBucketAttribution(t *testing.T) {
 	})
 }
 
+func TestBucketPlacementAttribution(t *testing.T) {
+	testplanet.Run(t, testplanet.Config{
+		SatelliteCount: 1, UplinkCount: 1,
+	}, func(t *testing.T, ctx *testcontext.Context, planet *testplanet.Planet) {
+		sat := planet.Satellites[0]
+
+		satProject, err := sat.API.DB.Console().Projects().Get(ctx, planet.Uplinks[0].Projects[0].ID)
+		require.NoError(t, err)
+
+		config := planet.Uplinks[0].Config
+		access, err := config.RequestAccessWithPassphrase(ctx, sat.NodeURL().String(), planet.Uplinks[0].APIKey[sat.ID()].Serialize(), "mypassphrase")
+		require.NoError(t, err)
+
+		project, err := config.OpenProject(ctx, access)
+		require.NoError(t, err)
+
+		// Test happy path.
+		bucketName := "testbucket"
+		_, err = project.CreateBucket(ctx, bucketName)
+		require.NoError(t, err)
+
+		bucketInfo, err := sat.API.Buckets.Service.GetBucket(ctx, []byte(bucketName), satProject.ID)
+		require.NoError(t, err)
+		assert.Equal(t, storj.DefaultPlacement, bucketInfo.Placement)
+
+		attributionInfo, err := planet.Satellites[0].DB.Attribution().Get(ctx, satProject.ID, []byte(bucketName))
+		require.NoError(t, err)
+		require.NotNil(t, attributionInfo.Placement)
+		assert.Equal(t, storj.DefaultPlacement, *attributionInfo.Placement)
+
+		require.NoError(t, planet.Satellites[0].DB.Buckets().DeleteBucket(ctx, []byte(bucketName), satProject.ID))
+
+		// Change the project default placement and confirm that recreating bucket fails due to preexisting attribution with different placement.
+		require.NoError(t, sat.API.DB.Console().Projects().UpdateDefaultPlacement(ctx, satProject.ID, storj.PlacementConstraint(1)))
+
+		_, err = project.CreateBucket(ctx, bucketName)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "already attributed to a different placement constraint")
+
+		// test case where bucket attribution has nil placement
+		bucketName += "2"
+		require.NoError(t, sat.API.DB.Console().Projects().UpdateDefaultPlacement(ctx, satProject.ID, storj.DefaultPlacement))
+		_, err = project.CreateBucket(ctx, bucketName)
+		require.NoError(t, err)
+
+		err = planet.Satellites[0].DB.Attribution().UpdatePlacement(ctx, satProject.ID, bucketName, nil)
+		require.NoError(t, err)
+
+		require.NoError(t, planet.Satellites[0].DB.Buckets().DeleteBucket(ctx, []byte(bucketName), satProject.ID))
+
+		require.NoError(t, sat.API.DB.Console().Projects().UpdateDefaultPlacement(ctx, satProject.ID, storj.PlacementConstraint(1)))
+		_, err = project.CreateBucket(ctx, bucketName)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "already attributed to a different placement constraint")
+
+		require.NoError(t, sat.API.DB.Console().Projects().UpdateDefaultPlacement(ctx, satProject.ID, storj.DefaultPlacement))
+		_, err = project.CreateBucket(ctx, bucketName)
+		require.NoError(t, err)
+	})
+}
+
+func TestBucketRecreationSunsetPlacement(t *testing.T) {
+	type testCase struct {
+		existing  storj.PlacementConstraint
+		requested storj.PlacementConstraint
+		allowed   bool
+	}
+
+	testplanet.Run(t, testplanet.Config{
+		SatelliteCount: 1, UplinkCount: 1,
+		Reconfigure: testplanet.Reconfigure{
+			Satellite: func(log *zap.Logger, index int, config *satellite.Config) {
+				config.Metainfo.SunsetPlacements = metainfo.PlacementMigrationsFlag{30: 0, 31: 12, 32: 0}
+			},
+		},
+	}, func(t *testing.T, ctx *testcontext.Context, planet *testplanet.Planet) {
+		sat := planet.Satellites[0]
+		projectID := planet.Uplinks[0].Projects[0].ID
+		uplinkCfg := planet.Uplinks[0].Config
+		access, err := uplinkCfg.RequestAccessWithPassphrase(ctx, sat.NodeURL().String(), planet.Uplinks[0].APIKey[sat.ID()].Serialize(), "mypassphrase")
+		require.NoError(t, err)
+		project, err := uplinkCfg.OpenProject(ctx, access)
+		require.NoError(t, err)
+
+		past := time.Now().Add(-time.Hour)
+		future := time.Now().Add(24 * time.Hour)
+
+		runCases := func(t *testing.T, cases []testCase) {
+			for i, tt := range cases {
+				errTag := fmt.Sprintf("%d. %+v", i, tt)
+				bucketName := "testbucket" + strconv.Itoa(i)
+
+				// Create the bucket under the existing placement, then delete it,
+				// keeping the attribution row.
+				require.NoError(t, sat.API.DB.Console().Projects().UpdateDefaultPlacement(ctx, projectID, tt.existing), errTag)
+				_, err := project.CreateBucket(ctx, bucketName)
+				require.NoError(t, err, errTag)
+
+				attributionInfo, err := sat.DB.Attribution().Get(ctx, projectID, []byte(bucketName))
+				require.NoError(t, err, errTag)
+				require.NotNil(t, attributionInfo.Placement, errTag)
+				require.Equal(t, tt.existing, *attributionInfo.Placement, errTag)
+
+				require.NoError(t, sat.DB.Buckets().DeleteBucket(ctx, []byte(bucketName), projectID), errTag)
+
+				// Recreate the bucket under the requested placement.
+				require.NoError(t, sat.API.DB.Console().Projects().UpdateDefaultPlacement(ctx, projectID, tt.requested), errTag)
+				_, err = project.CreateBucket(ctx, bucketName)
+				if !tt.allowed {
+					require.Error(t, err, errTag)
+					require.Contains(t, err.Error(), "already attributed to a different placement constraint", errTag)
+
+					attributionInfo, err = sat.DB.Attribution().Get(ctx, projectID, []byte(bucketName))
+					require.NoError(t, err, errTag)
+					require.NotNil(t, attributionInfo.Placement, errTag)
+					require.Equal(t, tt.existing, *attributionInfo.Placement, errTag)
+					continue
+				}
+				require.NoError(t, err, errTag)
+
+				bucketInfo, err := sat.API.Buckets.Service.GetBucket(ctx, []byte(bucketName), projectID)
+				require.NoError(t, err, errTag)
+				require.Equal(t, tt.requested, bucketInfo.Placement, errTag)
+			}
+		}
+
+		t.Run("before effective date", func(t *testing.T) {
+			sat.API.Metainfo.Endpoint.TestingSetSunsetPlacementsEffectiveDate(future)
+			runCases(t, []testCase{
+				{existing: 30, requested: 0, allowed: false},
+				{existing: 32, requested: 0, allowed: false},
+				{existing: 31, requested: 12, allowed: false},
+			})
+		})
+
+		t.Run("after effective date", func(t *testing.T) {
+			sat.API.Metainfo.Endpoint.TestingSetSunsetPlacementsEffectiveDate(past)
+			runCases(t, []testCase{
+				{existing: 30, requested: 0, allowed: true},
+				{existing: 32, requested: 0, allowed: true},
+				{existing: 31, requested: 12, allowed: true},
+				{existing: 30, requested: 12, allowed: false},
+				{existing: 32, requested: 12, allowed: false},
+				{existing: 31, requested: 0, allowed: false},
+				{existing: 0, requested: 12, allowed: false},
+				{existing: 1, requested: 0, allowed: false},
+			})
+		})
+
+		// Tests when a bucket is being recreated with a differing user agent.
+		// in this case, sunset placement validation does not happen at the endpoint
+		// level.
+		t.Run("differing user agent", func(t *testing.T) {
+			sat.API.Metainfo.Endpoint.TestingSetSunsetPlacementsEffectiveDate(past)
+
+			bucketName := "testbucket-useragent"
+			require.NoError(t, sat.API.DB.Console().Projects().UpdateDefaultPlacement(ctx, projectID, storj.PlacementConstraint(30)))
+			_, err := project.CreateBucket(ctx, bucketName)
+			require.NoError(t, err)
+
+			require.NoError(t, sat.DB.Attribution().UpdateUserAgent(ctx, projectID, bucketName, []byte("OldPartner")))
+			require.NoError(t, sat.DB.Buckets().DeleteBucket(ctx, []byte(bucketName), projectID))
+
+			require.NoError(t, sat.API.DB.Console().Projects().UpdateDefaultPlacement(ctx, projectID, storj.DefaultPlacement))
+			_, err = project.CreateBucket(ctx, bucketName)
+			require.NoError(t, err)
+
+			bucketInfo, err := sat.API.Buckets.Service.GetBucket(ctx, []byte(bucketName), projectID)
+			require.NoError(t, err)
+			require.Equal(t, storj.DefaultPlacement, bucketInfo.Placement)
+		})
+	})
+}
+
 func TestQueryAttribution(t *testing.T) {
 	testplanet.Run(t, testplanet.Config{
 		SatelliteCount: 1, StorageNodeCount: 4, UplinkCount: 0,
-		// TODO(spanner): There's an emulator bug with regards to MAX(timestamp),
-		// which causes some queries to fail.
-		// https://github.com/GoogleCloudPlatform/cloud-spanner-emulator/issues/73
-		SkipSpanner: true,
 		Reconfigure: testplanet.Reconfigure{
 			Satellite: testplanet.ReconfigureRS(2, 3, 4, 4),
 		},
@@ -252,10 +421,6 @@ func TestQueryAttribution(t *testing.T) {
 func TestAttributionReport(t *testing.T) {
 	testplanet.Run(t, testplanet.Config{
 		SatelliteCount: 1, StorageNodeCount: 4, UplinkCount: 1,
-		// TODO(spanner): There's an emulator bug with regards to MAX(timestamp),
-		// which causes some queries to fail.
-		// https://github.com/GoogleCloudPlatform/cloud-spanner-emulator/issues/73
-		SkipSpanner: true,
 		Reconfigure: testplanet.Reconfigure{
 			Satellite: testplanet.ReconfigureRS(2, 3, 4, 4),
 		},
@@ -271,7 +436,7 @@ func TestAttributionReport(t *testing.T) {
 		zenkoStr := "Zenko/1.0"
 		up.Config.UserAgent = zenkoStr
 
-		err := up.CreateBucket(ctx, planet.Satellites[0], bucketName)
+		err := up.TestingCreateBucket(ctx, planet.Satellites[0], bucketName)
 		require.NoError(t, err)
 
 		{ // upload and download as Zenko
@@ -358,7 +523,7 @@ func TestBucketAttributionConcurrentUpload(t *testing.T) {
 	}, func(t *testing.T, ctx *testcontext.Context, planet *testplanet.Planet) {
 		satellite := planet.Satellites[0]
 
-		err := planet.Uplinks[0].CreateBucket(ctx, satellite, "attr-bucket")
+		err := planet.Uplinks[0].TestingCreateBucket(ctx, satellite, "attr-bucket")
 		require.NoError(t, err)
 
 		config := uplink.Config{
@@ -433,6 +598,9 @@ func TestAttributionBeginObject(t *testing.T) {
 		satellite := planet.Satellites[0]
 		upl := planet.Uplinks[0]
 		proj := upl.Projects[0].ID
+		p, err := satellite.API.DB.Console().Projects().Get(ctx, proj)
+		require.NoError(t, err)
+		userID := p.OwnerID
 		ua := []byte("minio")
 
 		tests := []struct {
@@ -479,22 +647,37 @@ func TestAttributionBeginObject(t *testing.T) {
 					expectedBktUA = ua
 				}
 
-				p, err := config.OpenProject(ctx, upl.Access[satellite.ID()])
+				uplProj, err := config.OpenProject(ctx, upl.Access[satellite.ID()])
 				require.NoError(t, err)
 
-				_, err = p.CreateBucket(ctx, bucketName)
-				require.NoError(t, err)
+				// VA will now always be inserted on first bucket creation in CreateBucket endpoint in order to record the placement.
+				// To test buckets created before this change, which may not have a VA row, bypass CreateBucket endpoint and create
+				// the bucket directly in the DB.
+				if !tt.vaAttrBefore {
+					_, err = satellite.API.DB.Buckets().CreateBucket(ctx, buckets.Bucket{
+						ID:        testrand.UUID(),
+						Name:      bucketName,
+						ProjectID: proj,
+						CreatedBy: userID,
+						UserAgent: ua,
+						Created:   time.Now(),
+					})
+					require.NoError(t, err)
+				} else {
+					_, err = uplProj.CreateBucket(ctx, bucketName)
+					require.NoError(t, err)
+				}
 
-				require.NoError(t, p.Close())
+				require.NoError(t, uplProj.Close())
 
-				if !tt.bktAttrBefore && tt.vaAttrBefore {
+				if !tt.bktAttrBefore {
 					// remove user agent from bucket
 					err = satellite.API.DB.Buckets().UpdateUserAgent(ctx, proj, bucketName, nil)
 					require.NoError(t, err)
 				}
 
 				_, err = satellite.API.DB.Attribution().Get(ctx, proj, []byte(bucketName))
-				if !tt.bktAttrBefore && !tt.vaAttrBefore {
+				if !tt.vaAttrBefore {
 					require.Error(t, err)
 				} else {
 					require.NoError(t, err)
@@ -510,10 +693,10 @@ func TestAttributionBeginObject(t *testing.T) {
 
 				config.UserAgent = string(ua)
 
-				p, err = config.OpenProject(ctx, upl.Access[satellite.ID()])
+				uplProj, err = config.OpenProject(ctx, upl.Access[satellite.ID()])
 				require.NoError(t, err)
 
-				upload, err := p.UploadObject(ctx, bucketName, fmt.Sprintf("foobar-%d", i), nil)
+				upload, err := uplProj.UploadObject(ctx, bucketName, fmt.Sprintf("foobar-%d", i), nil)
 				require.NoError(t, err)
 
 				_, err = upload.Write([]byte("content"))

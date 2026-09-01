@@ -11,7 +11,14 @@
         <v-card ref="innerContent">
             <v-card-item class="pa-6 pr-5">
                 <template #prepend>
-                    <img class="d-block" src="@/assets/icon-access.svg" alt="icon">
+                    <v-sheet
+                        class="border-sm d-flex justify-center align-center"
+                        width="40"
+                        height="40"
+                        rounded="lg"
+                    >
+                        <v-icon :icon="LockKeyhole" size="18" />
+                    </v-sheet>
                 </template>
 
                 <v-card-title class="font-weight-bold">
@@ -20,7 +27,7 @@
 
                 <template #append>
                     <v-btn
-                        icon="$close"
+                        :icon="X"
                         variant="text"
                         size="small"
                         color="default"
@@ -58,7 +65,7 @@
                                     <password-input-eye-icons
                                         :is-visible="isPassphraseVisible"
                                         type="passphrase"
-                                        @toggleVisibility="isPassphraseVisible = !isPassphraseVisible"
+                                        @toggle-visibility="isPassphraseVisible = !isPassphraseVisible"
                                     />
                                 </template>
                             </v-text-field>
@@ -107,15 +114,16 @@
 </template>
 
 <script setup lang="ts">
-import { Component, computed, ref, watch } from 'vue';
-import { VForm, VRow, VCol, VTextField, VCardItem, VDivider, VCardTitle, VBtn, VCard, VCardActions, VDialog, VAlert } from 'vuetify/components';
+import { type Component, computed, ref, watch  } from 'vue';
+import { VForm, VRow, VCol, VTextField, VCardItem, VDivider, VCardTitle, VBtn, VCard, VCardActions, VDialog, VAlert, VSheet, VIcon } from 'vuetify/components';
+import { LockKeyhole, X } from '@lucide/vue';
 
 import { RequiredRule } from '@/types/common';
 import { useBucketsStore } from '@/store/modules/bucketsStore';
-import { Bucket } from '@/types/buckets';
+import type { Bucket } from '@/types/buckets';
 import { useProjectsStore } from '@/store/modules/projectsStore';
 import { AnalyticsErrorEventSource } from '@/utils/constants/analyticsEventNames';
-import { useNotify } from '@/utils/hooks';
+import { useNotify } from '@/composables/useNotify';
 
 import PasswordInputEyeIcons from '@/components/PasswordInputEyeIcons.vue';
 

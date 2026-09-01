@@ -8,45 +8,48 @@
                 <trial-expiration-banner v-if="isTrialExpirationBanner && isUserProjectOwner" :expired="isExpired" />
 
                 <PageTitleComponent title="Project Settings" />
-                <PageSubtitleComponent subtitle="Edit project information and set custom project limits." link="https://docs.storj.io/learn/concepts/limits" />
+                <PageSubtitleComponent
+                    subtitle="Edit project information and set custom project limits."
+                    :link="configStore.isDefaultBrand ? 'https://docs.storj.io/learn/concepts/limits' : undefined"
+                />
             </v-col>
         </v-row>
 
         <v-row>
             <v-col cols="12" sm="6" lg="4">
-                <v-card title="Project Name">
+                <v-card title="Project Name" class="pa-2">
                     <v-card-text>
-                        <v-chip color="default" variant="tonal" size="small" class="font-weight-bold">
+                        <v-chip color="primary" variant="tonal" size="small" class="font-weight-bold">
                             {{ project.name }}
                         </v-chip>
-                        <v-divider class="my-4" />
-                        <v-btn variant="outlined" color="default" size="small" rounded="md" @click="showEditNameDialog">
+                        <v-divider class="my-4 border-0" />
+                        <v-btn variant="outlined" color="default" :prepend-icon="Pencil" @click="showEditNameDialog">
                             Edit Name
                         </v-btn>
                     </v-card-text>
                 </v-card>
             </v-col>
             <v-col cols="12" sm="6" lg="4">
-                <v-card title="Project Description">
+                <v-card title="Project Description" class="pa-2">
                     <v-card-text>
-                        <v-chip color="default" variant="tonal" size="small" class="font-weight-bold">
+                        <v-chip color="primary" variant="tonal" size="small" class="font-weight-bold">
                             {{ project.description }}
                         </v-chip>
-                        <v-divider class="my-4" />
-                        <v-btn variant="outlined" color="default" size="small" rounded="md" @click="showEditDescriptionDialog">
+                        <v-divider class="my-4 border-0" />
+                        <v-btn variant="outlined" color="default" :prepend-icon="Pencil" @click="showEditDescriptionDialog">
                             Edit Description
                         </v-btn>
                     </v-card-text>
                 </v-card>
             </v-col>
-            <v-col v-if="satelliteManagedEncryptionEnabled || hasManagedPassphrase" cols="12" lg="4">
-                <v-card title="Project Encryption">
+            <v-col v-if="!hideEncryptionDetails" cols="12" lg="4">
+                <v-card title="Project Encryption" class="pa-2">
                     <v-card-text>
-                        <v-chip color="default" variant="tonal" size="small" class="font-weight-bold" :prepend-icon="Check">
-                            {{ hasManagedPassphrase ? 'Automatic' : 'Manual' }}
+                        <v-chip color="primary" variant="tonal" size="small" class="font-weight-bold" :prepend-icon="Check">
+                            {{ hasManagedPassphrase ? ProjectEncryption.Automatic : ProjectEncryption.Manual }}
                         </v-chip>
-                        <v-divider class="my-4" />
-                        <v-btn variant="outlined" color="default" rounded="md" size="small">
+                        <v-divider class="my-4 border-0" />
+                        <v-btn variant="outlined" color="default" :prepend-icon="View">
                             View Details
                             <project-encryption-information-dialog @new-project="isCreateProjectDialogShown = true" />
                         </v-btn>
@@ -55,84 +58,91 @@
             </v-col>
         </v-row>
 
-        <v-row>
-            <v-col>
-                <h3 class="mt-5">Limits</h3>
-            </v-col>
-        </v-row>
+        <template v-if="isProjectOwner || (!isProjectOwner && ownerHasPaidPrivileges)">
+            <v-row>
+                <v-col>
+                    <h3 class="mt-5">Project Limits</h3>
+                </v-col>
+            </v-row>
 
-        <v-row v-if="!isProjectOwnerPaidTier && billingEnabled">
-            <v-col cols="12" lg="4">
-                <v-card title="Free Trial">
-                    <v-card-subtitle>
-                        {{ storageLimitFormatted }} Storage / {{ bandwidthLimitFormatted }} Bandwidth. <br>
-                        Need more? Upgrade to Pro Account.
-                    </v-card-subtitle>
-                    <v-card-text>
-                        <v-divider class="mb-4" />
-                        <v-btn variant="flat" color="primary" size="small" rounded="md" :append-icon="ArrowRight" @click="toggleUpgradeFlow">
-                            Upgrade
-                        </v-btn>
-                    </v-card-text>
-                </v-card>
-            </v-col>
-        </v-row>
+            <v-row v-if="!isProjectOwnerPaidTier && billingEnabled">
+                <v-col cols="12" lg="4">
+                    <v-card title="Free Trial" class="pa-2">
+                        <v-card-subtitle>
+                            {{ storageLimitFormatted }} Storage / {{ bandwidthLimitFormatted }} Bandwidth. <br>
+                            Need more? Upgrade to Pro Account.
+                        </v-card-subtitle>
+                        <v-card-text>
+                            <v-btn variant="flat" color="primary" :append-icon="ArrowRight" @click="toggleUpgradeFlow">
+                                Upgrade
+                            </v-btn>
+                        </v-card-text>
+                    </v-card>
+                </v-col>
 
-        <v-row v-else>
-            <v-col cols="12" sm="6" lg="4">
-                <v-card title="Storage">
-                    <v-card-subtitle>
-                        Limit: {{ storageLimitFormatted }} <br>
-                        <span v-if="!noLimitsUiEnabled">Available Storage: {{ paidStorageLimitFormatted }}</span>
-                    </v-card-subtitle>
-                    <v-card-text>
-                        <v-divider class="mb-4" />
-                        <v-btn variant="outlined" color="default" size="small" rounded="md" @click="showStorageLimitDialog">
-                            Edit Storage Limit
-                        </v-btn>
-                    </v-card-text>
-                </v-card>
-            </v-col>
+                <v-col cols="12" lg="4">
+                    <LimitNotificationsSettings v-if="projectLimitNotificationsEnabled && isProjectOwnerOrAdmin" />
+                </v-col>
+            </v-row>
 
-            <v-col cols="12" sm="6" lg="4">
-                <v-card title="Download">
-                    <v-card-subtitle>
-                        Limit: {{ bandwidthLimitFormatted }} {{ bandwidthLimitFormatted === 'No Limit' ? '' : 'per month' }}<br>
-                        <span v-if="!noLimitsUiEnabled">Available Download: {{ paidBandwidthLimitFormatted }} per month</span>
-                    </v-card-subtitle>
-                    <v-card-text>
-                        <v-divider class="mb-4" />
-                        <v-btn variant="outlined" color="default" size="small" rounded="md" @click="showBandwidthLimitDialog">
-                            Edit Download Limit
-                        </v-btn>
-                    </v-card-text>
-                </v-card>
-            </v-col>
+            <v-row v-else>
+                <v-col cols="12" sm="6" lg="4">
+                    <v-card title="Storage" class="pa-2">
+                        <v-card-subtitle>
+                            Limit: {{ storageLimitFormatted }} <br>
+                            <span v-if="!noLimitsUiEnabled">Available Storage: {{ paidStorageLimitFormatted }}</span>
+                            <br v-else>
+                        </v-card-subtitle>
+                        <v-card-text>
+                            <v-btn variant="outlined" color="default" :prepend-icon="InfinityIcon" @click="showStorageLimitDialog">
+                                Edit Storage Limit
+                            </v-btn>
+                        </v-card-text>
+                    </v-card>
+                </v-col>
 
-            <v-col v-if="!noLimitsUiEnabled" cols="12" sm="6" lg="4">
-                <v-card title="Account Limits">
-                    <v-card-subtitle>
-                        Storage limit: {{ paidStorageLimitFormatted }} <br>
-                        Download limit: {{ paidBandwidthLimitFormatted }} per month
-                    </v-card-subtitle>
-                    <v-card-text>
-                        <v-divider class="mb-4" />
-                        <v-btn
-                            variant="outlined"
-                            color="default"
-                            size="small"
-                            rounded="md"
-                            @click="openRequestUrl"
-                        >
-                            Request Limits Increase
-                            <v-icon end :icon="SquareArrowOutUpRight" />
-                        </v-btn>
-                    </v-card-text>
-                </v-card>
-            </v-col>
-        </v-row>
+                <v-col cols="12" sm="6" lg="4">
+                    <v-card title="Download" class="pa-2">
+                        <v-card-subtitle>
+                            Limit: {{ bandwidthLimitFormatted }} {{ bandwidthLimitFormatted === 'No Limit' ? '' : 'per month' }}<br>
+                            <span v-if="!noLimitsUiEnabled">Available Download: {{ paidBandwidthLimitFormatted }} per month</span>
+                            <br v-else>
+                        </v-card-subtitle>
+                        <v-card-text>
+                            <v-btn variant="outlined" color="default" :prepend-icon="InfinityIcon" @click="showBandwidthLimitDialog">
+                                Edit Download Limit
+                            </v-btn>
+                        </v-card-text>
+                    </v-card>
+                </v-col>
 
-        <template v-if="promptForVersioningBeta || versioningUIEnabled">
+                <v-col v-if="!noLimitsUiEnabled" cols="12" sm="6" lg="4">
+                    <v-card title="Account Limits" class="pa-2">
+                        <v-card-subtitle>
+                            Storage limit: {{ paidStorageLimitFormatted }} <br>
+                            Download limit: {{ paidBandwidthLimitFormatted }} per month
+                        </v-card-subtitle>
+                        <v-card-text>
+                            <v-btn
+                                variant="outlined"
+                                color="default"
+                                rounded="md"
+                                :append-icon="ExternalLink"
+                                @click="openRequestUrl"
+                            >
+                                Request Limits Increase
+                            </v-btn>
+                        </v-card-text>
+                    </v-card>
+                </v-col>
+
+                <v-col cols="12" sm="6" lg="4">
+                    <LimitNotificationsSettings v-if="projectLimitNotificationsEnabled && isProjectOwnerOrAdmin" />
+                </v-col>
+            </v-row>
+        </template>
+
+        <template v-if="versioningUIEnabled">
             <v-row>
                 <v-col>
                     <h3 class="mt-5">Features</h3>
@@ -140,43 +150,45 @@
             </v-row>
 
             <v-row>
-                <v-col cols="12" sm="6" lg="4">
-                    <v-card title="Object Versioning (beta)">
-                        <v-card-subtitle v-if="versioningUIEnabled">
-                            Versioning is enabled for this project.
-                        </v-card-subtitle>
-                        <v-card-subtitle v-else>
-                            Enable object versioning on this project.
+                <v-col v-if="project.isClassic" cols="12" sm="6" lg="4">
+                    <v-card title="Migrate to new storage tiers" class="pa-2">
+                        <v-card-subtitle>
+                            This project uses legacy pricing tiers.
                         </v-card-subtitle>
 
                         <v-card-text>
-                            <v-divider class="mb-4" />
-                            <v-btn v-if="allowVersioningToggle" color="primary" size="small">
-                                Learn More
-                                <versioning-beta-dialog v-model="isVersioningDialogShown" />
-                            </v-btn>
-                            <v-btn v-else-if="versioningUIEnabled" variant="outlined" color="default" size="small" rounded="md">
-                                View Details
-                                <versioning-beta-dialog info />
+                            <v-btn color="primary" @click="isMigrateDialogShown = true">
+                                Migrate Project
                             </v-btn>
                         </v-card-text>
                     </v-card>
                 </v-col>
 
-                <v-col v-if="objectLockEnabled" cols="12" sm="6" lg="4">
-                    <v-card title="Object Lock (Beta)">
-                        <v-card-subtitle v-if="objectLockUIEnabledForProject">
-                            Enabled through Object Versioning (beta).
-                        </v-card-subtitle>
-                        <v-card-subtitle v-else>
-                            Versioning is required to use this feature.
+                <v-col cols="12" sm="6" lg="4">
+                    <v-card title="Object Versioning" class="pa-2">
+                        <v-card-subtitle>
+                            Versioning is enabled for this project.
                         </v-card-subtitle>
 
                         <v-card-text>
-                            <v-divider class="mb-4" />
-                            <v-btn color="default" variant="outlined" size="small" :disabled="!objectLockUIEnabledForProject">
+                            <v-btn variant="outlined" color="default">
                                 View Details
-                                <lock-beta-dialog />
+                                <versioning-info-dialog v-model="isVersioningDialogShown" />
+                            </v-btn>
+                        </v-card-text>
+                    </v-card>
+                </v-col>
+
+                <v-col v-if="objectLockUIEnabled" cols="12" sm="6" lg="4">
+                    <v-card title="Object Lock" class="pa-2">
+                        <v-card-subtitle>
+                            Object Lock is enabled for this project.
+                        </v-card-subtitle>
+
+                        <v-card-text>
+                            <v-btn color="default" variant="outlined">
+                                View Details
+                                <object-lock-info-dialog />
                             </v-btn>
                         </v-card-text>
                     </v-card>
@@ -193,13 +205,13 @@
 
             <v-row>
                 <v-col cols="12" sm="6" lg="4">
-                    <v-card title="Delete Project">
+                    <v-card title="Delete Project" class="pa-2">
                         <v-card-text>
                             <v-chip color="default" variant="tonal" size="small" class="font-weight-bold">
                                 Delete this project.
                             </v-chip>
-                            <v-divider class="my-4" />
-                            <v-btn variant="outlined" color="error" size="small" rounded="md" @click="isDeleteProjectDialogShown = true">
+                            <v-divider class="my-4 border-0" />
+                            <v-btn variant="outlined" color="error" @click="isDeleteProjectDialogShown = true">
                                 Delete
                             </v-btn>
                         </v-card-text>
@@ -213,10 +225,11 @@
     <edit-project-details-dialog v-model="isEditDetailsDialogShown" :field="fieldToChange" />
     <edit-project-limit-dialog v-model="isEditLimitDialogShown" :limit-type="limitToChange" />
     <delete-project-dialog v-model="isDeleteProjectDialogShown" />
+    <migrate-project-pricing-dialog v-model="isMigrateDialogShown" :project-id="project.id" @success="() => projectsStore.selectProject(project.id)" />
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue';
+import { computed, onMounted, ref } from 'vue';
 import {
     VContainer,
     VCard,
@@ -226,18 +239,17 @@ import {
     VBtn,
     VCol,
     VRow,
-    VIcon,
     VChip,
 } from 'vuetify/components';
-import { ArrowRight, SquareArrowOutUpRight, Check } from 'lucide-vue-next';
+import { ArrowRight, Check, Pencil, View, Infinity as InfinityIcon, ExternalLink } from '@lucide/vue';
 
 import { useProjectsStore } from '@/store/modules/projectsStore';
-import { FieldToChange, LimitToChange, Project } from '@/types/projects';
+import { type Project, FieldToChange, LimitToChange, ProjectEncryption  } from '@/types/projects';
 import { useUsersStore } from '@/store/modules/usersStore';
 import { Memory, Size } from '@/utils/bytesSize';
 import { useConfigStore } from '@/store/modules/configStore';
 import { decimalShift } from '@/utils/strings';
-import { useNotify } from '@/utils/hooks';
+import { useNotify } from '@/composables/useNotify';
 import {
     AnalyticsErrorEventSource,
 } from '@/utils/constants/analyticsEventNames';
@@ -250,18 +262,20 @@ import EditProjectLimitDialog from '@/components/dialogs/EditProjectLimitDialog.
 import PageTitleComponent from '@/components/PageTitleComponent.vue';
 import PageSubtitleComponent from '@/components/PageSubtitleComponent.vue';
 import TrialExpirationBanner from '@/components/TrialExpirationBanner.vue';
-import VersioningBetaDialog from '@/components/dialogs/VersioningBetaDialog.vue';
+import VersioningInfoDialog from '@/components/dialogs/VersioningInfoDialog.vue';
 import ProjectEncryptionInformationDialog from '@/components/dialogs/ProjectEncryptionInformationDialog.vue';
 import CreateProjectDialog from '@/components/dialogs/CreateProjectDialog.vue';
 import DeleteProjectDialog  from '@/components/dialogs/DeleteProjectDialog.vue';
-import LockBetaDialog from '@/components/dialogs/LockBetaDialog.vue';
+import ObjectLockInfoDialog from '@/components/dialogs/ObjectLockInfoDialog.vue';
+import MigrateProjectPricingDialog from '@/components/dialogs/MigrateProjectPricingDialog.vue';
+import LimitNotificationsSettings from '@/components/LimitNotificationsSettings.vue';
 
 const isCreateProjectDialogShown = ref<boolean>(false);
 const isDeleteProjectDialogShown = ref<boolean>(false);
 const isEditDetailsDialogShown = ref<boolean>(false);
 const isEditLimitDialogShown = ref<boolean>(false);
 const isVersioningDialogShown = ref<boolean>(false);
-const allowVersioningToggle = ref<boolean>(false);
+const isMigrateDialogShown = ref<boolean>(false);
 const fieldToChange = ref<FieldToChange>(FieldToChange.Name);
 const limitToChange = ref<LimitToChange>(LimitToChange.Storage);
 
@@ -283,7 +297,7 @@ const noLimitsUiEnabled = computed((): boolean => {
 /**
  * Indicates if billing features are enabled.
  */
-const billingEnabled = computed<boolean>(() => configStore.getBillingEnabled(usersStore.state.user.hasVarPartner));
+const billingEnabled = computed<boolean>(() => configStore.getBillingEnabled(usersStore.state.user));
 
 /**
  * Returns selected project from the store.
@@ -293,7 +307,7 @@ const project = computed<Project>(() => {
 });
 
 const projectCanBeDeleted = computed(() => {
-    return deleteProjectEnabled.value && isProjectOwner.value && isProjectOwnerPaidTier.value && !usersStore.state.user.externalID;
+    return deleteProjectEnabled.value && isProjectOwner.value && !usersStore.state.user.externalID;
 });
 
 /**
@@ -319,37 +333,33 @@ const isProjectOwnerOrAdmin = computed(() => {
     return isProjectOwner.value || isAdmin;
 });
 
-const promptForVersioningBeta = computed<boolean>(() => projectsStore.promptForVersioningBeta);
+/**
+ * Whether versioning UI is enabled.
+ */
+const versioningUIEnabled = computed(() => configStore.state.config.versioningUIEnabled);
 
 /**
- * Whether versioning has been enabled for current project.
+ * Whether object lock UI is enabled.
  */
-const versioningUIEnabled = computed(() => projectsStore.versioningUIEnabled);
-
-/**
- * Whether object lock has been enabled for current project.
- */
-const objectLockUIEnabledForProject = computed(() => projectsStore.objectLockUIEnabledForProject);
-
-/**
- * whether object lock UI is globally enabled.
- */
-const objectLockEnabled = computed(() => configStore.objectLockUIEnabled);
+const objectLockUIEnabled = computed(() => configStore.state.config.objectLockUIEnabled);
 
 /**
  * whether this project has a satellite managed passphrase.
  */
 const hasManagedPassphrase = computed(() => projectsStore.state.selectedProjectConfig.hasManagedPassphrase);
 
-/**
- * Indicates if satellite managed encryption passphrase is enabled.
- */
-const satelliteManagedEncryptionEnabled = computed<boolean>(() => configStore.state.config.satelliteManagedEncryptionEnabled);
+const hideEncryptionDetails = computed<boolean>(() => configStore.state.config.hideProjectEncryptionOptions);
+
+const projectLimitNotificationsEnabled = computed<boolean>(() => configStore.state.config.projectLimitNotificationsEnabled);
 
 /**
  * Returns whether this project is owned by a paid tier user.
  */
 const isProjectOwnerPaidTier = computed(() => projectsStore.selectedProjectConfig.isOwnerPaidTier);
+/**
+ * Returns whether the owner of this project has paid privileges
+ */
+const ownerHasPaidPrivileges = computed(() => projectsStore.selectedProjectConfig.hasPaidPrivileges);
 
 /**
  * Returns the current project limits from store.
@@ -402,7 +412,7 @@ const paidBandwidthLimitFormatted = computed<string>(() => {
  * Returns project limits increase request URL from config.
  */
 const projectLimitsIncreaseRequestURL = computed((): string => {
-    return configStore.state.config.projectLimitsIncreaseRequestURL;
+    return configStore.projectLimitsIncreaseRequestURL;
 });
 
 function toggleUpgradeFlow(): void {
@@ -481,16 +491,7 @@ onMounted(async () => {
     try {
         await projectsStore.getProjectLimits(project.value.id);
     } catch (error) {
-        notify.error(`Error fetching project limits. ${error.message}`, AnalyticsErrorEventSource.PROJECT_SETTINGS_AREA);
+        notify.notifyError(error, AnalyticsErrorEventSource.PROJECT_SETTINGS_AREA);
     }
 });
-
-watch(() => [projectsStore.promptForVersioningBeta, isVersioningDialogShown.value], (values) => {
-    if (values[0] && !allowVersioningToggle.value) {
-        allowVersioningToggle.value = true;
-    } else if (!values[0] && !values[1] && allowVersioningToggle.value) {
-        // throttle the banner dismissal for the dialog close animation.
-        setTimeout(() => allowVersioningToggle.value = false, 500);
-    }
-}, { immediate: true });
 </script>
